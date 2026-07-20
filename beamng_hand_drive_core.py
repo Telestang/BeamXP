@@ -1075,18 +1075,33 @@ def extract_slot_defs(part_body: str) -> list[SlotDef]:
 
 
 def vector_from_row(row: str, key: str) -> tuple[float, float, float] | None:
-    match = re.search(
-        rf'"{re.escape(key)}"\s*:\s*\{{\s*"x"\s*:\s*(?P<x>{NUMBER_RE})\s*,'
-        rf'\s*"y"\s*:\s*(?P<y>{NUMBER_RE})\s*,\s*"z"\s*:\s*(?P<z>{NUMBER_RE})\s*\}}',
-        row,
-    )
+    """A row's "pos"/"rot"/"scale" vector, one component at a time.
+
+    Some stock content makes a component a jbeam variable expression instead
+    of a literal -- e.g. the D-Series heavy hub's spacer:
+    "pos":{"x":"$=-$trackoffset_F-0.885", "y":-1.463, "z":0.46}. Reading x/y/z
+    independently via object_number_property (which already falls back to
+    approximate_expression_number, the same machinery node_transform_ops uses
+    for nodeOffset/nodeMove) means a literal y and z are recovered even when x
+    is an expression. The previous all-three-or-nothing regex discarded the
+    whole vector in that case -- not just the unparseable x, but the entirely
+    literal y and z along with it -- and any node_translation_offset that
+    reads this vector's sign lost the L/R distinction it exists to make."""
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*\{{', row)
     if match is None:
         return None
-    return (
-        float(match.group("x")),
-        float(match.group("y")),
-        float(match.group("z")),
-    )
+    brace = row.rfind("{", match.start(), match.end())
+    try:
+        end = transform_helpers.find_matching(row, brace, "{", "}")
+    except ValueError:
+        return None
+    object_text = row[brace:end]
+    x = object_number_property(object_text, "x")
+    y = object_number_property(object_text, "y")
+    z = object_number_property(object_text, "z")
+    if x is None or y is None or z is None:
+        return None
+    return (x, y, z)
 
 
 def vector_subtract(

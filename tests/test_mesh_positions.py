@@ -286,6 +286,40 @@ class SteeringDeltaGuardTests(unittest.TestCase):
         self.assertAlmostEqual(core.auto_delta_magnitude(context, conversion), 0.6852, places=4)
 
 
+class VectorFromRowExpressionTests(unittest.TestCase):
+    """A pos/rot/scale vector with a jbeam $= expression component (e.g. the
+    D-Series heavy hub's spacer, "x":"$=-$trackoffset_F-0.885") used to lose
+    the WHOLE vector -- not just the unparseable x, but a perfectly literal y
+    and z along with it -- because the old regex required all three components
+    to be literal numbers in one match."""
+
+    def test_literal_components_still_parse_exactly(self) -> None:
+        row = '["mesh", ["group"], [], {"pos":{"x":1.5, "y":-2.25, "z":0.1}}]'
+        self.assertEqual(core.vector_from_row(row, "pos"), (1.5, -2.25, 0.1))
+
+    def test_expression_component_recovers_sign_and_keeps_literal_siblings(self) -> None:
+        row = (
+            '["spacer_heavy", ["wheel_FR","wheelhub_FR"], [], '
+            '{"pos":{"x":"$=-$trackoffset_F-0.885", "y":-1.463, "z":0.46}, '
+            '"rot":{"x":0, "y":0, "z":180}}]'
+        )
+        pos = core.vector_from_row(row, "pos")
+        self.assertIsNotNone(pos)
+        self.assertLess(pos[0], 0)  # right side: negative x, sign is what matters
+        self.assertAlmostEqual(pos[1], -1.463, places=6)  # literal y: exact, not lost
+        self.assertAlmostEqual(pos[2], 0.46, places=6)  # literal z: exact, not lost
+
+    def test_mirrored_row_gets_the_opposite_sign(self) -> None:
+        left = '["spacer_heavy", [], [], {"pos":{"x":"$=$trackoffset_F+0.885", "y":0, "z":0}}]'
+        right = '["spacer_heavy", [], [], {"pos":{"x":"$=-$trackoffset_F-0.885", "y":0, "z":0}}]'
+        self.assertGreater(core.vector_from_row(left, "pos")[0], 0)
+        self.assertLess(core.vector_from_row(right, "pos")[0], 0)
+
+    def test_missing_key_still_returns_none(self) -> None:
+        row = '["mesh", ["group"], [], {"rot":{"x":0, "y":0, "z":0}}]'
+        self.assertIsNone(core.vector_from_row(row, "pos"))
+
+
 class SteeringAxisDeltaTests(unittest.TestCase):
     """The steering column rotation centre is a delta fallback only: it must
     fill in when the wheel geometry sits too near centre, and never override
