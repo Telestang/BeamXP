@@ -112,8 +112,6 @@ STRUCTURAL_PROMPT_DELAY_MS = 300
 # Thresholds are metres or fractions, tuned against the hand-verified
 # etk800 / pickup / sunburst2 baselines.
 
-SPATIAL_SYMMETRIC_RESIDUAL = 0.045   # below: reflection is a visual no-op
-SPATIAL_BORDERLINE_RESIDUAL = 0.09   # below: asymmetry within sampling noise
 SPATIAL_PAIR_RESIDUAL = 0.10         # twin acceptance (normalised Chamfer)
 SPATIAL_REACH_LIMIT = 1.35           # ergonomic: controls start within reach
 
@@ -142,11 +140,48 @@ def _spatial_entries_for_trim(
             # position is their average, a fictitious point the classifier
             # must not reason about
             continue
+        if placement is not None and object_id in context.variant_dependent_meshes:
+            rebuilt = core.vertex_cloud_for_resolved_placement(context, object_id, placement)
+            if rebuilt is not None:
+                arrays[object_id] = rebuilt
+                continue
         item = entries.get(object_id) or context.preview_by_id.get(object_id)
         if item is None:
             continue
         arrays[object_id] = np.array(item["sample_points"], dtype=float)
     return [o for o in present if o in arrays], arrays
+
+
+def _mesh_symmetry(
+    context: core.VehicleContext,
+    object_id: str,
+    points: object,
+    center_x: float,
+) -> tuple[int, float]:
+    """Full-vertex symmetry evidence at this trim's x placement."""
+    import numpy as np
+
+    full = core.full_vertex_clouds_for_ids(context, (object_id,)).get(object_id)
+    if full is None or len(full) == 0:
+        full = np.asarray(points, dtype=float)
+    placed = np.asarray(points, dtype=float)
+    preview = context.preview_by_id.get(object_id, {})
+    base_center = preview.get("center")
+    if len(placed):
+        placed_center_x = float((placed[:, 0].min() + placed[:, 0].max()) / 2.0)
+    else:
+        placed_center_x = float(center_x)
+    shift_x = placed_center_x - float(base_center[0]) if base_center is not None else 0.0
+    key = (object_id, round(shift_x, 9), round(float(center_x), 9))
+    cache = getattr(context, "_mesh_symmetry_cache", None)
+    if cache is None:
+        cache = {}
+        context._mesh_symmetry_cache = cache
+    if key not in cache:
+        shifted = np.asarray(full, dtype=float).copy()
+        shifted[:, 0] += shift_x
+        cache[key] = core.reflected_orphan_stats(shifted, center_x)
+    return cache[key]
 
 
 def _classify_meshes_for_trim(
@@ -155,13 +190,16 @@ def _classify_meshes_for_trim(
     present: list[str],
     entries_np: dict[str, object],
     want: list[str],
+    forced: frozenset[str] = frozenset(),
+    hard_vetoed: set[str] | None = None,
+    scoped: set[str] | None = None,
 ) -> tuple[dict[str, tuple[str, str, str, dict]], set[str]]:
     """Intrinsic class per mesh from one trim's geometry.
 
     Returns (verdicts, vetoed): verdict is (class, reason, confidence, extra)
-    with class in {"translate", "mirror", "pairable", "none"}; vetoed lists
-    meshes positively identified as exterior surfaces (they must never be
-    offered as pairing twins)."""
+    with class in {"translate", "mirror", "pairable", "functional_skip",
+    "none"}; vetoed lists meshes positively identified as exterior surfaces
+    (they must never be offered as pairing twins)."""
     import numpy as np
 
     eye = np.array(frame.eye)
@@ -185,6 +223,24 @@ def _classify_meshes_for_trim(
         if context.objects.get(o) is not None
         and core.steering_ref_score(o, context.objects[o]) >= 15
     }
+    # The eye camera sits inside the driver's seat volume.  Treat whichever
+    # furniture actually surrounds that eye as transparent so its cushion and
+    # backrest cannot hide rails/bases directly below it.  Geometry, not a
+    # seat token, identifies the host; this also handles benches and mod seats.
+    for object_id in present:
+        seat_points = entries_np.get(object_id)
+        if seat_points is None or len(seat_points) < 4:
+            continue
+        if float(np.linalg.norm(np.ptp(seat_points, axis=0))) < 0.50:
+            continue
+        under_eye = (
+            (np.abs(seat_points[:, 0] - eye[0]) < 0.25)
+            & (np.abs(seat_points[:, 1] - eye[1]) < 0.35)
+            & (seat_points[:, 2] > eye[2] - 0.75)
+            & (seat_points[:, 2] < eye[2] - 0.10)
+        )
+        if float(under_eye.mean()) >= 0.20:
+            transparent.add(object_id)
 
     scan = core.visibility_scan({o: entries_np[o] for o in present}, frame.eye, transparent)
     scan_no_glass = core.visibility_scan(
@@ -304,31 +360,52 @@ def _classify_meshes_for_trim(
                 or cand_enclosed
             )
         )
-        if not (cand_visible or cand_enclosed or cand_fitment or cand_cone):
+        if not (cand_visible or cand_enclosed or cand_fitment or cand_cone
+                or object_id in forced):
             continue
+        if scoped is not None:
+            scoped.add(object_id)
 
         if not cand_fitment:
             if beyond.get(object_id, 0.0) >= 0.40:
                 vetoed.add(object_id)
+                if hard_vetoed is not None:
+                    hard_vetoed.add(object_id)
                 continue  # outside the glasshouse (wipers, hood, truck bed)
             if out80 > half_width + 0.04:
                 vetoed.add(object_id)
+                if hard_vetoed is not None:
+                    hard_vetoed.add(object_id)
                 continue  # protrudes past the cabin shell (door skin)
             if out80 > half_width - 0.02 and stats["lined"] < 0.35 and stats["backed"] < 0.35:
                 vetoed.add(object_id)
+                if hard_vetoed is not None:
+                    hard_vetoed.add(object_id)
                 continue  # at the shell with nothing behind: exposed skin
             if (out80 > half_width - 0.03 and z70 > frame.eye[2] + 0.05
                     and extents[0] < 0.40 and extents[1] > 0.6):
                 vetoed.add(object_id)
+                if hard_vetoed is not None:
+                    hard_vetoed.add(object_id)
                 continue  # shell wall rising past the beltline: door frame/skin
             if z70 > ceiling_z + 0.04:
                 vetoed.add(object_id)
+                if hard_vetoed is not None:
+                    hard_vetoed.add(object_id)
                 continue  # above the headliner (roof accessories)
-            if (float(centroid[1]) < y_front - 0.12 and not in_cone) or float(centroid[1]) > y_rear + 0.15:
+            if (float(centroid[1]) < y_front - 0.12 and not in_cone
+                    and object_id not in forced):
                 vetoed.add(object_id)
-                continue  # ahead of the firewall / behind the cab
+                continue  # ahead of the firewall
+            if float(centroid[1]) > y_rear + 0.15:
+                vetoed.add(object_id)
+                if hard_vetoed is not None:
+                    hard_vetoed.add(object_id)
+                continue  # behind the cab
             if z70 < floor_z - 0.08 and not cand_cone:
                 vetoed.add(object_id)
+                if hard_vetoed is not None:
+                    hard_vetoed.add(object_id)
                 continue  # under the cabin floor
 
         if diagonal < 0.14 and stats["n"] < 40 and not in_cone:
@@ -358,11 +435,11 @@ def _classify_meshes_for_trim(
         planar = sds[0] / max(sds[1], 1e-6) < 0.35 or stats["n"] < 40
         display = emissive and planar and diagonal <= 0.9
 
-        residual = core.cloud_symmetry_residual(points, cx0)
+        orphans, coarse_fraction = _mesh_symmetry(context, object_id, points, cx0)
         if (not cand_visible and abs(float(centroid[0]) - cx0) < 0.12
-                and residual < 0.15 and not cand_fitment and not cand_cone):
+                and coarse_fraction < 0.15 and not cand_fitment and not cand_cone):
             continue  # barely-seen centred blob: mirroring it is a no-op
-        if residual < SPATIAL_SYMMETRIC_RESIDUAL:
+        if orphans == 0:
             xspan = float(np.ptp(points[:, 0]))
             z90 = float(np.percentile(points[:, 2], 90))
             fascia = (
@@ -373,13 +450,14 @@ def _classify_meshes_for_trim(
             if display:
                 verdicts[object_id] = ("mirror", "directional display", "med", {"flip": True})
             elif fascia:
-                # symmetric at cloud resolution, but the fascia carries
-                # sub-sampling driver detail (binnacle, vents): mirror it
+                # Geometrically symmetric, but a fascia may carry directional
+                # materials or generated detail, so preserve the established
+                # dashboard transform.
                 verdicts[object_id] = ("mirror", "dashboard fascia", "med", {})
             # else: symmetric about the centreline, reflection changes nothing
             continue
 
-        confidence = "low" if residual < SPATIAL_BORDERLINE_RESIDUAL else (
+        confidence = "low" if coarse_fraction < 0.05 else (
             "med" if not cand_visible else "high")
         reason = ("exterior driver fitment" if cand_fitment and not cand_visible
                   else "one-sided interior part")
@@ -390,7 +468,70 @@ def _classify_meshes_for_trim(
     return verdicts, vetoed
 
 
+def _passenger_footwell_forced(
+    frame: core.DriverFrame,
+    present: list[str],
+    entries_np: dict[str, object],
+    modes: dict[str, tuple[str, str, str, dict]],
+    hard_vetoed: set[str] | frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Unclassified meshes in a 30-degree cone at the opposite footwell.
+
+    The aim point is the reflected average of translated furniture below the
+    wheel (pedals and their cluster).  This only grants scope admission; the
+    ordinary veto, control-cone, symmetry, and pairing rules still decide the
+    verdict.
+    """
+    import math
+    import numpy as np
+
+    if frame.wheel_center is None:
+        return frozenset()
+    eye = np.asarray(frame.eye, dtype=float)
+    wheel_z = float(frame.wheel_center[2])
+    translated_centroids = []
+    for object_id in present:
+        if object_id == frame.wheel_id or modes.get(object_id, ("none",))[0] != "translate":
+            continue
+        points = entries_np.get(object_id)
+        if points is None or len(points) < 4:
+            continue
+        centroid = points.mean(axis=0)
+        if centroid[2] < wheel_z - 0.10 and float(np.linalg.norm(centroid - eye)) <= 1.6:
+            translated_centroids.append(centroid)
+    if not translated_centroids:
+        return frozenset()
+
+    aim = np.mean(translated_centroids, axis=0)
+    aim[0] = 2.0 * frame.center_x - aim[0]
+    axis = aim - eye
+    axis_length = float(np.linalg.norm(axis))
+    if axis_length < 1e-6:
+        return frozenset()
+    axis /= axis_length
+    min_cosine = math.cos(math.radians(30.0))
+    forced: set[str] = set()
+    for object_id in present:
+        if object_id in hard_vetoed or modes.get(object_id, ("none",))[0] != "none":
+            continue
+        points = entries_np.get(object_id)
+        if points is None or len(points) < 4:
+            continue
+        centroid = points.mean(axis=0)
+        if centroid[2] >= wheel_z:
+            continue  # a footwell cone never admits glazing/wipers above the wheel
+        point_ranges = np.linalg.norm(points - eye, axis=1)
+        if float(np.percentile(point_ranges, 80)) > 1.6:
+            continue  # centroid-near body/exhaust meshes are not cabin furniture
+        direction = centroid - eye
+        distance = float(np.linalg.norm(direction))
+        if 0.05 < distance <= 1.6 and float(direction @ axis) / distance >= min_cosine:
+            forced.add(object_id)
+    return frozenset(forced)
+
+
 def _resolve_trim_pairs(
+    context: core.VehicleContext,
     frame: core.DriverFrame,
     present: list[str],
     entries_np: dict[str, object],
@@ -406,6 +547,7 @@ def _resolve_trim_pairs(
     exclusive variants never compete for the same counterpart."""
     import numpy as np
 
+    material_symbols = core.mesh_material_symbols(context)
     pairables = [o for o in present if memo.get(o, ("none",))[0] == "pairable"]
     latent = [
         o for o in present
@@ -445,6 +587,24 @@ def _resolve_trim_pairs(
             twin_id = best[1]
             used.add(object_id)
             used.add(twin_id)
+            symbols_a = set(material_symbols.get(object_id, ()))
+            symbols_b = set(material_symbols.get(twin_id, ()))
+            # Directional-material twins bind mutually exclusive symbols.
+            # Multi-material housings may legitimately share their body
+            # material while using a side-specific auxiliary symbol; those
+            # are still safe structural pairs.
+            if symbols_a and symbols_b and symbols_a.isdisjoint(symbols_b):
+                reason = (
+                    "functionally sided: materials differ, needs build-side material rebind"
+                )
+                memo[object_id] = ("functional_skip", reason, "high", {})
+                memo[twin_id] = ("functional_skip", reason, "high", {})
+                pair_votes.pop(object_id, None)
+                pair_votes.pop(twin_id, None)
+                for votes in pair_votes.values():
+                    votes.pop(object_id, None)
+                    votes.pop(twin_id, None)
+                continue
             if memo.get(twin_id, ("none",))[0] == "none":
                 memo[twin_id] = ("pairable", "geometric twin across the centreline", "med", {})
             pair_votes.setdefault(object_id, {})[twin_id] = (
@@ -461,6 +621,7 @@ def _inherit_mounted_parts(
     memo: dict[str, tuple[str, str, str, dict]],
     vetoed: set[str],
     pair_votes: dict[str, dict[str, int]],
+    scoped: set[str],
 ) -> None:
     """Assembly propagation: a small part mounted ON a mirrored surface
     mirrors with it.
@@ -505,7 +666,7 @@ def _inherit_mounted_parts(
             and float(np.linalg.norm(entries_np[o].mean(axis=0) - eye)) <= 1.6
         ]
         if not hosts:
-            return
+            break
         changed = False
         for object_id in present:
             if memo.get(object_id, ("none",))[0] != "none" or object_id in vetoed:
@@ -529,7 +690,49 @@ def _inherit_mounted_parts(
                     changed = True
                     break
         if not changed:
-            return
+            break
+
+    # A genuinely floating scoped mesh can still be recognised by occlusion:
+    # if its eye rays continue into any transformed cabin/mirror furniture,
+    # the floater is cabin furniture too.  Contact inheritance above has
+    # already consumed anything mounted within 3 cm.
+    floaters: list[str] = []
+    for object_id in present:
+        if (object_id not in scoped or memo.get(object_id, ("none",))[0] != "none"
+                or object_id in vetoed):
+            continue
+        points = entries_np.get(object_id)
+        if points is None or len(points) < 4 or is_glass(object_id):
+            continue
+        diag = float(np.linalg.norm(np.ptp(points, axis=0)))
+        if diag > 0.70 or (diag < 0.14 and len(points) < 40):
+            continue
+        if float(np.percentile(np.linalg.norm(points - eye, axis=1), 80)) > 1.6:
+            continue
+        floaters.append(object_id)
+    if not floaters:
+        return
+
+    transformed = {
+        object_id: memo[object_id][0]
+        for object_id in present
+        if object_id in entries_np
+        and memo.get(object_id, ("none",))[0] in {"translate", "mirror", "pairable"}
+        and float(np.percentile(
+            np.linalg.norm(entries_np[object_id] - eye, axis=1), 80
+        )) <= 1.6
+    }
+    backing = core.directional_verdict_backing(
+        entries_np, frame.eye, floaters, transformed
+    )
+    for object_id in floaters:
+        classes = backing.get(object_id, {})
+        if not classes:
+            continue
+        behind_class = max(classes, key=lambda name: (classes[name], name))
+        memo[object_id] = (
+            "mirror", f"floating in front of {behind_class} geometry", "low", {}
+        )
 
 
 def build_mode_recommendations(
@@ -555,10 +758,15 @@ def build_mode_recommendations(
 
     state = getattr(context, "_spatial_recommendation_state", None)
     if state is None:
-        state = {"memo": {}, "vetoed": set(), "pair_votes": {}, "trims_done": set()}
+        state = {
+            "memo": {}, "vetoed": set(), "hard_vetoed": set(),
+            "scoped": set(), "pair_votes": {}, "trims_done": set(),
+        }
         context._spatial_recommendation_state = state
     memo: dict[str, tuple[str, str, str, dict]] = state["memo"]
     vetoed: set[str] = state["vetoed"]
+    hard_vetoed: set[str] = state.setdefault("hard_vetoed", set())
+    scoped: set[str] = state.setdefault("scoped", set())
     pair_votes: dict[str, dict[str, int]] = state["pair_votes"]
 
     trims: list[str | None] = sorted(context.variants) if context.variants else [None]
@@ -574,7 +782,9 @@ def build_mode_recommendations(
         ]
         if todo:
             verdicts, newly_vetoed = _classify_meshes_for_trim(
-                context, frame, present, entries_np, todo
+                context, frame, present, entries_np, todo,
+                hard_vetoed=hard_vetoed,
+                scoped=scoped,
             )
             vetoed.update(newly_vetoed)
             for o in todo:
@@ -584,9 +794,31 @@ def build_mode_recommendations(
                     memo[o] = verdict
                 elif previous[2] == "low" and verdict[0] != "none" and verdict[2] != "low":
                     memo[o] = verdict  # a trim resolved the borderline case
+            forced = _passenger_footwell_forced(
+                frame, present, entries_np, memo, hard_vetoed
+            )
+            forced_todo = [
+                o for o in present
+                if o in forced and memo.get(o, ("none",))[0] == "none"
+            ]
+            if forced_todo:
+                forced_verdicts, forced_vetoed = _classify_meshes_for_trim(
+                    context, frame, present, entries_np, forced_todo, forced,
+                    hard_vetoed, scoped,
+                )
+                vetoed.update(forced_vetoed)
+                for o in forced_todo:
+                    verdict = forced_verdicts.get(o, ("none", "", "med", {}))
+                    if verdict[0] != "none":
+                        memo[o] = verdict
+                        vetoed.discard(o)
         if trim not in state["trims_done"]:
-            _resolve_trim_pairs(frame, present, entries_np, memo, vetoed, pair_votes)
-            _inherit_mounted_parts(context, frame, present, entries_np, memo, vetoed, pair_votes)
+            _resolve_trim_pairs(
+                context, frame, present, entries_np, memo, vetoed, pair_votes
+            )
+            _inherit_mounted_parts(
+                context, frame, present, entries_np, memo, vetoed, pair_votes, scoped
+            )
             state["trims_done"].add(trim)
 
     # Meshes no trim uses stay unclassified on purpose: the union of mutually
@@ -598,7 +830,7 @@ def build_mode_recommendations(
     requested = set(object_ids)
     for object_id in sorted(requested & set(memo)):
         mode, reason, confidence, extra = memo[object_id]
-        if mode == "none":
+        if mode in {"none", "functional_skip"}:
             continue
         if confidence == "low":
             reason = f"{reason} (low confidence)"

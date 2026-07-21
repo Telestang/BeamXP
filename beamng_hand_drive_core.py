@@ -672,6 +672,134 @@ def preview_data_from_tree(
     return preview
 
 
+def full_vertex_clouds_for_ids(
+    context: VehicleContext,
+    ids: Iterable[str],
+) -> dict[str, np.ndarray]:
+    """Uncapped DAE vertex clouds, aligned to the placed preview centres.
+
+    Preview clouds are deliberately capped for interactive work, but striding
+    and truncating a vertex buffer can split exact mirror pairs.  Self-
+    symmetry therefore needs every authored vertex.  Each source DAE is
+    parsed at most once, including DAEs supplied by ``dae_source_zip``; any
+    unreadable mesh falls back to its preview cloud so failure favours a
+    benign extra mirror rather than a missed asymmetric part.
+
+    JBeam-placed shared meshes are commonly authored at the origin.  Their
+    full clouds are translated onto the representative preview bbox centre.
+    Per-trim x translation is applied by the classifier, which has the trim's
+    resolved preview in hand.
+    """
+    clouds = getattr(context, "_full_clouds", None)
+    if clouds is None:
+        clouds = {}
+        context._full_clouds = clouds
+    authored_clouds = getattr(context, "_authored_full_clouds", None)
+    if authored_clouds is None:
+        authored_clouds = {}
+        context._authored_full_clouds = authored_clouds
+    parsed_files = getattr(context, "_full_cloud_files", None)
+    if parsed_files is None:
+        parsed_files = set()
+        context._full_cloud_files = parsed_files
+
+    requested = {str(object_id) for object_id in ids}
+
+    def source_key(obj: DaeObject) -> tuple[str, str]:
+        source_zip = Path(obj.dae_source_zip or context.source_zip)
+        try:
+            zip_key = str(source_zip.resolve(strict=False)).lower()
+        except OSError:
+            zip_key = str(source_zip).lower()
+        return zip_key, obj.dae_path.replace("\\", "/")
+
+    by_file: dict[tuple[str, str], tuple[Path, str]] = {}
+    for object_id in requested:
+        if object_id in clouds:
+            continue
+        obj = context.objects.get(object_id)
+        if obj is None or not obj.dae_path:
+            continue
+        source_zip = Path(obj.dae_source_zip or context.source_zip)
+        by_file.setdefault(source_key(obj), (source_zip, obj.dae_path))
+
+    for key, (source_zip, dae_path) in by_file.items():
+        if key in parsed_files:
+            continue
+        parsed_files.add(key)
+        try:
+            full_preview = preview_data_from_tree(
+                parse_dae(source_zip, dae_path),
+                max_points_per_object=sys.maxsize,
+            )
+        except Exception:
+            full_preview = {}
+
+        # Cache every context object backed by this DAE.  A later trim can ask
+        # about a different mesh in the same file without forcing a reparse.
+        for object_id, obj in context.objects.items():
+            if source_key(obj) != key:
+                continue
+            authored = full_preview.get(object_id)
+            placed = context.preview_by_id.get(object_id)
+            if authored is None or placed is None:
+                continue
+            points = np.asarray(authored.get("sample_points", ()), dtype=float)
+            if len(points) == 0:
+                continue
+            authored_clouds[object_id] = points
+            authored_center = np.asarray(authored.get("center"), dtype=float)
+            placed_center = np.asarray(placed.get("center"), dtype=float)
+            if authored_center.shape == (3,) and placed_center.shape == (3,):
+                points = points + (placed_center - authored_center)
+            clouds[object_id] = points
+
+    result: dict[str, np.ndarray] = {}
+    for object_id in requested:
+        points = clouds.get(object_id)
+        if points is None:
+            preview = context.preview_by_id.get(object_id, {})
+            points = np.asarray(preview.get("sample_points", ()), dtype=float)
+            clouds[object_id] = points
+        result[object_id] = points
+    return result
+
+
+def vertex_cloud_for_resolved_placement(
+    context: VehicleContext,
+    object_id: str,
+    resolved: ResolvedMeshPosition,
+    max_points: int = 350,
+) -> np.ndarray | None:
+    """Rebuild one flexbody cloud from its authored DAE and trim matrix.
+
+    Representative previews can contain two simultaneous instances.  Merely
+    translating that preview for a trim which uses one instance leaves a
+    phantom twin in the cloud.  Variant-dependent, single-instance callers use
+    this helper to apply the actual trim matrix instead.
+    """
+    if len(resolved.matrices) != 1:
+        return None
+    full_vertex_clouds_for_ids(context, (object_id,))
+    authored = getattr(context, "_authored_full_clouds", {}).get(object_id)
+    if authored is None or len(authored) == 0:
+        return None
+    matrix = np.asarray(resolved.matrices[0], dtype=float)
+    homogeneous = np.concatenate(
+        [np.asarray(authored, dtype=float), np.ones((len(authored), 1), dtype=float)],
+        axis=1,
+    )
+    points = (homogeneous @ matrix.T)[:, :3]
+    if object_id not in context.jbeam_positioned_flexbodies:
+        pivot = context.mesh_pivots.get(object_id)
+        if pivot is not None and max(abs(value) for value in pivot) > 1e-9:
+            points = points - np.asarray(pivot, dtype=float)
+    if len(points) > max_points:
+        stride = max(1, len(points) // max_points)
+        points = points[::stride][:max_points]
+    return points
+
+
 def load_jbeam_texts(source_zip: Path, vehicle_id: str) -> dict[str, str]:
     prefix = f"{vehicle_prefix(vehicle_id)}/"
     with zipfile.ZipFile(source_zip) as zf:
@@ -6419,6 +6547,69 @@ def visibility_scan(
     return stats
 
 
+def directional_verdict_backing(
+    points_by_id: dict[str, np.ndarray],
+    eye: tuple[float, float, float],
+    foreground_ids: Iterable[str],
+    verdict_by_id: dict[str, str],
+    min_gap: float = 0.03,
+) -> dict[str, dict[str, float]]:
+    """Fractions of a mesh's sightline points backed by transformed classes.
+
+    For each 6-degree direction bin, the farthest point belonging to a mesh
+    in ``verdict_by_id`` supplies both its range and verdict class.  A
+    foreground point is backed when that transformed geometry continues at
+    least ``min_gap`` farther along the same eye ray.  Distances are otherwise
+    unbounded: this is a line-of-sight relationship, not a contact test.
+    """
+    transformed = [
+        object_id for object_id in verdict_by_id
+        if object_id in points_by_id and len(points_by_id[object_id])
+    ]
+    foreground = [
+        object_id for object_id in foreground_ids
+        if object_id in points_by_id and len(points_by_id[object_id])
+    ]
+    result = {object_id: {} for object_id in foreground}
+    if not transformed or not foreground:
+        return result
+
+    class_names = sorted(set(verdict_by_id[object_id] for object_id in transformed))
+    class_index = {name: index for index, name in enumerate(class_names)}
+    chunks = [points_by_id[object_id] for object_id in transformed]
+    classes = np.concatenate([
+        np.full(len(points_by_id[object_id]), class_index[verdict_by_id[object_id]])
+        for object_id in transformed
+    ])
+    all_points = np.concatenate(chunks)
+    bins, radii = spatial_spherical_bins(all_points - np.asarray(eye, dtype=float))
+    order = np.lexsort((radii, bins))
+    sorted_bins = bins[order]
+    is_last = np.r_[sorted_bins[1:] != sorted_bins[:-1], True]
+    winners = order[is_last]
+    n_bins = int(bins.max()) + 2
+    far_range = np.full(n_bins, -np.inf)
+    far_class = np.full(n_bins, -1, dtype=np.int64)
+    far_range[bins[winners]] = radii[winners]
+    far_class[bins[winners]] = classes[winners]
+
+    eye_v = np.asarray(eye, dtype=float)
+    for object_id in foreground:
+        points = points_by_id[object_id]
+        point_bins, point_ranges = spatial_spherical_bins(points - eye_v)
+        in_field = point_bins < n_bins
+        backed = np.zeros(len(points), dtype=bool)
+        backed[in_field] = far_range[point_bins[in_field]] > point_ranges[in_field] + min_gap
+        count = len(points)
+        for name, index in class_index.items():
+            matched = backed & in_field
+            matched[in_field] &= far_class[point_bins[in_field]] == index
+            hits = int(matched.sum())
+            if hits:
+                result[object_id][name] = float(hits) / count
+    return result
+
+
 def floor_height_from_shell(
     points_by_id: dict[str, np.ndarray],
     eye: tuple[float, float, float],
@@ -6519,6 +6710,66 @@ def cloud_symmetry_residual(points: np.ndarray, center_x: float) -> float:
     nearest = np.sqrt(squared.min(axis=1))
     diagonal = float(np.linalg.norm(np.ptp(points, axis=0)))
     return float(np.median(nearest)) / max(diagonal, 0.05)
+
+
+def reflected_orphan_stats(
+    points: np.ndarray,
+    center_x: float,
+    exact_tol: float = 1e-4,
+    coarse_tol: float = 0.02,
+) -> tuple[int, float]:
+    """Count vertices missing an x-reflected twin at two tolerances.
+
+    ``orphans`` uses a 0.1 mm default tolerance to absorb DAE float dust while
+    retaining a zero-threshold decision: only a mesh whose every vertex has a
+    reflected partner is a symmetry no-op.  ``coarse_fraction`` is diagnostic
+    evidence for confidence grading, never the skip decision.
+
+    A spatial hash keeps each pass linear for ordinary mesh density.  Actual
+    Euclidean distances are checked inside neighbouring cells, so quantisation
+    cannot turn a near cell into a false match.
+    """
+    cloud = np.asarray(points, dtype=float)
+    if len(cloud) == 0:
+        return 0, 0.0
+
+    reflected = cloud.copy()
+    reflected[:, 0] = 2.0 * float(center_x) - reflected[:, 0]
+
+    def orphan_count(tol: float) -> int:
+        if tol <= 0.0:
+            raise ValueError("symmetry tolerance must be positive")
+        cells: dict[tuple[int, int, int], list[np.ndarray]] = {}
+        indices = np.floor(cloud / tol).astype(np.int64)
+        for index, cell in enumerate(indices):
+            cells.setdefault((int(cell[0]), int(cell[1]), int(cell[2])), []).append(cloud[index])
+        tol2 = tol * tol
+        count = 0
+        for query in reflected:
+            base = np.floor(query / tol).astype(np.int64)
+            matched = False
+            for dx in (-1, 0, 1):
+                if matched:
+                    break
+                for dy in (-1, 0, 1):
+                    if matched:
+                        break
+                    for dz in (-1, 0, 1):
+                        candidates = cells.get(
+                            (int(base[0] + dx), int(base[1] + dy), int(base[2] + dz))
+                        )
+                        if candidates is None:
+                            continue
+                        if any(float(np.dot(point - query, point - query)) <= tol2 for point in candidates):
+                            matched = True
+                            break
+            if not matched:
+                count += 1
+        return count
+
+    exact_orphans = orphan_count(float(exact_tol))
+    coarse_orphans = orphan_count(float(coarse_tol))
+    return exact_orphans, float(coarse_orphans) / len(cloud)
 
 
 def mirror_pair_residual(points_a: np.ndarray, points_b: np.ndarray, center_x: float) -> float:

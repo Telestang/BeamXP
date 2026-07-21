@@ -10,10 +10,12 @@ is explicit, confined, and always low-confidence.
 
 Pure geometry lives in `beamng_hand_drive_core.py` (`DriverFrame`,
 `driver_frame_for_context`, `visibility_scan`, `floor_height_from_shell`,
-`glass_beyond_fractions`, `cloud_symmetry_residual`, `mirror_pair_residual`,
-`principal_extent_sds`, `material_flags_for_context`,
-`mesh_material_symbols`). Orchestration lives in `beamng_hand_drive_tool.py`
-(`_classify_meshes_for_trim`, `_resolve_trim_pairs`,
+`glass_beyond_fractions`, `full_vertex_clouds_for_ids`,
+`reflected_orphan_stats`, `mirror_pair_residual`,
+`directional_verdict_backing`, `principal_extent_sds`,
+`material_flags_for_context`, `mesh_material_symbols`). Orchestration lives in
+`beamng_hand_drive_tool.py` (`_classify_meshes_for_trim`,
+`_resolve_trim_pairs`, `_inherit_mounted_parts`,
 `build_mode_recommendations`).
 
 ## 1. The eye-frame (Step 0)
@@ -46,7 +48,10 @@ shell-relative rather than absolute.
 `visibility_scan` bins every present mesh's sample points into 6° equal-angle
 (elevation, azimuth) bins around E and takes the per-bin nearest opaque point
 as the **shell**. Steering-scored meshes are transparent (so the cluster,
-stalks and pedals behind the wheel are reachable). Per mesh it reports:
+stalks and pedals behind the wheel are reachable). The large mesh that
+geometrically surrounds the eye and extends below it is also transparent: the
+camera sits inside the driver's seat, and an opaque seat otherwise hides its
+own rails/base. Per mesh the scan reports:
 
 - `vf` — fraction of points on/inside the shell (range-scaled tolerance
   0.05 + 0.04·r);
@@ -101,15 +106,31 @@ real (see §7).
 
 ## 3. Symmetry and structural pairing (Steps 2–3)
 
-`cloud_symmetry_residual` reflects a candidate's cloud across the centreline
-and takes the median nearest-neighbour distance, normalised by the bbox
-diagonal. Below 0.045 the reflection is a visual no-op ⇒ **skip**, with two
-exceptions: the **dashboard fascia** (wide, forward of the eye, spanning the
-view band — symmetric at cloud resolution but carrying sub-sampling driver
-detail) mirrors, and a **directional display** (emissive material on a small
-planar surface) mirrors with `textureFlip`. Between 0.045 and 0.09 the
-verdict exists but is low-confidence; above, the mesh is one-sided ⇒
-**pairable**.
+Self-symmetry is decided on the **uncapped DAE vertex set**, not the 350-point
+preview. `sample_points` is `points[::stride][:max_points]`: the final
+truncation can discard a contiguous tail after striding and split authored
+mirror pairs. That sampling artifact — not a physical feature of the mesh —
+made symmetric meshes appear asymmetric.
+
+`full_vertex_clouds_for_ids` follows each object's
+`dae_source_zip or context.source_zip`, parses every source DAE at most once,
+and translates the authored cloud onto the placed preview centre. Shared
+accessories therefore come from the common pack that actually owns them. A
+trim's x placement is applied before testing. Parse failure falls back to the
+preview cloud, deliberately degrading toward an extra benign Mirror rather
+than a missed asymmetric part.
+
+`reflected_orphan_stats` reflects every vertex across the vehicle centreline
+and performs deterministic voxel-hash membership checks. A vertex is an exact
+orphan when no reflected partner exists within 0.1 mm; **only
+`exact_orphans == 0` skips**. The separate fraction unmatched within 2 cm is
+used for low-confidence grading (`< 0.05`) and the barely-seen centred-blob
+guard (`< 0.15`), never for the skip decision. There are two established
+exceptions to a zero-orphan no-op: the **dashboard fascia** still mirrors, and
+a small planar emissive **directional display** mirrors with `textureFlip`.
+Any exact orphan otherwise makes the mesh pairable. This is intentionally
+trigger-happy: small modelling offsets can produce an extra Mirror, which is
+preferred to missing real one-sided detail.
 
 Pairing is **relational and per trim**: each pairable seeks a geometric twin
 among *the meshes present in that trim* — mirrored centroid (±14 cm),
@@ -121,6 +142,13 @@ pair across trims. Twin present ⇒ one `kind:"pair"`
 `MODE_MIRROR_STRUCTURAL` entry naming the driver-side member; twin absent in
 every trim ⇒ aesthetic `MODE_MIRROR` with the reason saying so. Near-centred
 pairables (|x| < 8 cm) never pair — a centred fitment has nothing opposite.
+
+A prospective pair whose non-empty material-symbol sets are **disjoint** is
+protected as `functional_skip` with the reason “functionally sided: materials
+differ, needs build-side material rebind”. This catches material-animated
+directional lights while allowing ordinary multi-material housings that share
+a body material. The real build-side solution remains a later material rebind;
+until then, Skip is safer than swapping directional animation materials.
 
 ## 4. The control cone (Step 4)
 
@@ -141,10 +169,26 @@ shaft. A small **glass** pane inside the cone is an instrument cover and
 translates with the cluster (the D-series `gauges_cover_M`), which is why
 "glass ⇒ skip" is decided after the cone check.
 
+### Passenger-footwell blind-spot pass
+
+After the ordinary pass, the classifier averages the centroids of Translate
+meshes at least 10 cm below the steering wheel, reflects that point across the
+centreline, and aims a **30° field-of-view cone** from the eye at the opposite
+footwell. Only still-unclassified meshes enter this second pass. A forced mesh
+bypasses scope admission and the ahead-of-firewall y veto, but every other
+shell/glass/floor veto and the ordinary symmetry, control-cone and pairing
+logic still applies: forcing candidacy never forces a mode.
+
+The pass is bounded to below-wheel geometry whose 80th-percentile point range
+is within the 1.6 m cabin radius. Hard exterior, roof, rear-cab and under-floor
+vetoes persist between trims and cannot be reopened by the cone. This admits
+the passenger footplate while leaving SPOTLIGHT dummies, whole-body meshes and
+long exhausts out.
+
 ## 4b. Assembly propagation (mounted parts)
 
 Failure analysis against the baselines exposed one dominant pattern: almost
-every genuine miss was a part **physically touching (< 1.5 cm) an interior
+every genuine miss was a part **physically touching (< 3 cm) an interior
 part the classifier already handled** -- the hazard button on the dash face
 (cloud gap 0.000 m), the handbrake lever on its body (0.001), the shifter
 knob on its lever (0.000), dash seals on the fascia (0.004), the console on
@@ -159,6 +203,17 @@ passes resolve chains (button -> console -> dash). Translate and pair
 verdicts are never overridden, structural hosts never confer (their
 satellites pair on their own), and the radius bound keeps underbody
 bracketry from chaining off a leak.
+
+A second propagation rule handles genuinely floating scoped meshes. After
+the 3 cm contact passes, `directional_verdict_backing` reuses the 6° angular
+bins to ask whether a floater's eye rays continue at least 3 cm farther into
+geometry classified Translate, Mirror, or Pairable/structural. Any such
+backing, at any farther distance along the ray, makes the floater inherit
+low-confidence Mirror and records the verdict class behind it. Both floater
+and backing geometry are bounded to the 1.6 m cabin radius; glass,
+furniture-sized meshes over 0.7 m, and sub-resolution dummies are excluded.
+This covers detached laptop-mount poles without promoting SPOTLIGHT or axle
+braces.
 
 ## 5. Directional-texture flip (Step 5)
 
@@ -182,13 +237,20 @@ containing it, and memoised. Only meshes that are simultaneously
 are re-solved in later trims, and a trim that resolves the borderline case
 upgrades the memo. The only inherently per-trim step is pairing, which runs
 once per trim over that trim's present set. All state is cached on the
-context, so the cost profile is
-`O(unique_meshes × scan + trims × pairables)`: the etk800 union pass takes
-~19 s cold, and each subsequent per-trim call ~0.2 s. Per-trim point clouds
-come from `preview_entries_for_config`, so a trim that moves a mesh is judged
-on that trim's geometry. Meshes with **multiple simultaneous placements**
-(a wheel at four corners) are excluded outright — their resolved position is
-an average, a fictitious point the classifier must not reason about.
+context: intrinsic verdicts, scoped IDs, persistent hard vetoes, pair votes,
+full DAE clouds, parsed-file keys and exact symmetry results. The cost profile
+is `O(unique vertices + unique meshes × scan + trims × pairables)`;
+subsequent calls reuse uncapped clouds rather than reparsing a DAE.
+
+Per-trim point clouds normally come from `preview_entries_for_config`, so a
+trim that translates a mesh is judged at that trim's location. A
+variant-dependent flexbody with one placement is rebuilt from the authored
+DAE and that trim's matrix; this avoids carrying a representative two-seat
+cloud into a single-seat trim. Meshes with **multiple simultaneous placements
+in the current trim** (a wheel at four corners, or one base mesh under two
+seats) are excluded — their averaged position is fictitious. If another trim
+uses one instance, that trim supplies the intrinsic verdict; this is how the
+pickup and Sunburst racing-seat bases correctly fall back to aesthetic Mirror.
 
 ## 7. Validation against the hand-verified baselines
 
@@ -197,19 +259,26 @@ baseline `conversion.json`:
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **99.98 %** (1 diff) |
-| pickup | 63 | 12 335 | **98.19 %** |
-| sunburst2 | 38 | 7 561 | **94.37 %** |
+| etk800 | 29 | 4 516 | **95.68 %** (195 diffs) |
+| pickup | 73 | 12 335 | **92.16 %** (967 diffs) |
+| sunburst2 | 39 | 7 561 | **92.38 %** (576 diffs) |
 
-(The sunburst2 figure is lower than the others largely because assembly
-propagation now mirrors dash/console furniture -- shifter dressing, nav
-pods, the radio -- that the sunburst2 baseline leaves at skip while the
-etk800 baseline mirrors the identical furniture; the classifier follows the
-etk800 convention consistently. See category B.)
+These figures intentionally fell after replacing the tolerant capped-cloud
+residual with the signed-off exact-orphan policy. The literal zero threshold
+mirrors small DAE modelling offsets that the hand baselines skip: ETK has 184
+Skip→Mirror checks; pickup 409; Sunburst 425. This is the chosen
+false-positive/false-negative trade: a benign extra mirrored copy is preferred
+to leaving a real one-sided control behind. The remaining transition counts
+are:
 
-The whole-vehicle etk800 diff is **zero for all 1 109 parts**, including the
-single correct `textureFlip`. Every remaining disagreement falls into one of
-these categories:
+- ETK: 11 Structural→Mirror (per-trim twin absence);
+- pickup: 478 Structural→Mirror, 55 Mirror→Skip, 12 Structural→Skip,
+  8 Skip→Translate and 5 Mirror→Translate;
+- Sunburst: 64 Skip→Structural (mostly rear door-card baseline inconsistency),
+  37 Structural→Mirror, 4 Mirror→Skip, 3 Structural→Skip and
+  43 Mirror→Translate.
+
+Every disagreement falls into one of these categories:
 
 **A. Per-trim relational verdicts the baseline's single global mode cannot
 express (ours correct by the brief's own definition).** etk800
@@ -230,33 +299,30 @@ in the baseline; the identical rear ones were left unset), and
 `n2o_bottle_10lb` (baseline mirror on pickup, skip on sunburst2; ours:
 mirror on both).
 
-**C. Mirror↔skip of near-symmetric parts — visual no-ops at cloud
-resolution.** `pickup_bench`, `facelift_seats_F` and `facelift_console`,
-`sunburst2_console`, centred floor shifters (`pickup_shifter_M/T`,
-`grp_hb_lever_a`, `grp_shifter_knob_a`), dash seals, `hazard_button`,
-shifter-panel buttons, `sunburst2_grp_mirror`, `rollcage_simple`, `dino`.
-The brief's own rules (bench ⇒ skip, centred shifter ⇒ skip) side with the
-geometry here; the hand baseline chose mirror defensively. The genuinely
-sub-resolution content (a shift-pattern decal, the rear-view glass angle) is
-below what 350 positions can carry — that is the resolution floor, and these
-verdicts sit at or near the low-confidence band.
+**C. Mirror↔skip of visually near-symmetric parts.** Exact full-vertex testing
+now separates authored equality from “looks symmetric at preview density.”
+Benches and exactly mirrored carpets still skip; millimetre-scale offsets in
+sunvisors, roof covers, rear seats and driveline/exhaust meshes create exact
+orphans and therefore Mirror. Conversely, an exactly symmetric bench can skip
+where the baseline mirrored defensively. The coarse 2 cm fraction lowers
+confidence but never changes the zero-orphan decision.
 
 **D. Structural swaps of mirror-identical exterior pairs — render
 identically.** Desert-truck cage items the open buggy genuinely exposes to
-the eye (side mufflers, window nets) and wing-mirror satellites
-(`mirrorsignal_L/R`, flasher LEDs) pair with their twins; the baseline skips
-them. Swapping exact mirror twins produces the same image, so these are
-no-ops, but skip would be cleaner — the desert cab has no doors or glass, so
-the glasshouse boundary the vetoes rely on does not exist there.
+the eye (side mufflers, window nets) can still pair; the desert cab has no
+doors or glass, so the glasshouse boundary degenerates. Directional
+wing-mirror signals and generic flasher LEDs no longer pair: their disjoint
+material bindings produce protected Skip pending build-side material rebind.
+The two `_b` flasher Mirror rows in the per-trim script are the known subset
+validator artifact; a global recommendation marks the pair Skip.
 
-**E. Genuine scope misses — the eye cannot see them.** Deep hidden kit the
-baseline mirrors but the shell never reaches: `racingseat_base` (sunburst2,
-under the seats), `grp_footplate` (passenger footrest behind the dash line),
-`grp_extinguisher`, `gro_stand_S`, `grp_hb_line_a`, two of the four
-police-laptop mount variants, `racing_seat_base` and `dino` on the pickup.
-Visibility is a high-recall scope, not a perfect one; these are honest
-misses, and mirroring-vs-skipping hidden hardware is near-invisible either
-way.
+**E. Former sightline blind spots now covered.** Driver-seat transparency plus
+single-instance cloud rebuilding recovers `racingseat_base` and
+`racing_seat_base`; the reflected 30° passenger-footwell cone admits
+`grp_footplate`; angular verdict backing handles all three
+`police_laptop_mount_*` meshes. These targets match the baseline in every trim
+that uses them. Remaining hidden-kit differences are parts outside the scoped
+cone/radius, not name-based omissions.
 
 **F. Control-cone boundary judgment calls.** `sunburst2_dash_key` (ignition
 barrel beside the column: we translate with the column kit, the user
@@ -289,12 +355,17 @@ low/med confidence.
   pairs flagged "wall at the cabin shell (verify)".
 - **The resolution floor is real.** The steering-column top vs body split
   (centimetres, sliding with column length) is delegated to the one
-  sanctioned name hint and marked low-confidence. Sub-sampling content —
-  shift-pattern decals, mirror glass angle, badge text — cannot be recovered
-  from positions-only clouds at this density; those verdicts are the
-  skip-vs-mirror band in category C.
-- **Multi-instance meshes are outside the model.** A mesh placed four times
-  has no single position; it is excluded rather than mis-reasoned about.
+  sanctioned name hint and marked low-confidence. Self-symmetry now uses all
+  DAE positions, but texture-only content — shift-pattern decals, mirror-glass
+  direction, badge text — is still not recoverable from positions.
+- **Multi-instance meshes are outside a single-trim verdict.** A mesh placed
+  four times has no single position and is excluded in that trim. A
+  variant-dependent trim with one instance is rebuilt from its authored cloud
+  and can supply the global intrinsic verdict.
+- **Functionally sided pairs await a build fix.** Disjoint material symbols
+  are enough to prevent an unsafe structural swap, but safe conversion needs
+  generated meshes rebound to their twins' directional materials. Until that
+  build-side work lands, the classifier intentionally emits no recommendation.
 - **Open vehicles weaken the shell.** The desert trucks have no doors or
   glass, so "inside the glasshouse" degenerates and cage-mounted exterior
   lights become spatially interior. The verdicts there are no-op pair swaps,

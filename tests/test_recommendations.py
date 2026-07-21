@@ -245,6 +245,31 @@ class ControlConeTests(unittest.TestCase):
         self.assertEqual(recs["grp_padalbox_footplate"]["mode"], core.MODE_TRANSLATE)
         self.assertEqual(recs["race_footplate"]["mode"], core.MODE_MIRROR)
 
+    def test_passenger_footwell_cone_admits_an_occluded_plate(self) -> None:
+        meshes = base_cabin()
+        meshes["driver_pedal_cluster"] = box_cloud(
+            (0.40, -0.82, 0.45), (0.22, 0.20, 0.20), n=110, seed=51
+        )
+        plate = box_cloud(
+            (-0.40, -0.75, 0.40), (0.24, 0.24, 0.08), n=90, seed=52
+        )
+        meshes["passenger_blind_plate"] = plate
+        # Exact eye rays at 60% range guarantee that ordinary visibility does
+        # not admit the plate; the reflected-pedal second pass must do it.
+        eye = np.asarray(EYE, dtype=float)
+        meshes["passenger_ray_blocker"] = eye + 0.60 * (plate - eye)
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        first, _vetoed = tool._classify_meshes_for_trim(
+            context, frame, present, arrays, present
+        )
+        self.assertNotIn("passenger_blind_plate", first)
+
+        recs = recommend(context)
+        self.assertEqual(recs["driver_pedal_cluster"]["mode"], core.MODE_TRANSLATE)
+        self.assertEqual(recs["passenger_blind_plate"]["mode"], core.MODE_MIRROR)
+
 
 class SymmetryAndPairingTests(unittest.TestCase):
     def test_front_bench_skips_but_buckets_pair(self) -> None:
@@ -276,6 +301,35 @@ class SymmetryAndPairingTests(unittest.TestCase):
         recs = recommend(make_context(meshes))
         self.assertEqual(recs["racingseat_base"]["mode"], core.MODE_MIRROR)
         self.assertEqual(recs["racingseat_base"]["source_id"], "")
+
+    def test_driver_seat_is_transparent_to_paired_and_lone_bases(self) -> None:
+        meshes = base_cabin()
+        driver_base = box_cloud(
+            (0.40, 0.15, 0.30), (0.30, 0.30, 0.08), n=110, seed=44
+        )
+        meshes["fixture_base_FL"] = driver_base
+        meshes["fixture_base_FR"] = mirror_x(driver_base)
+        cabin_ids = [
+            object_id for object_id in base_cabin()
+            if object_id not in {"veh_seat_FR"}
+        ]
+
+        paired = make_context(
+            meshes,
+            trims={"two_seat": list(meshes)},
+        )
+        paired_recs = recommend(paired)
+        pair = paired_recs.get("fixture_base_FL") or paired_recs.get("fixture_base_FR")
+        self.assertIsNotNone(pair)
+        self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+
+        single = make_context(
+            meshes,
+            trims={"single_seat": cabin_ids + ["fixture_base_FL"]},
+        )
+        single_recs = recommend(single)
+        self.assertEqual(single_recs["fixture_base_FL"]["mode"], core.MODE_MIRROR)
+        self.assertIn("twin absent", single_recs["fixture_base_FL"]["reason"])
 
     def test_mutually_exclusive_variants_do_not_pair_but_cotrim_twins_do(self) -> None:
         # recast of the lhd/rhd-token case: two interior-mirror variants are
@@ -337,6 +391,26 @@ class SymmetryAndPairingTests(unittest.TestCase):
 
 
 class MaterialTests(unittest.TestCase):
+    def test_geometric_twins_with_different_materials_are_protected_skips(self) -> None:
+        meshes = base_cabin()
+        left = box_cloud((0.90, -0.42, 1.00), (0.14, 0.14, 0.12), n=110, seed=55)
+        meshes["functional_L"] = left
+        meshes["functional_R"] = mirror_x(left)
+        context = make_context(
+            meshes,
+            materials={
+                "functional_L": ("signal_l",),
+                "functional_R": ("signal_r",),
+            },
+        )
+        recs = recommend(context)
+        self.assertNotIn("functional_L", recs)
+        self.assertNotIn("functional_R", recs)
+        memo = context._spatial_recommendation_state["memo"]
+        for object_id in ("functional_L", "functional_R"):
+            self.assertEqual(memo[object_id][0], "functional_skip")
+            self.assertIn("needs build-side material rebind", memo[object_id][1])
+
     def test_directional_display_mirrors_with_texture_flip(self) -> None:
         meshes = base_cabin()
         meshes["veh_screen"] = box_cloud((0.02, -0.47, 0.95), (0.20, 0.02, 0.08), n=30, seed=24)
@@ -370,6 +444,49 @@ class MaterialTests(unittest.TestCase):
         self.assertNotIn("veh_windscreen", recs)
 
 
+class SightlineInheritanceTests(unittest.TestCase):
+    def test_floating_scoped_mesh_in_front_of_translate_inherits_mirror(self) -> None:
+        meshes = base_cabin()
+        host = box_cloud((0.40, -0.62, 0.78), (0.30, 0.16, 0.24), n=100, seed=53)
+        eye = np.asarray(EYE, dtype=float)
+        floater = eye + 0.55 * (host - eye)
+        dummy = eye + 0.40 * (
+            box_cloud((0.40, -0.62, 0.78), (0.05, 0.04, 0.04), n=20, seed=54) - eye
+        )
+        meshes["translated_host"] = host
+        meshes["floating_pole"] = floater
+        meshes["SPOTLIGHT"] = dummy
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+
+        backing = core.directional_verdict_backing(
+            arrays,
+            frame.eye,
+            ["floating_pole"],
+            {"translated_host": "translate"},
+        )
+        self.assertGreater(backing["floating_pole"]["translate"], 0.0)
+
+        memo = {
+            object_id: ("none", "", "med", {}) for object_id in present
+        }
+        memo["translated_host"] = ("translate", "fixture", "high", {})
+        tool._inherit_mounted_parts(
+            context,
+            frame,
+            present,
+            arrays,
+            memo,
+            set(),
+            {},
+            {"floating_pole", "SPOTLIGHT"},
+        )
+        self.assertEqual(memo["floating_pole"][0], "mirror")
+        self.assertIn("translate geometry", memo["floating_pole"][1])
+        self.assertEqual(memo["SPOTLIGHT"][0], "none")
+
+
 class ResolutionFloorTests(unittest.TestCase):
     def test_column_top_translates_but_column_body_and_rack_mirror(self) -> None:
         # finer than spatial resolution: the split rides on the one
@@ -394,6 +511,19 @@ class ResolutionFloorTests(unittest.TestCase):
 
 
 class GeometryHelperTests(unittest.TestCase):
+    def test_reflected_orphans_require_every_exact_twin(self) -> None:
+        half = box_cloud((0.35, 0.0, 0.0), (0.2, 0.4, 0.3), n=80, seed=39)
+        symmetric = np.concatenate([half, mirror_x(half)])
+        orphans, coarse = core.reflected_orphan_stats(symmetric, 0.0)
+        self.assertEqual(orphans, 0)
+        self.assertEqual(coarse, 0.0)
+
+        asymmetric = symmetric.copy()
+        asymmetric[0, 1] += 0.05
+        orphans, coarse = core.reflected_orphan_stats(asymmetric, 0.0)
+        self.assertEqual(orphans, 2)
+        self.assertGreater(coarse, 0.0)
+
     def test_symmetry_residual_separates_centred_from_one_sided(self) -> None:
         centred = box_cloud((0.0, 0.0, 0.0), (1.0, 0.5, 0.5), n=300, seed=30)
         offset = box_cloud((0.4, 0.0, 0.0), (0.3, 0.5, 0.5), n=300, seed=31)
