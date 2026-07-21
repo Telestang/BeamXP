@@ -47,14 +47,21 @@ shell-relative rather than absolute.
 
 `visibility_scan` bins every present mesh's sample points into 6° equal-angle
 (elevation, azimuth) bins around E and takes the per-bin nearest opaque point
-as the **shell**. Steering-scored meshes are transparent (so the cluster,
+as the **360° shell**. Driver-visible admission is narrower: a point must also
+have a non-negative projection onto the driver's forward vector, giving the
+requested **180° forward hemisphere**. Geometry behind the eye can still
+contribute enclosure/backing evidence, but cannot become a candidate merely
+because it wins a sparse rearward angular bin. Steering-scored meshes are
+transparent (so the cluster,
 stalks and pedals behind the wheel are reachable). The large mesh that
 geometrically surrounds the eye and extends below it is also transparent: the
 camera sits inside the driver's seat, and an opaque seat otherwise hides its
 own rails/base. Per mesh the scan reports:
 
-- `vf` — fraction of points on/inside the shell (range-scaled tolerance
-  0.05 + 0.04·r);
+- `vf` — fraction of points on/inside the 360° shell (range-scaled tolerance
+  0.05 + 0.04·r), retained for enclosure and backing;
+- `front_vf` — the same visibility test intersected with the forward 180°
+  hemisphere;
 - `backed` — fraction with *any other mesh* somewhere behind them;
 - `lined` — fraction with another mesh **3–30 cm** behind in the same
   direction. This is the key layer signal: a door card has the skin close
@@ -63,7 +70,7 @@ own rails/base. Per mesh the scan reports:
 - `min_r` — nearest approach to the eye.
 
 A mesh becomes an interior **candidate** through any of four channels:
-visible (`vf ≥ 0.28`), enclosed (backed, shallow, inside the envelope),
+driver-visible (`front_vf ≥ 0.28`), enclosed (backed, shallow, inside the envelope),
 exterior-fitment (compact, at beltline height, just outboard of the shell,
 visible once glass is removed — wing mirrors), or the control cone.
 Candidacy is deliberately high-recall; **corroborating vetoes** then remove
@@ -259,24 +266,25 @@ baseline `conversion.json`:
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **95.68 %** (195 diffs) |
-| pickup | 73 | 12 335 | **92.16 %** (967 diffs) |
-| sunburst2 | 39 | 7 561 | **92.38 %** (576 diffs) |
+| etk800 | 29 | 4 516 | **95.37 %** (209 diffs) |
+| pickup | 73 | 12 335 | **93.00 %** (863 diffs) |
+| sunburst2 | 39 | 7 561 | **93.65 %** (480 diffs) |
 
-These figures intentionally fell after replacing the tolerant capped-cloud
-residual with the signed-off exact-orphan policy. The literal zero threshold
-mirrors small DAE modelling offsets that the hand baselines skip: ETK has 184
-Skip→Mirror checks; pickup 409; Sunburst 425. This is the chosen
-false-positive/false-negative trade: a benign extra mirrored copy is preferred
-to leaving a real one-sided control behind. The remaining transition counts
-are:
+These figures include the signed-off exact-orphan policy: the literal zero
+threshold mirrors small DAE modelling offsets that the hand baselines skip.
+That is the chosen false-positive/false-negative trade: a benign extra mirrored
+copy is preferred to leaving a real one-sided control behind. Restricting
+driver-visible admission to the forward hemisphere subsequently removed 44
+ETK, 104 pickup and 96 Sunburst rearward false-positive checks; ETK also gained
+58 intentional Structural→Skip differences because its hand baseline had
+mistakenly paired both rear door cards. Current transition counts are:
 
-- ETK: 11 Structural→Mirror (per-trim twin absence);
-- pickup: 478 Structural→Mirror, 55 Mirror→Skip, 12 Structural→Skip,
-  8 Skip→Translate and 5 Mirror→Translate;
-- Sunburst: 64 Skip→Structural (mostly rear door-card baseline inconsistency),
-  37 Structural→Mirror, 4 Mirror→Skip, 3 Structural→Skip and
-  43 Mirror→Translate.
+- ETK: 140 Skip→Mirror, 11 Structural→Mirror (per-trim twin absence) and
+  58 Structural→Skip (the two rear door cards in every trim);
+- pickup: 305 Skip→Mirror, 478 Structural→Mirror, 55 Mirror→Skip,
+  12 Structural→Skip, 8 Skip→Translate and 5 Mirror→Translate;
+- Sunburst: 393 Skip→Mirror, 37 Structural→Mirror, 4 Mirror→Skip,
+  3 Structural→Skip and 43 Mirror→Translate.
 
 Every disagreement falls into one of these categories:
 
@@ -289,15 +297,16 @@ correct. Same shape: `pickup_mirror_L` (one trim without its twin),
 `pickup_mirror_R_facelift`, `sunburst2_seats_FR`, `sunburst2_doorpanel_FL`
 (one trim each).
 
-**B. Baseline internal inconsistencies where the classifier is the
-consistent one.** The etk800 baseline pairs its rear door cards
-(`doorpanel_RL/RR` structural); the pickup and sunburst2 baselines leave
-their rear/crew door cards at skip. The classifier pairs rear cards on all
-three vehicles (~30 % of pickup and sunburst2 per-trim diffs). Likewise
-crew-cab interior door handles (the front `windowhandle_L/R` are structural
-in the baseline; the identical rear ones were left unset), and
-`n2o_bottle_10lb` (baseline mirror on pickup, skip on sunburst2; ours:
-mirror on both).
+**B. Forward-hemisphere corrections and baseline inconsistencies.** The
+general visibility channel is now the forward 180° only. The ETK baseline's
+structural rear-door-card modes were confirmed as a hand-baseline mistake, so
+`doorpanel_RL/RR` correctly remain Skip (58 checks). Sunburst's two rear-card
+Skip→Structural rows likewise disappear. Pickup's ordinary rear-card leaks
+and all five carpet-family leaks disappear; rear parts with independent
+enclosure/wall evidence are still allowed because the 360° shell remains an
+enclosure measurement, not driver visibility. Crew-cab interior door handles
+remain a baseline inconsistency: the front `windowhandle_L/R` are structural
+in the baseline while the identical rear ones were left unset.
 
 **C. Mirror↔skip of visually near-symmetric parts.** Exact full-vertex testing
 now separates authored equality from “looks symmetric at preview density.”
@@ -332,11 +341,11 @@ cone says translate, user said mirror), `pickup_facelift_shifter_T_buttons`
 them while translating the shifter they sit on). Centimetre-scale calls
 where reasonable conversions disagree.
 
-**G. Residual leaks (wrong, and known).** `pickup_fueltank_short` (7 trims)
-and `pickup_shocktop_R_offroad` (2 trims) still read as enclosed interior on
-some configurations — under-body geometry whose occluders are too sparse to
-close the shell. Both surface as Mirror of parts nobody sees; both carry
-low/med confidence.
+**G. Residual leak (wrong, and known).** `pickup_shocktop_R_offroad` (2 trims)
+still reads as enclosed interior on some configurations — under-body geometry
+whose occluders are too sparse to close the shell. `pickup_fueltank_short` is
+fixed: its former 41–45 % visibility came entirely from sparse backward/down
+bins, so `front_vf == 0` leaves it Skip in all seven trims.
 
 ## 8. Honesty: where this is fragile
 

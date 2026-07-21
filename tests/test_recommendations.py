@@ -161,6 +161,37 @@ class DriverFrameTests(unittest.TestCase):
 
 
 class ScopeTests(unittest.TestCase):
+    def test_visible_admission_is_limited_to_forward_hemisphere(self) -> None:
+        front = box_cloud((0.40, -0.50, 0.90), (0.10, 0.10, 0.10), n=80, seed=56)
+        rear = box_cloud((0.40, 0.90, 0.90), (0.10, 0.10, 0.10), n=80, seed=57)
+        stats = core.visibility_scan(
+            {"front": front, "rear": rear},
+            EYE,
+            set(),
+            (0.0, -1.0, 0.0),
+        )
+        self.assertGreater(stats["front"]["front_vf"], 0.80)
+        self.assertEqual(stats["rear"]["front_vf"], 0.0)
+        # The enclosure shell remains spherical; only driver-visible
+        # admission is field-of-view limited.
+        self.assertGreater(stats["rear"]["vf"], 0.70)
+
+    def test_rearward_exposed_mesh_does_not_enter_from_visibility(self) -> None:
+        meshes = base_cabin()
+        meshes["rear_exposed"] = box_cloud(
+            (0.28, 0.75, 0.42), (0.30, 0.40, 0.15), n=110, seed=58
+        )
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        stats = core.visibility_scan(arrays, frame.eye, set(), frame.forward)
+
+        # This fuel-tank-like fixture is exposed in the spherical shell but
+        # entirely behind the eye, so exposure alone must not admit it.
+        self.assertGreater(stats["rear_exposed"]["vf"], 0.28)
+        self.assertEqual(stats["rear_exposed"]["front_vf"], 0.0)
+        self.assertNotIn("rear_exposed", recommend(context))
+
     def test_door_card_pairs_and_exterior_skin_gets_nothing(self) -> None:
         recs = recommend(make_context(base_cabin()))
         self.assertIn("veh_card_FL", recs)

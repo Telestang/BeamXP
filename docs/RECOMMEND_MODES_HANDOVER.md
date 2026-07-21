@@ -192,8 +192,10 @@ wrong way.
 
 ## Decisions locked (do NOT reopen)
 
-- **No behind-camera rule** — rear door cards keep pairing everywhere (the user
-  called the earlier "ignore behind the eye" idea a mistake; keep scope tight).
+- **Superseded after handover:** generic driver-visible admission is restricted
+  to the forward 180° hemisphere. The 360° shell remains for enclosure and
+  backing, but a rearward mesh cannot enter scope from visibility alone. The
+  ETK baseline's paired rear door cards were confirmed as a baseline mistake.
 - **Shifter/nav/console furniture** should all Mirror under the spatial method;
   the sunburst2-vs-etk800 baseline disagreement there is a baseline
   inconsistency, not a bug. Don't tune toward either baseline. The user will

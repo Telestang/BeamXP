@@ -242,9 +242,14 @@ def _classify_meshes_for_trim(
         if float(under_eye.mean()) >= 0.20:
             transparent.add(object_id)
 
-    scan = core.visibility_scan({o: entries_np[o] for o in present}, frame.eye, transparent)
+    scan = core.visibility_scan(
+        {o: entries_np[o] for o in present}, frame.eye, transparent, frame.forward
+    )
     scan_no_glass = core.visibility_scan(
-        {o: entries_np[o] for o in present if o not in glass_ids}, frame.eye, transparent
+        {o: entries_np[o] for o in present if o not in glass_ids},
+        frame.eye,
+        transparent,
+        frame.forward,
     )
     beyond = core.glass_beyond_fractions(entries_np, frame.eye, glass_ids, present)
 
@@ -338,7 +343,11 @@ def _classify_meshes_for_trim(
             continue
 
         # scope channels: candidates, not absolutes
-        cand_visible = stats["vf"] >= 0.28
+        # General driver visibility is a camera-like forward hemisphere.  The
+        # 360-degree shell remains available as ``vf`` for enclosure/backing,
+        # but geometry behind the eye cannot enter scope merely by winning a
+        # sparse angular bin through the seat or floor.
+        cand_visible = stats["front_vf"] >= 0.28
         cand_enclosed = (
             stats["vf"] >= 0.08 and stats["backed"] >= 0.45
             and out80 <= half_width - 0.02 and stats["depth"] <= 0.45
@@ -461,7 +470,8 @@ def _classify_meshes_for_trim(
             "med" if not cand_visible else "high")
         reason = ("exterior driver fitment" if cand_fitment and not cand_visible
                   else "one-sided interior part")
-        if out80 >= half_width - 0.05 and stats["vf"] < 0.50 and not cand_fitment:
+        if (out80 >= half_width - 0.05 and stats["front_vf"] < 0.50
+                and not cand_fitment):
             confidence = "low"
             reason = "wall at the cabin shell (verify: possible exterior sheet)"
         verdicts[object_id] = ("pairable", reason, confidence, {"flip": display})

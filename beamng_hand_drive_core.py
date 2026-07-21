@@ -6456,11 +6456,14 @@ def visibility_scan(
     points_by_id: dict[str, np.ndarray],
     eye: tuple[float, float, float],
     transparent_ids: set[str],
+    forward: tuple[float, float, float] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Nearest-surface shell around the eye plus per-mesh evidence.
 
     Per mesh:
-      vf     -- fraction of points on/inside the shell (the eye can see them)
+      vf     -- fraction of points on/inside the 360-degree shell
+      front_vf -- fraction both on/inside the shell and in the forward
+                  180-degree hemisphere (equals vf when forward is omitted)
       backed -- fraction with ANY other mesh somewhere behind (not outermost)
       lined  -- fraction with another mesh CLOSE behind, 3-30 cm (a lining
                 layer: door card over skin); own-mesh thickness never counts
@@ -6479,7 +6482,8 @@ def visibility_scan(
         owners.append(np.full(len(points), index))
     all_points = np.concatenate(chunks)
     owner = np.concatenate(owners)
-    bins, radii = spatial_spherical_bins(all_points - np.array(eye))
+    eye_vectors = all_points - np.array(eye)
+    bins, radii = spatial_spherical_bins(eye_vectors)
     opaque = np.array([ids[o] not in transparent_ids for o in owner])
     n_bins = int(bins.max()) + 2
     field = np.full(n_bins, np.inf)
@@ -6527,6 +6531,14 @@ def visibility_scan(
 
     tolerance = 0.05 + 0.04 * radii
     visible = radii <= field[bins] + tolerance
+    if forward is None:
+        front_visible = visible
+    else:
+        forward_v = np.asarray(forward, dtype=float)
+        norm = float(np.linalg.norm(forward_v))
+        if norm > 1e-9:
+            forward_v /= norm
+        front_visible = visible & ((eye_vectors @ forward_v) >= 0.0)
     depth = np.maximum(0.0, radii - field[bins])
     behind1 = (far1[bins] > radii + 0.05) & (far1_owner[bins] != owner)
     behind2 = (far2[bins] > radii + 0.05) & (far2_owner[bins] != owner)
@@ -6539,6 +6551,7 @@ def visibility_scan(
         stats[object_id] = {
             "n": count,
             "vf": float(visible[mask].sum()) / count,
+            "front_vf": float(front_visible[mask].sum()) / count,
             "backed": float(backed[mask].sum()) / count,
             "lined": float(lined_flag[mask].sum()) / count,
             "depth": float(depth[mask].mean()),
