@@ -261,46 +261,50 @@ pickup and Sunburst racing-seat bases correctly fall back to aesthetic Mirror.
 
 ## 7. Validation against the hand-verified baselines
 
-Per trim (not a union), diffing every used mesh's mode against the
-baseline `conversion.json`:
+`python scripts/validate_spatial_classifier.py` obtains one global
+recommendation from the union of meshes used by the selected trims, then
+applies that recommendation to each trim before diffing every used mesh
+against the baseline `conversion.json`. Structural pairs count both members;
+when only one member is fitted, the desired aesthetic-Mirror fallback is
+treated as semantic agreement rather than a Structural→Mirror mismatch. This
+models the UI/build path and avoids the old state-cache artifact caused by
+calling the global recommender independently for each trim.
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **95.37 %** (209 diffs) |
-| pickup | 73 | 12 335 | **93.00 %** (863 diffs) |
-| sunburst2 | 39 | 7 561 | **93.65 %** (480 diffs) |
+| etk800 | 29 | 4 516 | **96.48 %** (159 diffs) |
+| pickup | 73 | 12 335 | **96.17 %** (473 diffs) |
+| sunburst2 | 39 | 7 561 | **90.97 %** (683 diffs) |
 
 These figures include the signed-off exact-orphan policy: the literal zero
 threshold mirrors small DAE modelling offsets that the hand baselines skip.
 That is the chosen false-positive/false-negative trade: a benign extra mirrored
 copy is preferred to leaving a real one-sided control behind. Restricting
-driver-visible admission to the forward hemisphere subsequently removed 44
-ETK, 104 pickup and 96 Sunburst rearward false-positive checks; ETK also gained
-58 intentional Structural→Skip differences because its hand baseline had
-mistakenly paired both rear door cards. Current transition counts are:
+driver-visible admission to the forward hemisphere removed rearward
+visibility-only candidates. The ETK baseline was also corrected so its rear
+door cards are Skip. Current true-mismatch transition counts are:
 
-- ETK: 140 Skip→Mirror, 11 Structural→Mirror (per-trim twin absence) and
-  58 Structural→Skip (the two rear door cards in every trim);
-- pickup: 305 Skip→Mirror, 478 Structural→Mirror, 55 Mirror→Skip,
-  12 Structural→Skip, 8 Skip→Translate and 5 Mirror→Translate;
-- Sunburst: 393 Skip→Mirror, 37 Structural→Mirror, 4 Mirror→Skip,
-  3 Structural→Skip and 43 Mirror→Translate.
+- ETK: 152 Skip→Mirror, 4 Skip→Structural and 3 Structural→Skip;
+- pickup: 267 Skip→Mirror, 74 Skip→Structural, 105 Mirror→Skip,
+  14 Structural→Skip, 8 Skip→Translate and 5 Mirror→Translate; two desired
+  twin-absent fallbacks are excluded;
+- Sunburst: 583 Skip→Mirror, 39 Mirror→Skip, 18 Structural→Skip and
+  43 Mirror→Translate; two desired twin-absent fallbacks are excluded.
 
 Every disagreement falls into one of these categories:
 
 **A. Per-trim relational verdicts the baseline's single global mode cannot
-express (ours correct by the brief's own definition).** etk800
-`racing_seat_FL` in `844_track_M`: the trim carries only the driver racing
-seat, so the classifier says "aesthetic mirror, twin absent in this trim"
-while the global baseline says structural — the brief explicitly calls this
-correct. Same shape: `pickup_mirror_L` (one trim without its twin),
-`pickup_mirror_R_facelift`, `sunburst2_seats_FR`, `sunburst2_doorpanel_FL`
-(one trim each).
+express.** The validator now normalises these before counting differences: a
+globally structural pair remains structural when both members are fitted and
+becomes aesthetic Mirror when only one is fitted. The latter is explicitly
+reported as an excluded fallback count, never as a mismatch. The remaining
+`racing_seat_FL/FR` Structural→Skip rows are therefore genuine global
+recommendation misses, not missing-twin noise.
 
 **B. Forward-hemisphere corrections and baseline inconsistencies.** The
 general visibility channel is now the forward 180° only. The ETK baseline's
-structural rear-door-card modes were confirmed as a hand-baseline mistake, so
-`doorpanel_RL/RR` correctly remain Skip (58 checks). Sunburst's two rear-card
+structural rear-door-card modes were confirmed as a hand-baseline mistake and
+corrected to Skip; `doorpanel_RL/RR` now agree as Skip. Sunburst's two rear-card
 Skip→Structural rows likewise disappear. Pickup's ordinary rear-card leaks
 and all five carpet-family leaks disappear; rear parts with independent
 enclosure/wall evidence are still allowed because the 360° shell remains an
@@ -322,8 +326,8 @@ the eye (side mufflers, window nets) can still pair; the desert cab has no
 doors or glass, so the glasshouse boundary degenerates. Directional
 wing-mirror signals and generic flasher LEDs no longer pair: their disjoint
 material bindings produce protected Skip pending build-side material rebind.
-The two `_b` flasher Mirror rows in the per-trim script are the known subset
-validator artifact; a global recommendation marks the pair Skip.
+The global validator now correctly shows the flasher pair as agreement; the
+old two-row `_b` mismatch was solely a subset-call artifact.
 
 **E. Former sightline blind spots now covered.** Driver-seat transparency plus
 single-instance cloud rebuilding recovers `racingseat_base` and

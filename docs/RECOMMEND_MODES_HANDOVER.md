@@ -217,10 +217,10 @@ Scratch validators used last session live under the session scratchpad; the
 pattern:
 
 - `python -m unittest discover -s tests` — must stay green (90 tests).
-- Per-trim diff vs baseline: load cached context
-  (`pickle.load(open(proj/"context.cache","rb"))["context"]`), call
-  `build_mode_recommendations` per trim's used-mesh set, diff modes against
-  `proj/"conversion.json"`; pairs count BOTH members. Projects at
+- Run `python scripts/validate_spatial_classifier.py`. It loads each cached
+  context, obtains the global recommendation once, applies structural pairs
+  per trim, excludes the desired aesthetic fallback when a twin is absent,
+  and diffs modes against `conversion.json`; pairs count BOTH members. Projects at
   `C:\Users\ashle\AppData\Local\BeamXP\handedness_conversion_projects\{etk800,
   pickup,sunburst2}`.
 - Watch for regressions the last attempt hit: SPOTLIGHT-type sub-resolution
