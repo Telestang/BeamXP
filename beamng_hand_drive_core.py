@@ -172,6 +172,13 @@ class VehicleContext:
     # positions get resolved/averaged. Props anchor their mesh pivot in
     # vehicle space, so hand conversion must transform pivot positions.
     mesh_pivots: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    # Authored geometry centre per mesh (world space, node translation
+    # included), captured before apply_resolved_mesh_positions overwrites
+    # preview_by_id. A flexbody row that authors no pos of its own renders at
+    # this centre minus the node's own translation (see
+    # flexbody_row_needs_node_translation) -- the node offset is a leftover
+    # export artefact the game does not apply, not real placement.
+    mesh_authored_centers: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     # Meshes whose resolved position differs between trims -- i.e. declared by
     # parts that can never coexist. The single position on DaeObject is only a
     # representative for these; ask resolved_mesh_positions_for_config for the
@@ -371,30 +378,6 @@ def list_dae_objects_for_path(path: Path) -> dict[str, DaeObject]:
 
 
 _game_common_zips_cache: list[Path] | None = None
-
-
-def is_game_content_zip(zip_path: Path | str | None) -> bool:
-    """Whether a DAE came from the game install rather than a mod.
-
-    Vanilla DAEs place flexbody meshes with a real node transform (the
-    D-Series gooseneck hitch node sits at y=+3.70), so that transform has to
-    be applied. Mod DAEs routinely ship a leftover Blender object transform on
-    top of vertices already in vehicle space, which the game ignores; applying
-    it drops the astra's fog light below the road. See
-    mesh_preview.build_scene."""
-    if zip_path is None:
-        return False
-    try:
-        resolved = Path(zip_path).resolve(strict=False)
-    except OSError:
-        return False
-    parts = [part.lower() for part in resolved.parts]
-    # The game keeps vehicles under <install>/content/vehicles/; mods live in
-    # the user data folder's mods/ tree.
-    for index in range(len(parts) - 1):
-        if parts[index] == "content" and parts[index + 1] == "vehicles":
-            return True
-    return False
 
 
 def beamng_game_common_zips() -> list[Path]:
@@ -2122,16 +2105,19 @@ def apply_resolved_mesh_positions(
     preview_by_id: dict[str, dict[str, object]],
     resolved: dict[str, ResolvedMeshPosition],
     mesh_pivots: dict[str, tuple[float, float, float]] | None = None,
+    jbeam_positioned_flexbodies: set[str] | None = None,
 ) -> None:
     """Move each mesh to its representative position (see
     representative_mesh_positions). Flexbody previews are transformed by the
     representative trim's row matrices so rotation/scale survive; prop previews
     are translated by the delta, matching how the engine places each kind.
 
-    Mod flexbody previews additionally shed the DAE node translation, because
-    that is what the renderers do with them (see mesh_preview.build_scene).
-    Without this the preview boxes and the drawn geometry disagree by the node
-    translation on exactly those meshes."""
+    A flexbody mesh whose row authors no pos of its own additionally sheds the
+    DAE node translation, because that is what the renderers do with it (see
+    flexbody_row_needs_node_translation / mesh_preview.build_scene). Without
+    this the preview boxes and the drawn geometry disagree by the node
+    translation on exactly those meshes -- e.g. etk800's manual shifter."""
+    positioned = jbeam_positioned_flexbodies or set()
     for mesh, entry in resolved.items():
         obj = objects.get(mesh)
         if obj is None:
@@ -2143,7 +2129,7 @@ def apply_resolved_mesh_positions(
             continue
         if entry.matrices:
             preview = transform_preview_points(preview, list(entry.matrices))
-            if not is_game_content_zip(obj.dae_source_zip):
+            if mesh not in positioned:
                 pivot = (mesh_pivots or {}).get(mesh)
                 if pivot is not None and max(abs(value) for value in pivot) > 1e-9:
                     preview = translate_preview_points(
@@ -2536,7 +2522,7 @@ def hand_from_text(text: str) -> str:
 # Bump whenever context-building logic changes in a way that affects cached
 # VehicleContext content (parsing, pivots, common indexing, ...). Structural
 # dataclass changes are caught automatically via the field-name fingerprint.
-CONTEXT_CACHE_VERSION = 4  # 4: mesh positions resolved per trim, not averaged across all parts
+CONTEXT_CACHE_VERSION = 5  # 5: bare flexbody rows resolve position without the node's own translation
 
 
 def context_cache_path(source_zip: Path, vehicle_id: str) -> Path:
@@ -2876,6 +2862,14 @@ def load_vehicle_context(
     )
     objects.update(prop_objects)
     preview_by_id.update(prop_previews)
+    # Snapshot authored centres before apply_resolved_mesh_positions rewrites
+    # preview_by_id below -- resolving a bare flexbody row's position needs
+    # the ORIGINAL geometry centre, not the representative-shifted one.
+    mesh_authored_centers = {
+        object_id: tuple(preview["center"])
+        for object_id, preview in preview_by_id.items()
+        if isinstance(preview, dict) and "center" in preview
+    }
     # Only the positioned-mesh set is wanted here; the placements themselves
     # span parts that cannot coexist, so positions come from the per-config
     # resolution below instead.
@@ -2898,12 +2892,17 @@ def load_vehicle_context(
         part_body_index=part_body_index,
         jbeam_positioned_flexbodies=positioned_flexbodies,
         mesh_pivots=mesh_pivots,
+        mesh_authored_centers=mesh_authored_centers,
     )
     # Resolving positions needs a finished context (variants, part index,
     # pivots), so it runs here rather than inline above.
     representative, variant_dependent = representative_mesh_positions(context)
     apply_resolved_mesh_positions(
-        context.objects, context.preview_by_id, representative, context.mesh_pivots
+        context.objects,
+        context.preview_by_id,
+        representative,
+        context.mesh_pivots,
+        context.jbeam_positioned_flexbodies,
     )
     context.variant_dependent_meshes = variant_dependent
     save_vehicle_context_cache(context)
@@ -3120,6 +3119,47 @@ def likely_stock_steering_ref_ids(
     return [object_id for _score, object_id in scored]
 
 
+def flexbody_row_needs_node_translation(context: VehicleContext, mesh: str) -> bool:
+    """Whether mesh's own DAE node translation is real placement (add it) or a
+    leftover export artefact the game ignores (drop it).
+
+    The tell is whether ANY flexbody row placing this mesh authors its own
+    "pos": if it does, the mesh is a reusable template the row positions
+    (the D-Series gooseneck hitch is one part's pos:{y:0.325} away from
+    another's pos:{y:-0.03}), and the node's translation is a second, real
+    contribution that must be added on top -- dropping it put the hitch 3.85 m
+    from the bed. A BARE row (mesh + material groups, no pos/rot/scale at all,
+    e.g. etk800's manual shifter knob and boot) means the DAE vertices are
+    already authored at their final position; the node still carries a
+    translation, but it is a Blender-export artefact the game does not apply,
+    and adding it moves the mesh across the vehicle (the shifter rendered on
+    the passenger side, mirrored from the steering wheel). This is the exact
+    signal jbeam_positioned_flexbodies already tracks for the same reason on
+    the build side (generate_daes), just reused here for preview/detection."""
+    return mesh in context.jbeam_positioned_flexbodies
+
+
+def flexbody_mesh_reference_point(
+    context: VehicleContext,
+    mesh: str,
+    obj: DaeObject,
+) -> tuple[float, float, float]:
+    """The point a flexbody row's own matrix should be applied to.
+
+    KEEP: the node's authored translation (mesh_pivots) -- real placement.
+    DROP: that translation backed out of the authored geometry centre, i.e.
+    where the mesh sits once the node's redundant offset is removed. Falls
+    back to the node translation if no authored centre was captured (e.g. a
+    mesh with no geometry), which is at worst today's behaviour."""
+    if flexbody_row_needs_node_translation(context, mesh):
+        return context.mesh_pivots.get(mesh, (obj.x, obj.y, obj.z))
+    center = context.mesh_authored_centers.get(mesh)
+    pivot = context.mesh_pivots.get(mesh)
+    if center is None or pivot is None:
+        return context.mesh_pivots.get(mesh, (obj.x, obj.y, obj.z))
+    return (center[0] - pivot[0], center[1] - pivot[1], center[2] - pivot[2])
+
+
 def selected_flexbody_mesh_placements(
     context: VehicleContext,
     config_name: str,
@@ -3128,8 +3168,10 @@ def selected_flexbody_mesh_placements(
     """Flexbody placements for the parts ONE config actually selects.
 
     Unlike collect_flexbody_mesh_placements this never mixes parts that cannot
-    coexist. Positions are measured from the authored pivot, so it is safe to
-    call after DaeObject coordinates have been resolved."""
+    coexist. Positions are measured from the authored pivot (or, for a mesh
+    whose row authors no pos of its own, the authored geometry centre -- see
+    flexbody_mesh_reference_point), so it is safe to call after DaeObject
+    coordinates have been resolved."""
     selected = selected_parts_for_config(context, config_name)
     placements: dict[str, list[MeshPlacement]] = {}
     part_slot_options = selected.get("part_slot_options", {})
@@ -3149,7 +3191,7 @@ def selected_flexbody_mesh_placements(
             obj = context.objects.get(mesh)
             if obj is None:
                 continue
-            pivot = context.mesh_pivots.get(mesh, (obj.x, obj.y, obj.z))
+            pivot = flexbody_mesh_reference_point(context, mesh, obj)
             matrix = flexbody_row_source_matrix(row, inherited_options)
             placements.setdefault(mesh, []).append(
                 MeshPlacement(
@@ -5468,9 +5510,7 @@ def output_vehicle_preview_payload(
         if obj.dae_source_zip is None:
             path = Path(obj.dae_path)
             key = ("file", str(path), "")
-            # Generated output DAEs are written by this tool with the node
-            # transform already meaning what it says.
-            entry = {"path": str(path), "dae_path": str(path), "game_content": True}
+            entry = {"path": str(path), "dae_path": str(path)}
         else:
             zip_path = obj.dae_source_zip or context.source_zip
             key = ("zip", str(zip_path), obj.dae_path)
@@ -5478,7 +5518,6 @@ def output_vehicle_preview_payload(
                 "zip": str(zip_path),
                 "dae_path": obj.dae_path,
                 "path": str(extract_preview_dae(zip_path, obj.dae_path, cache_dir)),
-                "game_content": is_game_content_zip(zip_path),
             }
         index = dae_index.get(key)
         if index is None:
@@ -5552,6 +5591,11 @@ def output_vehicle_preview_payload(
                         "kind": kind,
                         "mode": "output" if is_generated else MODE_SKIP,
                         "matrix": matrix4_flat(world),
+                        # Our own generated geometry always means what its node
+                        # says; source geometry follows the row-authorship rule
+                        # (see flexbody_row_needs_node_translation).
+                        "keep_node_translation": is_generated
+                        or (kind == "flex" and flexbody_row_needs_node_translation(context, mesh)),
                         **({"rotation_source": rotation_source} if rotation_source else {}),
                     }
                 )
@@ -5639,13 +5683,7 @@ def full_vehicle_preview_payload(
         if index is None:
             index = len(dae_entries)
             dae_index[key] = index
-            dae_entries.append(
-                {
-                    "zip": str(zip_path),
-                    "dae_path": obj.dae_path,
-                    "game_content": is_game_content_zip(zip_path),
-                }
-            )
+            dae_entries.append({"zip": str(zip_path), "dae_path": obj.dae_path})
         return index
 
     def final_matrix(mesh: str, mode: str, world: list[list[float]]) -> list[list[float]]:
@@ -5711,6 +5749,9 @@ def full_vehicle_preview_payload(
                         "mode": mode if target_hand is not None else MODE_SKIP,
                         "matrix": matrix4_flat(final_matrix(mesh, mode, world)),
                         "stock_matrix": matrix4_flat(world),
+                        "keep_node_translation": (
+                            kind != "flex" or flexbody_row_needs_node_translation(context, geometry_mesh)
+                        ),
                     }
                 )
 
@@ -5766,6 +5807,9 @@ def full_vehicle_preview_payload(
                 "mode": mode if target_hand is not None else MODE_SKIP,
                 "matrix": matrix4_flat(final_matrix(mesh, mode, world)),
                 "stock_matrix": matrix4_flat(world),
+                "keep_node_translation": (
+                    kind != "flex" or flexbody_row_needs_node_translation(context, geometry_mesh)
+                ),
                 "extra": True,
             }
         )

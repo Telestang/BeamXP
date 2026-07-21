@@ -315,18 +315,6 @@ class SceneData:
 MODE_PALETTE_ORDER = ["skip", "translate", "mirror", "mirrorStructural", "output"]
 
 
-def dae_is_game_content(dae_files: list, dae_index: object) -> bool:
-    """Whether this instance's DAE came from the game install.
-
-    Decides how a flexbody node's world translation is treated; see the two
-    branches in build_scene. Unknown (older payloads) is treated as mod
-    content, preserving the previous behaviour."""
-    if not isinstance(dae_index, int) or not (0 <= dae_index < len(dae_files)):
-        return False
-    entry = dae_files[dae_index]
-    return bool(isinstance(entry, dict) and entry.get("game_content"))
-
-
 def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
     """Assemble a SceneData from a full-vehicle preview payload.
 
@@ -378,16 +366,21 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
                 # node's rotation (baseRotationGlobal supplies it instead), keeps
                 # translation (pivot) and scale; re-root the subtree accordingly
                 rebase = derotated_matrix(node_own_matrix) @ np.linalg.inv(node_own_matrix)
-            elif dae_is_game_content(dae_files, dae_index):
-                # vanilla flexbodies: the node's world translation is real
-                # placement and must be applied. pickup_common.DAE puts the
-                # gooseneck hitch node at y=+3.70; dropping it threw the mesh
-                # 3.85 m, out in front of the cab and 1.76 m up.
+            elif inst.get("keep_node_translation", True):
+                # This row authors its own pos elsewhere (or this geometry is
+                # our own generated output): the node's world translation is
+                # real placement and must be applied. pickup_common.DAE's
+                # gooseneck hitch is one row's pos:{y:0.325} away from
+                # another's pos:{y:-0.03}; dropping the node put the mesh
+                # 3.85 m out, in front of the cab and 1.76 m up.
                 rebase = np.eye(4)
             else:
-                # mod flexbodies: vertices are already in vehicle space and the
-                # node carries a leftover Blender object transform the game
-                # ignores. Applying it puts the astra's fog light below the road.
+                # A BARE row (mesh + material groups, no pos/rot/scale at all):
+                # the vertices are already authored at their final position and
+                # the node's translation is a leftover export artefact the game
+                # does not apply. Applying it anyway sinks the astra's fog light
+                # below the road, and puts etk800's manual shifter on the
+                # passenger side, mirrored from the steering wheel.
                 rebase = np.eye(4)
                 rebase[:3, 3] = -node_own_matrix[:3, 3]
             node_entries = [(rebase @ mat, gid) for mat, gid in node_entries]

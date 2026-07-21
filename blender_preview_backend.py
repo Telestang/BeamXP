@@ -97,17 +97,6 @@ def prepare_dae_for_import(path: Path, aliases: dict[str, str], index: int, targ
     return target
 
 
-def dae_is_game_content(payload: dict, dae_index: object) -> bool:
-    """Whether this instance's DAE came from the game install rather than a
-    mod. Unknown (older payloads) is treated as mod content, preserving the
-    previous behaviour."""
-    dae_files = payload.get("dae_files", [])
-    if not isinstance(dae_index, int) or not (0 <= dae_index < len(dae_files)):
-        return False
-    entry = dae_files[dae_index]
-    return bool(isinstance(entry, dict) and entry.get("game_content"))
-
-
 def node_aliases_for_payload(payload: dict) -> list[dict[str, str]]:
     dae_files = payload.get("dae_files", [])
     aliases_by_dae: list[dict[str, str]] = [dict() for _entry in dae_files]
@@ -225,12 +214,17 @@ def main() -> None:
         # keeps translation (pivot) and scale.
         #
         # Flexbodies keep the node's rotation/scale, and whether the world
-        # translation applies depends on where the DAE came from. Vanilla DAEs
-        # place meshes with a real node transform (pickup_common.DAE puts the
-        # gooseneck hitch at y=+3.70), so it must be applied. Mod DAEs ship
-        # vertices already in vehicle space plus a leftover Blender object
-        # transform the game ignores; applying that sinks the astra's fog
-        # light below the road. Mirrors mesh_preview.build_scene.
+        # translation applies depends on whether this row authors its own pos
+        # elsewhere (see flexbody_row_needs_node_translation in core.py). A row
+        # that does is a reusable template the row itself positions --
+        # pickup_common.DAE's gooseneck hitch is one row's pos:{y:0.325} away
+        # from another's pos:{y:-0.03} -- so the node's translation is a real,
+        # additional contribution and must be applied. A BARE row (mesh +
+        # material groups, nothing else) means the vertices are already
+        # authored at their final position and the node's translation is a
+        # leftover export artefact the game ignores; applying it anyway sinks
+        # the astra's fog light below the road and puts etk800's manual
+        # shifter on the passenger side. Mirrors mesh_preview.build_scene.
         rebase = Matrix.Identity(4)
         if base is not None:
             node_matrix = base.matrix_world
@@ -238,7 +232,7 @@ def main() -> None:
                 loc, _rot, scale = node_matrix.decompose()
                 derotated = Matrix.Translation(loc) @ Matrix.Diagonal((scale.x, scale.y, scale.z, 1.0))
                 rebase = derotated @ node_matrix.inverted()
-            elif not dae_is_game_content(payload, instance.get("dae")):
+            elif not instance.get("keep_node_translation", True):
                 rebase = Matrix.Translation(-node_matrix.translation)
         is_converted = instance.get("mode") not in (None, "", "skip")
         targets = [(changed_col if is_converted else unchanged_col, "matrix", instance["mesh"])]

@@ -30,12 +30,28 @@ def part(part_id: str, slot_type: str, mesh: str, pos: tuple[float, float, float
     )
 
 
+def bare_part(part_id: str, slot_type: str, mesh: str) -> str:
+    """A flexbody row with no pos/rot/scale at all -- mesh name + material
+    groups only, e.g. etk800's manual shifter knob and boot."""
+    return (
+        f'"{part_id}": {{\n'
+        f'"slotType": "{slot_type}",\n'
+        '"flexbodies": [\n'
+        '    ["mesh", "[group]:"],\n'
+        f'    ["{mesh}", ["group"]],\n'
+        "],\n"
+        "}"
+    )
+
+
 def make_context(
     *,
     objects: dict[str, core.DaeObject],
     pivots: dict[str, tuple[float, float, float]],
     part_index: dict[str, tuple[str, str]],
     variants: list[str],
+    positioned_flexbodies: set[str] = frozenset(),
+    authored_centers: dict[str, tuple[float, float, float]] | None = None,
 ) -> core.VehicleContext:
     return core.VehicleContext(
         source_zip=Path("test.zip"),
@@ -50,6 +66,8 @@ def make_context(
         project_dir=Path("project"),
         part_body_index=part_index,
         mesh_pivots=pivots,
+        jbeam_positioned_flexbodies=set(positioned_flexbodies),
+        mesh_authored_centers=authored_centers or {},
     )
 
 
@@ -318,6 +336,67 @@ class VectorFromRowExpressionTests(unittest.TestCase):
     def test_missing_key_still_returns_none(self) -> None:
         row = '["mesh", ["group"], [], {"rot":{"x":0, "y":0, "z":0}}]'
         self.assertIsNone(core.vector_from_row(row, "pos"))
+
+
+class NodeTranslationRuleTests(unittest.TestCase):
+    """Whether a flexbody mesh's DAE node translation is real placement (add
+    it) or a leftover export artefact (drop it) depends on whether ANY row
+    placing it authors its own pos -- not on vanilla vs mod origin, which
+    breaks down within a single vanilla DAE. etk800's manual shifter knob and
+    boot are bare rows (mesh + material groups, nothing else) on a node whose
+    translation is -0.2622 in x; keeping it rendered the shifter on the
+    passenger side, mirrored from the steering wheel at x=+0.4."""
+
+    def test_bare_row_drops_node_translation_using_the_authored_centre(self) -> None:
+        context = make_context(
+            objects={"shifter": obj("shifter", (0.0, 0.0, 0.0))},
+            pivots={"shifter": (-0.2621656, 0.0, 0.0)},
+            part_index={"shifter_part": (bare_part("shifter_part", "shifter", "shifter"), "a.jbeam")},
+            variants=["only"],
+            positioned_flexbodies=set(),  # no row anywhere authors pos
+            authored_centers={"shifter": (-0.2316278, -0.2317128, 0.6757048)},
+        )
+        context.selected_parts_cache = {"only": {"parts": {"shifter_part"}, "part_slot_options": {}}}
+        context.mesh_roles_cache = {"only": (set(), set(), {"shifter"})}
+        context.selected_node_positions_cache = {"only": {}}
+
+        resolved = core.resolved_mesh_positions_for_config(context, "only")["shifter"]
+        # Matches the etk800 shifter's real, renderer-verified x (+0.0305),
+        # not the KEEP value (-0.2316) that put it on the wrong side.
+        self.assertAlmostEqual(resolved.position[0], 0.0305378, places=6)
+        self.assertGreater(resolved.position[0], 0.0)  # same side as the +0.4 steering wheel
+
+    def test_authored_row_keeps_node_translation(self) -> None:
+        context = make_context(
+            objects={"hitch": obj("hitch", (0.0, 0.0, 0.0))},
+            pivots={"hitch": (0.0, 3.698417, 0.0)},
+            part_index={"hitch_part": (part("hitch_part", "hitch", "hitch", (0.0, 0.325, 0.0)), "a.jbeam")},
+            variants=["only"],
+            positioned_flexbodies={"hitch"},  # the row authors pos:{y:0.325}
+        )
+        context.selected_parts_cache = {"only": {"parts": {"hitch_part"}, "part_slot_options": {}}}
+        context.mesh_roles_cache = {"only": (set(), set(), {"hitch"})}
+        context.selected_node_positions_cache = {"only": {}}
+
+        resolved = core.resolved_mesh_positions_for_config(context, "only")["hitch"]
+        self.assertAlmostEqual(resolved.position[1], 4.023417, places=6)
+
+    def test_bare_row_without_authored_centre_falls_back_to_the_node_pivot(self) -> None:
+        # No authored_centers entry captured for this mesh (e.g. no geometry
+        # indexed): fall back to today's behaviour rather than guessing.
+        context = make_context(
+            objects={"shifter": obj("shifter", (0.0, 0.0, 0.0))},
+            pivots={"shifter": (-0.26, 0.0, 0.0)},
+            part_index={"shifter_part": (bare_part("shifter_part", "shifter", "shifter"), "a.jbeam")},
+            variants=["only"],
+            positioned_flexbodies=set(),
+        )
+        context.selected_parts_cache = {"only": {"parts": {"shifter_part"}, "part_slot_options": {}}}
+        context.mesh_roles_cache = {"only": (set(), set(), {"shifter"})}
+        context.selected_node_positions_cache = {"only": {}}
+
+        resolved = core.resolved_mesh_positions_for_config(context, "only")["shifter"]
+        self.assertAlmostEqual(resolved.position[0], -0.26, places=6)
 
 
 class SteeringAxisDeltaTests(unittest.TestCase):
