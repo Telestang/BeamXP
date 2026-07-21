@@ -517,6 +517,34 @@ class SightlineInheritanceTests(unittest.TestCase):
         self.assertIn("translate geometry", memo["floating_pole"][1])
         self.assertEqual(memo["SPOTLIGHT"][0], "none")
 
+    def test_rearward_floater_does_not_inherit_from_sightline(self) -> None:
+        meshes = base_cabin()
+        host = box_cloud((0.40, 1.05, 0.78), (0.30, 0.16, 0.24), n=100, seed=59)
+        eye = np.asarray(EYE, dtype=float)
+        floater = eye + 0.55 * (host - eye)
+        meshes["rear_transformed_host"] = host
+        meshes["rear_floating_lamp"] = floater
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        memo = {
+            object_id: ("none", "", "med", {}) for object_id in present
+        }
+        memo["rear_transformed_host"] = ("mirror", "fixture", "high", {})
+
+        tool._inherit_mounted_parts(
+            context,
+            frame,
+            present,
+            arrays,
+            memo,
+            set(),
+            {},
+            {"rear_floating_lamp"},
+        )
+
+        self.assertEqual(memo["rear_floating_lamp"][0], "none")
+
 
 class ResolutionFloorTests(unittest.TestCase):
     def test_column_top_translates_but_column_body_and_rack_mirror(self) -> None:

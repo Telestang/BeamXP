@@ -707,6 +707,8 @@ def _inherit_mounted_parts(
     # the floater is cabin furniture too.  Contact inheritance above has
     # already consumed anything mounted within 3 cm.
     floaters: list[str] = []
+    sightline_entries = dict(entries_np)
+    forward = np.asarray(frame.forward, dtype=float)
     for object_id in present:
         if (object_id not in scoped or memo.get(object_id, ("none",))[0] != "none"
                 or object_id in vetoed):
@@ -719,6 +721,14 @@ def _inherit_mounted_parts(
             continue
         if float(np.percentile(np.linalg.norm(points - eye, axis=1), 80)) > 1.6:
             continue
+        # Sightline inheritance is driver-visible evidence, so use the same
+        # forward 180-degree hemisphere as ordinary visible admission.  Keep
+        # only the mesh points in front of the eye; a rear lamp must not
+        # inherit merely because its backward rays terminate on bodywork.
+        front_points = points[((points - eye) @ forward) >= 0.0]
+        if not len(front_points):
+            continue
+        sightline_entries[object_id] = front_points
         floaters.append(object_id)
     if not floaters:
         return
@@ -733,7 +743,7 @@ def _inherit_mounted_parts(
         )) <= 1.6
     }
     backing = core.directional_verdict_backing(
-        entries_np, frame.eye, floaters, transformed
+        sightline_entries, frame.eye, floaters, transformed
     )
     for object_id in floaters:
         classes = backing.get(object_id, {})

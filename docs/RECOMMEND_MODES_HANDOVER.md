@@ -161,6 +161,9 @@ a transformed mesh should inherit Mirror.
   what's behind; extend it (or add a sibling) to report the **verdict class** of
   the mesh behind, not just its existence. Run this as an extra pass in/after
   `_inherit_mounted_parts`.
+- **Post-handover correction:** only points in the driver's forward 180°
+  hemisphere participate. The earlier unrestricted directions incorrectly
+  mirrored the ETK rear-window third brake light through rearward bodywork.
 - Targets: laptop-mount poles (sunburst2 `police_laptop_mount_*`) and similar
   floaters between the dash and other transformed meshes.
 

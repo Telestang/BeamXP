@@ -213,8 +213,11 @@ bracketry from chaining off a leak.
 
 A second propagation rule handles genuinely floating scoped meshes. After
 the 3 cm contact passes, `directional_verdict_backing` reuses the 6° angular
-bins to ask whether a floater's eye rays continue at least 3 cm farther into
-geometry classified Translate, Mirror, or Pairable/structural. Any such
+bins to ask whether a floater's **forward-hemisphere** eye rays continue at
+least 3 cm farther into geometry classified Translate, Mirror, or
+Pairable/structural. Rearward points are removed before this test, matching
+the general 180° driver-visible rule; this prevents a rear-window third brake
+light from inheriting through bodywork behind it. Any qualifying forward
 backing, at any farther distance along the ray, makes the floater inherit
 low-confidence Mirror and records the verdict class behind it. Both floater
 and backing geometry are bounded to the 1.6 m cabin radius; glass,
@@ -272,7 +275,7 @@ calling the global recommender independently for each trim.
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **96.48 %** (159 diffs) |
+| etk800 | 29 | 4 516 | **96.79 %** (145 diffs) |
 | pickup | 73 | 12 335 | **96.17 %** (473 diffs) |
 | sunburst2 | 39 | 7 561 | **90.97 %** (683 diffs) |
 
@@ -284,7 +287,7 @@ driver-visible admission to the forward hemisphere removed rearward
 visibility-only candidates. The ETK baseline was also corrected so its rear
 door cards are Skip. Current true-mismatch transition counts are:
 
-- ETK: 152 Skip→Mirror, 4 Skip→Structural and 3 Structural→Skip;
+- ETK: 138 Skip→Mirror, 4 Skip→Structural and 3 Structural→Skip;
 - pickup: 267 Skip→Mirror, 74 Skip→Structural, 105 Mirror→Skip,
   14 Structural→Skip, 8 Skip→Translate and 5 Mirror→Translate; two desired
   twin-absent fallbacks are excluded;
