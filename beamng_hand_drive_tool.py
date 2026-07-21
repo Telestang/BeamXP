@@ -97,214 +97,558 @@ BUILD_LABELS = {
 STRUCTURAL_PROMPT_DELAY_MS = 300
 
 
-RECOMMEND_SIDE_PAIRS = (
-    ("_fl", "_fr"),
-    ("_fr", "_fl"),
-    ("_rl", "_rr"),
-    ("_rr", "_rl"),
-    ("_frontleft", "_frontright"),
-    ("_frontright", "_frontleft"),
-    ("_rearleft", "_rearright"),
-    ("_rearright", "_rearleft"),
-    ("_left", "_right"),
-    ("_right", "_left"),
-    ("_driver", "_passenger"),
-    ("_passenger", "_driver"),
-    ("_l", "_r"),
-    ("_r", "_l"),
-    ("-l", "-r"),
-    ("-r", "-l"),
-    (".l", ".r"),
-    (".r", ".l"),
-)
+# ---------------------------------------------------------------------------
+# Recommend Modes: eye-anchored spatial classifier
+#
+# Modes are decided from the vehicle's 3D geometry relative to the driver's
+# eye (core.DriverFrame), not from part names. Per trim, a nearest-surface
+# shell swept from the eye scopes interior CANDIDATES; corroborating evidence
+# (backing/lining layers, the cabin envelope, glass planes) accepts or vetoes
+# them; self-symmetry decides skip-vs-act; twin geometry decides structural
+# pairs against the meshes actually present in that trim. The single
+# sanctioned name usage is the steering-column hint at the resolution floor
+# (top vs body are centimetres apart and slide with column length).
+#
+# Thresholds are metres or fractions, tuned against the hand-verified
+# etk800 / pickup / sunburst2 baselines.
 
-RECOMMEND_TRANSLATE_PATTERNS = (
-    r"digidash|digital_?dash|cluster|instrument",
-    r"gauge|gauges|needle|speedo|tacho|tachometer",
-    r"(?:gas|brake|clutch|throttle).*pedal|pedal.*(?:gas|brake|clutch|throttle)",
-    r"pedalbox|pedal_box|padalbox",
-    r"steer(?:ing)?_?wheel|steerwheel|(?:^|_)steer_[0-9]",
-    r"paddle|signal_?stalk|wiper_?stalk",
-    r"shift_?light",
-    # Only the column TOP moves with the wheel (ignition/stalk details face
-    # the driver); column bodies and racks stay in the mirror pool
-    # (sunburst2 reference data).
-    r"steering_?column\w*top",
-)
-
-RECOMMEND_TRANSLATE_EXCLUDE_PATTERNS = (
-    # A pedalbox's own footplate moves with the pedals; standalone
-    # footplates/stands are cabin furniture and stay in the mirror pool.
-    r"(?<!box_)footplate|(?:^|_)stand(?:_|$)|stand_plate",
-)
-
-# Headliners and sunvisors deliberately do NOT appear here: they span the
-# cabin symmetrically on essentially every vehicle, so mirroring them only
-# generates mesh copies with no visual change (etk800 reference data).
-RECOMMEND_MIRROR_PATTERNS = (
-    r"dash|dashboard|console",
-    r"parking_?brake|park_?brake|pbrake|hand_?brake|(?:^|_)hb_",
-    r"shifter|shift_?knob|(?:^|_)grp_shift",
-    r"radio|laptop|interior",
-    r"steering_?column|(?:^|_)column(?:_|$)",
-    r"intmirror|grp_mirror|hazard|dash_key|(?:^|_)key(?:_|$)",
-    r"extinguisher|footplate|(?:^|_)stand(?:_|$)|stand_plate|cable",
-)
-
-# Display screens get Mirror plus a texture flip so the image keeps its
-# left/right reading. "windscreen" must not match; "gauges_screen" is caught
-# by the translate patterns first.
-RECOMMEND_SCREEN_PATTERNS = (
-    r"(?<!wind)screen",
-)
-
-RECOMMEND_STRUCTURAL_PATTERNS = (
-    r"door_?panel",
-    r"(?:^|_)mirror(?:_|$)|mirror_?stalk",
-    r"(?:^|_)(?:race_?)?seats?(?:_|$)|racing_?seat",
-)
-
-# Plural "seats" meshes are cabin-spanning benches (etk800_seats_R = rear
-# bench, where R means rear, not right): symmetric, nothing to mirror.
-RECOMMEND_UNPAIRED_MIRROR_EXCLUDE_PATTERNS = (
-    r"seats(?:_|$)",
-)
+SPATIAL_SYMMETRIC_RESIDUAL = 0.045   # below: reflection is a visual no-op
+SPATIAL_BORDERLINE_RESIDUAL = 0.09   # below: asymmetry within sampling noise
+SPATIAL_PAIR_RESIDUAL = 0.10         # twin acceptance (normalised Chamfer)
+SPATIAL_REACH_LIMIT = 1.35           # ergonomic: controls start within reach
 
 
-def recommendation_text(context: core.VehicleContext, object_id: str) -> str:
-    values = [object_id]
-    obj = context.objects.get(object_id)
-    if obj is not None and obj.name and obj.name != object_id:
-        values.append(obj.name)
-    return re.sub(r"[^a-z0-9]+", "_", " ".join(values).lower())
+def _spatial_entries_for_trim(
+    context: core.VehicleContext,
+    trim: str | None,
+    available: set[str],
+) -> tuple[list[str], dict[str, object]]:
+    """Meshes present in one trim with their per-trim point clouds."""
+    if trim is None:
+        present = sorted(available)
+        entries = context.preview_by_id
+        resolved = {}
+    else:
+        present = sorted(core.used_meshes_for_config(context, trim) & available)
+        entries = core.preview_entries_for_config(context, trim)
+        resolved = core.resolved_mesh_positions_for_config(context, trim)
+    import numpy as np
+
+    arrays: dict[str, object] = {}
+    for object_id in present:
+        placement = resolved.get(object_id)
+        if placement is not None and len(placement.matrices) > 1:
+            # simultaneous instances (a wheel at four corners): the resolved
+            # position is their average, a fictitious point the classifier
+            # must not reason about
+            continue
+        item = entries.get(object_id) or context.preview_by_id.get(object_id)
+        if item is None:
+            continue
+        arrays[object_id] = np.array(item["sample_points"], dtype=float)
+    return [o for o in present if o in arrays], arrays
 
 
-def recommendation_matches(text: str, patterns: tuple[str, ...]) -> bool:
-    return any(re.search(pattern, text) is not None for pattern in patterns)
+def _classify_meshes_for_trim(
+    context: core.VehicleContext,
+    frame: core.DriverFrame,
+    present: list[str],
+    entries_np: dict[str, object],
+    want: list[str],
+) -> tuple[dict[str, tuple[str, str, str, dict]], set[str]]:
+    """Intrinsic class per mesh from one trim's geometry.
+
+    Returns (verdicts, vetoed): verdict is (class, reason, confidence, extra)
+    with class in {"translate", "mirror", "pairable", "none"}; vetoed lists
+    meshes positively identified as exterior surfaces (they must never be
+    offered as pairing twins)."""
+    import numpy as np
+
+    eye = np.array(frame.eye)
+    f = np.array(frame.forward)
+    cx0 = frame.center_x
+    wheel = np.array(frame.wheel_center) if frame.wheel_center is not None else None
+
+    material_symbols = core.mesh_material_symbols(context)
+    material_flags = core.material_flags_for_context(context)
+
+    def mesh_flag(object_id: str, flag: str, require_all: bool) -> bool:
+        symbols = material_symbols.get(object_id)
+        if not symbols:
+            return False
+        values = [bool(material_flags.get(symbol, {}).get(flag)) for symbol in symbols]
+        return all(values) if require_all else any(values)
+
+    glass_ids = {o for o in present if mesh_flag(o, "glass", require_all=True)}
+    transparent = {
+        o for o in present
+        if context.objects.get(o) is not None
+        and core.steering_ref_score(o, context.objects[o]) >= 15
+    }
+
+    scan = core.visibility_scan({o: entries_np[o] for o in present}, frame.eye, transparent)
+    scan_no_glass = core.visibility_scan(
+        {o: entries_np[o] for o in present if o not in glass_ids}, frame.eye, transparent
+    )
+    beyond = core.glass_beyond_fractions(entries_np, frame.eye, glass_ids, present)
+
+    # cabin envelope from the lining: well-seen surfaces with structure behind
+    lining = [
+        o for o in present
+        if scan[o]["vf"] >= 0.30 and scan[o]["backed"] >= 0.35 and scan[o]["n"] >= 40
+        and o not in glass_ids and beyond.get(o, 0.0) < 0.30
+        and float(entries_np[o].mean(axis=0)[2]) <= frame.eye[2] + 0.25
+    ]
+    if lining:
+        lining_points = np.concatenate([entries_np[o] for o in lining])
+        # half-width from closely-lined walls (card-over-skin layers); a mid
+        # percentile keeps one exposed sheet in a gutted trim from dragging
+        # the envelope out to the skin
+        reaches = {
+            o: float(np.percentile(np.abs(entries_np[o][:, 0] - cx0), 97)) for o in lining
+        }
+        wall_reaches = [v for o, v in reaches.items() if scan[o]["lined"] >= 0.40 and v >= 0.45]
+        if wall_reaches:
+            # p60: robust against the whole body shell or an exposed sheet
+            # joining the wall list and dragging the envelope outward
+            half_width = float(np.percentile(wall_reaches, 60))
+        else:
+            side_reaches = [v for v in reaches.values() if v >= 0.45] or list(reaches.values())
+            half_width = float(np.percentile(side_reaches, 60))
+        ceiling_z = float(np.percentile(lining_points[:, 2], 97))
+        floor_z = float(np.percentile(lining_points[:, 2], 3))
+        upper = lining_points[lining_points[:, 2] > frame.eye[2] - 0.75]
+        if len(upper) >= 100:
+            y_front = float(np.percentile(upper[:, 1], 2))
+            y_rear = float(np.percentile(upper[:, 1], 98))
+        else:
+            y_front = float(np.percentile(lining_points[:, 1], 2))
+            y_rear = float(np.percentile(lining_points[:, 1], 98))
+    else:
+        half_width, ceiling_z = 0.85, frame.eye[2] + 0.25
+        floor_z = frame.eye[2] - 1.35
+        y_front, y_rear = frame.eye[1] - 2.2, frame.eye[1] + 1.6
+    shell_floor = core.floor_height_from_shell(entries_np, frame.eye, frame.forward, transparent)
+    if shell_floor is not None:
+        floor_z = max(floor_z, shell_floor)
+
+    wheel_ahead = float((wheel - eye)[:2] @ f[:2]) if wheel is not None else 0.6
+    wheel_dist = float(np.linalg.norm(wheel - eye)) if wheel is not None else 0.8
+    wheel_x = float(wheel[0]) if wheel is not None else frame.eye[0]
+
+    verdicts: dict[str, tuple[str, str, str, dict]] = {}
+    vetoed: set[str] = set()
+    for object_id in want:
+        points = entries_np.get(object_id)
+        obj = context.objects.get(object_id)
+        if points is None or obj is None or len(points) < 4:
+            continue
+        centroid = points.mean(axis=0)
+        stats = scan[object_id]
+        near_eye = float(np.linalg.norm(centroid - eye)) <= 1.25 and centroid[2] >= frame.eye[2] - 0.8
+        if (core.is_default_steering_ref(object_id, obj) or object_id == frame.wheel_id) and near_eye:
+            # the wheel anchor's mesh may span the whole steering shaft, so it
+            # is exempt from every other test
+            verdicts[object_id] = ("translate", "steering wheel", "high", {})
+            continue
+
+        extents = np.ptp(points, axis=0)
+        diagonal = float(np.linalg.norm(extents))
+        ahead = float((centroid[:2] - eye[:2]) @ f[:2])
+        lat_signed = float(frame.side * (centroid[0] - wheel_x))
+        below = frame.eye[2] - float(centroid[2])
+        out80 = float(np.percentile(np.abs(points[:, 0] - cx0), 80))
+        stats_ng = scan_no_glass.get(object_id, stats)
+        z70 = float(np.percentile(points[:, 2], 70))
+
+        # oriented control cone: forward-and-down of the eye, laterally from
+        # just inboard of the column out to the driver's door, no broad walls
+        wall_lateral = extents[0] < 0.22 and extents[1] > 0.45 and extents[2] > 0.45
+        in_cone = (
+            0.20 <= ahead <= wheel_ahead + 1.0
+            and -0.22 <= lat_signed <= 0.33
+            and -0.10 <= below <= 1.35
+            and not wall_lateral
+        )
+
+        if object_id in glass_ids:
+            # a small pane in the cone is an instrument cover moving with the
+            # cluster; real windows are wide or lateral and never convert
+            if (diagonal <= 0.7 and 0.20 <= ahead <= wheel_ahead + 1.0
+                    and -0.22 <= lat_signed <= 0.33 and -0.10 <= below <= 1.35
+                    and stats["depth"] <= 0.30
+                    and (stats["vf"] >= 0.30 or stats["min_r"] <= wheel_dist + 0.45)):
+                verdicts[object_id] = ("translate", "instrument cover in the control cone", "med", {})
+            continue
+
+        # scope channels: candidates, not absolutes
+        cand_visible = stats["vf"] >= 0.28
+        cand_enclosed = (
+            stats["vf"] >= 0.08 and stats["backed"] >= 0.45
+            and out80 <= half_width - 0.02 and stats["depth"] <= 0.45
+        )
+        cand_fitment = (
+            stats_ng["vf"] >= 0.12 and diagonal <= 0.60
+            and 0.15 <= ahead <= 1.5 and abs(float(centroid[2]) - frame.eye[2]) <= 0.7
+            and abs(float(centroid[0]) - cx0) >= half_width - 0.06
+        )
+        buried_lined = stats["backed"] >= 0.75 and stats["depth"] <= 0.35
+        cand_cone = (
+            in_cone and stats["depth"] <= 0.75
+            and stats["min_r"] <= SPATIAL_REACH_LIMIT
+            and (float(centroid[2]) >= floor_z - 0.10 or buried_lined)
+            and (
+                stats["vf"] >= 0.45
+                or stats["min_r"] <= wheel_dist + 0.45
+                or buried_lined
+                or cand_enclosed
+            )
+        )
+        if not (cand_visible or cand_enclosed or cand_fitment or cand_cone):
+            continue
+
+        if not cand_fitment:
+            if beyond.get(object_id, 0.0) >= 0.40:
+                vetoed.add(object_id)
+                continue  # outside the glasshouse (wipers, hood, truck bed)
+            if out80 > half_width + 0.04:
+                vetoed.add(object_id)
+                continue  # protrudes past the cabin shell (door skin)
+            if out80 > half_width - 0.02 and stats["lined"] < 0.35 and stats["backed"] < 0.35:
+                vetoed.add(object_id)
+                continue  # at the shell with nothing behind: exposed skin
+            if (out80 > half_width - 0.03 and z70 > frame.eye[2] + 0.05
+                    and extents[0] < 0.40 and extents[1] > 0.6):
+                vetoed.add(object_id)
+                continue  # shell wall rising past the beltline: door frame/skin
+            if z70 > ceiling_z + 0.04:
+                vetoed.add(object_id)
+                continue  # above the headliner (roof accessories)
+            if (float(centroid[1]) < y_front - 0.12 and not in_cone) or float(centroid[1]) > y_rear + 0.15:
+                vetoed.add(object_id)
+                continue  # ahead of the firewall / behind the cab
+            if z70 < floor_z - 0.08 and not cand_cone:
+                vetoed.add(object_id)
+                continue  # under the cabin floor
+
+        if diagonal < 0.14 and stats["n"] < 40 and not in_cone:
+            continue  # sub-resolution marker/dummy (engine light helpers)
+
+        # Step 6, the resolution floor: the steering-column top (translate)
+        # vs body/rack (mirror) are centimetres apart and slide with column
+        # length -- the ONE sanctioned name hint, confined to the column axis
+        lowered_name = f"{object_id} {obj.name}".lower()
+        if (0.2 <= ahead and abs(float(centroid[0]) - wheel_x) <= 0.40
+                and "column" in lowered_name and ahead > wheel_ahead - 0.1):
+            if "top" in lowered_name:
+                verdicts[object_id] = (
+                    "translate", "steering column top (resolution floor: name hint)", "low", {})
+            else:
+                verdicts[object_id] = (
+                    "mirror", "steering column body (resolution floor: name hint)", "low", {})
+            continue
+
+        if cand_cone:
+            confidence = "high" if (abs(lat_signed) < 0.24 and ahead <= wheel_ahead + 0.75) else "med"
+            verdicts[object_id] = ("translate", "in the driver control cone", confidence, {})
+            continue
+
+        emissive = mesh_flag(object_id, "emissive", require_all=False)
+        sds = core.principal_extent_sds(points)
+        planar = sds[0] / max(sds[1], 1e-6) < 0.35 or stats["n"] < 40
+        display = emissive and planar and diagonal <= 0.9
+
+        residual = core.cloud_symmetry_residual(points, cx0)
+        if (not cand_visible and abs(float(centroid[0]) - cx0) < 0.12
+                and residual < 0.15 and not cand_fitment and not cand_cone):
+            continue  # barely-seen centred blob: mirroring it is a no-op
+        if residual < SPATIAL_SYMMETRIC_RESIDUAL:
+            xspan = float(np.ptp(points[:, 0]))
+            z90 = float(np.percentile(points[:, 2], 90))
+            fascia = (
+                xspan >= max(1.05, 1.3 * half_width) and ahead >= 0.45
+                and float(centroid[2]) <= frame.eye[2] + 0.05 and z90 >= frame.eye[2] - 0.62
+                and extents[2] >= 0.28 and stats["vf"] >= 0.30
+            )
+            if display:
+                verdicts[object_id] = ("mirror", "directional display", "med", {"flip": True})
+            elif fascia:
+                # symmetric at cloud resolution, but the fascia carries
+                # sub-sampling driver detail (binnacle, vents): mirror it
+                verdicts[object_id] = ("mirror", "dashboard fascia", "med", {})
+            # else: symmetric about the centreline, reflection changes nothing
+            continue
+
+        confidence = "low" if residual < SPATIAL_BORDERLINE_RESIDUAL else (
+            "med" if not cand_visible else "high")
+        reason = ("exterior driver fitment" if cand_fitment and not cand_visible
+                  else "one-sided interior part")
+        if out80 >= half_width - 0.05 and stats["vf"] < 0.50 and not cand_fitment:
+            confidence = "low"
+            reason = "wall at the cabin shell (verify: possible exterior sheet)"
+        verdicts[object_id] = ("pairable", reason, confidence, {"flip": display})
+    return verdicts, vetoed
 
 
-def recommendation_pair_candidate(object_id: str, candidates: set[str]) -> str | None:
-    lowered = object_id.lower()
-    lower_to_id = {candidate.lower(): candidate for candidate in candidates}
-    # "lhd"/"rhd" are handedness tokens, not side tokens: the "_l" inside
-    # "_lhd" must not pair bx_mirror_int_lhd with bx_mirror_int_rhd. Side
-    # tokens elsewhere in such names (bx_mirror_L_rhd) still pair normally.
-    hand_spans = [match.span() for match in re.finditer(r"[lr]hd", lowered)]
-    for left, right in RECOMMEND_SIDE_PAIRS:
-        start = 0
-        while True:
-            idx = lowered.find(left, start)
-            if idx < 0:
-                break
-            if any(idx < end and begin < idx + len(left) for begin, end in hand_spans):
-                start = idx + 1
+def _resolve_trim_pairs(
+    frame: core.DriverFrame,
+    present: list[str],
+    entries_np: dict[str, object],
+    memo: dict[str, tuple[str, str, str, dict]],
+    vetoed: set[str],
+    pair_votes: dict[str, dict[str, int]],
+) -> None:
+    """Match pairable meshes to geometric twins among THIS trim's present set.
+
+    Twins may also come from the latent pool: meshes the scan under-admitted
+    (the passenger-side twin the eye barely sees) but never ones positively
+    vetoed as exterior. Each twin is consumed once per trim, so mutually
+    exclusive variants never compete for the same counterpart."""
+    import numpy as np
+
+    pairables = [o for o in present if memo.get(o, ("none",))[0] == "pairable"]
+    latent = [
+        o for o in present
+        if memo.get(o, ("none",))[0] == "none" and o not in vetoed
+        and o in entries_np and len(entries_np[o]) >= 4
+    ]
+    used: set[str] = set()
+    cx0 = frame.center_x
+    for object_id in sorted(
+        pairables, key=lambda o: (-frame.side * float(entries_np[o][:, 0].mean()), o)
+    ):
+        if object_id in used:
+            continue
+        points_a = entries_np[object_id]
+        centroid_a = points_a.mean(axis=0)
+        if abs(float(centroid_a[0]) - cx0) < 0.08:
+            continue  # centred: a one-sided fitment, nothing to pair with
+        best: tuple[float, str] | None = None
+        for twin_id in pairables + latent:
+            if twin_id == object_id or twin_id in used:
                 continue
-            candidate = lowered[:idx] + right + lowered[idx + len(left) :]
-            if candidate in lower_to_id:
-                return lower_to_id[candidate]
-            break
-    return None
+            points_b = entries_np[twin_id]
+            centroid_b = points_b.mean(axis=0)
+            if abs((float(centroid_a[0]) - cx0) + (float(centroid_b[0]) - cx0)) > 0.14:
+                continue
+            if (abs(float(centroid_a[1]) - float(centroid_b[1])) > 0.35
+                    or abs(float(centroid_a[2]) - float(centroid_b[2])) > 0.35):
+                continue
+            diag_a = float(np.linalg.norm(np.ptp(points_a, axis=0)))
+            diag_b = float(np.linalg.norm(np.ptp(points_b, axis=0)))
+            if max(diag_a, diag_b) / max(min(diag_a, diag_b), 1e-6) > 1.5:
+                continue
+            residual = core.mirror_pair_residual(points_a, points_b, cx0)
+            if residual <= SPATIAL_PAIR_RESIDUAL and (best is None or residual < best[0]):
+                best = (residual, twin_id)
+        if best is not None:
+            twin_id = best[1]
+            used.add(object_id)
+            used.add(twin_id)
+            if memo.get(twin_id, ("none",))[0] == "none":
+                memo[twin_id] = ("pairable", "geometric twin across the centreline", "med", {})
+            pair_votes.setdefault(object_id, {})[twin_id] = (
+                pair_votes.get(object_id, {}).get(twin_id, 0) + 1)
+            pair_votes.setdefault(twin_id, {})[object_id] = (
+                pair_votes.get(twin_id, {}).get(object_id, 0) + 1)
+
+
+def _inherit_mounted_parts(
+    context: core.VehicleContext,
+    frame: core.DriverFrame,
+    present: list[str],
+    entries_np: dict[str, object],
+    memo: dict[str, tuple[str, str, str, dict]],
+    vetoed: set[str],
+    pair_votes: dict[str, dict[str, int]],
+) -> None:
+    """Assembly propagation: a small part mounted ON a mirrored surface
+    mirrors with it.
+
+    Individually, a hazard button or a handbrake lever is near-centred and
+    symmetric -- reflection looks like a no-op at cloud resolution, so the
+    per-mesh verdict is skip. But these are components of assemblies (button
+    on dash, knob on lever, seals on fascia): when the surface a part touches
+    is classified aesthetic Mirror, the part inherits Mirror at low
+    confidence rather than staying behind. Two passes resolve chains
+    (button -> console -> dash). Only skip/none verdicts are upgraded --
+    translate/pair verdicts and vetoed exterior meshes are never touched --
+    and glass panes never inherit."""
+    import numpy as np
+
+    material_symbols = core.mesh_material_symbols(context)
+    material_flags = core.material_flags_for_context(context)
+
+    def is_glass(object_id: str) -> bool:
+        symbols = material_symbols.get(object_id)
+        return bool(symbols) and all(
+            material_flags.get(s, {}).get("glass") for s in symbols
+        )
+
+    eye = np.array(frame.eye)
+
+    def is_mirror_host(object_id: str) -> bool:
+        mode = memo.get(object_id, ("none",))[0]
+        if mode == "mirror":
+            return True
+        # an unpaired pairable emits as aesthetic Mirror ("twin absent"), so
+        # it anchors its satellites the same way; a paired host is structural
+        # and its satellites pair on their own
+        return mode == "pairable" and object_id not in pair_votes
+
+    for _ in range(2):
+        hosts = [
+            o for o in present
+            if is_mirror_host(o)
+            and o in entries_np
+            and float(np.linalg.norm(np.ptp(entries_np[o], axis=0))) >= 0.15
+            and float(np.linalg.norm(entries_np[o].mean(axis=0) - eye)) <= 1.6
+        ]
+        if not hosts:
+            return
+        changed = False
+        for object_id in present:
+            if memo.get(object_id, ("none",))[0] != "none" or object_id in vetoed:
+                continue
+            points = entries_np.get(object_id)
+            if points is None or len(points) < 4 or is_glass(object_id):
+                continue
+            diag = float(np.linalg.norm(np.ptp(points, axis=0)))
+            if diag > 0.70:
+                continue  # furniture-sized: judged on its own evidence
+            if diag < 0.14 and len(points) < 40:
+                continue  # sub-resolution marker/dummy (engine light helpers)
+            if float(np.linalg.norm(points.mean(axis=0) - eye)) > 1.6:
+                continue  # outside the cabin radius: not interior furniture
+            for host in hosts:
+                host_points = entries_np[host]
+                gap2 = ((points[:, None, :] - host_points[None, :, :]) ** 2).sum(axis=2)
+                if float(np.sqrt(gap2.min())) <= 0.03:
+                    memo[object_id] = (
+                        "mirror", f"mounted on {host}", "low", {})
+                    changed = True
+                    break
+        if not changed:
+            return
 
 
 def build_mode_recommendations(
     context: core.VehicleContext,
     object_ids: list[str],
 ) -> list[dict[str, str]]:
-    available = [object_id for object_id in object_ids if object_id in context.objects]
-    candidate_set = set(available)
-    paired: set[str] = set()
+    """Classify meshes for hand conversion from the driver's viewpoint.
+
+    Batch model: the intrinsic class is a property of the mesh, not the trim,
+    so each unique mesh is classified once (in the first trim that contains
+    it) and memoised; later trims only re-solve low-confidence meshes whose
+    position is trim-dependent, plus the inherently per-trim structural
+    pairing. State is cached on the context so reopening the modal reuses
+    every solved trim. No driver frame (no camera and no wheel) means no
+    trustworthy spatial reasoning: the answer is no recommendations, never a
+    name-based guess."""
+    available = {o for o in object_ids if o in context.objects and o in context.preview_by_id}
+    if not available:
+        return []
+    frame = core.driver_frame_for_context(context)
+    if frame is None:
+        return []
+
+    state = getattr(context, "_spatial_recommendation_state", None)
+    if state is None:
+        state = {"memo": {}, "vetoed": set(), "pair_votes": {}, "trims_done": set()}
+        context._spatial_recommendation_state = state
+    memo: dict[str, tuple[str, str, str, dict]] = state["memo"]
+    vetoed: set[str] = state["vetoed"]
+    pair_votes: dict[str, dict[str, int]] = state["pair_votes"]
+
+    trims: list[str | None] = sorted(context.variants) if context.variants else [None]
+    for trim in trims:
+        present, entries_np = _spatial_entries_for_trim(context, trim, available)
+        if not present:
+            continue
+        todo = [
+            o for o in present
+            if o not in memo
+            or (memo[o][2] == "low" and o in context.variant_dependent_meshes
+                and trim not in state["trims_done"])
+        ]
+        if todo:
+            verdicts, newly_vetoed = _classify_meshes_for_trim(
+                context, frame, present, entries_np, todo
+            )
+            vetoed.update(newly_vetoed)
+            for o in todo:
+                verdict = verdicts.get(o, ("none", "", "med", {}))
+                previous = memo.get(o)
+                if previous is None or previous[0] == "none":
+                    memo[o] = verdict
+                elif previous[2] == "low" and verdict[0] != "none" and verdict[2] != "low":
+                    memo[o] = verdict  # a trim resolved the borderline case
+        if trim not in state["trims_done"]:
+            _resolve_trim_pairs(frame, present, entries_np, memo, vetoed, pair_votes)
+            _inherit_mounted_parts(context, frame, present, entries_np, memo, vetoed, pair_votes)
+            state["trims_done"].add(trim)
+
+    # Meshes no trim uses stay unclassified on purpose: the union of mutually
+    # exclusive variants is not a cabin, and a part no config fits cannot be
+    # converted anyway.
+
     recommendations: list[dict[str, str]] = []
-
-    handled: set[str] = set()
-    for object_id in available:
-        if object_id in paired:
+    emitted_pairs: set[frozenset] = set()
+    requested = set(object_ids)
+    for object_id in sorted(requested & set(memo)):
+        mode, reason, confidence, extra = memo[object_id]
+        if mode == "none":
             continue
-        text = recommendation_text(context, object_id)
-        if not recommendation_matches(text, RECOMMEND_STRUCTURAL_PATTERNS):
-            continue
-        source_id = recommendation_pair_candidate(object_id, candidate_set)
-        if source_id is not None and source_id not in paired:
-            recommendations.append(
-                {
+        if confidence == "low":
+            reason = f"{reason} (low confidence)"
+        if mode == "pairable":
+            votes = pair_votes.get(object_id)
+            twin = max(votes, key=lambda t: (votes[t], t)) if votes else None
+            if twin is not None and twin in requested:
+                key = frozenset((object_id, twin))
+                if key in emitted_pairs:
+                    continue
+                emitted_pairs.add(key)
+                # name the driver-side member so the modal reads naturally
+                obj_a = context.objects.get(object_id)
+                obj_b = context.objects.get(twin)
+                first, second = object_id, twin
+                if obj_a is not None and obj_b is not None:
+                    if frame.side * obj_b.x > frame.side * obj_a.x:
+                        first, second = twin, object_id
+                recommendations.append({
                     "kind": "pair",
-                    "object_id": object_id,
-                    "source_id": source_id,
+                    "object_id": first,
+                    "source_id": second,
                     "mode": core.MODE_MIRROR_STRUCTURAL,
-                    "reason": "left/right name pair",
-                }
-            )
-            paired.add(object_id)
-            paired.add(source_id)
-        elif (
-            source_id is None
-            and not recommendation_matches(text, RECOMMEND_UNPAIRED_MIRROR_EXCLUDE_PATTERNS)
-            # Instrument-named parts that happen to carry a mirror/seat token
-            # (shiftlight_multi_led_mirror) belong to the translate rules below.
-            and not recommendation_matches(text, RECOMMEND_TRANSLATE_PATTERNS)
-        ):
-            # Seat/mirror-style hardware with no opposite-side counterpart is
-            # driver-only kit (racing seat bases, single wing mirrors): mirror
-            # it onto the other side.
-            recommendations.append(
-                {
+                    "reason": reason,
+                    "confidence": confidence,
+                })
+            else:
+                entry = {
                     "kind": "single",
                     "object_id": object_id,
                     "source_id": "",
                     "mode": core.MODE_MIRROR,
-                    "reason": "one-sided seat/mirror part",
+                    "reason": f"{reason}; twin absent in this trim",
+                    "confidence": confidence,
                 }
-            )
-            handled.add(object_id)
-
-    for object_id in available:
-        if object_id in paired or object_id in handled:
-            continue
-        text = recommendation_text(context, object_id)
-        obj = context.objects.get(object_id)
-        if obj is not None and core.steering_ref_score(object_id, obj) >= 15:
-            recommendations.append(
-                {
-                    "kind": "single",
-                    "object_id": object_id,
-                    "source_id": "",
-                    "mode": core.MODE_TRANSLATE,
-                    "reason": "steering wheel",
-                }
-            )
-        elif recommendation_matches(text, RECOMMEND_TRANSLATE_PATTERNS) and not recommendation_matches(
-            text,
-            RECOMMEND_TRANSLATE_EXCLUDE_PATTERNS,
-        ):
-            recommendations.append(
-                {
-                    "kind": "single",
-                    "object_id": object_id,
-                    "source_id": "",
-                    "mode": core.MODE_TRANSLATE,
-                    "reason": "driver control or instrument name",
-                }
-            )
-        elif recommendation_matches(text, RECOMMEND_SCREEN_PATTERNS):
-            recommendations.append(
-                {
-                    "kind": "single",
-                    "object_id": object_id,
-                    "source_id": "",
-                    "mode": core.MODE_MIRROR,
-                    "textureFlip": True,
-                    "reason": "display screen: mirror + flip texture",
-                }
-            )
-        elif recommendation_matches(text, RECOMMEND_MIRROR_PATTERNS):
-            recommendations.append(
-                {
-                    "kind": "single",
-                    "object_id": object_id,
-                    "source_id": "",
-                    "mode": core.MODE_MIRROR,
-                    "reason": "asymmetric interior name",
-                }
-            )
+                if extra.get("flip"):
+                    entry["textureFlip"] = True
+                recommendations.append(entry)
+        else:
+            entry = {
+                "kind": "single",
+                "object_id": object_id,
+                "source_id": "",
+                "mode": core.MODE_TRANSLATE if mode == "translate" else core.MODE_MIRROR,
+                "reason": reason,
+                "confidence": confidence,
+            }
+            if mode == "mirror" and extra.get("flip"):
+                entry["textureFlip"] = True
+            recommendations.append(entry)
 
     mode_order = {
         core.MODE_TRANSLATE: 0,

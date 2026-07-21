@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree as ET
 
+import numpy as np
+
 import beamng_transform_helpers as transform_helpers
 import plate_generator
 
@@ -643,6 +645,14 @@ def preview_data_from_tree(
 
         if not object_points:
             continue
+        # Material bindings feed the spatial classifier (glass panes bound the
+        # cabin; emissive surfaces are displays that need a texture flip).
+        material_symbols = sorted({
+            re.sub(r"-material$", "", symbol).lower()
+            for inst_mat in node.findall(".//c:instance_material", NS)
+            for symbol in (inst_mat.get("symbol") or inst_mat.get("target", "").lstrip("#"),)
+            if symbol
+        })
         bounds = transform_helpers.bounds_from_points(object_points)
         min_point, max_point = bounds
         center = (
@@ -655,6 +665,7 @@ def preview_data_from_tree(
             "center": center,
             "sample_points": transform_helpers.sample_points(object_points, max_points_per_object),
             "geometry_ids": geometry_ids,
+            "materials": tuple(material_symbols),
         }
         for alias in dae_node_aliases(node):
             preview.setdefault(alias, item)
@@ -6128,3 +6139,487 @@ def build_batch(
         plate_summary=plate_summary,
         installed_plates_zip=installed_plates_zip,
     )
+
+
+# ---------------------------------------------------------------------------
+# Spatial geometry for Recommend Modes
+#
+# The classifier in beamng_hand_drive_tool.build_mode_recommendations reasons
+# from the driver's viewpoint: an eye point parsed from the jbeam internal
+# camera, a nearest-surface shell swept around it, and per-mesh evidence
+# (visibility, backing, symmetry, twin geometry). The pure geometry lives
+# here; the tool module only orchestrates.
+
+SPATIAL_BIN_DEG = 6.0
+
+
+@dataclass(frozen=True)
+class DriverFrame:
+    """The driver's viewpoint: everything the classifier measures is relative
+    to this frame, so it transfers across cabins (saloon, truck, buggy)."""
+
+    eye: tuple[float, float, float]
+    forward: tuple[float, float, float]
+    side: int  # +1 driver sits at +x of the centreline, -1 at -x
+    center_x: float
+    wheel_id: str | None
+    wheel_center: tuple[float, float, float] | None
+    source: str  # "camera+wheel" | "camera" | "wheel"
+
+
+def iter_named_array_texts(text: str, key: str) -> list[str]:
+    """Bracket-matched bodies of every '"key": [...]' array in a jbeam text.
+
+    Raw-text variant of part_named_array_for_context for callers that have no
+    part id in hand (the internal camera can sit in any part of any file)."""
+    bodies: list[str] = []
+    for match in re.finditer(rf'"{re.escape(key)}"\s*:\s*\[', text):
+        depth = 0
+        i = match.end() - 1
+        start = i
+        in_str = False
+        escaped = False
+        while i < len(text):
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        bodies.append(text[start:i + 1])
+    return bodies
+
+
+def parse_internal_camera_positions(
+    jbeam_texts: dict[str, str],
+    node_positions: dict[str, tuple[float, float, float]],
+) -> list[tuple[float, float, float]]:
+    """Eye positions of every "dash"/"driver" camerasInternal row.
+
+    Coordinates are literal numbers on every vanilla vehicle measured so far;
+    a quoted value is resolved through node_positions component-wise as a
+    fallback, and rows that resolve nothing are dropped rather than guessed."""
+    rows: list[tuple[float, float, float]] = []
+    for text in jbeam_texts.values():
+        for array_text in iter_named_array_texts(text, "camerasInternal"):
+            for row in iter_active_top_level_rows(array_text):
+                values = split_top_level_values(row)
+                if not values:
+                    continue
+                kind = quoted_string_value(values[0])
+                if kind not in ("dash", "driver"):
+                    continue
+                position: list[float] = []
+                ok = True
+                for value in values[1:4]:
+                    value = value.strip()
+                    quoted = quoted_string_value(value)
+                    if quoted is not None:
+                        node = node_positions.get(quoted)
+                        if node is None:
+                            ok = False
+                            break
+                        position.append(float(node[len(position)]))
+                        continue
+                    try:
+                        position.append(float(value))
+                    except ValueError:
+                        ok = False
+                        break
+                if ok and len(position) == 3:
+                    rows.append((position[0], position[1], position[2]))
+    return rows
+
+
+def driver_frame_for_context(
+    context: VehicleContext,
+    object_ids: Iterable[str] | None = None,
+) -> DriverFrame | None:
+    """Anchor the classifier on the driver's eye.
+
+    Camera rows give the eye; the steering wheel corroborates it and fixes the
+    forward direction. Camera without wheel keeps BeamNG's -y-forward
+    convention; wheel without camera estimates the eye behind/above the rim
+    (degraded); neither means the spatial frame is untrustworthy and callers
+    must emit nothing rather than guess."""
+    candidates = list(object_ids) if object_ids is not None else list(context.objects)
+    camera_rows = parse_internal_camera_positions(context.jbeam_texts, context.node_positions)
+    eye: tuple[float, float, float] | None = None
+    if camera_rows:
+        arr = np.array(camera_rows, dtype=float)
+        eye = tuple(float(v) for v in np.median(arr, axis=0))
+
+    best: tuple[int, int, str] | None = None
+    for object_id in candidates:
+        obj = context.objects.get(object_id)
+        if obj is None or object_id not in context.preview_by_id:
+            continue
+        if is_default_steering_ref(object_id, obj):
+            rank = (
+                steering_ref_score(object_id, obj),
+                vehicle_prefix_rank(context, object_id),
+            )
+            if best is None or (rank[0], -rank[1]) > (best[0], -best[1]):
+                best = (rank[0], rank[1], object_id)
+    wheel_id = best[2] if best else None
+    wheel_center: tuple[float, float, float] | None = None
+    if wheel_id is not None:
+        points = np.array(context.preview_by_id[wheel_id]["sample_points"], dtype=float)
+        if eye is not None:
+            # Wheel meshes may include the whole steering shaft; keep the rim
+            # (near and below the eye) so the centre is the hub, not the rack.
+            distances = np.linalg.norm(points - np.array(eye), axis=1)
+            mask = (distances < 1.3) & (points[:, 2] < eye[2] + 0.25)
+            if int(mask.sum()) >= 10:
+                points = points[mask]
+        wheel_center = tuple(float(v) for v in np.median(points, axis=0))
+
+    if eye is None and wheel_center is None:
+        return None
+    center_x = median_value([p[0] for p in context.node_positions.values()]) or 0.0
+    if eye is None:
+        eye = (wheel_center[0], wheel_center[1] + 0.60, wheel_center[2] + 0.35)
+        source = "wheel"
+        forward = (0.0, -1.0, 0.0)
+    elif wheel_center is None:
+        source = "camera"
+        forward = (0.0, -1.0, 0.0)
+    else:
+        source = "camera+wheel"
+        fxy = np.array([wheel_center[0] - eye[0], wheel_center[1] - eye[1]])
+        norm = float(np.linalg.norm(fxy))
+        forward = (fxy[0] / norm, fxy[1] / norm, 0.0) if norm > 0.05 else (0.0, -1.0, 0.0)
+    side = 1 if (eye[0] - center_x) >= 0 else -1
+    return DriverFrame(
+        eye=eye,
+        forward=(float(forward[0]), float(forward[1]), 0.0),
+        side=side,
+        center_x=float(center_x),
+        wheel_id=wheel_id,
+        wheel_center=wheel_center,
+        source=source,
+    )
+
+
+def spatial_spherical_bins(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Equal-angle (elevation, azimuth) bin index and range per direction."""
+    radii = np.maximum(np.linalg.norm(vectors, axis=1), 1e-9)
+    elevation = np.arcsin(np.clip(vectors[:, 2] / radii, -1.0, 1.0))
+    azimuth = np.arctan2(vectors[:, 1], vectors[:, 0])
+    step = math.radians(SPATIAL_BIN_DEG)
+    n_azimuth = int(2 * math.pi / step) + 1
+    i_el = ((elevation + math.pi / 2) / step).astype(np.int64)
+    i_az = ((azimuth + math.pi) / step).astype(np.int64)
+    return i_el * n_azimuth + i_az, radii
+
+
+def visibility_scan(
+    points_by_id: dict[str, np.ndarray],
+    eye: tuple[float, float, float],
+    transparent_ids: set[str],
+) -> dict[str, dict[str, float]]:
+    """Nearest-surface shell around the eye plus per-mesh evidence.
+
+    Per mesh:
+      vf     -- fraction of points on/inside the shell (the eye can see them)
+      backed -- fraction with ANY other mesh somewhere behind (not outermost)
+      lined  -- fraction with another mesh CLOSE behind, 3-30 cm (a lining
+                layer: door card over skin); own-mesh thickness never counts
+      depth  -- mean distance points sit behind the shell (occlusion depth)
+      min_r  -- nearest point to the eye
+
+    The shell is per-bin nearest with a range-scaled tolerance; deliberately
+    NOT dilated -- on ~350-point clouds dilation over-occludes far worse than
+    leaks under-occlude, and the vetoes downstream absorb the leaks."""
+    ids: list[str] = []
+    chunks: list[np.ndarray] = []
+    owners: list[np.ndarray] = []
+    for index, (object_id, points) in enumerate(points_by_id.items()):
+        ids.append(object_id)
+        chunks.append(points)
+        owners.append(np.full(len(points), index))
+    all_points = np.concatenate(chunks)
+    owner = np.concatenate(owners)
+    bins, radii = spatial_spherical_bins(all_points - np.array(eye))
+    opaque = np.array([ids[o] not in transparent_ids for o in owner])
+    n_bins = int(bins.max()) + 2
+    field = np.full(n_bins, np.inf)
+    np.minimum.at(field, bins[opaque], radii[opaque])
+
+    far1 = np.full(n_bins, -np.inf)
+    far1_owner = np.full(n_bins, -1)
+    far2 = np.full(n_bins, -np.inf)
+    far2_owner = np.full(n_bins, -1)
+    bins_o = bins[opaque]
+    radii_o = radii[opaque]
+    owner_o = owner[opaque]
+    order = np.lexsort((radii_o, bins_o))
+    sorted_bins = bins_o[order]
+    sorted_radii = radii_o[order]
+    sorted_owner = owner_o[order]
+    is_last = np.r_[sorted_bins[1:] != sorted_bins[:-1], True]
+    far1[sorted_bins[is_last]] = sorted_radii[is_last]
+    far1_owner[sorted_bins[is_last]] = sorted_owner[is_last]
+    second_idx = np.flatnonzero(is_last) - 1
+    second_idx = second_idx[second_idx >= 0]
+    is_second = np.zeros(len(sorted_bins), dtype=bool)
+    is_second[second_idx] = True
+    if len(sorted_bins):
+        is_second &= np.r_[sorted_bins[:-1] == sorted_bins[1:], False]
+    far2[sorted_bins[is_second]] = sorted_radii[is_second]
+    far2_owner[sorted_bins[is_second]] = sorted_owner[is_second]
+
+    # close backing (lined): another mesh within (0.03, 0.30] behind, same bin
+    lined_flag = np.zeros(len(all_points), dtype=bool)
+    segment_start = np.flatnonzero(np.r_[True, sorted_bins[1:] != sorted_bins[:-1]])
+    segment_end = np.r_[segment_start[1:], len(sorted_bins)]
+    opaque_idx = np.flatnonzero(opaque)
+    for seg_a, seg_b in zip(segment_start, segment_end):
+        if seg_b - seg_a < 2:
+            continue
+        seg_radii = sorted_radii[seg_a:seg_b]
+        seg_owner = sorted_owner[seg_a:seg_b]
+        for i in range(seg_b - seg_a):
+            r_i = seg_radii[i]
+            lo = np.searchsorted(seg_radii, r_i + 0.03, side="right")
+            hi = np.searchsorted(seg_radii, r_i + 0.30, side="right")
+            if lo < hi and np.any(seg_owner[lo:hi] != seg_owner[i]):
+                lined_flag[opaque_idx[order[seg_a + i]]] = True
+
+    tolerance = 0.05 + 0.04 * radii
+    visible = radii <= field[bins] + tolerance
+    depth = np.maximum(0.0, radii - field[bins])
+    behind1 = (far1[bins] > radii + 0.05) & (far1_owner[bins] != owner)
+    behind2 = (far2[bins] > radii + 0.05) & (far2_owner[bins] != owner)
+    backed = behind1 | behind2
+
+    stats: dict[str, dict[str, float]] = {}
+    for index, object_id in enumerate(ids):
+        mask = owner == index
+        count = int(mask.sum())
+        stats[object_id] = {
+            "n": count,
+            "vf": float(visible[mask].sum()) / count,
+            "backed": float(backed[mask].sum()) / count,
+            "lined": float(lined_flag[mask].sum()) / count,
+            "depth": float(depth[mask].mean()),
+            "min_r": float(radii[mask].min()),
+        }
+    return stats
+
+
+def floor_height_from_shell(
+    points_by_id: dict[str, np.ndarray],
+    eye: tuple[float, float, float],
+    forward: tuple[float, float, float],
+    transparent_ids: set[str],
+) -> float | None:
+    """Cabin floor height read off the shell in the forward-down (footwell)
+    sector. Straight-down rays end on the seat cushion, so they are excluded."""
+    chunks = [pts for oid, pts in points_by_id.items() if oid not in transparent_ids]
+    if not chunks:
+        return None
+    all_points = np.concatenate(chunks)
+    vectors = all_points - np.array(eye)
+    radii = np.maximum(np.linalg.norm(vectors, axis=1), 1e-9)
+    elevation = np.arcsin(np.clip(vectors[:, 2] / radii, -1.0, 1.0))
+    horizontal = vectors[:, :2] / np.maximum(np.linalg.norm(vectors[:, :2], axis=1), 1e-9)[:, None]
+    forwardness = horizontal @ np.array(forward[:2])
+    footwell = (
+        (elevation < math.radians(-35.0))
+        & (elevation > math.radians(-75.0))
+        & (forwardness > 0.5)
+    )
+    if int(footwell.sum()) < 20:
+        return None
+    bins, seg_radii = spatial_spherical_bins(vectors[footwell])
+    heights = all_points[footwell][:, 2]
+    n_bins = int(bins.max()) + 2
+    nearest_field = np.full(n_bins, np.inf)
+    np.minimum.at(nearest_field, bins, seg_radii)
+    nearest = seg_radii <= nearest_field[bins] + 0.02
+    return float(np.percentile(heights[nearest], 20))
+
+
+def glass_beyond_fractions(
+    points_by_id: dict[str, np.ndarray],
+    eye: tuple[float, float, float],
+    glass_ids: set[str],
+    check_ids: Iterable[str],
+) -> dict[str, float]:
+    """Fraction of each mesh's points beyond a large planar glass pane within
+    the pane's angular footprint: outside the glasshouse (wipers beyond the
+    windscreen, the truck bed beyond the rear window). Small panes (gauge
+    lenses) are not cabin boundaries and are ignored."""
+    result = {object_id: 0.0 for object_id in check_ids}
+    eye_v = np.array(eye)
+    step = math.radians(SPATIAL_BIN_DEG)
+    n_azimuth = int(2 * math.pi / step) + 1
+    panes: list[tuple[np.ndarray, np.ndarray, set]] = []
+    for glass_id in glass_ids:
+        points = points_by_id.get(glass_id)
+        if points is None or len(points) < 10:
+            continue
+        if float(np.linalg.norm(np.ptp(points, axis=0))) < 0.75:
+            continue  # instrument lens, not a window
+        centroid = points.mean(axis=0)
+        centered = points - centroid
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        normal = vt[2]
+        rms = float(np.sqrt(((centered @ normal) ** 2).mean()))
+        if rms > 0.05:
+            continue  # not planar enough to bound anything
+        if (centroid - eye_v) @ normal < 0:
+            normal = -normal  # orient away from the eye
+        pane_bins, _ = spatial_spherical_bins(points - eye_v)
+        footprint = set()
+        for b in set(pane_bins.tolist()):
+            for d_el in (-2, -1, 0, 1, 2):
+                for d_az in (-2, -1, 0, 1, 2):
+                    footprint.add(b + d_el * n_azimuth + d_az)
+        panes.append((centroid, normal, footprint))
+    if not panes:
+        return result
+    for object_id in result:
+        points = points_by_id.get(object_id)
+        if points is None or len(points) == 0:
+            continue
+        point_bins, _ = spatial_spherical_bins(points - eye_v)
+        beyond = np.zeros(len(points), dtype=bool)
+        for centroid, normal, footprint in panes:
+            in_footprint = np.fromiter(
+                (b in footprint for b in point_bins.tolist()), bool, len(points)
+            )
+            distance = (points - centroid) @ normal
+            beyond |= in_footprint & (distance > 0.05)
+        result[object_id] = float(beyond.mean())
+    return result
+
+
+def cloud_symmetry_residual(points: np.ndarray, center_x: float) -> float:
+    """Normalised Chamfer residual of the cloud against its own x-reflection.
+
+    Small means reflecting the mesh across the centreline is a visual no-op;
+    large means the mesh is one-sided. Normalised by the bbox diagonal so a
+    4 cm button and a 2 m dashboard are judged on the same scale."""
+    reflected = points.copy()
+    reflected[:, 0] = 2 * center_x - reflected[:, 0]
+    squared = ((reflected[:, None, :] - points[None, :, :]) ** 2).sum(axis=2)
+    nearest = np.sqrt(squared.min(axis=1))
+    diagonal = float(np.linalg.norm(np.ptp(points, axis=0)))
+    return float(np.median(nearest)) / max(diagonal, 0.05)
+
+
+def mirror_pair_residual(points_a: np.ndarray, points_b: np.ndarray, center_x: float) -> float:
+    """Symmetric normalised Chamfer distance between reflect(A) and B: how
+    well B is A's geometric twin across the centreline."""
+    reflected = points_a.copy()
+    reflected[:, 0] = 2 * center_x - reflected[:, 0]
+
+    def chamfer(u: np.ndarray, v: np.ndarray) -> float:
+        squared = ((u[:, None, :] - v[None, :, :]) ** 2).sum(axis=2)
+        return float(np.median(np.sqrt(squared.min(axis=1))))
+
+    diagonal = float(np.linalg.norm(np.ptp(np.concatenate([points_a, points_b]), axis=0)))
+    return (chamfer(reflected, points_b) + chamfer(points_b, reflected)) / 2.0 / max(diagonal, 0.05)
+
+
+def principal_extent_sds(points: np.ndarray) -> np.ndarray:
+    """Ascending standard deviations along the cloud's principal axes
+    (thickness, width, length): the planarity/elongation fingerprint."""
+    centered = points - points.mean(axis=0)
+    covariance = centered.T @ centered / max(len(points) - 1, 1)
+    return np.sqrt(np.maximum(np.linalg.eigvalsh(covariance), 0.0))
+
+
+def material_flags_for_context(context: VehicleContext) -> dict[str, dict[str, bool]]:
+    """Material name -> {"emissive", "glass"} from every *.materials.json in
+    the vehicle zip and the game's common zips.
+
+    emissive = any stage carries an emissiveMap (a lit display image).
+    glass    = translucent and NOT emissive (a window; translucent+emissive is
+               a screen). Cached on the context; missing zips degrade to {}."""
+    cached = getattr(context, "_material_flags", None)
+    if cached is not None:
+        return cached
+    flags: dict[str, dict[str, bool]] = {}
+    zips = [context.source_zip] + common_zip_candidates(context.source_zip)
+    for zip_path in zips:
+        try:
+            zf = zipfile.ZipFile(zip_path)
+        except Exception:
+            continue
+        with zf:
+            for name in zf.namelist():
+                if not name.replace("\\", "/").endswith(".materials.json"):
+                    continue
+                try:
+                    data = parse_beamng_json(
+                        zf.read(name).decode("utf-8", errors="replace"), label=name
+                    )
+                except Exception:
+                    continue
+                for key, value in data.items():
+                    if not isinstance(value, dict):
+                        continue
+                    material_name = str(value.get("mapTo") or value.get("name") or key)
+                    stages = value.get("Stages") or []
+                    emissive = any(
+                        isinstance(stage, dict) and "emissiveMap" in stage for stage in stages
+                    )
+                    glass = bool(value.get("translucent")) and not emissive
+                    flags[material_name.lower()] = {"emissive": emissive, "glass": glass}
+    context._material_flags = flags
+    return flags
+
+
+def mesh_material_symbols(context: VehicleContext) -> dict[str, tuple[str, ...]]:
+    """Mesh id -> material symbols bound in the DAE.
+
+    New contexts carry them in preview_by_id (preview_data_from_tree); older
+    cached contexts fall back to a one-off parse of the vehicle's own DAEs.
+    Shared-library meshes without symbols simply get no material evidence."""
+    cached = getattr(context, "_material_symbols", None)
+    if cached is not None:
+        return cached
+    symbols: dict[str, tuple[str, ...]] = {}
+    missing = False
+    for object_id, item in context.preview_by_id.items():
+        materials = item.get("materials")
+        if materials is None:
+            missing = True
+        elif materials:
+            symbols[object_id] = tuple(materials)
+    if missing and not symbols:
+        try:
+            with zipfile.ZipFile(context.source_zip) as zf:
+                for dae_path in context.dae_paths:
+                    try:
+                        tree = ET.parse(io.BytesIO(zf.read(dae_path)))
+                    except Exception:
+                        continue
+                    for node in tree.getroot().findall(".//c:node", NS):
+                        node_symbols = {
+                            re.sub(r"-material$", "", symbol).lower()
+                            for inst in node.findall(".//c:instance_material", NS)
+                            for symbol in (inst.get("symbol") or inst.get("target", "").lstrip("#"),)
+                            if symbol
+                        }
+                        if node_symbols:
+                            for alias in dae_node_aliases(node):
+                                symbols.setdefault(alias, tuple(sorted(node_symbols)))
+        except Exception:
+            pass
+    context._material_symbols = symbols
+    return symbols
