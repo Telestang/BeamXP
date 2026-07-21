@@ -135,12 +135,10 @@ def _spatial_entries_for_trim(
     arrays: dict[str, object] = {}
     for object_id in present:
         placement = resolved.get(object_id)
-        if placement is not None and len(placement.matrices) > 1:
-            # simultaneous instances (a wheel at four corners): the resolved
-            # position is their average, a fictitious point the classifier
-            # must not reason about
-            continue
-        if placement is not None and object_id in context.variant_dependent_meshes:
+        if placement is not None and (
+            len(placement.matrices) > 1
+            or object_id in context.variant_dependent_meshes
+        ):
             rebuilt = core.vertex_cloud_for_resolved_placement(context, object_id, placement)
             if rebuilt is not None:
                 arrays[object_id] = rebuilt
@@ -150,6 +148,48 @@ def _spatial_entries_for_trim(
             continue
         arrays[object_id] = np.array(item["sample_points"], dtype=float)
     return [o for o in present if o in arrays], arrays
+
+
+def _spatial_surfaces_for_trim(
+    context: core.VehicleContext,
+    trim: str | None,
+    present: list[str],
+    entries_np: dict[str, object],
+) -> dict[str, object]:
+    """Filled DAE surfaces at the same per-trim placement as point clouds."""
+    import numpy as np
+
+    base = core.full_surface_triangles_for_ids(context, present)
+    resolved = (
+        core.resolved_mesh_positions_for_config(context, trim)
+        if trim is not None else {}
+    )
+    surfaces: dict[str, object] = {}
+    for object_id in present:
+        placement = resolved.get(object_id)
+        if placement is not None and (
+            len(placement.matrices) > 1
+            or object_id in context.variant_dependent_meshes
+        ):
+            rebuilt = core.surface_triangles_for_resolved_placement(
+                context, object_id, placement
+            )
+            if rebuilt is not None and len(rebuilt):
+                surfaces[object_id] = rebuilt
+                continue
+        triangles = base.get(object_id)
+        points = entries_np.get(object_id)
+        preview = context.preview_by_id.get(object_id)
+        if triangles is None or len(triangles) == 0 or points is None or preview is None:
+            continue
+        placed_center = (np.min(points, axis=0) + np.max(points, axis=0)) / 2.0
+        preview_center = np.asarray(preview.get("center"), dtype=float)
+        if preview_center.shape == (3,):
+            delta = placed_center - preview_center
+            if float(np.max(np.abs(delta))) > 1e-9:
+                triangles = triangles + delta
+        surfaces[object_id] = triangles
+    return surfaces
 
 
 def _mesh_symmetry(
@@ -193,6 +233,7 @@ def _classify_meshes_for_trim(
     forced: frozenset[str] = frozenset(),
     hard_vetoed: set[str] | None = None,
     scoped: set[str] | None = None,
+    surface_np: dict[str, object] | None = None,
 ) -> tuple[dict[str, tuple[str, str, str, dict]], set[str]]:
     """Intrinsic class per mesh from one trim's geometry.
 
@@ -223,6 +264,7 @@ def _classify_meshes_for_trim(
         if context.objects.get(o) is not None
         and core.steering_ref_score(o, context.objects[o]) >= 15
     }
+    driver_seat_ids: set[str] = set()
     # The eye camera sits inside the driver's seat volume.  Treat whichever
     # furniture actually surrounds that eye as transparent so its cushion and
     # backrest cannot hide rails/bases directly below it.  Geometry, not a
@@ -241,6 +283,52 @@ def _classify_meshes_for_trim(
         )
         if float(under_eye.mean()) >= 0.20:
             transparent.add(object_id)
+            driver_seat_ids.add(object_id)
+
+    # Rails/bases sit below the seat cushion and need conversion with it even
+    # when the carpet or floor hides most of their eye rays.  This channel is
+    # deliberately compact and directly under the detected driver seat, so a
+    # longitudinal shaft or other underbody assembly cannot qualify.
+    under_seat_candidates: set[str] = set()
+    if driver_seat_ids:
+        for object_id in present:
+            points = entries_np.get(object_id)
+            if points is None or len(points) < 4:
+                continue
+            diagonal = float(np.linalg.norm(np.ptp(points, axis=0)))
+            if not 0.12 <= diagonal <= 0.70:
+                continue
+            centroid = points.mean(axis=0)
+            if float((centroid[:2] - eye[:2]) @ f[:2]) <= 0.0:
+                continue
+            under_seat = (
+                (np.abs(points[:, 0] - eye[0]) < 0.32)
+                & (np.abs(points[:, 1] - eye[1]) < 0.42)
+                & (points[:, 2] > eye[2] - 1.00)
+                & (points[:, 2] < eye[2] - 0.45)
+            )
+            if float(under_seat.mean()) >= 0.20:
+                under_seat_candidates.add(object_id)
+
+    def compiled_surface(excluded: set[str]) -> object | None:
+        chunks = [
+            np.asarray(triangles, dtype=float).reshape((-1, 3, 3))
+            for object_id, triangles in (surface_np or {}).items()
+            if object_id not in excluded and len(triangles)
+        ]
+        return np.concatenate(chunks) if chunks else None
+
+    # Concatenating once turns hundreds of tiny per-object NumPy kernels per
+    # ray test into large, bounded batches.  The extra scene excludes glass
+    # and is consulted only by the narrow exterior-fitment channel.
+    surface_scene = compiled_surface(transparent)
+    surface_scene_no_glass = compiled_surface(transparent | glass_ids)
+    glass_chunks = [
+        np.asarray(surface_np[object_id], dtype=float).reshape((-1, 3, 3))
+        for object_id in glass_ids
+        if surface_np and object_id in surface_np and len(surface_np[object_id])
+    ]
+    surface_scene_glass = np.concatenate(glass_chunks) if glass_chunks else None
 
     scan = core.visibility_scan(
         {o: entries_np[o] for o in present}, frame.eye, transparent, frame.forward
@@ -297,6 +385,112 @@ def _classify_meshes_for_trim(
     wheel_dist = float(np.linalg.norm(wheel - eye)) if wheel is not None else 0.8
     wheel_x = float(wheel[0]) if wheel is not None else frame.eye[0]
 
+    # Exact rays for different candidate meshes are independent.  Preserve
+    # the stateful verdict/pair ordering below, but compute this expensive
+    # broad-phase superset concurrently.  Four workers also composes cleanly
+    # with the validator's three vehicle processes on a 12-thread machine.
+    exact_by_id: dict[str, dict[str, float] | None] = {}
+    exact_glass_by_id: dict[str, dict[str, float] | None] = {}
+    if surface_scene is not None:
+        exact_ids = []
+        for object_id in want:
+            if object_id in glass_ids:
+                continue
+            points = entries_np.get(object_id)
+            if points is None or len(points) < 4:
+                continue
+            stats = scan[object_id]
+            stats_ng = scan_no_glass.get(object_id, stats)
+            centroid = points.mean(axis=0)
+            extents = np.ptp(points, axis=0)
+            diagonal = float(np.linalg.norm(extents))
+            ahead = float((centroid[:2] - eye[:2]) @ f[:2])
+            lat_signed = float(frame.side * (centroid[0] - wheel_x))
+            below = frame.eye[2] - float(centroid[2])
+            out80 = float(np.percentile(np.abs(points[:, 0] - cx0), 80))
+            wall_lateral = (
+                extents[0] < 0.22 and extents[1] > 0.45 and extents[2] > 0.45
+            )
+            in_cone = (
+                0.20 <= ahead <= wheel_ahead + 1.0
+                and -0.22 <= lat_signed <= 0.33
+                and -0.10 <= below <= 1.35
+                and not wall_lateral
+            )
+            enclosed = (
+                stats["vf"] >= 0.08
+                and stats["backed"] >= 0.45
+                and out80 <= half_width - 0.02
+                and stats["depth"] <= 0.45
+            )
+            fitment = (
+                stats_ng["vf"] >= 0.12
+                and diagonal <= 0.60
+                and 0.15 <= ahead <= 1.5
+                and abs(float(centroid[2]) - frame.eye[2]) <= 0.7
+                and abs(float(centroid[0]) - cx0) >= half_width - 0.06
+            )
+            buried = stats["backed"] >= 0.75 and stats["depth"] <= 0.35
+            cone = (
+                in_cone
+                and stats["depth"] <= 0.75
+                and stats["min_r"] <= SPATIAL_REACH_LIMIT
+                and (float(centroid[2]) >= floor_z - 0.10 or buried)
+                and (
+                    stats["vf"] >= 0.45
+                    or stats["min_r"] <= wheel_dist + 0.45
+                    or buried
+                    or enclosed
+                )
+            )
+            might_enter = (
+                stats["front_vf"] >= 0.28
+                or enclosed
+                or fitment
+                or cone
+                or object_id in under_seat_candidates
+                or object_id in forced
+            )
+            if might_enter:
+                exact_ids.append(object_id)
+        if exact_ids:
+            with ThreadPoolExecutor(
+                max_workers=min(4, len(exact_ids)),
+                thread_name_prefix="spatial-rays",
+            ) as executor:
+                futures = {
+                    object_id: executor.submit(
+                        core.surface_visibility_stats,
+                        entries_np[object_id],
+                        frame.eye,
+                        surface_scene,
+                        set(),
+                        frame.forward,
+                    )
+                    for object_id in exact_ids
+                }
+                glass_futures = {
+                    object_id: executor.submit(
+                        core.surface_visibility_stats,
+                        entries_np[object_id],
+                        frame.eye,
+                        surface_scene_glass,
+                        set(),
+                        frame.forward,
+                    )
+                    for object_id in exact_ids
+                    if surface_scene_glass is not None
+                    and beyond.get(object_id, 0.0) >= 0.40
+                }
+                exact_by_id = {
+                    object_id: future.result()
+                    for object_id, future in futures.items()
+                }
+                exact_glass_by_id = {
+                    object_id: future.result()
+                    for object_id, future in glass_futures.items()
+                }
+
     verdicts: dict[str, tuple[str, str, str, dict]] = {}
     vetoed: set[str] = set()
     for object_id in want:
@@ -342,41 +536,94 @@ def _classify_meshes_for_trim(
                 verdicts[object_id] = ("translate", "instrument cover in the control cone", "med", {})
             continue
 
-        # scope channels: candidates, not absolutes
-        # General driver visibility is a camera-like forward hemisphere.  The
-        # 360-degree shell remains available as ``vf`` for enclosure/backing,
-        # but geometry behind the eye cannot enter scope merely by winning a
-        # sparse angular bin through the seat or floor.
-        cand_visible = stats["front_vf"] >= 0.28
-        cand_enclosed = (
-            stats["vf"] >= 0.08 and stats["backed"] >= 0.45
-            and out80 <= half_width - 0.02 and stats["depth"] <= 0.45
-        )
-        cand_fitment = (
-            stats_ng["vf"] >= 0.12 and diagonal <= 0.60
-            and 0.15 <= ahead <= 1.5 and abs(float(centroid[2]) - frame.eye[2]) <= 0.7
-            and abs(float(centroid[0]) - cx0) >= half_width - 0.06
-        )
-        buried_lined = stats["backed"] >= 0.75 and stats["depth"] <= 0.35
-        cand_cone = (
-            in_cone and stats["depth"] <= 0.75
-            and stats["min_r"] <= SPATIAL_REACH_LIMIT
-            and (float(centroid[2]) >= floor_z - 0.10 or buried_lined)
-            and (
-                stats["vf"] >= 0.45
-                or stats["min_r"] <= wheel_dist + 0.45
-                or buried_lined
-                or cand_enclosed
+        # Scope channels are candidates, not absolutes.  The cheap point shell
+        # is only a broad phase: when it says a mesh might enter, trace those
+        # same sample rays against the filled DAE triangles.  This catches a
+        # body/carpet face covering a part even when none of the face's sparse
+        # vertices happens to share the point's 6-degree angular bin.
+        def candidate_channels(
+            candidate_stats: dict[str, float],
+            candidate_stats_ng: dict[str, float],
+        ) -> tuple[bool, bool, bool, bool]:
+            visible = candidate_stats["front_vf"] >= 0.28
+            enclosed = (
+                candidate_stats["vf"] >= 0.08
+                and candidate_stats["backed"] >= 0.45
+                and out80 <= half_width - 0.02
+                and candidate_stats["depth"] <= 0.45
             )
+            fitment = (
+                candidate_stats_ng["vf"] >= 0.12
+                and diagonal <= 0.60
+                and 0.15 <= ahead <= 1.5
+                and abs(float(centroid[2]) - frame.eye[2]) <= 0.7
+                and abs(float(centroid[0]) - cx0) >= half_width - 0.06
+            )
+            buried = (
+                candidate_stats["backed"] >= 0.75
+                and candidate_stats["depth"] <= 0.35
+            )
+            cone = (
+                in_cone
+                and candidate_stats["depth"] <= 0.75
+                and candidate_stats["min_r"] <= SPATIAL_REACH_LIMIT
+                and (float(centroid[2]) >= floor_z - 0.10 or buried)
+                and (
+                    candidate_stats["vf"] >= 0.45
+                    or candidate_stats["min_r"] <= wheel_dist + 0.45
+                    or buried
+                    or enclosed
+                )
+            )
+            return visible, enclosed, fitment, cone
+
+        cand_visible, cand_enclosed, cand_fitment, cand_cone = candidate_channels(
+            stats, stats_ng
         )
+        point_cand_fitment = cand_fitment
+        if surface_scene is not None and (
+            cand_visible or cand_enclosed or cand_fitment or cand_cone
+            or object_id in under_seat_candidates
+            or object_id in forced
+        ):
+            exact = exact_by_id.get(object_id)
+            if object_id not in exact_by_id:
+                exact = core.surface_visibility_stats(
+                    points, frame.eye, surface_scene, set(), frame.forward
+                )
+            if exact is not None:
+                stats = dict(stats)
+                stats.update({key: exact[key] for key in ("vf", "front_vf")})
+                stats_ng = stats
+                if point_cand_fitment and surface_scene_no_glass is not None:
+                    exact_ng = core.surface_visibility_stats(
+                        points,
+                        frame.eye,
+                        surface_scene_no_glass,
+                        set(),
+                        frame.forward,
+                    )
+                    if exact_ng is not None:
+                        stats_ng = dict(stats)
+                        stats_ng.update({
+                            key: exact_ng[key] for key in ("vf", "front_vf")
+                        })
+                cand_visible, cand_enclosed, cand_fitment, cand_cone = candidate_channels(
+                    stats, stats_ng
+                )
         if not (cand_visible or cand_enclosed or cand_fitment or cand_cone
+                or object_id in under_seat_candidates
                 or object_id in forced):
             continue
         if scoped is not None:
             scoped.add(object_id)
 
         if not cand_fitment:
-            if beyond.get(object_id, 0.0) >= 0.40:
+            beyond_fraction = beyond.get(object_id, 0.0)
+            exact_glass = exact_glass_by_id.get(object_id)
+            if exact_glass is not None:
+                beyond_fraction = exact_glass["blocked"]
+            if beyond_fraction >= 0.40:
                 vetoed.add(object_id)
                 if hard_vetoed is not None:
                     hard_vetoed.add(object_id)
@@ -402,7 +649,7 @@ def _classify_meshes_for_trim(
                 if hard_vetoed is not None:
                     hard_vetoed.add(object_id)
                 continue  # above the headliner (roof accessories)
-            if (float(centroid[1]) < y_front - 0.12 and not in_cone
+            if (float(centroid[1]) < y_front - 0.12 and not cand_visible and not in_cone
                     and object_id not in forced):
                 vetoed.add(object_id)
                 continue  # ahead of the firewall
@@ -794,17 +1041,23 @@ def build_mode_recommendations(
         present, entries_np = _spatial_entries_for_trim(context, trim, available)
         if not present:
             continue
+        surface_np: dict[str, object] = {}
         todo = [
             o for o in present
             if o not in memo
-            or (memo[o][2] == "low" and o in context.variant_dependent_meshes
+            or (o in context.variant_dependent_meshes
+                and (memo[o][0] == "none" or memo[o][2] == "low")
                 and trim not in state["trims_done"])
         ]
         if todo:
+            surface_np = _spatial_surfaces_for_trim(
+                context, trim, present, entries_np
+            )
             verdicts, newly_vetoed = _classify_meshes_for_trim(
                 context, frame, present, entries_np, todo,
                 hard_vetoed=hard_vetoed,
                 scoped=scoped,
+                surface_np=surface_np,
             )
             vetoed.update(newly_vetoed)
             for o in todo:
@@ -822,9 +1075,13 @@ def build_mode_recommendations(
                 if o in forced and memo.get(o, ("none",))[0] == "none"
             ]
             if forced_todo:
+                if not surface_np:
+                    surface_np = _spatial_surfaces_for_trim(
+                        context, trim, present, entries_np
+                    )
                 forced_verdicts, forced_vetoed = _classify_meshes_for_trim(
                     context, frame, present, entries_np, forced_todo, forced,
-                    hard_vetoed, scoped,
+                    hard_vetoed, scoped, surface_np,
                 )
                 vetoed.update(forced_vetoed)
                 for o in forced_todo:

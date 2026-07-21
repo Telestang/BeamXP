@@ -352,6 +352,108 @@ def geometry_position_points(geometry: ET.Element) -> list[tuple[float, float, f
     return points
 
 
+def geometry_surface_triangles(
+    geometry: ET.Element,
+) -> list[tuple[tuple[float, float, float], ...]]:
+    """Return the indexed triangle surface of one COLLADA geometry.
+
+    Position clouds alone do not describe the filled surface between vertices,
+    which makes them unsuitable for exact visibility/occlusion tests.  Resolve
+    each primitive's POSITION (usually routed through VERTEX), then triangulate
+    polygonal primitives with a deterministic fan.  Malformed primitives are
+    skipped locally rather than discarding the rest of the geometry.
+    """
+    mesh = geometry.find("c:mesh", NS)
+    if mesh is None:
+        return []
+
+    sources_by_id = {
+        source.get("id"): source
+        for source in mesh.findall("c:source", NS)
+        if source.get("id")
+    }
+    points_by_source = {
+        source_id: source_xyz_points(source)
+        for source_id, source in sources_by_id.items()
+    }
+    vertices_positions: dict[str, str] = {}
+    for vertices in mesh.findall("c:vertices", NS):
+        vertices_id = vertices.get("id")
+        if not vertices_id:
+            continue
+        for input_elem in vertices.findall("c:input", NS):
+            if input_elem.get("semantic") != "POSITION":
+                continue
+            source_url = input_elem.get("source", "")
+            if source_url.startswith("#"):
+                vertices_positions[vertices_id] = source_url[1:]
+                break
+
+    triangles: list[tuple[tuple[float, float, float], ...]] = []
+    primitive_tags = ("triangles", "polylist", "polygons")
+    for tag in primitive_tags:
+        for primitive in mesh.findall(f"c:{tag}", NS):
+            inputs = primitive.findall("c:input", NS)
+            if not inputs:
+                continue
+            stride = max(int(item.get("offset", "0")) for item in inputs) + 1
+            position_offset: int | None = None
+            position_source: str | None = None
+            for item in inputs:
+                semantic = item.get("semantic")
+                source_url = item.get("source", "")
+                if not source_url.startswith("#"):
+                    continue
+                source_id = source_url[1:]
+                if semantic == "VERTEX":
+                    source_id = vertices_positions.get(source_id, "")
+                elif semantic != "POSITION":
+                    continue
+                if source_id in points_by_source:
+                    position_offset = int(item.get("offset", "0"))
+                    position_source = source_id
+                    break
+            if position_offset is None or position_source is None:
+                continue
+            source_points = points_by_source[position_source]
+
+            polygons: list[list[int]] = []
+            if tag == "triangles":
+                for p_elem in primitive.findall("c:p", NS):
+                    values = [int(value) for value in (p_elem.text or "").split()]
+                    indices = values[position_offset::stride]
+                    polygons.extend(
+                        indices[index : index + 3]
+                        for index in range(0, len(indices) - 2, 3)
+                    )
+            elif tag == "polylist":
+                p_elem = primitive.find("c:p", NS)
+                vcount_elem = primitive.find("c:vcount", NS)
+                if p_elem is None or vcount_elem is None:
+                    continue
+                values = [int(value) for value in (p_elem.text or "").split()]
+                indices = values[position_offset::stride]
+                cursor = 0
+                for count_text in (vcount_elem.text or "").split():
+                    count = int(count_text)
+                    polygons.append(indices[cursor : cursor + count])
+                    cursor += count
+            else:
+                for p_elem in primitive.findall("c:p", NS):
+                    values = [int(value) for value in (p_elem.text or "").split()]
+                    polygons.append(values[position_offset::stride])
+
+            for polygon in polygons:
+                if len(polygon) < 3:
+                    continue
+                for index in range(1, len(polygon) - 1):
+                    corner_indices = (polygon[0], polygon[index], polygon[index + 1])
+                    if any(i < 0 or i >= len(source_points) for i in corner_indices):
+                        continue
+                    triangles.append(tuple(source_points[i] for i in corner_indices))
+    return triangles
+
+
 def bounds_from_points(
     points: list[tuple[float, float, float]],
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:

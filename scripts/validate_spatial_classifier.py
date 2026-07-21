@@ -35,7 +35,11 @@ CLASSIFIER_CACHE_ATTRS = (
     "_spatial_recommendation_state",
     "_mesh_symmetry_cache",
     "_full_clouds",
-    "_full_cloud_parsed_files",
+    "_authored_full_clouds",
+    "_full_cloud_files",
+    "_surface_triangles",
+    "_authored_surface_triangles",
+    "_surface_triangle_files",
 )
 
 

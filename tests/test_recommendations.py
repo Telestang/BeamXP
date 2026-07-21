@@ -161,6 +161,22 @@ class DriverFrameTests(unittest.TestCase):
 
 
 class ScopeTests(unittest.TestCase):
+    def test_filled_triangle_occludes_ray_through_its_interior(self) -> None:
+        points = np.array(((0.0, 0.0, 2.0), (2.0, 0.0, 2.0)))
+        cover = np.array((
+            ((-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (0.0, 1.0, 1.0)),
+        ))
+        stats = core.surface_visibility_stats(
+            points,
+            (0.0, 0.0, 0.0),
+            {"cover": cover},
+            set(),
+            (0.0, 0.0, 1.0),
+        )
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["vf"], 0.5)
+        self.assertEqual(stats["front_vf"], 0.5)
+
     def test_visible_admission_is_limited_to_forward_hemisphere(self) -> None:
         front = box_cloud((0.40, -0.50, 0.90), (0.10, 0.10, 0.10), n=80, seed=56)
         rear = box_cloud((0.40, 0.90, 0.90), (0.10, 0.10, 0.10), n=80, seed=57)
@@ -361,6 +377,27 @@ class SymmetryAndPairingTests(unittest.TestCase):
         single_recs = recommend(single)
         self.assertEqual(single_recs["fixture_base_FL"]["mode"], core.MODE_MIRROR)
         self.assertIn("twin absent", single_recs["fixture_base_FL"]["reason"])
+
+    def test_variant_dependent_none_is_retried_at_later_placement(self) -> None:
+        meshes = base_cabin()
+        meshes["moving_fixture"] = sym_cloud(
+            (0.0, -0.45, 0.82), (0.28, 0.12, 0.18), n=100, seed=60
+        )
+        ids = list(meshes)
+        context = make_context(
+            meshes,
+            trims={"a_centred": ids, "b_offset": ids},
+        )
+        context.variant_dependent_meshes.add("moving_fixture")
+        context.resolved_positions_cache["a_centred"]["moving_fixture"] = (
+            core.ResolvedMeshPosition((0.0, -0.45, 0.82))
+        )
+        context.resolved_positions_cache["b_offset"]["moving_fixture"] = (
+            core.ResolvedMeshPosition((-0.40, -0.45, 0.82))
+        )
+
+        recs = recommend(context)
+        self.assertEqual(recs["moving_fixture"]["mode"], core.MODE_MIRROR)
 
     def test_mutually_exclusive_variants_do_not_pair_but_cotrim_twins_do(self) -> None:
         # recast of the lhd/rhd-token case: two interior-mirror variants are

@@ -11,6 +11,7 @@ is explicit, confined, and always low-confidence.
 Pure geometry lives in `beamng_hand_drive_core.py` (`DriverFrame`,
 `driver_frame_for_context`, `visibility_scan`, `floor_height_from_shell`,
 `glass_beyond_fractions`, `full_vertex_clouds_for_ids`,
+`full_surface_triangles_for_ids`, `surface_visibility_stats`,
 `reflected_orphan_stats`, `mirror_pair_residual`,
 `directional_verdict_backing`, `principal_extent_sds`,
 `material_flags_for_context`, `mesh_material_symbols`). Orchestration lives in
@@ -69,17 +70,37 @@ own rails/base. Per mesh the scan reports:
 - `depth` — mean distance points sit behind the shell;
 - `min_r` — nearest approach to the eye.
 
-A mesh becomes an interior **candidate** through any of four channels:
+The 6° point shell is now a **broad phase**, not the final exposure test. A
+vertex-only shell cannot see the filled interior of a triangle: this was why
+all 350 points of `etk800_exhaust_R` could appear to fall through gaps between
+the sparse vertices of the body, carpet and heatshield. The classifier parses
+indexed COLLADA `triangles`, `polylist` and `polygons`, applies each object's
+node and per-trim placement matrices, and traces every candidate point's open
+eye segment against those filled triangles. A point is visible only when no
+opaque triangle intersects before it (the final 2 mm is ignored so the point's
+own incident face does not hide itself). In `844_150_M` the old shell reported
+53/350 visible exhaust points, including 25/350 forward; the exact surface
+test reports **0/350 visible and 350/350 blocked**.
+
+A mesh becomes an interior **candidate** through the four general channels:
 driver-visible (`front_vf ≥ 0.28`), enclosed (backed, shallow, inside the envelope),
 exterior-fitment (compact, at beltline height, just outboard of the shell,
-visible once glass is removed — wing mirrors), or the control cone.
+visible once glass is removed — wing mirrors), or the control cone. There is
+also a narrow under-seat channel for compact hardware directly below the
+geometrically detected driver seat; it grants candidacy only, allowing a seat
+rail/base to reach ordinary symmetry and pairing even when carpet hides most
+eye rays. Its centroid must remain in the forward hemisphere, so rearward
+fixtures cannot enter through it.
 Candidacy is deliberately high-recall; **corroborating vetoes** then remove
 what the porous shell let through:
 
 - **beyond a glass plane**: large planar translucent panes (windscreen, door
   and rear glass, identified from `*.materials.json`, not names) bound the
   glasshouse; ≥40 % of points beyond a pane within its angular footprint ⇒
-  exterior (wipers, hood, the truck bed through the rear window). Panes
+  exterior (wipers, hood, the truck bed through the rear window). The sparse
+  point result is refined against the panes' filled triangles before this veto
+  fires; this is why the common-pack `dino` mascot is correctly inside despite
+  the point bins falsely reporting 67.7% beyond glass. Panes
   smaller than 0.75 m are instrument lenses and never bound anything;
 - **past the cabin shell**: the envelope half-width comes from the *lined
   walls* (p60 of their |x| reaches — robust to the whole body shell or an
@@ -189,8 +210,10 @@ logic still applies: forcing candidacy never forces a mode.
 The pass is bounded to below-wheel geometry whose 80th-percentile point range
 is within the 1.6 m cabin radius. Hard exterior, roof, rear-cab and under-floor
 vetoes persist between trims and cannot be reopened by the cone. This admits
-the passenger footplate while leaving SPOTLIGHT dummies, whole-body meshes and
-long exhausts out.
+the passenger footplate while leaving SPOTLIGHT dummies out. Remaining
+driveshaft/transfer-case mismatches show that the blind cone's cabin boundary
+still needs refinement; they remain visible in the report rather than being
+hidden by a special underfloor rule.
 
 ## 4b. Assembly propagation (mounted parts)
 
@@ -242,25 +265,27 @@ guessed.
 
 The intrinsic class is a property of the mesh, not the trim. The classifier
 walks trims in order; each unique mesh is classified once, in the first trim
-containing it, and memoised. Only meshes that are simultaneously
-**low-confidence and variant-dependent** (`context.variant_dependent_meshes`)
-are re-solved in later trims, and a trim that resolves the borderline case
-upgrades the memo. The only inherently per-trim step is pairing, which runs
+containing it, and memoised. Low-confidence or no-verdict meshes whose
+placement is variant-dependent (`context.variant_dependent_meshes`) are
+re-solved in later trims until a decisive placement upgrades the memo. The
+only inherently per-trim step is pairing, which runs
 once per trim over that trim's present set. All state is cached on the
 context: intrinsic verdicts, scoped IDs, persistent hard vetoes, pair votes,
-full DAE clouds, parsed-file keys and exact symmetry results. The cost profile
-is `O(unique vertices + unique meshes × scan + trims × pairables)`;
+full DAE clouds and triangle surfaces, parsed-file keys and exact symmetry
+results. Candidate-ray tests for separate meshes are independent, so up to
+four run concurrently while stateful trim ordering, memo updates and pairing
+remain sequential. The cost profile is
+`O(unique vertices + candidate rays × scene triangles + trims × pairables)`;
 subsequent calls reuse uncapped clouds rather than reparsing a DAE.
 
 Per-trim point clouds normally come from `preview_entries_for_config`, so a
-trim that translates a mesh is judged at that trim's location. A
-variant-dependent flexbody with one placement is rebuilt from the authored
-DAE and that trim's matrix; this avoids carrying a representative two-seat
-cloud into a single-seat trim. Meshes with **multiple simultaneous placements
-in the current trim** (a wheel at four corners, or one base mesh under two
-seats) are excluded — their averaged position is fictitious. If another trim
-uses one instance, that trim supplies the intrinsic verdict; this is how the
-pickup and Sunburst racing-seat bases correctly fall back to aesthetic Mirror.
+trim that translates a mesh is judged at that trim's location. A flexbody is
+rebuilt from the authored DAE and every real matrix in that trim. Multiple
+simultaneous placements are represented by the union of their transformed
+clouds/surfaces, never their fictitious average. If a symmetric multi-instance
+placement produces no verdict, a later variant-dependent placement (for
+example a single driver racing-seat base) can supply the decisive intrinsic
+verdict.
 
 ## 7. Validation against the hand-verified baselines
 
@@ -275,9 +300,9 @@ calling the global recommender independently for each trim.
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **96.79 %** (145 diffs) |
-| pickup | 73 | 12 335 | **96.17 %** (473 diffs) |
-| sunburst2 | 39 | 7 561 | **90.97 %** (683 diffs) |
+| etk800 | 29 | 4 516 | **98.80 %** (54 diffs) |
+| pickup | 73 | 12 335 | **97.76 %** (276 diffs) |
+| sunburst2 | 39 | 7 561 | **92.21 %** (589 diffs) |
 
 These figures include the signed-off exact-orphan policy: the literal zero
 threshold mirrors small DAE modelling offsets that the hand baselines skip.
@@ -287,12 +312,13 @@ driver-visible admission to the forward hemisphere removed rearward
 visibility-only candidates. The ETK baseline was also corrected so its rear
 door cards are Skip. Current true-mismatch transition counts are:
 
-- ETK: 138 Skip→Mirror, 4 Skip→Structural and 3 Structural→Skip;
-- pickup: 267 Skip→Mirror, 74 Skip→Structural, 105 Mirror→Skip,
-  14 Structural→Skip, 8 Skip→Translate and 5 Mirror→Translate; two desired
+- ETK: 51 Skip→Mirror and 3 Structural→Skip;
+- pickup: 55 Skip→Mirror, 98 Skip→Structural, 104 Mirror→Skip,
+  14 Structural→Skip and 5 Mirror→Translate; two desired
   twin-absent fallbacks are excluded;
-- Sunburst: 583 Skip→Mirror, 39 Mirror→Skip, 18 Structural→Skip and
-  43 Mirror→Translate; two desired twin-absent fallbacks are excluded.
+- Sunburst: 424 Skip→Mirror, 64 Skip→Structural, 40 Mirror→Skip,
+  18 Structural→Skip and 43 Mirror→Translate; two desired twin-absent
+  fallbacks are excluded.
 
 Every disagreement falls into one of these categories:
 
@@ -301,8 +327,9 @@ express.** The validator now normalises these before counting differences: a
 globally structural pair remains structural when both members are fitted and
 becomes aesthetic Mirror when only one is fitted. The latter is explicitly
 reported as an excluded fallback count, never as a mismatch. The remaining
-`racing_seat_FL/FR` Structural→Skip rows are therefore genuine global
-recommendation misses, not missing-twin noise.
+`racing_seat_FL/FR` Structural→Skip rows are not missing-twin noise: their
+disjoint `racing_seat_fl`/`racing_seat_fr` material bindings trigger the
+signed-off functionally-sided safe Skip pending material rebinding.
 
 **B. Forward-hemisphere corrections and baseline inconsistencies.** The
 general visibility channel is now the forward 180° only. The ETK baseline's
@@ -332,8 +359,9 @@ material bindings produce protected Skip pending build-side material rebind.
 The global validator now correctly shows the flasher pair as agreement; the
 old two-row `_b` mismatch was solely a subset-call artifact.
 
-**E. Former sightline blind spots now covered.** Driver-seat transparency plus
-single-instance cloud rebuilding recovers `racingseat_base` and
+**E. Former sightline blind spots now covered.** Driver-seat transparency,
+under-seat candidacy and real multi-instance rebuilding recover
+`racingseat_base` and
 `racing_seat_base`; the reflected 30° passenger-footwell cone admits
 `grp_footplate`; angular verdict backing handles all three
 `police_laptop_mount_*` meshes. These targets match the baseline in every trim
@@ -348,22 +376,22 @@ cone says translate, user said mirror), `pickup_facelift_shifter_T_buttons`
 them while translating the shifter they sit on). Centimetre-scale calls
 where reasonable conversions disagree.
 
-**G. Residual leak (wrong, and known).** `pickup_shocktop_R_offroad` (2 trims)
-still reads as enclosed interior on some configurations — under-body geometry
-whose occluders are too sparse to close the shell. `pickup_fueltank_short` is
-fixed: its former 41–45 % visibility came entirely from sparse backward/down
-bins, so `front_vf == 0` leaves it Skip in all seven trims.
+**G. Residual leaks (wrong, and known).** Filled-surface occlusion fixes the
+covered ETK exhaust: `etk800_exhaust_R` is absent from every mismatch row, as
+are `pickup_fueltank_short` and `pickup_shocktop_R_offroad`. The remaining
+driveline rows (`etk800_driveshaft_F`, `etk_transfercase`,
+`pickup_frontshaft`, `pickup_transfer_case`, and Sunburst driveline/exhaust
+parts) enter through blind footwell/contact/pair channels rather than ordinary
+exact visibility. Those channels are the next work, not a reason to weaken
+the surface test.
 
 ## 8. Honesty: where this is fragile
 
-- **Occlusion on ~350-point clouds is the weak joint.** The shell is porous:
-  a 74-point windscreen leaves 6°-bin gaps, so `vf` for any single mesh can
-  be off by ±0.2. Dilating the occlusion field was tried and rejected — it
-  over-occludes catastrophically (door cards fell to `vf` 0.02). The design
-  answer is that no admission or veto rests on `vf` alone; every decision
-  pairs it with backing, lining, envelope, glass-plane or symmetry evidence,
-  and conflicts surface as low confidence rather than a confident wrong
-  answer.
+- **The point shell remains approximate backing/envelope evidence.** Final
+  candidate exposure and disputed glass crossings use filled DAE triangles,
+  but `backed`, `lined`, `depth` and the initial cabin envelope still come from
+  6° preview bins. Their sparsity can affect non-visibility channels,
+  particularly the forced footwell cone and contact inheritance.
 - **The `lined` signal saves the card-vs-skin call but is not free.** Rear
   wheel-arch clutter can fake a backing for a rear door skin (hence the
   beltline veto), and a fender flare bolted to a gutted race door sheet makes
@@ -374,10 +402,10 @@ bins, so `front_vf == 0` leaves it Skip in all seven trims.
   sanctioned name hint and marked low-confidence. Self-symmetry now uses all
   DAE positions, but texture-only content — shift-pattern decals, mirror-glass
   direction, badge text — is still not recoverable from positions.
-- **Multi-instance meshes are outside a single-trim verdict.** A mesh placed
-  four times has no single position and is excluded in that trim. A
-  variant-dependent trim with one instance is rebuilt from its authored cloud
-  and can supply the global intrinsic verdict.
+- **Multi-instance surfaces cost more.** They are represented honestly as the
+  union of every placement, so four-wheel and two-seat meshes no longer
+  collapse to an average or disappear. This increases triangle count for that
+  trim but keeps spatial reasoning correct.
 - **Functionally sided pairs await a build fix.** Disjoint material symbols
   are enough to prevent an unsafe structural swap, but safe conversion needs
   generated meshes rebound to their twins' directional materials. Until that

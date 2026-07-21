@@ -672,6 +672,131 @@ def preview_data_from_tree(
     return preview
 
 
+def surface_triangles_from_tree(
+    tree: ET.ElementTree,
+) -> dict[str, np.ndarray]:
+    """Filled triangle surfaces for each object in an already-parsed DAE."""
+    root = tree.getroot()
+    library_geometries = root.find("c:library_geometries", NS)
+    if library_geometries is None:
+        return {}
+
+    local_by_geometry: dict[str, np.ndarray] = {}
+    for geometry in library_geometries.findall("c:geometry", NS):
+        geometry_id = geometry.get("id")
+        if not geometry_id:
+            continue
+        triangles = transform_helpers.geometry_surface_triangles(geometry)
+        local_by_geometry[geometry_id] = np.asarray(triangles, dtype=float).reshape((-1, 3, 3))
+
+    surfaces: dict[str, np.ndarray] = {}
+    for node in root.findall(".//c:node", NS):
+        matrix_elem = node.find("c:matrix", NS)
+        if matrix_elem is None or not matrix_elem.text:
+            continue
+        matrix = np.asarray(transform_helpers.parse_matrix(matrix_elem.text), dtype=float)
+        chunks: list[np.ndarray] = []
+        for instance in node.findall(".//c:instance_geometry", NS):
+            url = instance.get("url", "")
+            if not url.startswith("#"):
+                continue
+            local = local_by_geometry.get(url[1:])
+            if local is None or len(local) == 0:
+                continue
+            flat = local.reshape((-1, 3))
+            homogeneous = np.concatenate(
+                [flat, np.ones((len(flat), 1), dtype=float)], axis=1
+            )
+            chunks.append((homogeneous @ matrix.T)[:, :3].reshape((-1, 3, 3)))
+        if not chunks:
+            continue
+        triangles = np.concatenate(chunks)
+        for alias in dae_node_aliases(node):
+            surfaces.setdefault(alias, triangles)
+    return surfaces
+
+
+def full_surface_triangles_for_ids(
+    context: VehicleContext,
+    ids: Iterable[str],
+) -> dict[str, np.ndarray]:
+    """DAE triangle surfaces aligned to the representative placed previews.
+
+    Each source file is parsed once for surfaces, including shared accessory
+    packs referenced through ``dae_source_zip``.  Missing or malformed
+    primitives yield an empty surface so callers can safely retain the older
+    point-shell result as their fallback.
+    """
+    surfaces = getattr(context, "_surface_triangles", None)
+    if surfaces is None:
+        surfaces = {}
+        context._surface_triangles = surfaces
+    authored_surfaces = getattr(context, "_authored_surface_triangles", None)
+    if authored_surfaces is None:
+        authored_surfaces = {}
+        context._authored_surface_triangles = authored_surfaces
+    parsed_files = getattr(context, "_surface_triangle_files", None)
+    if parsed_files is None:
+        parsed_files = set()
+        context._surface_triangle_files = parsed_files
+
+    requested = {str(object_id) for object_id in ids}
+
+    def source_key(obj: DaeObject) -> tuple[str, str]:
+        source_zip = Path(obj.dae_source_zip or context.source_zip)
+        try:
+            zip_key = str(source_zip.resolve(strict=False)).lower()
+        except OSError:
+            zip_key = str(source_zip).lower()
+        return zip_key, obj.dae_path.replace("\\", "/")
+
+    by_file: dict[tuple[str, str], tuple[Path, str]] = {}
+    for object_id in requested:
+        if object_id in surfaces:
+            continue
+        obj = context.objects.get(object_id)
+        if obj is None or not obj.dae_path:
+            continue
+        by_file.setdefault(
+            source_key(obj),
+            (Path(obj.dae_source_zip or context.source_zip), obj.dae_path),
+        )
+
+    for key, (source_zip, dae_path) in by_file.items():
+        if key in parsed_files:
+            continue
+        parsed_files.add(key)
+        try:
+            tree = parse_dae(source_zip, dae_path)
+            file_surfaces = surface_triangles_from_tree(tree)
+            file_preview = preview_data_from_tree(tree, max_points_per_object=sys.maxsize)
+        except Exception:
+            file_surfaces = {}
+            file_preview = {}
+
+        for object_id, obj in context.objects.items():
+            if source_key(obj) != key:
+                continue
+            triangles = file_surfaces.get(object_id)
+            if triangles is None or len(triangles) == 0:
+                surfaces.setdefault(object_id, np.empty((0, 3, 3), dtype=float))
+                continue
+            authored_surfaces[object_id] = triangles
+            authored = file_preview.get(object_id)
+            placed = context.preview_by_id.get(object_id)
+            if authored is not None and placed is not None:
+                authored_center = np.asarray(authored.get("center"), dtype=float)
+                placed_center = np.asarray(placed.get("center"), dtype=float)
+                if authored_center.shape == (3,) and placed_center.shape == (3,):
+                    triangles = triangles + (placed_center - authored_center)
+            surfaces[object_id] = triangles
+
+    return {
+        object_id: surfaces.get(object_id, np.empty((0, 3, 3), dtype=float))
+        for object_id in requested
+    }
+
+
 def full_vertex_clouds_for_ids(
     context: VehicleContext,
     ids: Iterable[str],
@@ -771,25 +896,28 @@ def vertex_cloud_for_resolved_placement(
     resolved: ResolvedMeshPosition,
     max_points: int = 350,
 ) -> np.ndarray | None:
-    """Rebuild one flexbody cloud from its authored DAE and trim matrix.
+    """Rebuild one flexbody cloud from its authored DAE and trim matrices.
 
-    Representative previews can contain two simultaneous instances.  Merely
-    translating that preview for a trim which uses one instance leaves a
-    phantom twin in the cloud.  Variant-dependent, single-instance callers use
-    this helper to apply the actual trim matrix instead.
+    Representative previews can contain a different instance count from the
+    current trim.  Apply every real placement and return their sampled union;
+    this avoids both phantom twins in single-seat trims and fictitious averaged
+    positions in two-seat/four-wheel trims.
     """
-    if len(resolved.matrices) != 1:
+    if not resolved.matrices:
         return None
     full_vertex_clouds_for_ids(context, (object_id,))
     authored = getattr(context, "_authored_full_clouds", {}).get(object_id)
     if authored is None or len(authored) == 0:
         return None
-    matrix = np.asarray(resolved.matrices[0], dtype=float)
     homogeneous = np.concatenate(
         [np.asarray(authored, dtype=float), np.ones((len(authored), 1), dtype=float)],
         axis=1,
     )
-    points = (homogeneous @ matrix.T)[:, :3]
+    chunks = [
+        (homogeneous @ np.asarray(matrix, dtype=float).T)[:, :3]
+        for matrix in resolved.matrices
+    ]
+    points = np.concatenate(chunks)
     if object_id not in context.jbeam_positioned_flexbodies:
         pivot = context.mesh_pivots.get(object_id)
         if pivot is not None and max(abs(value) for value in pivot) > 1e-9:
@@ -798,6 +926,33 @@ def vertex_cloud_for_resolved_placement(
         stride = max(1, len(points) // max_points)
         points = points[::stride][:max_points]
     return points
+
+
+def surface_triangles_for_resolved_placement(
+    context: VehicleContext,
+    object_id: str,
+    resolved: ResolvedMeshPosition,
+) -> np.ndarray | None:
+    """Rebuild one object's authored surface at all of its trim matrices."""
+    if not resolved.matrices:
+        return None
+    full_surface_triangles_for_ids(context, (object_id,))
+    authored = getattr(context, "_authored_surface_triangles", {}).get(object_id)
+    if authored is None or len(authored) == 0:
+        return None
+    flat = np.asarray(authored, dtype=float).reshape((-1, 3))
+    homogeneous = np.concatenate(
+        [flat, np.ones((len(flat), 1), dtype=float)], axis=1
+    )
+    triangles = np.concatenate([
+        (homogeneous @ np.asarray(matrix, dtype=float).T)[:, :3].reshape((-1, 3, 3))
+        for matrix in resolved.matrices
+    ])
+    if object_id not in context.jbeam_positioned_flexbodies:
+        pivot = context.mesh_pivots.get(object_id)
+        if pivot is not None and max(abs(value) for value in pivot) > 1e-9:
+            triangles = triangles - np.asarray(pivot, dtype=float)
+    return triangles
 
 
 def load_jbeam_texts(source_zip: Path, vehicle_id: str) -> dict[str, str]:
@@ -6558,6 +6713,107 @@ def visibility_scan(
             "min_r": float(radii[mask].min()),
         }
     return stats
+
+
+def surface_visibility_stats(
+    points: np.ndarray,
+    eye: tuple[float, float, float],
+    triangles_by_id: dict[str, np.ndarray] | np.ndarray,
+    transparent_ids: set[str],
+    forward: tuple[float, float, float] | None = None,
+    endpoint_gap: float = 0.002,
+) -> dict[str, float] | None:
+    """Exact point visibility against filled mesh triangles.
+
+    Rays run from the eye to each sampled point.  A point is hidden when any
+    opaque triangle intersects the open segment, including an earlier surface
+    of its own mesh.  Intersections within ``endpoint_gap`` of the sampled
+    point are ignored so that the point's incident face does not hide itself.
+    Callers may supply per-object arrays or one scene compiled once for the
+    trim; the classifier uses the latter to avoid hundreds of tiny NumPy
+    kernels per candidate.
+    """
+    points = np.asarray(points, dtype=float)
+    if len(points) == 0:
+        return None
+    origin = np.asarray(eye, dtype=float)
+    directions = points - origin
+    distances = np.linalg.norm(directions, axis=1)
+    valid_rays = distances > 1e-9
+    blocked = np.zeros(len(points), dtype=bool)
+    has_surface = False
+
+    # Moller-Trumbore, vectorised over all still-live rays and bounded chunks
+    # of triangles.  Parameters use the unnormalised eye->point vector, so an
+    # intersection lies on the segment precisely when 0 < t < 1.
+    if isinstance(triangles_by_id, np.ndarray):
+        surface_items = (("", triangles_by_id),)
+    else:
+        surface_items = triangles_by_id.items()
+    for object_id, object_triangles in surface_items:
+        if object_id in transparent_ids:
+            continue
+        triangles = np.asarray(object_triangles, dtype=float).reshape((-1, 3, 3))
+        if len(triangles) == 0:
+            continue
+        has_surface = True
+        for start in range(0, len(triangles), 1024):
+            active = np.flatnonzero(valid_rays & ~blocked)
+            if len(active) == 0:
+                break
+            tri = triangles[start : start + 1024]
+            vertex0 = tri[:, 0]
+            edge1 = tri[:, 1] - vertex0
+            edge2 = tri[:, 2] - vertex0
+            # Degenerate export faces cannot occlude anything and amplify
+            # floating-point noise in the determinant.
+            nondegenerate = np.linalg.norm(np.cross(edge1, edge2), axis=1) > 1e-12
+            if not bool(nondegenerate.any()):
+                continue
+            vertex0 = vertex0[nondegenerate]
+            edge1 = edge1[nondegenerate]
+            edge2 = edge2[nondegenerate]
+            ray_d = directions[active]
+            pvec = np.cross(ray_d[:, None, :], edge2[None, :, :])
+            det = np.einsum("tj,rtj->rt", edge1, pvec)
+            determinant_ok = np.abs(det) > 1e-10
+            inverse_det = np.zeros_like(det)
+            np.divide(1.0, det, out=inverse_det, where=determinant_ok)
+            tvec = origin[None, :] - vertex0
+            u = np.einsum("tj,rtj->rt", tvec, pvec) * inverse_det
+            qvec = np.cross(tvec, edge1)
+            v = np.einsum("rj,tj->rt", ray_d, qvec) * inverse_det
+            t_num = np.einsum("tj,tj->t", edge2, qvec)
+            t = t_num[None, :] * inverse_det
+            maximum_t = 1.0 - endpoint_gap / distances[active]
+            hit = (
+                determinant_ok
+                & (u >= -1e-9)
+                & (v >= -1e-9)
+                & (u + v <= 1.0 + 1e-9)
+                & (t > 1e-7)
+                & (t < maximum_t[:, None])
+            )
+            blocked[active[np.any(hit, axis=1)]] = True
+        if bool((valid_rays & ~blocked).sum()) == 0:
+            break
+
+    if not has_surface:
+        return None
+    visible = valid_rays & ~blocked
+    if forward is None:
+        front_visible = visible
+    else:
+        forward_v = np.asarray(forward, dtype=float)
+        norm = float(np.linalg.norm(forward_v))
+        if norm > 1e-9:
+            forward_v /= norm
+        front_visible = visible & ((directions @ forward_v) >= 0.0)
+    return {
+        "vf": float(visible.sum()) / len(points),
+        "front_vf": float(front_visible.sum()) / len(points),
+        "blocked": float(blocked.sum()) / len(points),
+    }
 
 
 def directional_verdict_backing(

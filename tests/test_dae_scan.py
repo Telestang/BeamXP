@@ -1,8 +1,41 @@
 from __future__ import annotations
 
 import unittest
+import xml.etree.ElementTree as ET
+
+import numpy as np
 
 import beamng_hand_drive_core as core
+import beamng_transform_helpers as transform_helpers
+
+
+class DaeSurfaceTriangleTests(unittest.TestCase):
+    def test_extracts_triangles_and_triangulates_polylist(self) -> None:
+        data = b'''<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
+          <library_geometries><geometry id="g"><mesh>
+            <source id="positions">
+              <float_array id="positions-array" count="12">0 0 0  1 0 0  1 1 0  0 1 0</float_array>
+              <technique_common><accessor source="#positions-array" count="4" stride="3">
+                <param name="X"/><param name="Y"/><param name="Z"/>
+              </accessor></technique_common>
+            </source>
+            <vertices id="vertices"><input semantic="POSITION" source="#positions"/></vertices>
+            <triangles count="1"><input semantic="VERTEX" source="#vertices" offset="0"/><p>0 1 2</p></triangles>
+            <polylist count="1"><input semantic="VERTEX" source="#vertices" offset="0"/><vcount>4</vcount><p>0 1 2 3</p></polylist>
+          </mesh></geometry></library_geometries>
+          <library_visual_scenes><visual_scene><node id="panel">
+            <matrix>1 0 0 4  0 1 0 5  0 0 1 6  0 0 0 1</matrix>
+            <instance_geometry url="#g"/>
+          </node></visual_scene></library_visual_scenes>
+        </COLLADA>'''
+        tree = ET.ElementTree(ET.fromstring(data))
+        geometry = tree.getroot().find("c:library_geometries/c:geometry", transform_helpers.NS)
+
+        local = transform_helpers.geometry_surface_triangles(geometry)
+        self.assertEqual(len(local), 3)
+        surfaces = core.surface_triangles_from_tree(tree)
+        self.assertEqual(surfaces["panel"].shape, (3, 3, 3))
+        np.testing.assert_allclose(surfaces["panel"][0, 0], (4.0, 5.0, 6.0))
 
 
 class DaeAliasCandidateTests(unittest.TestCase):
