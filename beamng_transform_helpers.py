@@ -5,6 +5,8 @@ import re
 from functools import lru_cache
 from xml.etree import ElementTree as ET
 
+import numpy as np
+
 
 NS = {"c": "http://www.collada.org/2005/11/COLLADASchema"}
 
@@ -290,12 +292,12 @@ def transform_point(
     )
 
 
-def source_xyz_points(source: ET.Element) -> list[tuple[float, float, float]]:
+def source_xyz_array(source: ET.Element) -> np.ndarray:
     float_array = source.find("c:float_array", NS)
     accessor = source.find(".//c:accessor", NS)
     if float_array is None or accessor is None or not float_array.text:
-        return []
-    values = [float(v) for v in float_array.text.split()]
+        return np.empty((0, 3), dtype=float)
+    values = np.fromstring(float_array.text, dtype=float, sep=" ")
     stride = int(accessor.get("stride", "3"))
     offset = int(accessor.get("offset", "0"))
     count = int(accessor.get("count", str(len(values) // stride)))
@@ -305,20 +307,21 @@ def source_xyz_points(source: ET.Element) -> list[tuple[float, float, float]]:
         y_idx = params.index("Y")
         z_idx = params.index("Z")
     except ValueError:
-        return []
-    points: list[tuple[float, float, float]] = []
-    for idx in range(count):
-        base_idx = offset + idx * stride
-        if base_idx + max(x_idx, y_idx, z_idx) >= len(values):
-            break
-        points.append(
-            (
-                values[base_idx + x_idx],
-                values[base_idx + y_idx],
-                values[base_idx + z_idx],
-            )
-        )
-    return points
+        return np.empty((0, 3), dtype=float)
+    if stride <= 0 or offset < 0:
+        return np.empty((0, 3), dtype=float)
+    maximum_component = max(x_idx, y_idx, z_idx)
+    available = max(0, (len(values) - offset - maximum_component + stride - 1) // stride)
+    count = min(count, available)
+    if count <= 0:
+        return np.empty((0, 3), dtype=float)
+    bases = offset + np.arange(count, dtype=np.int64) * stride
+    return values[bases[:, None] + np.array((x_idx, y_idx, z_idx))]
+
+
+def source_xyz_points(source: ET.Element) -> list[tuple[float, float, float]]:
+    """Compatibility list form of the vectorised COLLADA position reader."""
+    return [tuple(point) for point in source_xyz_array(source).tolist()]
 
 
 def geometry_position_points(geometry: ET.Element) -> list[tuple[float, float, float]]:
@@ -354,7 +357,7 @@ def geometry_position_points(geometry: ET.Element) -> list[tuple[float, float, f
 
 def geometry_surface_triangles(
     geometry: ET.Element,
-) -> list[tuple[tuple[float, float, float], ...]]:
+) -> np.ndarray:
     """Return the indexed triangle surface of one COLLADA geometry.
 
     Position clouds alone do not describe the filled surface between vertices,
@@ -365,7 +368,7 @@ def geometry_surface_triangles(
     """
     mesh = geometry.find("c:mesh", NS)
     if mesh is None:
-        return []
+        return np.empty((0, 3, 3), dtype=float)
 
     sources_by_id = {
         source.get("id"): source
@@ -373,7 +376,7 @@ def geometry_surface_triangles(
         if source.get("id")
     }
     points_by_source = {
-        source_id: source_xyz_points(source)
+        source_id: source_xyz_array(source)
         for source_id, source in sources_by_id.items()
     }
     vertices_positions: dict[str, str] = {}
@@ -389,7 +392,22 @@ def geometry_surface_triangles(
                 vertices_positions[vertices_id] = source_url[1:]
                 break
 
-    triangles: list[tuple[tuple[float, float, float], ...]] = []
+    triangle_chunks: list[np.ndarray] = []
+
+    def add_polygon(source_points: np.ndarray, polygon: np.ndarray) -> None:
+        if len(polygon) < 3:
+            return
+        corner_indices = np.column_stack((
+            np.full(len(polygon) - 2, polygon[0], dtype=np.int64),
+            polygon[1:-1],
+            polygon[2:],
+        ))
+        valid = np.all(
+            (corner_indices >= 0) & (corner_indices < len(source_points)), axis=1
+        )
+        if bool(valid.any()):
+            triangle_chunks.append(source_points[corner_indices[valid]])
+
     primitive_tags = ("triangles", "polylist", "polygons")
     for tag in primitive_tags:
         for primitive in mesh.findall(f"c:{tag}", NS):
@@ -417,41 +435,49 @@ def geometry_surface_triangles(
                 continue
             source_points = points_by_source[position_source]
 
-            polygons: list[list[int]] = []
             if tag == "triangles":
                 for p_elem in primitive.findall("c:p", NS):
-                    values = [int(value) for value in (p_elem.text or "").split()]
-                    indices = values[position_offset::stride]
-                    polygons.extend(
-                        indices[index : index + 3]
-                        for index in range(0, len(indices) - 2, 3)
+                    values = np.fromstring(
+                        p_elem.text or "", dtype=np.int64, sep=" "
                     )
+                    indices = values[position_offset::stride]
+                    usable = len(indices) - len(indices) % 3
+                    if usable <= 0:
+                        continue
+                    corner_indices = indices[:usable].reshape((-1, 3))
+                    valid = np.all(
+                        (corner_indices >= 0)
+                        & (corner_indices < len(source_points)),
+                        axis=1,
+                    )
+                    if bool(valid.any()):
+                        triangle_chunks.append(source_points[corner_indices[valid]])
             elif tag == "polylist":
                 p_elem = primitive.find("c:p", NS)
                 vcount_elem = primitive.find("c:vcount", NS)
                 if p_elem is None or vcount_elem is None:
                     continue
-                values = [int(value) for value in (p_elem.text or "").split()]
+                values = np.fromstring(
+                    p_elem.text or "", dtype=np.int64, sep=" "
+                )
                 indices = values[position_offset::stride]
                 cursor = 0
-                for count_text in (vcount_elem.text or "").split():
-                    count = int(count_text)
-                    polygons.append(indices[cursor : cursor + count])
+                counts = np.fromstring(
+                    vcount_elem.text or "", dtype=np.int64, sep=" "
+                )
+                for count in counts:
+                    count = int(count)
+                    add_polygon(source_points, indices[cursor : cursor + count])
                     cursor += count
             else:
                 for p_elem in primitive.findall("c:p", NS):
-                    values = [int(value) for value in (p_elem.text or "").split()]
-                    polygons.append(values[position_offset::stride])
-
-            for polygon in polygons:
-                if len(polygon) < 3:
-                    continue
-                for index in range(1, len(polygon) - 1):
-                    corner_indices = (polygon[0], polygon[index], polygon[index + 1])
-                    if any(i < 0 or i >= len(source_points) for i in corner_indices):
-                        continue
-                    triangles.append(tuple(source_points[i] for i in corner_indices))
-    return triangles
+                    values = np.fromstring(
+                        p_elem.text or "", dtype=np.int64, sep=" "
+                    )
+                    add_polygon(source_points, values[position_offset::stride])
+    if not triangle_chunks:
+        return np.empty((0, 3, 3), dtype=float)
+    return np.concatenate(triangle_chunks)
 
 
 def bounds_from_points(

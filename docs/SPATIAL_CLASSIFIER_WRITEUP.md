@@ -12,12 +12,13 @@ Pure geometry lives in `beamng_hand_drive_core.py` (`DriverFrame`,
 `driver_frame_for_context`, `visibility_scan`, `floor_height_from_shell`,
 `glass_beyond_fractions`, `full_vertex_clouds_for_ids`,
 `full_surface_triangles_for_ids`, `surface_visibility_stats`,
-`reflected_orphan_stats`, `mirror_pair_residual`,
+`surface_visibility_stats_batch`, `reflected_orphan_stats`, `mirror_pair_residual`,
 `directional_verdict_backing`, `principal_extent_sds`,
 `material_flags_for_context`, `mesh_material_symbols`). Orchestration lives in
 `beamng_hand_drive_tool.py` (`_classify_meshes_for_trim`,
 `_resolve_trim_pairs`, `_inherit_mounted_parts`,
-`build_mode_recommendations`).
+`build_mode_recommendations`). Optional compute acceleration lives in
+`spatial_visibility_backend.py`.
 
 ## 1. The eye-frame (Step 0)
 
@@ -277,10 +278,13 @@ once per trim over that trim's present set. All state is cached on the
 context: intrinsic verdicts, scoped IDs, persistent hard vetoes, pair votes,
 full DAE clouds and triangle surfaces, parsed-file keys and exact symmetry
 results. Candidate-ray tests for separate meshes are independent, so up to
-four run concurrently while stateful trim ordering, memo updates and pairing
-remain sequential. The cost profile is
-`O(unique vertices + candidate rays × scene triangles + trims × pairables)`;
-subsequent calls reuse uncapped clouds rather than reparsing a DAE.
+all of them share one GPU dispatch and scene upload; the CPU fallback retains
+a four-worker pool. Stateful trim ordering, memo updates and pairing remain
+sequential. Exact ray cost remains
+`O(candidate rays × scene triangles)`; the CPU symmetry fallback uses its
+linear spatial hash while the GPU's small-cloud all-pairs kernel is
+`O(unique vertices²)`. Subsequent calls reuse uncapped clouds rather than
+reparsing a DAE.
 
 Per-trim point clouds normally come from `preview_entries_for_config`, so a
 trim that translates a mesh is judged at that trim's location. A flexbody is
@@ -291,7 +295,60 @@ placement produces no verdict, a later variant-dependent placement (for
 example a single driver racing-seat base) can supply the decisive intrinsic
 verdict.
 
-## 7. Validation against the hand-verified baselines
+## 7. Compute acceleration and measured cost
+
+The three dominant data-parallel kernels have an automatic OpenGL 4.3 compute
+path through ModernGL, which is already an application dependency:
+
+- all candidate eye rays are concatenated, the filled trim scene is uploaded
+  once, and one Möller–Trumbore dispatch returns the blocked flags;
+- one thread per preview point evaluates the existing 6° shell visibility,
+  backing, lining and depth rules inside its pre-sorted angular bin;
+- one double-precision thread per full vertex performs the exact reflected-
+  twin search at both the 0.1 mm and 2 cm tolerances.
+
+The shell and symmetry shaders use double precision. The ray shader uses
+float32 geometry for throughput, but preserves the same open-segment and 2 mm
+endpoint rules. CPU/GPU tests cover each kernel, all real ETK candidates in
+the representative police trim matched their CPU statistics exactly, and the
+complete three-vehicle mismatch report is identical to the CPU reference.
+
+Contexts and shaders are lazy and thread-local because OpenGL contexts have
+thread affinity. A missing OpenGL 4.3 implementation, shader compilation
+failure, allocation failure or dispatch failure silently selects the existing
+CPU implementation for that thread. `BEAMXP_SPATIAL_BACKEND=cpu` forces the
+reference CPU path; `auto` (the default) or `gpu` attempts compute first.
+
+Independent vehicles remain safe validator process-level work. Stateful trim
+memo, pairing and inheritance stay sequential within a vehicle. Extracting
+independent DAE files with Python threads was measured and rejected: on the
+largest 12 pickup sources it regressed from 22.3 s sequential to 33.6 s with
+two workers and 55.6 s with four due to XML/GIL and memory contention.
+Instead, DAE source paths and file membership are indexed once, uncapped
+cloud/surface data is shared, resolved-placement loaders avoid redundant
+cache entry, and COLLADA float/index parsing uses NumPy.
+
+Measured on the development GTX 1650 4 GB, using the live AppData baselines:
+
+| configuration | three-vehicle validator | speedup |
+|---|---:|---:|
+| original CPU, sequential | 960.1 s | 1.00× |
+| GPU filled rays, sequential | 490.7 s | 1.96× |
+| GPU filled rays, 3 vehicle processes | 267.4 s | 3.59× |
+| GPU rays + symmetry + point shell | 131.0 s | 7.33× |
+| all GPU kernels + geometry/source caches | **81.1 s** | **11.83×** |
+
+The representative ETK police trim's classifier stage fell from 21.74 s to
+1.06 s (20.5×). During the final three-process run GPU utilisation measured
+22.5% average, 33% p95 and 35% peak, versus the initially observed ~7%: the
+remaining idle time is CPU-side trim placement and stateful classification,
+not an undersized ray dispatch. Pickup's remaining standalone phase totals
+are approximately 25.7 s surface preparation, 12.8 s point placement, 33.7 s
+across the driver/passenger classification passes, 3.4 s pairing and 2.4 s
+inheritance. Reusing first-pass trim analysis in the passenger pass is the
+next isolated performance opportunity.
+
+## 8. Validation against the hand-verified baselines
 
 `python scripts/validate_spatial_classifier.py` obtains one global
 recommendation from the union of meshes used by the selected trims, then
@@ -392,7 +449,7 @@ every mismatch row, as are `pickup_fueltank_short`,
 remaining pickup and Sunburst driveline rows enter through other
 contact/pair/scope channels and need separate tracing.
 
-## 8. Honesty: where this is fragile
+## 9. Honesty: where this is fragile
 
 - **The point shell remains approximate backing/envelope evidence.** Final
   candidate exposure and disputed glass crossings use filled DAE triangles,

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import unittest
 from pathlib import Path
+import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 import beamng_hand_drive_core as core
 import beamng_hand_drive_tool as tool
+import spatial_visibility_backend
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +179,73 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(stats["vf"], 0.5)
         self.assertEqual(stats["front_vf"], 0.5)
 
+    def test_batched_cpu_surface_visibility_matches_scalar_reference(self) -> None:
+        points_by_id = {
+            "first": np.array(((0.0, 0.0, 2.0), (2.0, 0.0, 2.0))),
+            "second": np.array(((0.2, 0.0, 3.0), (-2.0, 0.0, 2.0))),
+        }
+        cover = np.array((
+            ((-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (0.0, 1.0, 1.0)),
+        ))
+        expected = {
+            object_id: core.surface_visibility_stats(
+                points,
+                (0.0, 0.0, 0.0),
+                cover,
+                set(),
+                (0.0, 0.0, 1.0),
+            )
+            for object_id, points in points_by_id.items()
+        }
+        with patch.dict(
+            "os.environ", {spatial_visibility_backend.SPATIAL_BACKEND_ENV: "cpu"}
+        ):
+            actual = core.surface_visibility_stats_batch(
+                points_by_id,
+                (0.0, 0.0, 0.0),
+                cover,
+                (0.0, 0.0, 1.0),
+            )
+        self.assertEqual(actual, expected)
+
+    def test_gpu_surface_visibility_matches_scalar_reference_when_available(
+        self,
+    ) -> None:
+        points_by_id = {
+            "first": np.array(((0.0, 0.0, 2.0), (2.0, 0.0, 2.0))),
+            "second": np.array(((0.2, 0.0, 3.0), (-2.0, 0.0, 2.0))),
+        }
+        cover = np.array((
+            ((-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (0.0, 1.0, 1.0)),
+        ))
+        expected = {
+            object_id: core.surface_visibility_stats(
+                points,
+                (0.0, 0.0, 0.0),
+                cover,
+                set(),
+                (0.0, 0.0, 1.0),
+            )
+            for object_id, points in points_by_id.items()
+        }
+        spatial_visibility_backend.reset_thread_backend()
+        try:
+            with patch.dict(
+                "os.environ",
+                {spatial_visibility_backend.SPATIAL_BACKEND_ENV: "gpu"},
+            ):
+                if spatial_visibility_backend.gpu_renderer() is None:
+                    self.skipTest("OpenGL 4.3 compute context is unavailable")
+                actual = core.surface_visibility_stats_batch(
+                    points_by_id,
+                    (0.0, 0.0, 0.0),
+                    cover,
+                    (0.0, 0.0, 1.0),
+                )
+        finally:
+            spatial_visibility_backend.reset_thread_backend()
+        self.assertEqual(actual, expected)
+
     def test_visible_admission_is_limited_to_forward_hemisphere(self) -> None:
         front = box_cloud((0.40, -0.50, 0.90), (0.10, 0.10, 0.10), n=80, seed=56)
         rear = box_cloud((0.40, 0.90, 0.90), (0.10, 0.10, 0.10), n=80, seed=57)
@@ -191,6 +260,30 @@ class ScopeTests(unittest.TestCase):
         # The enclosure shell remains spherical; only driver-visible
         # admission is field-of-view limited.
         self.assertGreater(stats["rear"]["vf"], 0.70)
+
+    def test_gpu_visibility_shell_matches_cpu_reference_when_available(self) -> None:
+        meshes = base_cabin()
+        with patch.dict(
+            "os.environ", {spatial_visibility_backend.SPATIAL_BACKEND_ENV: "cpu"}
+        ):
+            expected = core.visibility_scan(
+                meshes, EYE, {"veh_steer"}, (0.0, -1.0, 0.0)
+            )
+
+        spatial_visibility_backend.reset_thread_backend()
+        try:
+            with patch.dict(
+                "os.environ",
+                {spatial_visibility_backend.SPATIAL_BACKEND_ENV: "gpu"},
+            ):
+                if spatial_visibility_backend.gpu_renderer() is None:
+                    self.skipTest("OpenGL 4.3 compute context is unavailable")
+                actual = core.visibility_scan(
+                    meshes, EYE, {"veh_steer"}, (0.0, -1.0, 0.0)
+                )
+        finally:
+            spatial_visibility_backend.reset_thread_backend()
+        self.assertEqual(actual, expected)
 
     def test_rearward_exposed_mesh_does_not_enter_from_visibility(self) -> None:
         meshes = base_cabin()
@@ -685,6 +778,28 @@ class GeometryHelperTests(unittest.TestCase):
         orphans, coarse = core.reflected_orphan_stats(asymmetric, 0.0)
         self.assertEqual(orphans, 2)
         self.assertGreater(coarse, 0.0)
+
+    def test_gpu_reflected_orphans_match_cpu_reference_when_available(self) -> None:
+        half = box_cloud((0.35, 0.0, 0.0), (0.2, 0.4, 0.3), n=80, seed=61)
+        cloud = np.concatenate([half, mirror_x(half)])
+        cloud[0, 1] += 0.05
+        with patch.dict(
+            "os.environ", {spatial_visibility_backend.SPATIAL_BACKEND_ENV: "cpu"}
+        ):
+            expected = core.reflected_orphan_stats(cloud, 0.0)
+
+        spatial_visibility_backend.reset_thread_backend()
+        try:
+            with patch.dict(
+                "os.environ",
+                {spatial_visibility_backend.SPATIAL_BACKEND_ENV: "gpu"},
+            ):
+                if spatial_visibility_backend.gpu_renderer() is None:
+                    self.skipTest("OpenGL 4.3 compute context is unavailable")
+                actual = core.reflected_orphan_stats(cloud, 0.0)
+        finally:
+            spatial_visibility_backend.reset_thread_backend()
+        self.assertEqual(actual, expected)
 
     def test_symmetry_residual_separates_centred_from_one_sided(self) -> None:
         centred = box_cloud((0.0, 0.0, 0.0), (1.0, 0.5, 0.5), n=300, seed=30)

@@ -387,13 +387,15 @@ def _classify_meshes_for_trim(
     wheel_x = float(wheel[0]) if wheel is not None else frame.eye[0]
 
     # Exact rays for different candidate meshes are independent.  Preserve
-    # the stateful verdict/pair ordering below, but compute this expensive
-    # broad-phase superset concurrently.  Four workers also composes cleanly
-    # with the validator's three vehicle processes on a 12-thread machine.
+    # the stateful verdict/pair ordering below, but batch this expensive
+    # broad-phase superset into one GPU scene upload/dispatch.  The core
+    # helper retains the previous bounded CPU thread pool as its fallback.
     exact_by_id: dict[str, dict[str, float] | None] = {}
+    exact_no_glass_by_id: dict[str, dict[str, float] | None] = {}
     exact_glass_by_id: dict[str, dict[str, float] | None] = {}
     if surface_scene is not None:
         exact_ids = []
+        fitment_ids = []
         for object_id in want:
             if object_id in glass_ids:
                 continue
@@ -454,43 +456,40 @@ def _classify_meshes_for_trim(
             )
             if might_enter:
                 exact_ids.append(object_id)
+                if fitment:
+                    fitment_ids.append(object_id)
         if exact_ids:
-            with ThreadPoolExecutor(
-                max_workers=min(4, len(exact_ids)),
-                thread_name_prefix="spatial-rays",
-            ) as executor:
-                futures = {
-                    object_id: executor.submit(
-                        core.surface_visibility_stats,
-                        entries_np[object_id],
-                        frame.eye,
-                        surface_scene,
-                        set(),
-                        frame.forward,
-                    )
-                    for object_id in exact_ids
-                }
-                glass_futures = {
-                    object_id: executor.submit(
-                        core.surface_visibility_stats,
-                        entries_np[object_id],
-                        frame.eye,
-                        surface_scene_glass,
-                        set(),
-                        frame.forward,
-                    )
-                    for object_id in exact_ids
-                    if surface_scene_glass is not None
-                    and beyond.get(object_id, 0.0) >= 0.40
-                }
-                exact_by_id = {
-                    object_id: future.result()
-                    for object_id, future in futures.items()
-                }
-                exact_glass_by_id = {
-                    object_id: future.result()
-                    for object_id, future in glass_futures.items()
-                }
+            exact_by_id = core.surface_visibility_stats_batch(
+                {object_id: entries_np[object_id] for object_id in exact_ids},
+                frame.eye,
+                surface_scene,
+                frame.forward,
+            )
+            if fitment_ids and surface_scene_no_glass is not None:
+                exact_no_glass_by_id = core.surface_visibility_stats_batch(
+                    {
+                        object_id: entries_np[object_id]
+                        for object_id in fitment_ids
+                    },
+                    frame.eye,
+                    surface_scene_no_glass,
+                    frame.forward,
+                )
+            glass_ids_to_scan = [
+                object_id for object_id in exact_ids
+                if surface_scene_glass is not None
+                and beyond.get(object_id, 0.0) >= 0.40
+            ]
+            if glass_ids_to_scan:
+                exact_glass_by_id = core.surface_visibility_stats_batch(
+                    {
+                        object_id: entries_np[object_id]
+                        for object_id in glass_ids_to_scan
+                    },
+                    frame.eye,
+                    surface_scene_glass,
+                    frame.forward,
+                )
 
     verdicts: dict[str, tuple[str, str, str, dict]] = {}
     vetoed: set[str] = set()
@@ -589,21 +588,25 @@ def _classify_meshes_for_trim(
         ):
             exact = exact_by_id.get(object_id)
             if object_id not in exact_by_id:
-                exact = core.surface_visibility_stats(
-                    points, frame.eye, surface_scene, set(), frame.forward
-                )
+                exact = core.surface_visibility_stats_batch(
+                    {object_id: points},
+                    frame.eye,
+                    surface_scene,
+                    frame.forward,
+                ).get(object_id)
             if exact is not None:
                 stats = dict(stats)
                 stats.update({key: exact[key] for key in ("vf", "front_vf")})
                 stats_ng = stats
                 if point_cand_fitment and surface_scene_no_glass is not None:
-                    exact_ng = core.surface_visibility_stats(
-                        points,
-                        frame.eye,
-                        surface_scene_no_glass,
-                        set(),
-                        frame.forward,
-                    )
+                    exact_ng = exact_no_glass_by_id.get(object_id)
+                    if object_id not in exact_no_glass_by_id:
+                        exact_ng = core.surface_visibility_stats_batch(
+                            {object_id: points},
+                            frame.eye,
+                            surface_scene_no_glass,
+                            frame.forward,
+                        ).get(object_id)
                     if exact_ng is not None:
                         stats_ng = dict(stats)
                         stats_ng.update({

@@ -104,6 +104,11 @@ pip install -r requirements.txt
 
 `requirements.txt` covers the in-app preview (numpy, moderngl) and preview image handling (Pillow). PyInstaller is only installed by the packaging script if you build the Windows exe yourself.
 
+Recommend Modes automatically uses an OpenGL 4.3 compute-capable GPU for its
+spatial geometry kernels when available; it does not require CUDA. Unsupported
+or failed GPU setup falls back to the equivalent CPU implementation. Set
+`BEAMXP_SPATIAL_BACKEND=cpu` to force the reference CPU path for diagnostics.
+
 The tool can still build conversions without Blender configured.
 
 ### Linux

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -22,6 +23,7 @@ import numpy as np
 
 import beamng_transform_helpers as transform_helpers
 import plate_generator
+import spatial_visibility_backend
 
 
 def default_user_data_dir() -> Path:
@@ -716,6 +718,53 @@ def surface_triangles_from_tree(
     return surfaces
 
 
+def dae_source_index(
+    context: VehicleContext,
+) -> tuple[
+    dict[str, tuple[str, str]],
+    dict[tuple[str, str], tuple[str, ...]],
+    dict[tuple[str, str], tuple[Path, str]],
+]:
+    """Stable DAE source keys and file membership for every context object.
+
+    Shared accessory packs make source paths significant, but resolving the
+    same zip path inside every per-object/per-trim cache lookup is extremely
+    expensive on Windows.  Build the immutable index once, resolving each
+    distinct zip only once.
+    """
+    cached = getattr(context, "_dae_source_index", None)
+    if cached is not None:
+        return cached
+
+    resolved_zips: dict[str, str] = {}
+    keys: dict[str, tuple[str, str]] = {}
+    members: dict[tuple[str, str], list[str]] = {}
+    files: dict[tuple[str, str], tuple[Path, str]] = {}
+    for object_id, obj in context.objects.items():
+        source_zip = Path(obj.dae_source_zip or context.source_zip)
+        raw_zip = str(source_zip)
+        zip_key = resolved_zips.get(raw_zip)
+        if zip_key is None:
+            try:
+                zip_key = str(source_zip.resolve(strict=False)).lower()
+            except OSError:
+                zip_key = raw_zip.lower()
+            resolved_zips[raw_zip] = zip_key
+        dae_path = obj.dae_path.replace("\\", "/")
+        key = (zip_key, dae_path)
+        keys[object_id] = key
+        members.setdefault(key, []).append(object_id)
+        files.setdefault(key, (source_zip, obj.dae_path))
+
+    result = (
+        keys,
+        {key: tuple(object_ids) for key, object_ids in members.items()},
+        files,
+    )
+    context._dae_source_index = result
+    return result
+
+
 def full_surface_triangles_for_ids(
     context: VehicleContext,
     ids: Iterable[str],
@@ -741,14 +790,7 @@ def full_surface_triangles_for_ids(
         context._surface_triangle_files = parsed_files
 
     requested = {str(object_id) for object_id in ids}
-
-    def source_key(obj: DaeObject) -> tuple[str, str]:
-        source_zip = Path(obj.dae_source_zip or context.source_zip)
-        try:
-            zip_key = str(source_zip.resolve(strict=False)).lower()
-        except OSError:
-            zip_key = str(source_zip).lower()
-        return zip_key, obj.dae_path.replace("\\", "/")
+    source_keys, source_members, source_files = dae_source_index(context)
 
     by_file: dict[tuple[str, str], tuple[Path, str]] = {}
     for object_id in requested:
@@ -757,10 +799,9 @@ def full_surface_triangles_for_ids(
         obj = context.objects.get(object_id)
         if obj is None or not obj.dae_path:
             continue
-        by_file.setdefault(
-            source_key(obj),
-            (Path(obj.dae_source_zip or context.source_zip), obj.dae_path),
-        )
+        key = source_keys.get(object_id)
+        if key is not None:
+            by_file.setdefault(key, source_files[key])
 
     for key, (source_zip, dae_path) in by_file.items():
         if key in parsed_files:
@@ -769,23 +810,61 @@ def full_surface_triangles_for_ids(
         try:
             tree = parse_dae(source_zip, dae_path)
             file_surfaces = surface_triangles_from_tree(tree)
-            file_preview = preview_data_from_tree(tree, max_points_per_object=sys.maxsize)
+            authored_centers = getattr(context, "_authored_full_centers", {})
+            needs_preview = any(
+                object_id not in authored_centers
+                for object_id in source_members.get(key, ())
+            )
+            file_preview = (
+                preview_data_from_tree(tree, max_points_per_object=sys.maxsize)
+                if needs_preview else {}
+            )
         except Exception:
             file_surfaces = {}
             file_preview = {}
 
-        for object_id, obj in context.objects.items():
-            if source_key(obj) != key:
-                continue
+        clouds = getattr(context, "_full_clouds", None)
+        if clouds is None:
+            clouds = {}
+            context._full_clouds = clouds
+        authored_clouds = getattr(context, "_authored_full_clouds", None)
+        if authored_clouds is None:
+            authored_clouds = {}
+            context._authored_full_clouds = authored_clouds
+        authored_centers = getattr(context, "_authored_full_centers", None)
+        if authored_centers is None:
+            authored_centers = {}
+            context._authored_full_centers = authored_centers
+        full_files = getattr(context, "_full_cloud_files", None)
+        if full_files is None:
+            full_files = set()
+            context._full_cloud_files = full_files
+        full_files.add(key)
+
+        for object_id in source_members.get(key, ()):
             triangles = file_surfaces.get(object_id)
             if triangles is None or len(triangles) == 0:
                 surfaces.setdefault(object_id, np.empty((0, 3, 3), dtype=float))
-                continue
-            authored_surfaces[object_id] = triangles
             authored = file_preview.get(object_id)
             placed = context.preview_by_id.get(object_id)
-            if authored is not None and placed is not None:
+            if authored is not None:
+                points = np.asarray(authored.get("sample_points", ()), dtype=float)
                 authored_center = np.asarray(authored.get("center"), dtype=float)
+                if len(points):
+                    authored_clouds[object_id] = points
+                    if authored_center.shape == (3,):
+                        authored_centers[object_id] = authored_center
+                    if placed is not None:
+                        placed_center = np.asarray(placed.get("center"), dtype=float)
+                        if authored_center.shape == (3,) and placed_center.shape == (3,):
+                            points = points + (placed_center - authored_center)
+                    clouds[object_id] = points
+            if triangles is None or len(triangles) == 0:
+                continue
+            authored_surfaces[object_id] = triangles
+            authored_center = authored_centers.get(object_id)
+            if authored_center is not None and placed is not None:
+                authored_center = np.asarray(authored_center, dtype=float)
                 placed_center = np.asarray(placed.get("center"), dtype=float)
                 if authored_center.shape == (3,) and placed_center.shape == (3,):
                     triangles = triangles + (placed_center - authored_center)
@@ -823,20 +902,17 @@ def full_vertex_clouds_for_ids(
     if authored_clouds is None:
         authored_clouds = {}
         context._authored_full_clouds = authored_clouds
+    authored_centers = getattr(context, "_authored_full_centers", None)
+    if authored_centers is None:
+        authored_centers = {}
+        context._authored_full_centers = authored_centers
     parsed_files = getattr(context, "_full_cloud_files", None)
     if parsed_files is None:
         parsed_files = set()
         context._full_cloud_files = parsed_files
 
     requested = {str(object_id) for object_id in ids}
-
-    def source_key(obj: DaeObject) -> tuple[str, str]:
-        source_zip = Path(obj.dae_source_zip or context.source_zip)
-        try:
-            zip_key = str(source_zip.resolve(strict=False)).lower()
-        except OSError:
-            zip_key = str(source_zip).lower()
-        return zip_key, obj.dae_path.replace("\\", "/")
+    source_keys, source_members, source_files = dae_source_index(context)
 
     by_file: dict[tuple[str, str], tuple[Path, str]] = {}
     for object_id in requested:
@@ -845,8 +921,9 @@ def full_vertex_clouds_for_ids(
         obj = context.objects.get(object_id)
         if obj is None or not obj.dae_path:
             continue
-        source_zip = Path(obj.dae_source_zip or context.source_zip)
-        by_file.setdefault(source_key(obj), (source_zip, obj.dae_path))
+        key = source_keys.get(object_id)
+        if key is not None:
+            by_file.setdefault(key, source_files[key])
 
     for key, (source_zip, dae_path) in by_file.items():
         if key in parsed_files:
@@ -862,9 +939,7 @@ def full_vertex_clouds_for_ids(
 
         # Cache every context object backed by this DAE.  A later trim can ask
         # about a different mesh in the same file without forcing a reparse.
-        for object_id, obj in context.objects.items():
-            if source_key(obj) != key:
-                continue
+        for object_id in source_members.get(key, ()):
             authored = full_preview.get(object_id)
             placed = context.preview_by_id.get(object_id)
             if authored is None or placed is None:
@@ -874,6 +949,8 @@ def full_vertex_clouds_for_ids(
                 continue
             authored_clouds[object_id] = points
             authored_center = np.asarray(authored.get("center"), dtype=float)
+            if authored_center.shape == (3,):
+                authored_centers[object_id] = authored_center
             placed_center = np.asarray(placed.get("center"), dtype=float)
             if authored_center.shape == (3,) and placed_center.shape == (3,):
                 points = points + (placed_center - authored_center)
@@ -905,8 +982,10 @@ def vertex_cloud_for_resolved_placement(
     """
     if not resolved.matrices:
         return None
-    full_vertex_clouds_for_ids(context, (object_id,))
     authored = getattr(context, "_authored_full_clouds", {}).get(object_id)
+    if authored is None:
+        full_vertex_clouds_for_ids(context, (object_id,))
+        authored = getattr(context, "_authored_full_clouds", {}).get(object_id)
     if authored is None or len(authored) == 0:
         return None
     homogeneous = np.concatenate(
@@ -936,8 +1015,10 @@ def surface_triangles_for_resolved_placement(
     """Rebuild one object's authored surface at all of its trim matrices."""
     if not resolved.matrices:
         return None
-    full_surface_triangles_for_ids(context, (object_id,))
     authored = getattr(context, "_authored_surface_triangles", {}).get(object_id)
+    if authored is None:
+        full_surface_triangles_for_ids(context, (object_id,))
+        authored = getattr(context, "_authored_surface_triangles", {}).get(object_id)
     if authored is None or len(authored) == 0:
         return None
     flat = np.asarray(authored, dtype=float).reshape((-1, 3))
@@ -6640,6 +6721,25 @@ def visibility_scan(
     eye_vectors = all_points - np.array(eye)
     bins, radii = spatial_spherical_bins(eye_vectors)
     opaque = np.array([ids[o] not in transparent_ids for o in owner])
+    gpu_shell = spatial_visibility_backend.gpu_visibility_shell(
+        eye_vectors, bins, radii, owner, opaque, forward
+    )
+    if gpu_shell is not None:
+        visible, front_visible, backed, lined_flag, depth = gpu_shell
+        stats: dict[str, dict[str, float]] = {}
+        for index, object_id in enumerate(ids):
+            mask = owner == index
+            count = int(mask.sum())
+            stats[object_id] = {
+                "n": count,
+                "vf": float(visible[mask].sum()) / count,
+                "front_vf": float(front_visible[mask].sum()) / count,
+                "backed": float(backed[mask].sum()) / count,
+                "lined": float(lined_flag[mask].sum()) / count,
+                "depth": float(depth[mask].mean()),
+                "min_r": float(radii[mask].min()),
+            }
+        return stats
     n_bins = int(bins.max()) + 2
     field = np.full(n_bins, np.inf)
     np.minimum.at(field, bins[opaque], radii[opaque])
@@ -6814,6 +6914,95 @@ def surface_visibility_stats(
         "front_vf": float(front_visible.sum()) / len(points),
         "blocked": float(blocked.sum()) / len(points),
     }
+
+
+def surface_visibility_stats_batch(
+    points_by_id: dict[str, np.ndarray],
+    eye: tuple[float, float, float],
+    triangles: np.ndarray,
+    forward: tuple[float, float, float] | None = None,
+    endpoint_gap: float = 0.002,
+    max_cpu_workers: int = 4,
+) -> dict[str, dict[str, float] | None]:
+    """Exact visibility for many meshes with one compiled triangle scene.
+
+    The GPU path concatenates every candidate's rays into one compute dispatch
+    and uploads the scene once.  It implements the same Moller-Trumbore/open-
+    segment test as :func:`surface_visibility_stats`.  Machines without an
+    OpenGL 4.3 compute context retain the previous bounded CPU thread pool.
+    Set ``BEAMXP_SPATIAL_BACKEND=cpu`` to force that reference path.
+    """
+    usable = {
+        object_id: np.asarray(points, dtype=float).reshape((-1, 3))
+        for object_id, points in points_by_id.items()
+        if len(points)
+    }
+    if not usable:
+        return {}
+    scene = np.asarray(triangles, dtype=float).reshape((-1, 3, 3))
+    if not len(scene):
+        return {object_id: None for object_id in usable}
+
+    ids = list(usable)
+    counts = [len(usable[object_id]) for object_id in ids]
+    all_points = np.concatenate([usable[object_id] for object_id in ids])
+    blocked = spatial_visibility_backend.gpu_blocked_rays(
+        all_points, eye, scene, endpoint_gap
+    )
+    if blocked is None:
+        workers = max(1, min(max_cpu_workers, len(ids)))
+        if workers == 1:
+            return {
+                object_id: surface_visibility_stats(
+                    usable[object_id], eye, scene, set(), forward, endpoint_gap
+                )
+                for object_id in ids
+            }
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="spatial-rays"
+        ) as executor:
+            futures = {
+                object_id: executor.submit(
+                    surface_visibility_stats,
+                    usable[object_id],
+                    eye,
+                    scene,
+                    set(),
+                    forward,
+                    endpoint_gap,
+                )
+                for object_id in ids
+            }
+            return {
+                object_id: futures[object_id].result()
+                for object_id in ids
+            }
+
+    origin = np.asarray(eye, dtype=float)
+    directions = all_points - origin
+    distances = np.linalg.norm(directions, axis=1)
+    valid = distances > 1e-9
+    visible = valid & ~blocked
+    if forward is None:
+        front_visible = visible
+    else:
+        forward_v = np.asarray(forward, dtype=float)
+        norm = float(np.linalg.norm(forward_v))
+        if norm > 1e-9:
+            forward_v /= norm
+        front_visible = visible & ((directions @ forward_v) >= 0.0)
+
+    results: dict[str, dict[str, float] | None] = {}
+    offset = 0
+    for object_id, count in zip(ids, counts):
+        item = slice(offset, offset + count)
+        results[object_id] = {
+            "vf": float(visible[item].sum()) / count,
+            "front_vf": float(front_visible[item].sum()) / count,
+            "blocked": float(blocked[item].sum()) / count,
+        }
+        offset += count
+    return results
 
 
 def directional_verdict_backing(
@@ -7001,13 +7190,22 @@ def reflected_orphan_stats(
     cloud = np.asarray(points, dtype=float)
     if len(cloud) == 0:
         return 0, 0.0
+    if exact_tol <= 0.0 or coarse_tol <= 0.0:
+        raise ValueError("symmetry tolerance must be positive")
+
+    gpu_stats = spatial_visibility_backend.gpu_reflected_orphan_stats(
+        cloud,
+        float(center_x),
+        float(exact_tol),
+        float(coarse_tol),
+    )
+    if gpu_stats is not None:
+        return gpu_stats
 
     reflected = cloud.copy()
     reflected[:, 0] = 2.0 * float(center_x) - reflected[:, 0]
 
     def orphan_count(tol: float) -> int:
-        if tol <= 0.0:
-            raise ValueError("symmetry tolerance must be positive")
         cells: dict[tuple[int, int, int], list[np.ndarray]] = {}
         indices = np.floor(cloud / tol).astype(np.int64)
         for index, cell in enumerate(indices):
