@@ -135,6 +135,53 @@ SPATIAL_REACH_LIMIT = 1.35           # ergonomic: controls start within reach
 SPATIAL_CONTACT_LIMIT = 0.0301       # 3 cm contact plus 0.1 mm float dust
 
 
+def _is_enclosed_candidate(
+    stats: dict[str, float],
+    out80: float,
+    half_width: float,
+) -> bool:
+    """Whether shell evidence places a mesh inside the occupied cabin."""
+    ordinarily_inboard = out80 <= half_width - 0.02
+    lined_at_boundary = (
+        stats["front_vf"] >= 0.25
+        and stats["backed"] >= 0.75
+        and stats["lined"] >= 0.75
+        and out80 <= half_width
+        and stats["depth"] <= 0.35
+    )
+    return (
+        stats["vf"] >= 0.08
+        and stats["backed"] >= 0.45
+        and stats["depth"] <= 0.45
+        and (ordinarily_inboard or lined_at_boundary)
+    )
+
+
+def _unscoped_contact_is_cabin_furniture(
+    points: object,
+    frame: core.DriverFrame,
+) -> bool:
+    """Bound hidden contact inheritance to the occupant-sized cabin volume."""
+    import numpy as np
+
+    if points is None:
+        return False
+    cloud = np.asarray(points, dtype=float)
+    if len(cloud) < 4:
+        return False
+    eye = np.asarray(frame.eye, dtype=float)
+    forward = np.asarray(frame.forward, dtype=float)
+    centroid = cloud.mean(axis=0)
+    ahead = float((centroid[:2] - eye[:2]) @ forward[:2])
+    z70 = float(np.percentile(cloud[:, 2], 70))
+    range80 = float(np.percentile(np.linalg.norm(cloud - eye, axis=1), 80))
+    return (
+        -0.60 <= ahead <= 1.00
+        and frame.eye[2] - 0.70 <= z70 <= frame.eye[2] + 0.35
+        and range80 <= 1.60
+    )
+
+
 def _spatial_entries_for_trim(
     context: core.VehicleContext,
     trim: str | None,
@@ -415,8 +462,6 @@ def _classify_meshes_for_trim(
         exact_ids = []
         fitment_ids = []
         for object_id in want:
-            if object_id in glass_ids:
-                continue
             points = entries_np.get(object_id)
             if points is None or len(points) < 4:
                 continue
@@ -438,12 +483,7 @@ def _classify_meshes_for_trim(
                 and -0.10 <= below <= 1.35
                 and not wall_lateral
             )
-            enclosed = (
-                stats["vf"] >= 0.08
-                and stats["backed"] >= 0.45
-                and out80 <= half_width - 0.02
-                and stats["depth"] <= 0.45
-            )
+            enclosed = _is_enclosed_candidate(stats, out80, half_width)
             fitment = (
                 stats_ng["vf"] >= 0.12
                 and diagonal <= 0.60
@@ -544,16 +584,6 @@ def _classify_meshes_for_trim(
             and not wall_lateral
         )
 
-        if object_id in glass_ids:
-            # a small pane in the cone is an instrument cover moving with the
-            # cluster; real windows are wide or lateral and never convert
-            if (diagonal <= 0.7 and 0.20 <= ahead <= wheel_ahead + 1.0
-                    and -0.22 <= lat_signed <= 0.33 and -0.10 <= below <= 1.35
-                    and stats["depth"] <= 0.30
-                    and (stats["vf"] >= 0.30 or stats["min_r"] <= wheel_dist + 0.45)):
-                verdicts[object_id] = ("translate", "instrument cover in the control cone", "med", {})
-            continue
-
         # Scope channels are candidates, not absolutes.  The cheap point shell
         # is only a broad phase: when it says a mesh might enter, trace those
         # same sample rays against the filled DAE triangles.  This catches a
@@ -564,11 +594,10 @@ def _classify_meshes_for_trim(
             candidate_stats_ng: dict[str, float],
         ) -> tuple[bool, bool, bool, bool]:
             visible = candidate_stats["front_vf"] >= 0.28
-            enclosed = (
-                candidate_stats["vf"] >= 0.08
-                and candidate_stats["backed"] >= 0.45
-                and out80 <= half_width - 0.02
-                and candidate_stats["depth"] <= 0.45
+            enclosed = _is_enclosed_candidate(
+                candidate_stats,
+                out80,
+                half_width,
             )
             fitment = (
                 candidate_stats_ng["vf"] >= 0.12
@@ -713,15 +742,13 @@ def _classify_meshes_for_trim(
         display = emissive and planar and diagonal <= 0.9
 
         orphans, coarse_fraction = _mesh_symmetry(context, object_id, points, cx0)
-        if (not cand_visible and abs(float(centroid[0]) - cx0) < 0.12
-                and coarse_fraction < 0.15 and not cand_fitment and not cand_cone):
-            continue  # barely-seen centred blob: mirroring it is a no-op
         if orphans == 0:
             xspan = float(np.ptp(points[:, 0]))
             z90 = float(np.percentile(points[:, 2], 90))
             fascia = (
                 xspan >= max(1.05, 1.3 * half_width) and ahead >= 0.45
-                and float(centroid[2]) <= frame.eye[2] + 0.05 and z90 >= frame.eye[2] - 0.62
+                and float(centroid[2]) <= frame.eye[2] - 0.18
+                and z90 >= frame.eye[2] - 0.62
                 and extents[2] >= 0.28 and stats["vf"] >= 0.30
             )
             if display:
@@ -932,17 +959,8 @@ def _inherit_mounted_parts(
     confidence rather than staying behind. Two passes resolve chains
     (button -> console -> dash). Only skip/none verdicts are upgraded --
     translate/pair verdicts and vetoed exterior meshes are never touched --
-    and glass panes never inherit."""
+    and transparent panes use the same rules as every other mesh."""
     import numpy as np
-
-    material_symbols = core.mesh_material_symbols(context)
-    material_flags = core.material_flags_for_context(context)
-
-    def is_glass(object_id: str) -> bool:
-        symbols = material_symbols.get(object_id)
-        return bool(symbols) and all(
-            material_flags.get(s, {}).get("glass") for s in symbols
-        )
 
     eye = np.array(frame.eye)
 
@@ -967,10 +985,20 @@ def _inherit_mounted_parts(
             break
         changed = False
         for object_id in present:
-            if memo.get(object_id, ("none",))[0] != "none" or object_id in vetoed:
+            if (
+                (
+                    object_id not in scoped
+                    and not _unscoped_contact_is_cabin_furniture(
+                        entries_np.get(object_id),
+                        frame,
+                    )
+                )
+                or memo.get(object_id, ("none",))[0] != "none"
+                or object_id in vetoed
+            ):
                 continue
             points = entries_np.get(object_id)
-            if points is None or len(points) < 4 or is_glass(object_id):
+            if points is None or len(points) < 4:
                 continue
             diag = float(np.linalg.norm(np.ptp(points, axis=0)))
             if diag > 0.70:
@@ -1002,7 +1030,7 @@ def _inherit_mounted_parts(
                 or object_id in vetoed):
             continue
         points = entries_np.get(object_id)
-        if points is None or len(points) < 4 or is_glass(object_id):
+        if points is None or len(points) < 4:
             continue
         diag = float(np.linalg.norm(np.ptp(points, axis=0)))
         if diag > 0.70 or (diag < 0.14 and len(points) < 40):

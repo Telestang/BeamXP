@@ -7261,13 +7261,33 @@ def principal_extent_sds(points: np.ndarray) -> np.ndarray:
     return np.sqrt(np.maximum(np.linalg.eigvalsh(covariance), 0.0))
 
 
+def material_uses_glass_blending(value: dict[str, object]) -> bool:
+    """Whether a translucent material has evidence of active alpha blending.
+
+    BeamNG materials sometimes carry ``translucent: true`` while explicitly
+    disabling blending and supplying no opacity map (for example crawler cage
+    metal and hubcaps).  Those are not transparent panes and must not define
+    the classifier's glasshouse.
+    """
+    if not bool(value.get("translucent")):
+        return False
+    blend_op = str(value.get("translucentBlendOp") or "").strip().lower()
+    active_blend = blend_op not in {"", "none"}
+    opacity_map = any(
+        isinstance(stage, dict) and bool(stage.get("opacityMap"))
+        for stage in (value.get("Stages") or [])
+    )
+    return active_blend or opacity_map
+
+
 def material_flags_for_context(context: VehicleContext) -> dict[str, dict[str, bool]]:
     """Material name -> {"emissive", "glass"} from every *.materials.json in
     the vehicle zip and the game's common zips.
 
     emissive = any stage carries an emissiveMap (a lit display image).
-    glass    = translucent and NOT emissive (a window; translucent+emissive is
-               a screen). Cached on the context; missing zips degrade to {}."""
+    glass    = translucent with active alpha/opacity evidence and NOT emissive
+               (a window; translucent+emissive is a screen). Cached on the
+               context; missing zips degrade to {}."""
     cached = getattr(context, "_material_flags", None)
     if cached is not None:
         return cached
@@ -7296,7 +7316,7 @@ def material_flags_for_context(context: VehicleContext) -> dict[str, dict[str, b
                     emissive = any(
                         isinstance(stage, dict) and "emissiveMap" in stage for stage in stages
                     )
-                    glass = bool(value.get("translucent")) and not emissive
+                    glass = material_uses_glass_blending(value) and not emissive
                     flags[material_name.lower()] = {"emissive": emissive, "glass": glass}
     context._material_flags = flags
     return flags

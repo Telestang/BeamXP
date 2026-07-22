@@ -163,6 +163,18 @@ class DriverFrameTests(unittest.TestCase):
 
 
 class ScopeTests(unittest.TestCase):
+    def test_strongly_lined_boundary_mesh_is_enclosed(self) -> None:
+        stats = {
+            "vf": 0.267,
+            "front_vf": 0.267,
+            "backed": 1.0,
+            "lined": 0.95,
+            "depth": 0.21,
+        }
+        self.assertTrue(tool._is_enclosed_candidate(stats, 0.792, 0.803))
+        stats["lined"] = 0.30
+        self.assertFalse(tool._is_enclosed_candidate(stats, 0.792, 0.803))
+
     def test_filled_triangle_occludes_ray_through_its_interior(self) -> None:
         points = np.array(((0.0, 0.0, 2.0), (2.0, 0.0, 2.0)))
         cover = np.array((
@@ -456,6 +468,25 @@ class ControlConeTests(unittest.TestCase):
 
 
 class SymmetryAndPairingTests(unittest.TestCase):
+    def test_large_centred_near_symmetry_still_mirrors_exact_orphans(self) -> None:
+        meshes = base_cabin()
+        meshes["near_symmetric_large"] = sym_cloud(
+            (0.0, -0.10, 0.80), (1.20, 1.20, 0.80), n=300, seed=70
+        ) + np.array((0.002, 0.0, 0.0))
+        context = make_context(meshes)
+
+        recs = recommend(context)
+        orphans, coarse = tool._mesh_symmetry(
+            context,
+            "near_symmetric_large",
+            meshes["near_symmetric_large"],
+            0.0,
+        )
+
+        self.assertGreater(orphans, 0)
+        self.assertEqual(coarse, 0.0)
+        self.assertEqual(recs["near_symmetric_large"]["mode"], core.MODE_MIRROR)
+
     def test_centred_asymmetric_mesh_is_aesthetic_not_pairable(self) -> None:
         meshes = base_cabin()
         centred = box_cloud(
@@ -632,7 +663,7 @@ class SymmetryAndPairingTests(unittest.TestCase):
         self.assertIsNotNone(pair)
         self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
 
-    def test_wing_mirrors_pair_through_the_door_glass(self) -> None:
+    def test_wing_mirrors_and_door_glass_pair_by_geometry(self) -> None:
         meshes = base_cabin()
         glass_fl = box_cloud((0.76, -0.05, 1.10), (0.03, 0.75, 0.32), n=120, seed=22)
         wing_l = box_cloud((0.90, -0.42, 1.00), (0.14, 0.14, 0.12), n=110, seed=23)
@@ -649,7 +680,13 @@ class SymmetryAndPairingTests(unittest.TestCase):
             material_flags={"veh_glass": {"glass": True, "emissive": False}},
         )
         recs = recommend(context)
-        self.assertNotIn("veh_doorglass_FL", recs)
+        glass_pair = recs.get("veh_doorglass_FL") or recs.get("veh_doorglass_FR")
+        self.assertIsNotNone(glass_pair)
+        self.assertEqual(glass_pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(
+            {glass_pair["object_id"], glass_pair["source_id"]},
+            {"veh_doorglass_FL", "veh_doorglass_FR"},
+        )
         pair = recs.get("veh_wing_L") or recs.get("veh_wing_R")
         self.assertIsNotNone(pair)
         self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
@@ -659,6 +696,20 @@ class SymmetryAndPairingTests(unittest.TestCase):
 
 
 class MaterialTests(unittest.TestCase):
+    def test_translucent_material_needs_active_alpha_evidence_for_glass(self) -> None:
+        opaque_cage = {
+            "translucent": True,
+            "translucentBlendOp": "None",
+            "Stages": [{"baseColorMap": "cage_d.color.png"}],
+        }
+        real_glass = {
+            "translucent": True,
+            "translucentBlendOp": "PreMulAlpha",
+            "Stages": [{"opacityMap": "glass_o.data.png"}],
+        }
+        self.assertFalse(core.material_uses_glass_blending(opaque_cage))
+        self.assertTrue(core.material_uses_glass_blending(real_glass))
+
     def test_geometric_twins_with_different_materials_are_protected_skips(self) -> None:
         meshes = base_cabin()
         left = box_cloud((0.90, -0.42, 1.00), (0.14, 0.14, 0.12), n=110, seed=55)
@@ -694,7 +745,9 @@ class MaterialTests(unittest.TestCase):
     def test_cluster_screen_in_cone_translates_and_windscreen_skips(self) -> None:
         meshes = base_cabin()
         meshes["veh_gauges_screen"] = box_cloud((0.40, -0.53, 0.95), (0.20, 0.02, 0.10), n=30, seed=25)
-        meshes["veh_windscreen"] = sym_cloud((0.0, -0.78, 1.28), (1.45, 0.06, 0.40), n=140, seed=26)
+        meshes["veh_windscreen"] = sym_cloud(
+            (0.0, -0.78, 1.15), (1.45, 0.06, 0.40), n=140, seed=26
+        )
         context = make_context(
             meshes,
             materials={
@@ -729,11 +782,58 @@ class SightlineInheritanceTests(unittest.TestCase):
         memo["mirror_host"] = ("mirror", "fixture", "high", {})
 
         tool._inherit_mounted_parts(
-            context, frame, present, arrays, memo, set(), {}, set()
+            context,
+            frame,
+            present,
+            arrays,
+            memo,
+            set(),
+            {},
+            {"mounted_satellite"},
         )
 
         self.assertEqual(memo["mounted_satellite"][0], "mirror")
         self.assertIn("mounted on mirror_host", memo["mounted_satellite"][1])
+
+    def test_unscoped_contact_outside_cabin_volume_cannot_inherit(self) -> None:
+        meshes = base_cabin()
+        host = np.array((
+            (0.30, -1.10, 0.70), (0.50, -1.10, 0.70),
+            (0.30, -1.00, 0.70), (0.50, -1.00, 0.70),
+        ))
+        meshes["mirror_host"] = host
+        meshes["outside_scope"] = host + np.array((0.0, 0.0, 0.01))
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        memo = {object_id: ("none", "", "med", {}) for object_id in present}
+        memo["mirror_host"] = ("mirror", "fixture", "high", {})
+
+        tool._inherit_mounted_parts(
+            context, frame, present, arrays, memo, set(), {}, set()
+        )
+
+        self.assertEqual(memo["outside_scope"][0], "none")
+
+    def test_unscoped_contact_inside_cabin_volume_can_inherit(self) -> None:
+        meshes = base_cabin()
+        host = np.array((
+            (0.30, -0.60, 0.70), (0.50, -0.60, 0.70),
+            (0.30, -0.40, 0.70), (0.50, -0.40, 0.70),
+        ))
+        meshes["mirror_host"] = host
+        meshes["hidden_button"] = host + np.array((0.0, 0.0, 0.01))
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        memo = {object_id: ("none", "", "med", {}) for object_id in present}
+        memo["mirror_host"] = ("mirror", "fixture", "high", {})
+
+        tool._inherit_mounted_parts(
+            context, frame, present, arrays, memo, set(), {}, set()
+        )
+
+        self.assertEqual(memo["hidden_button"][0], "mirror")
 
     def test_floating_scoped_mesh_in_front_of_translate_inherits_mirror(self) -> None:
         meshes = base_cabin()

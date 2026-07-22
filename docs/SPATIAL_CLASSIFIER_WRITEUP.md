@@ -153,8 +153,10 @@ than a missed asymmetric part.
 and performs deterministic voxel-hash membership checks. A vertex is an exact
 orphan when no reflected partner exists within 0.1 mm; **only
 `exact_orphans == 0` skips**. The separate fraction unmatched within 2 cm is
-used for low-confidence grading (`< 0.05`) and the barely-seen centred-blob
-guard (`< 0.15`), never for the skip decision. There are two established
+used only for low-confidence grading (`< 0.05`), never for the skip decision.
+The former barely-seen centred-blob guard was removed after it suppressed a
+2.62 m roll cage with 1,451 exact orphans merely because its coarse fraction
+was 4.07%. There are two established
 exceptions to a zero-orphan no-op: the **dashboard fascia** still mirrors, and
 a small planar emissive **directional display** mirrors with `textureFlip`.
 Any exact orphan otherwise makes the mesh transformable. A mesh whose
@@ -202,8 +204,10 @@ interact with it: visibility, nearness to the wheel, or a fully-lined shallow
 position (the race pedal box bolted behind the dash with `vf ≈ 0`). The
 wheel anchor itself is exempt from every test because its mesh may span the
 shaft. A small **glass** pane inside the cone is an instrument cover and
-translates with the cluster (the D-series `gauges_cover_M`), which is why
-"glass ⇒ skip" is decided after the cone check.
+translates with the cluster (the D-series `gauges_cover_M`) through the same
+control-cone rule as an opaque cover. Transparency is spatial evidence, not a
+verdict shortcut: symmetric panes naturally Skip, while asymmetric panes
+Mirror or pair like any other mesh.
 
 ### Passenger-footwell blind-spot pass
 
@@ -234,14 +238,17 @@ knob on its lever (0.000), dash seals on the fascia (0.004), the console on
 the dash (0.002). Individually each is near-centred and symmetric, so its
 own verdict is skip; as a component of an assembly it should move with its
 host. `_inherit_mounted_parts` therefore propagates: a small
-(diag <= 0.7 m), non-glass, non-dummy mesh with a skip/none verdict, inside
+(diag <= 0.7 m), non-dummy mesh with a skip/none verdict, inside
 the cabin radius (<= 1.6 m of the eye), whose cloud touches (<= 3 cm) a mesh
 classified aesthetic Mirror -- including an unpaired pairable, which emits as
 Mirror -- inherits Mirror at low confidence ("mounted on <host>"). Two
 passes resolve chains (button -> console -> dash). Translate and pair
 verdicts are never overridden, structural hosts never confer (their
 satellites pair on their own), and the radius bound keeps underbody
-bracketry from chaining off a leak.
+bracketry from chaining off a leak. Scoped candidates may use the full radius;
+an unscoped contact is additionally confined to the occupant-sized furniture
+volume (0.6 m behind to 1.0 m ahead of the eye, and within 0.70 m below or
+0.35 m above it), preventing front-strut and low-driveline chains.
 The implementation allows 0.1 mm of numerical dust on that boundary; this
 keeps `police_laptop_mount_b_alt` attached to its mirrored mount at a measured
 30.0219 mm rather than recovering it through the passenger cone.
@@ -267,11 +274,15 @@ records each node's `<instance_material>` symbols (older cached contexts
 lazily re-parse the vehicle's own DAEs once), and
 `material_flags_for_context` reads every `*.materials.json` in the vehicle
 and common zips — `emissiveMap` in any stage ⇒ emissive display;
-`translucent` *without* emissive ⇒ window glass. A mirrored, small, planar,
-emissive surface gets `textureFlip`. Across all three reference vehicles
-this flags exactly one mesh — `etk800_screen` — which is precisely the
-baseline's flip set. If materials cannot be loaded the flip is skipped, not
-guessed.
+`translucent` plus an active alpha blend or opacity map, without emissive ⇒
+window glass. The positive alpha evidence matters because BeamNG marks some
+opaque cage metal and hubcaps `translucent: true` while explicitly using blend
+mode `None`. Glass remains useful glasshouse/occlusion evidence but no longer
+short-circuits its own verdict: it follows ordinary scope, symmetry and pairing.
+A mirrored, small, planar, emissive surface gets `textureFlip`. Across all
+three reference vehicles this flags exactly one mesh — `etk800_screen` — which
+is precisely the baseline's flip set. If materials cannot be loaded the flip
+is skipped, not guessed.
 
 ## 6. Batch model and caching (§3 of the brief)
 
@@ -372,9 +383,9 @@ materials. Other Structural→Skip results remain visible.
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **99.38 %** (28 diffs) |
-| pickup | 73 | 12 335 | **98.55 %** (179 diffs) |
-| sunburst2 | 39 | 7 561 | **93.39 %** (500 diffs) |
+| etk800 | 29 | 4 516 | **97.19 %** (127 diffs) |
+| pickup | 73 | 12 335 | **98.20 %** (222 diffs) |
+| sunburst2 | 39 | 7 561 | **94.67 %** (403 diffs) |
 
 These figures include the signed-off exact-orphan policy: the literal zero
 threshold mirrors small DAE modelling offsets that the hand baselines skip.
@@ -384,11 +395,11 @@ driver-visible admission to the forward hemisphere removed rearward
 visibility-only candidates. The ETK baseline was also corrected so its rear
 door cards are Skip. Current true-mismatch transition counts are:
 
-- ETK: 28 Skip→Mirror; three expected functionally-sided skips are excluded;
-- pickup: 83 Skip→Mirror, 42 Skip→Structural, and 54 Mirror→Skip;
+- ETK: 127 Skip→Mirror; three expected functionally-sided skips are excluded;
+- pickup: 120 Skip→Mirror, 58 Skip→Structural, and 44 Mirror→Skip;
   two desired twin-absent fallbacks and 14 expected
   functionally-sided skips are excluded;
-- Sunburst: 392 Skip→Mirror, 64 Skip→Structural, 1 Mirror→Skip,
+- Sunburst: 296 Skip→Mirror, 64 Skip→Structural,
   and 43 Mirror→Translate; two desired twin-absent fallbacks and 18 expected
   functionally-sided skips are excluded.
 
@@ -421,7 +432,9 @@ Benches and exactly mirrored carpets still skip; millimetre-scale offsets in
 sunvisors, roof covers, rear seats and driveline/exhaust meshes create exact
 orphans and therefore Mirror. Conversely, an exactly symmetric bench can skip
 where the baseline mirrored defensively. The coarse 2 cm fraction lowers
-confidence but never changes the zero-orphan decision.
+confidence but never changes the zero-orphan decision. Transparent geometry
+uses the same rule: intact exact panes skip, while asymmetric damaged glass or
+separate side panes may Mirror/pair; those extra generated copies are benign.
 
 **D. Structural swaps of mirror-identical exterior pairs — render
 identically.** Desert-truck cage items the open buggy genuinely exposes to
@@ -450,11 +463,12 @@ them while translating the shifter they sit on). Centimetre-scale calls
 where reasonable conversions disagree.
 
 **G. Residual leaks (wrong, and known).** Filled-surface occlusion fixes the
-covered ETK exhaust, driveshaft and transfer case: all three are absent from
-every mismatch row, as are `pickup_fueltank_short`,
-`pickup_shocktop_R_offroad` and the 32-trim `sunburst2_exhaust_pipe` leak. The
-remaining pickup and Sunburst driveline rows enter through other
-contact/pair/scope channels and need separate tracing.
+covered ETK exhaust, driveshaft and transfer case. Bounding unscoped contact
+inheritance to the occupant-sized cabin volume also removes the pickup transfer
+case/front-shaft/race-exhaust chains and Sunburst's driveline, transmission and
+intercooler chains without losing the laptop mounts or shifter satellites.
+`pickup_fueltank_short`, `pickup_shocktop_R_offroad` and the 32-trim
+`sunburst2_exhaust_pipe` leak likewise remain absent.
 
 ## 9. Honesty: where this is fragile
 
