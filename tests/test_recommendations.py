@@ -456,6 +456,69 @@ class ControlConeTests(unittest.TestCase):
 
 
 class SymmetryAndPairingTests(unittest.TestCase):
+    def test_centred_asymmetric_mesh_is_aesthetic_not_pairable(self) -> None:
+        meshes = base_cabin()
+        centred = box_cloud(
+            (0.0, -0.48, 0.72), (0.40, 0.10, 0.18), n=120, seed=61
+        )
+        # Uneven tessellation pulls the point centroid well beyond 5 cm even
+        # though the geometric bbox remains centred on the vehicle.
+        dense_side = centred[centred[:, 0] > 0.05]
+        centred = np.concatenate([centred, dense_side, dense_side, dense_side])
+        meshes["centred_asymmetric"] = centred
+        context = make_context(meshes)
+
+        recs = recommend(context)
+
+        bbox_center_x = (centred[:, 0].min() + centred[:, 0].max()) / 2.0
+        self.assertGreater(abs(float(centred[:, 0].mean())), 0.05)
+        self.assertLess(abs(float(bbox_center_x)), 0.05)
+        self.assertEqual(recs["centred_asymmetric"]["mode"], core.MODE_MIRROR)
+        self.assertEqual(
+            context._spatial_recommendation_state["memo"]["centred_asymmetric"][0],
+            "mirror",
+        )
+
+    def test_pairing_rejects_a_centred_latent_twin(self) -> None:
+        meshes = {
+            "offcentre": box_cloud(
+                (0.06, -0.48, 0.72), (0.08, 0.10, 0.18), n=80, seed=62
+            ),
+            "centred_latent": box_cloud(
+                (0.0, -0.48, 0.72), (0.08, 0.10, 0.18), n=80, seed=63
+            ),
+        }
+        context = make_context(meshes)
+        frame = core.DriverFrame(
+            eye=EYE,
+            center_x=0.0,
+            side=1,
+            forward=(0.0, -1.0, 0.0),
+            wheel_id=None,
+            wheel_center=None,
+            source="fixture",
+        )
+        entries = {key: np.asarray(value) for key, value in meshes.items()}
+        memo = {
+            "offcentre": ("pairable", "fixture", "high", {}),
+            "centred_latent": ("none", "", "med", {}),
+        }
+        votes: dict[str, dict[str, int]] = {}
+
+        with patch.object(core, "mirror_pair_residual", return_value=0.0):
+            tool._resolve_trim_pairs(
+                context,
+                frame,
+                list(meshes),
+                entries,
+                memo,
+                set(),
+                votes,
+            )
+
+        self.assertNotIn("offcentre", votes)
+        self.assertEqual(memo["centred_latent"][0], "none")
+
     def test_front_bench_skips_but_buckets_pair(self) -> None:
         bench_meshes = base_cabin()
         del bench_meshes["veh_seat_FL"]

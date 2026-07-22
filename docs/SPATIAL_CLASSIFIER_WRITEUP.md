@@ -157,12 +157,17 @@ used for low-confidence grading (`< 0.05`) and the barely-seen centred-blob
 guard (`< 0.15`), never for the skip decision. There are two established
 exceptions to a zero-orphan no-op: the **dashboard fascia** still mirrors, and
 a small planar emissive **directional display** mirrors with `textureFlip`.
-Any exact orphan otherwise makes the mesh pairable. This is intentionally
-trigger-happy: small modelling offsets can produce an extra Mirror, which is
-preferred to missing real one-sided detail.
+Any exact orphan otherwise makes the mesh transformable. A mesh whose
+bounding-box centre is within 5 cm of the vehicle centreline goes directly to
+aesthetic Mirror; only geometry at least 5 cm off-centre becomes pairable.
+The bbox centre is deliberate: unequal vertex density can pull a dashboard's
+point centroid sideways even though its geometric extent is centred. This is
+intentionally trigger-happy: small modelling offsets can produce an extra
+Mirror, which is preferred to missing real one-sided detail.
 
 Pairing is **relational and per trim**: each pairable seeks a geometric twin
-among *the meshes present in that trim* — mirrored centroid (±14 cm),
+among *the meshes present in that trim* — mirrored bbox lateral centre
+(±14 cm),
 overlapping y/z, comparable size, and `mirror_pair_residual ≤ 0.10`. Twins
 may come from the latent pool (the passenger-side counterpart the eye barely
 sees) but never from the vetoed-exterior set, and each twin is consumed once
@@ -170,7 +175,9 @@ per trim, so mutually exclusive variants (the recast lhd/rhd case) can never
 pair across trims. Twin present ⇒ one `kind:"pair"`
 `MODE_MIRROR_STRUCTURAL` entry naming the driver-side member; twin absent in
 every trim ⇒ aesthetic `MODE_MIRROR` with the reason saying so. Near-centred
-pairables (|x| < 8 cm) never pair — a centred fitment has nothing opposite.
+asymmetric meshes (bbox-centre |x| < 5 cm) never enter pairing — a centred
+fitment has nothing opposite. Twin resolution repeats the same gate
+defensively before comparing candidates.
 
 A prospective pair whose non-empty material-symbol sets are **disjoint** is
 protected as `functional_skip` with the reason “functionally sided: materials
@@ -366,8 +373,8 @@ materials. Other Structural→Skip results remain visible.
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
 | etk800 | 29 | 4 516 | **99.38 %** (28 diffs) |
-| pickup | 73 | 12 335 | **97.94 %** (254 diffs) |
-| sunburst2 | 39 | 7 561 | **92.87 %** (539 diffs) |
+| pickup | 73 | 12 335 | **98.55 %** (179 diffs) |
+| sunburst2 | 39 | 7 561 | **93.39 %** (500 diffs) |
 
 These figures include the signed-off exact-orphan policy: the literal zero
 threshold mirrors small DAE modelling offsets that the hand baselines skip.
@@ -378,10 +385,10 @@ visibility-only candidates. The ETK baseline was also corrected so its rear
 door cards are Skip. Current true-mismatch transition counts are:
 
 - ETK: 28 Skip→Mirror; three expected functionally-sided skips are excluded;
-- pickup: 63 Skip→Mirror, 82 Skip→Structural, 104 Mirror→Skip,
-  and 5 Mirror→Translate; two desired twin-absent fallbacks and 14 expected
+- pickup: 83 Skip→Mirror, 42 Skip→Structural, and 54 Mirror→Skip;
+  two desired twin-absent fallbacks and 14 expected
   functionally-sided skips are excluded;
-- Sunburst: 392 Skip→Mirror, 64 Skip→Structural, 40 Mirror→Skip,
+- Sunburst: 392 Skip→Mirror, 64 Skip→Structural, 1 Mirror→Skip,
   and 43 Mirror→Translate; two desired twin-absent fallbacks and 18 expected
   functionally-sided skips are excluded.
 

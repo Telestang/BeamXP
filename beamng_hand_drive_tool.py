@@ -113,6 +113,7 @@ STRUCTURAL_PROMPT_DELAY_MS = 300
 # etk800 / pickup / sunburst2 baselines.
 
 SPATIAL_PAIR_RESIDUAL = 0.10         # twin acceptance (normalised Chamfer)
+SPATIAL_PAIR_MIN_OFFSET = 0.05        # bbox centre must be 5 cm off-centre
 SPATIAL_REACH_LIMIT = 1.35           # ergonomic: controls start within reach
 SPATIAL_CONTACT_LIMIT = 0.0301       # 3 cm contact plus 0.1 mm float dust
 
@@ -724,7 +725,15 @@ def _classify_meshes_for_trim(
                 and not cand_fitment):
             confidence = "low"
             reason = "wall at the cabin shell (verify: possible exterior sheet)"
-        verdicts[object_id] = ("pairable", reason, confidence, {"flip": display})
+        lateral_center = float(
+            (np.min(points[:, 0]) + np.max(points[:, 0])) / 2.0
+        )
+        mode = (
+            "pairable"
+            if abs(lateral_center - cx0) >= SPATIAL_PAIR_MIN_OFFSET
+            else "mirror"
+        )
+        verdicts[object_id] = (mode, reason, confidence, {"flip": display})
     return verdicts, vetoed
 
 
@@ -816,22 +825,34 @@ def _resolve_trim_pairs(
     ]
     used: set[str] = set()
     cx0 = frame.center_x
+    lateral_centers = {
+        object_id: float(
+            (np.min(entries_np[object_id][:, 0]) + np.max(entries_np[object_id][:, 0]))
+            / 2.0
+        )
+        for object_id in present
+        if object_id in entries_np and len(entries_np[object_id])
+    }
     for object_id in sorted(
-        pairables, key=lambda o: (-frame.side * float(entries_np[o][:, 0].mean()), o)
+        pairables, key=lambda o: (-frame.side * lateral_centers[o], o)
     ):
         if object_id in used:
             continue
         points_a = entries_np[object_id]
         centroid_a = points_a.mean(axis=0)
-        if abs(float(centroid_a[0]) - cx0) < 0.08:
-            continue  # centred: a one-sided fitment, nothing to pair with
+        center_a_x = lateral_centers[object_id]
+        if abs(center_a_x - cx0) < SPATIAL_PAIR_MIN_OFFSET:
+            continue  # centred asymmetric mesh: aesthetic Mirror, never a pair
         best: tuple[float, str] | None = None
         for twin_id in pairables + latent:
             if twin_id == object_id or twin_id in used:
                 continue
             points_b = entries_np[twin_id]
             centroid_b = points_b.mean(axis=0)
-            if abs((float(centroid_a[0]) - cx0) + (float(centroid_b[0]) - cx0)) > 0.14:
+            center_b_x = lateral_centers[twin_id]
+            if abs(center_b_x - cx0) < SPATIAL_PAIR_MIN_OFFSET:
+                continue
+            if abs((center_a_x - cx0) + (center_b_x - cx0)) > 0.14:
                 continue
             if (abs(float(centroid_a[1]) - float(centroid_b[1])) > 0.35
                     or abs(float(centroid_a[2]) - float(centroid_b[2])) > 0.35):
