@@ -203,22 +203,23 @@ After the ordinary pass, the classifier averages the centroids of Translate
 meshes at least 10 cm below the steering wheel, reflects that point across the
 centreline, and aims a **30° field-of-view cone** from the eye at the opposite
 footwell. Only still-unclassified meshes enter this second pass. A forced mesh
-bypasses scope admission and the ahead-of-firewall y veto, but every other
-shell/glass/floor veto and the ordinary symmetry, control-cone and pairing
-logic still applies: forcing candidacy never forces a mode.
+is queued for the same filled-surface visibility refinement used on the driver
+side even when the sparse point shell saw nothing. Cone membership does **not**
+grant admission: after refinement the mesh must satisfy the ordinary visible,
+enclosed, fitment or control evidence. The cone locates a blind spot; it does
+not provide x-ray vision.
 
 The pass is bounded to below-wheel geometry whose 80th-percentile point range
 is within the 1.6 m cabin radius. Hard exterior, roof, rear-cab and under-floor
-vetoes persist between trims and cannot be reopened by the cone. This admits
-the passenger footplate while leaving SPOTLIGHT dummies out. Remaining
-driveshaft/transfer-case mismatches show that the blind cone's cabin boundary
-still needs refinement; they remain visible in the report rather than being
-hidden by a special underfloor rule.
+vetoes persist between trims and cannot be reopened by the cone. The real
+`grp_footplate` is recovered because its sparse shell says 0% visible while
+filled triangles show 44%; ETK's covered driveshaft and transfer case are
+rejected at 0% and 2.25% respectively.
 
 ## 4b. Assembly propagation (mounted parts)
 
 Failure analysis against the baselines exposed one dominant pattern: almost
-every genuine miss was a part **physically touching (< 3 cm) an interior
+every genuine miss was a part **physically touching (nominally 3 cm) an interior
 part the classifier already handled** -- the hazard button on the dash face
 (cloud gap 0.000 m), the handbrake lever on its body (0.001), the shifter
 knob on its lever (0.000), dash seals on the fascia (0.004), the console on
@@ -233,6 +234,9 @@ passes resolve chains (button -> console -> dash). Translate and pair
 verdicts are never overridden, structural hosts never confer (their
 satellites pair on their own), and the radius bound keeps underbody
 bracketry from chaining off a leak.
+The implementation allows 0.1 mm of numerical dust on that boundary; this
+keeps `police_laptop_mount_b_alt` attached to its mirrored mount at a measured
+30.0219 mm rather than recovering it through the passenger cone.
 
 A second propagation rule handles genuinely floating scoped meshes. After
 the 3 cm contact passes, `directional_verdict_backing` reuses the 6° angular
@@ -300,9 +304,9 @@ calling the global recommender independently for each trim.
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **98.80 %** (54 diffs) |
-| pickup | 73 | 12 335 | **97.76 %** (276 diffs) |
-| sunburst2 | 39 | 7 561 | **92.21 %** (589 diffs) |
+| etk800 | 29 | 4 516 | **99.31 %** (31 diffs) |
+| pickup | 73 | 12 335 | **97.83 %** (268 diffs) |
+| sunburst2 | 39 | 7 561 | **92.63 %** (557 diffs) |
 
 These figures include the signed-off exact-orphan policy: the literal zero
 threshold mirrors small DAE modelling offsets that the hand baselines skip.
@@ -312,11 +316,11 @@ driver-visible admission to the forward hemisphere removed rearward
 visibility-only candidates. The ETK baseline was also corrected so its rear
 door cards are Skip. Current true-mismatch transition counts are:
 
-- ETK: 51 Skip→Mirror and 3 Structural→Skip;
-- pickup: 55 Skip→Mirror, 98 Skip→Structural, 104 Mirror→Skip,
+- ETK: 28 Skip→Mirror and 3 Structural→Skip;
+- pickup: 63 Skip→Mirror, 82 Skip→Structural, 104 Mirror→Skip,
   14 Structural→Skip and 5 Mirror→Translate; two desired
   twin-absent fallbacks are excluded;
-- Sunburst: 424 Skip→Mirror, 64 Skip→Structural, 40 Mirror→Skip,
+- Sunburst: 392 Skip→Mirror, 64 Skip→Structural, 40 Mirror→Skip,
   18 Structural→Skip and 43 Mirror→Translate; two desired twin-absent
   fallbacks are excluded.
 
@@ -361,8 +365,8 @@ old two-row `_b` mismatch was solely a subset-call artifact.
 
 **E. Former sightline blind spots now covered.** Driver-seat transparency,
 under-seat candidacy and real multi-instance rebuilding recover
-`racingseat_base` and
-`racing_seat_base`; the reflected 30° passenger-footwell cone admits
+`racingseat_base` and `racing_seat_base`; the reflected 30° passenger-footwell
+cone requests the exact rescan that admits
 `grp_footplate`; angular verdict backing handles all three
 `police_laptop_mount_*` meshes. These targets match the baseline in every trim
 that uses them. Remaining hidden-kit differences are parts outside the scoped
@@ -377,13 +381,11 @@ them while translating the shifter they sit on). Centimetre-scale calls
 where reasonable conversions disagree.
 
 **G. Residual leaks (wrong, and known).** Filled-surface occlusion fixes the
-covered ETK exhaust: `etk800_exhaust_R` is absent from every mismatch row, as
-are `pickup_fueltank_short` and `pickup_shocktop_R_offroad`. The remaining
-driveline rows (`etk800_driveshaft_F`, `etk_transfercase`,
-`pickup_frontshaft`, `pickup_transfer_case`, and Sunburst driveline/exhaust
-parts) enter through blind footwell/contact/pair channels rather than ordinary
-exact visibility. Those channels are the next work, not a reason to weaken
-the surface test.
+covered ETK exhaust, driveshaft and transfer case: all three are absent from
+every mismatch row, as are `pickup_fueltank_short`,
+`pickup_shocktop_R_offroad` and the 32-trim `sunburst2_exhaust_pipe` leak. The
+remaining pickup and Sunburst driveline rows enter through other
+contact/pair/scope channels and need separate tracing.
 
 ## 8. Honesty: where this is fragile
 
@@ -391,7 +393,8 @@ the surface test.
   candidate exposure and disputed glass crossings use filled DAE triangles,
   but `backed`, `lined`, `depth` and the initial cabin envelope still come from
   6° preview bins. Their sparsity can affect non-visibility channels,
-  particularly the forced footwell cone and contact inheritance.
+  particularly contact inheritance and non-visibility pairing channels. The
+  passenger blind-spot cone itself now uses exact surface exposure.
 - **The `lined` signal saves the card-vs-skin call but is not free.** Rear
   wheel-arch clutter can fake a backing for a rear door skin (hence the
   beltline veto), and a fender flare bolted to a gutted race door sheet makes

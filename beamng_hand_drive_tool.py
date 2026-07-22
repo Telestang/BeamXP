@@ -114,6 +114,7 @@ STRUCTURAL_PROMPT_DELAY_MS = 300
 
 SPATIAL_PAIR_RESIDUAL = 0.10         # twin acceptance (normalised Chamfer)
 SPATIAL_REACH_LIMIT = 1.35           # ergonomic: controls start within reach
+SPATIAL_CONTACT_LIMIT = 0.0301       # 3 cm contact plus 0.1 mm float dust
 
 
 def _spatial_entries_for_trim(
@@ -612,8 +613,7 @@ def _classify_meshes_for_trim(
                     stats, stats_ng
                 )
         if not (cand_visible or cand_enclosed or cand_fitment or cand_cone
-                or object_id in under_seat_candidates
-                or object_id in forced):
+                or object_id in under_seat_candidates):
             continue
         if scoped is not None:
             scoped.add(object_id)
@@ -732,12 +732,12 @@ def _passenger_footwell_forced(
     modes: dict[str, tuple[str, str, str, dict]],
     hard_vetoed: set[str] | frozenset[str] = frozenset(),
 ) -> frozenset[str]:
-    """Unclassified meshes in a 30-degree cone at the opposite footwell.
+    """Unclassified meshes to surface-rescan in the opposite footwell.
 
     The aim point is the reflected average of translated furniture below the
-    wheel (pedals and their cluster).  This only grants scope admission; the
-    ordinary veto, control-cone, symmetry, and pairing rules still decide the
-    verdict.
+    wheel (pedals and their cluster).  Cone membership requests the exact
+    filled-surface scan even when the sparse point shell reports no exposure;
+    it does not itself grant admission or a verdict.
     """
     import math
     import numpy as np
@@ -941,7 +941,7 @@ def _inherit_mounted_parts(
             for host in hosts:
                 host_points = entries_np[host]
                 gap2 = ((points[:, None, :] - host_points[None, :, :]) ** 2).sum(axis=2)
-                if float(np.sqrt(gap2.min())) <= 0.03:
+                if float(np.sqrt(gap2.min())) <= SPATIAL_CONTACT_LIMIT:
                     memo[object_id] = (
                         "mirror", f"mounted on {host}", "low", {})
                     changed = True

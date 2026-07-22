@@ -292,7 +292,7 @@ class ControlConeTests(unittest.TestCase):
         self.assertEqual(recs["grp_padalbox_footplate"]["mode"], core.MODE_TRANSLATE)
         self.assertEqual(recs["race_footplate"]["mode"], core.MODE_MIRROR)
 
-    def test_passenger_footwell_cone_admits_an_occluded_plate(self) -> None:
+    def test_passenger_cone_rescans_but_cannot_see_through_a_surface(self) -> None:
         meshes = base_cabin()
         meshes["driver_pedal_cluster"] = box_cloud(
             (0.40, -0.82, 0.45), (0.22, 0.20, 0.20), n=110, seed=51
@@ -301,8 +301,9 @@ class ControlConeTests(unittest.TestCase):
             (-0.40, -0.75, 0.40), (0.24, 0.24, 0.08), n=90, seed=52
         )
         meshes["passenger_blind_plate"] = plate
-        # Exact eye rays at 60% range guarantee that ordinary visibility does
-        # not admit the plate; the reflected-pedal second pass must do it.
+        # Sparse blocker points at 60% range make the broad point shell report
+        # no exposure. The passenger cone must request an exact surface scan,
+        # then obey that scan instead of granting x-ray admission.
         eye = np.asarray(EYE, dtype=float)
         meshes["passenger_ray_blocker"] = eye + 0.60 * (plate - eye)
         context = make_context(meshes)
@@ -312,10 +313,53 @@ class ControlConeTests(unittest.TestCase):
             context, frame, present, arrays, present
         )
         self.assertNotIn("passenger_blind_plate", first)
+        self.assertEqual(first["driver_pedal_cluster"][0], "translate")
+        forced = tool._passenger_footwell_forced(
+            frame, present, arrays, first
+        )
+        self.assertIn("passenger_blind_plate", forced)
 
-        recs = recommend(context)
-        self.assertEqual(recs["driver_pedal_cluster"]["mode"], core.MODE_TRANSLATE)
-        self.assertEqual(recs["passenger_blind_plate"]["mode"], core.MODE_MIRROR)
+        harmless_surface = np.array((
+            ((-1.0, -1.0, -10.0), (1.0, -1.0, -10.0), (0.0, 1.0, -10.0)),
+        ))
+        visible, _ = tool._classify_meshes_for_trim(
+            context,
+            frame,
+            present,
+            arrays,
+            ["passenger_blind_plate"],
+            forced,
+            surface_np={"harmless": harmless_surface},
+        )
+        self.assertEqual(visible["passenger_blind_plate"][0], "pairable")
+
+        cover_triangles = []
+        for point in plate:
+            direction = point - eye
+            direction /= np.linalg.norm(direction)
+            reference = np.array((0.0, 0.0, 1.0))
+            if abs(float(direction @ reference)) > 0.9:
+                reference = np.array((0.0, 1.0, 0.0))
+            across = np.cross(direction, reference)
+            across /= np.linalg.norm(across)
+            upward = np.cross(direction, across)
+            centre = eye + 0.60 * (point - eye)
+            radius = 0.004
+            cover_triangles.append((
+                centre + radius * across,
+                centre - radius * across + radius * upward,
+                centre - radius * across - radius * upward,
+            ))
+        hidden, _ = tool._classify_meshes_for_trim(
+            context,
+            frame,
+            present,
+            arrays,
+            ["passenger_blind_plate"],
+            forced,
+            surface_np={"opaque_cover": np.asarray(cover_triangles)},
+        )
+        self.assertNotIn("passenger_blind_plate", hidden)
 
 
 class SymmetryAndPairingTests(unittest.TestCase):
@@ -513,6 +557,28 @@ class MaterialTests(unittest.TestCase):
 
 
 class SightlineInheritanceTests(unittest.TestCase):
+    def test_contact_inheritance_allows_submillimetre_threshold_dust(self) -> None:
+        meshes = base_cabin()
+        host = np.array((
+            (0.30, -0.60, 0.70), (0.50, -0.60, 0.70),
+            (0.30, -0.40, 0.70), (0.50, -0.40, 0.70),
+        ))
+        satellite = host + np.array((0.0, 0.0, 0.03002))
+        meshes["mirror_host"] = host
+        meshes["mounted_satellite"] = satellite
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        memo = {object_id: ("none", "", "med", {}) for object_id in present}
+        memo["mirror_host"] = ("mirror", "fixture", "high", {})
+
+        tool._inherit_mounted_parts(
+            context, frame, present, arrays, memo, set(), {}, set()
+        )
+
+        self.assertEqual(memo["mounted_satellite"][0], "mirror")
+        self.assertIn("mounted on mirror_host", memo["mounted_satellite"][1])
+
     def test_floating_scoped_mesh_in_front_of_translate_inherits_mirror(self) -> None:
         meshes = base_cabin()
         host = box_cloud((0.40, -0.62, 0.78), (0.30, 0.16, 0.24), n=100, seed=53)
