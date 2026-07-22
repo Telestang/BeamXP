@@ -300,13 +300,17 @@ against the baseline `conversion.json`. Structural pairs count both members;
 when only one member is fitted, the desired aesthetic-Mirror fallback is
 treated as semantic agreement rather than a Structural→Mirror mismatch. This
 models the UI/build path and avoids the old state-cache artifact caused by
-calling the global recommender independently for each trim.
+calling the global recommender independently for each trim. A baseline
+Structural→Skip result is likewise excluded when the classifier explicitly
+identifies the pair as functionally sided by differing materials: Skip is the
+deliberate safe interim until generated meshes can rebind their twin's
+materials. Other Structural→Skip results remain visible.
 
 | vehicle | trims | per-trim mode checks | agreement |
 |---|---|---|---|
-| etk800 | 29 | 4 516 | **99.31 %** (31 diffs) |
-| pickup | 73 | 12 335 | **97.83 %** (268 diffs) |
-| sunburst2 | 39 | 7 561 | **92.63 %** (557 diffs) |
+| etk800 | 29 | 4 516 | **99.38 %** (28 diffs) |
+| pickup | 73 | 12 335 | **97.94 %** (254 diffs) |
+| sunburst2 | 39 | 7 561 | **92.87 %** (539 diffs) |
 
 These figures include the signed-off exact-orphan policy: the literal zero
 threshold mirrors small DAE modelling offsets that the hand baselines skip.
@@ -316,13 +320,13 @@ driver-visible admission to the forward hemisphere removed rearward
 visibility-only candidates. The ETK baseline was also corrected so its rear
 door cards are Skip. Current true-mismatch transition counts are:
 
-- ETK: 28 Skip→Mirror and 3 Structural→Skip;
+- ETK: 28 Skip→Mirror; three expected functionally-sided skips are excluded;
 - pickup: 63 Skip→Mirror, 82 Skip→Structural, 104 Mirror→Skip,
-  14 Structural→Skip and 5 Mirror→Translate; two desired
-  twin-absent fallbacks are excluded;
+  and 5 Mirror→Translate; two desired twin-absent fallbacks and 14 expected
+  functionally-sided skips are excluded;
 - Sunburst: 392 Skip→Mirror, 64 Skip→Structural, 40 Mirror→Skip,
-  18 Structural→Skip and 43 Mirror→Translate; two desired twin-absent
-  fallbacks are excluded.
+  and 43 Mirror→Translate; two desired twin-absent fallbacks and 18 expected
+  functionally-sided skips are excluded.
 
 Every disagreement falls into one of these categories:
 
@@ -330,10 +334,11 @@ Every disagreement falls into one of these categories:
 express.** The validator now normalises these before counting differences: a
 globally structural pair remains structural when both members are fitted and
 becomes aesthetic Mirror when only one is fitted. The latter is explicitly
-reported as an excluded fallback count, never as a mismatch. The remaining
-`racing_seat_FL/FR` Structural→Skip rows are not missing-twin noise: their
+reported as an excluded fallback count, never as a mismatch. The
+`racing_seat_FL/FR` Structural→Skip outcomes are not missing-twin noise: their
 disjoint `racing_seat_fl`/`racing_seat_fr` material bindings trigger the
-signed-off functionally-sided safe Skip pending material rebinding.
+signed-off functionally-sided safe Skip pending material rebinding. The
+validator reports these in its excluded count instead of its mismatch table.
 
 **B. Forward-hemisphere corrections and baseline inconsistencies.** The
 general visibility channel is now the forward 180° only. The ETK baseline's

@@ -31,6 +31,7 @@ from beamng_hand_drive_tool import build_mode_recommendations  # noqa: E402
 
 
 DEFAULT_VEHICLES = ("etk800", "pickup", "sunburst2")
+FUNCTIONALLY_SIDED_REASON_PREFIX = "functionally sided: materials differ"
 CLASSIFIER_CACHE_ATTRS = (
     "_spatial_recommendation_state",
     "_mesh_symmetry_cache",
@@ -100,6 +101,41 @@ def is_expected_structural_fallback(
     )
 
 
+def is_expected_functionally_sided_skip(
+    baseline: str,
+    recommended: str,
+    reason: str,
+) -> bool:
+    """Whether a structural baseline hit the deliberate material-safe Skip."""
+    return (
+        baseline == core.MODE_MIRROR_STRUCTURAL
+        and recommended == core.MODE_SKIP
+        and reason.startswith(FUNCTIONALLY_SIDED_REASON_PREFIX)
+    )
+
+
+def functionally_sided_skip_reasons(
+    context: core.VehicleContext,
+) -> dict[str, str]:
+    """Read deliberate material-safe Skips from the completed classifier state.
+
+    Skip rows are intentionally absent from the public recommendation list, so
+    the validator uses the diagnostic memo retained on the context instead.
+    """
+    state = getattr(context, "_spatial_recommendation_state", None)
+    memo = state.get("memo", {}) if isinstance(state, dict) else {}
+    return {
+        object_id: str(verdict[1])
+        for object_id, verdict in memo.items()
+        if (
+            isinstance(verdict, tuple)
+            and len(verdict) >= 2
+            and verdict[0] == "functional_skip"
+            and str(verdict[1]).startswith(FUNCTIONALLY_SIDED_REASON_PREFIX)
+        )
+    }
+
+
 def validate_vehicle(
     projects_root: str,
     vehicle: str,
@@ -125,7 +161,7 @@ def validate_vehicle(
     mismatch_rows: Counter[tuple[str, str, str]] = Counter()
     mismatch_trims: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     transition_counts: Counter[tuple[str, str]] = Counter()
-    observations: list[tuple[str, str, str, str, bool]] = []
+    observations: list[tuple[str, str, str, str, str, bool]] = []
     checks = 0
 
     used_by_trim = {
@@ -138,19 +174,30 @@ def validate_vehicle(
     }
     all_used = set().union(*used_by_trim.values()) if used_by_trim else set()
     recommendations = build_mode_recommendations(context, sorted(all_used))
+    functional_skip_reasons = functionally_sided_skip_reasons(context)
 
     for trim, used in used_by_trim.items():
         actual_verdicts = recommendation_modes_for_trim(recommendations, used)
         for object_id in sorted(used):
             expected = baseline_parts.get(object_id, {}).get("mode", core.MODE_SKIP)
-            actual, _reason, structural_fallback = actual_verdicts[object_id]
+            actual, reason, structural_fallback = actual_verdicts[object_id]
+            if actual == core.MODE_SKIP and object_id in functional_skip_reasons:
+                reason = functional_skip_reasons[object_id]
             checks += 1
             observations.append(
-                (trim, object_id, expected, actual, structural_fallback)
+                (trim, object_id, expected, actual, reason, structural_fallback)
             )
 
     ignored_structural_fallbacks = 0
-    for trim, object_id, expected, actual, structural_fallback in observations:
+    ignored_functionally_sided_skips = 0
+    for (
+        trim,
+        object_id,
+        expected,
+        actual,
+        reason,
+        structural_fallback,
+    ) in observations:
         if expected == actual:
             continue
         if is_expected_structural_fallback(
@@ -159,6 +206,9 @@ def validate_vehicle(
             structural_fallback,
         ):
             ignored_structural_fallbacks += 1
+            continue
+        if is_expected_functionally_sided_skip(expected, actual, reason):
+            ignored_functionally_sided_skips += 1
             continue
         key = (object_id, expected, actual)
         mismatch_rows[key] += 1
@@ -187,6 +237,7 @@ def validate_vehicle(
         "agreement_percent": 100.0 * (checks - differences) / checks if checks else 100.0,
         "unique_mismatches": len(rows),
         "ignored_structural_fallbacks": ignored_structural_fallbacks,
+        "ignored_functionally_sided_skips": ignored_functionally_sided_skips,
         "transitions": [
             {
                 "baseline": baseline,
@@ -210,7 +261,9 @@ def markdown_report(results: list[dict[str, Any]], show_trims: bool) -> str:
                 f"per-trim checks; **{result['agreement_percent']:.2f}% agreement**; "
                 f"{result['unique_mismatches']} unique part/mode rows; "
                 f"{result['ignored_structural_fallbacks']:,} expected twin-absent "
-                "fallbacks excluded."
+                "fallbacks and "
+                f"{result['ignored_functionally_sided_skips']:,} expected "
+                "functionally-sided skips excluded."
             ),
             "",
         ])

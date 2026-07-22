@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import beamng_hand_drive_core as core
 from scripts.validate_spatial_classifier import (
+    functionally_sided_skip_reasons,
+    is_expected_functionally_sided_skip,
     is_expected_structural_fallback,
     recommendation_modes_for_trim,
 )
@@ -46,6 +49,65 @@ class StructuralFallbackTests(unittest.TestCase):
         self.assertEqual(lone["left"][0], core.MODE_MIRROR)
         self.assertIn("twin absent", lone["left"][1])
         self.assertTrue(lone["left"][2])
+
+
+class FunctionallySidedSkipTests(unittest.TestCase):
+    def test_material_safe_structural_skip_is_semantic_agreement(self) -> None:
+        self.assertTrue(is_expected_functionally_sided_skip(
+            core.MODE_MIRROR_STRUCTURAL,
+            core.MODE_SKIP,
+            (
+                "functionally sided: materials differ, needs build-side "
+                "material rebind"
+            ),
+        ))
+
+    def test_unrelated_structural_skips_are_not_ignored(self) -> None:
+        self.assertFalse(is_expected_functionally_sided_skip(
+            core.MODE_MIRROR_STRUCTURAL,
+            core.MODE_SKIP,
+            "no confident geometric twin",
+        ))
+        self.assertFalse(is_expected_functionally_sided_skip(
+            core.MODE_MIRROR,
+            core.MODE_SKIP,
+            "functionally sided: materials differ, needs build-side material rebind",
+        ))
+        self.assertFalse(is_expected_functionally_sided_skip(
+            core.MODE_MIRROR_STRUCTURAL,
+            core.MODE_MIRROR,
+            "functionally sided: materials differ, needs build-side material rebind",
+        ))
+
+    def test_reasons_come_from_classifier_memo_because_skip_rows_are_not_emitted(
+        self,
+    ) -> None:
+        context = SimpleNamespace(_spatial_recommendation_state={
+            "memo": {
+                "safe_skip": (
+                    "functional_skip",
+                    (
+                        "functionally sided: materials differ, needs build-side "
+                        "material rebind"
+                    ),
+                    "high",
+                    {},
+                ),
+                "ordinary_skip": ("none", "not visible", "med", {}),
+                "unrelated_internal_skip": (
+                    "functional_skip", "another reason", "high", {}
+                ),
+            },
+        })
+        self.assertEqual(
+            functionally_sided_skip_reasons(context),
+            {
+                "safe_skip": (
+                    "functionally sided: materials differ, needs build-side "
+                    "material rebind"
+                ),
+            },
+        )
 
 
 if __name__ == "__main__":
