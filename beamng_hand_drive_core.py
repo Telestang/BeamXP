@@ -6704,6 +6704,9 @@ def visibility_scan(
       lined  -- fraction with another mesh CLOSE behind, 3-30 cm (a lining
                 layer: door card over skin); own-mesh thickness never counts
       depth  -- mean distance points sit behind the shell (occlusion depth)
+      front_backed -- backed fraction contributed only by forward points
+      front_lined  -- lined fraction contributed only by forward points
+      front_depth  -- mean occlusion depth of forward points only
       min_r  -- nearest point to the eye
 
     The shell is per-bin nearest with a range-scaled tolerance; deliberately
@@ -6721,6 +6724,14 @@ def visibility_scan(
     eye_vectors = all_points - np.array(eye)
     bins, radii = spatial_spherical_bins(eye_vectors)
     opaque = np.array([ids[o] not in transparent_ids for o in owner])
+    if forward is None:
+        forward_mask = np.ones(len(all_points), dtype=bool)
+    else:
+        forward_v = np.asarray(forward, dtype=float)
+        norm = float(np.linalg.norm(forward_v))
+        if norm > 1e-9:
+            forward_v /= norm
+        forward_mask = (eye_vectors @ forward_v) >= 0.0
     gpu_shell = spatial_visibility_backend.gpu_visibility_shell(
         eye_vectors, bins, radii, owner, opaque, forward
     )
@@ -6730,6 +6741,7 @@ def visibility_scan(
         for index, object_id in enumerate(ids):
             mask = owner == index
             count = int(mask.sum())
+            front_mask = mask & forward_mask
             stats[object_id] = {
                 "n": count,
                 "vf": float(visible[mask].sum()) / count,
@@ -6737,6 +6749,12 @@ def visibility_scan(
                 "backed": float(backed[mask].sum()) / count,
                 "lined": float(lined_flag[mask].sum()) / count,
                 "depth": float(depth[mask].mean()),
+                "front_backed": float(backed[front_mask].sum()) / count,
+                "front_lined": float(lined_flag[front_mask].sum()) / count,
+                "front_depth": (
+                    float(depth[front_mask].mean())
+                    if front_mask.any() else float("inf")
+                ),
                 "min_r": float(radii[mask].min()),
             }
         return stats
@@ -6789,11 +6807,7 @@ def visibility_scan(
     if forward is None:
         front_visible = visible
     else:
-        forward_v = np.asarray(forward, dtype=float)
-        norm = float(np.linalg.norm(forward_v))
-        if norm > 1e-9:
-            forward_v /= norm
-        front_visible = visible & ((eye_vectors @ forward_v) >= 0.0)
+        front_visible = visible & forward_mask
     depth = np.maximum(0.0, radii - field[bins])
     behind1 = (far1[bins] > radii + 0.05) & (far1_owner[bins] != owner)
     behind2 = (far2[bins] > radii + 0.05) & (far2_owner[bins] != owner)
@@ -6803,6 +6817,7 @@ def visibility_scan(
     for index, object_id in enumerate(ids):
         mask = owner == index
         count = int(mask.sum())
+        front_mask = mask & forward_mask
         stats[object_id] = {
             "n": count,
             "vf": float(visible[mask].sum()) / count,
@@ -6810,6 +6825,12 @@ def visibility_scan(
             "backed": float(backed[mask].sum()) / count,
             "lined": float(lined_flag[mask].sum()) / count,
             "depth": float(depth[mask].mean()),
+            "front_backed": float(backed[front_mask].sum()) / count,
+            "front_lined": float(lined_flag[front_mask].sum()) / count,
+            "front_depth": (
+                float(depth[front_mask].mean())
+                if front_mask.any() else float("inf")
+            ),
             "min_r": float(radii[mask].min()),
         }
     return stats
@@ -7239,9 +7260,8 @@ def reflected_orphan_stats(
     return exact_orphans, float(coarse_orphans) / len(cloud)
 
 
-def mirror_pair_residual(points_a: np.ndarray, points_b: np.ndarray, center_x: float) -> float:
-    """Symmetric normalised Chamfer distance between reflect(A) and B: how
-    well B is A's geometric twin across the centreline."""
+def mirror_pair_distance(points_a: np.ndarray, points_b: np.ndarray, center_x: float) -> float:
+    """Symmetric Chamfer distance in metres between reflect(A) and B."""
     reflected = points_a.copy()
     reflected[:, 0] = 2 * center_x - reflected[:, 0]
 
@@ -7249,8 +7269,15 @@ def mirror_pair_residual(points_a: np.ndarray, points_b: np.ndarray, center_x: f
         squared = ((u[:, None, :] - v[None, :, :]) ** 2).sum(axis=2)
         return float(np.median(np.sqrt(squared.min(axis=1))))
 
+    return (chamfer(reflected, points_b) + chamfer(points_b, reflected)) / 2.0
+
+
+def mirror_pair_residual(points_a: np.ndarray, points_b: np.ndarray, center_x: float) -> float:
+    """Symmetric normalised Chamfer distance between reflect(A) and B: how
+    well B is A's geometric twin across the centreline."""
+    distance = mirror_pair_distance(points_a, points_b, center_x)
     diagonal = float(np.linalg.norm(np.ptp(np.concatenate([points_a, points_b]), axis=0)))
-    return (chamfer(reflected, points_b) + chamfer(points_b, reflected)) / 2.0 / max(diagonal, 0.05)
+    return distance / max(diagonal, 0.05)
 
 
 def principal_extent_sds(points: np.ndarray) -> np.ndarray:
@@ -7361,3 +7388,71 @@ def mesh_material_symbols(context: VehicleContext) -> dict[str, tuple[str, ...]]
             pass
     context._material_symbols = symbols
     return symbols
+
+
+def inert_material_alias_symbols(context: VehicleContext) -> frozenset[str]:
+    """Material symbols whose definitions contain no functional properties.
+
+    Some geometric twins bind separate L/R aliases even though both aliases
+    are empty placeholders. Those aliases do not carry texture, blending,
+    emissive, or other state and are safe for structural pairing. Missing or
+    meaningful definitions remain conservative and are not returned.
+    """
+    cached = getattr(context, "_inert_material_alias_symbols", None)
+    if cached is not None:
+        return cached
+
+    ignored_metadata = {
+        "class", "mapTo", "name", "persistentId", "version", "Stages"
+    }
+
+    def has_value(value: object) -> bool:
+        if value is None or value is False:
+            return False
+        if isinstance(value, (str, bytes, tuple, list, dict)):
+            return bool(value)
+        return True
+
+    def is_inert(definition: dict[str, object]) -> bool:
+        if any(
+            has_value(value)
+            for key, value in definition.items()
+            if key not in ignored_metadata
+        ):
+            return False
+        for stage in definition.get("Stages") or []:
+            if isinstance(stage, dict) and any(
+                has_value(value) for value in stage.values()
+            ):
+                return False
+        return True
+
+    states: dict[str, bool] = {}
+    zips = [context.source_zip] + common_zip_candidates(context.source_zip)
+    for zip_path in zips:
+        try:
+            zf = zipfile.ZipFile(zip_path)
+        except Exception:
+            continue
+        with zf:
+            for name in zf.namelist():
+                if not name.replace("\\", "/").endswith(".materials.json"):
+                    continue
+                try:
+                    data = parse_beamng_json(
+                        zf.read(name).decode("utf-8", errors="replace"),
+                        label=name,
+                    )
+                except Exception:
+                    continue
+                for key, value in data.items():
+                    if not isinstance(value, dict):
+                        continue
+                    symbol = str(
+                        value.get("mapTo") or value.get("name") or key
+                    ).lower()
+                    states[symbol] = states.get(symbol, True) and is_inert(value)
+
+    result = frozenset(symbol for symbol, inert in states.items() if inert)
+    context._inert_material_alias_symbols = result
+    return result

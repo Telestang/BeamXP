@@ -5,9 +5,11 @@ from types import SimpleNamespace
 
 import beamng_hand_drive_core as core
 from scripts.validate_spatial_classifier import (
+    classifier_detection_methods,
     functionally_sided_skip_reasons,
     is_expected_functionally_sided_skip,
     is_expected_structural_fallback,
+    markdown_report,
     recommendation_modes_for_trim,
 )
 
@@ -107,6 +109,58 @@ class FunctionallySidedSkipTests(unittest.TestCase):
                     "material rebind"
                 ),
             },
+        )
+
+
+class DetectionMethodReportTests(unittest.TestCase):
+    def test_detection_methods_come_from_classifier_memo(self) -> None:
+        context = SimpleNamespace(_spatial_recommendation_state={
+            "memo": {
+                "rear_part": (
+                    "mirror",
+                    "one-sided interior part",
+                    "med",
+                    {"detection": "cabin enclosure shell"},
+                ),
+                "unclassified": ("none", "", "med", {}),
+            },
+        })
+        self.assertEqual(
+            classifier_detection_methods(context),
+            {
+                "rear_part": "cabin enclosure shell",
+                "unclassified": "not admitted by spatial scope or vetoed",
+            },
+        )
+
+    def test_markdown_includes_detection_method_column(self) -> None:
+        report = markdown_report([{
+            "vehicle": "pickup",
+            "differences": 1,
+            "checks": 1,
+            "agreement_percent": 0.0,
+            "unique_mismatches": 1,
+            "ignored_structural_fallbacks": 0,
+            "ignored_functionally_sided_skips": 0,
+            "transitions": [{
+                "baseline": core.MODE_SKIP,
+                "recommended": core.MODE_MIRROR,
+                "count": 1,
+            }],
+            "rows": [{
+                "object_id": "rear_part",
+                "baseline": core.MODE_SKIP,
+                "recommended": core.MODE_MIRROR,
+                "trim_count": 1,
+                "trims": ["deserttruck_prerunner_A"],
+                "detection_method": "cabin enclosure shell",
+            }],
+        }], show_trims=False)
+        self.assertIn("| Part | Detection method | Affected trims | Trims |", report)
+        self.assertIn(
+            "| `rear_part` | cabin enclosure shell | 1 | "
+            "`deserttruck_prerunner_A` |",
+            report,
         )
 
 

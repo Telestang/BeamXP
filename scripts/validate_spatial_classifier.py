@@ -136,6 +136,24 @@ def functionally_sided_skip_reasons(
     }
 
 
+def classifier_detection_methods(
+    context: core.VehicleContext,
+) -> dict[str, str]:
+    """Return the diagnostic classifier channel retained for each mesh."""
+    state = getattr(context, "_spatial_recommendation_state", None)
+    memo = state.get("memo", {}) if isinstance(state, dict) else {}
+    methods: dict[str, str] = {}
+    for object_id, verdict in memo.items():
+        if not isinstance(verdict, tuple) or len(verdict) < 4:
+            continue
+        extra = verdict[3]
+        if isinstance(extra, dict) and extra.get("detection"):
+            methods[object_id] = str(extra["detection"])
+        elif verdict[0] == "none":
+            methods[object_id] = "not admitted by spatial scope or vetoed"
+    return methods
+
+
 def validate_vehicle(
     projects_root: str,
     vehicle: str,
@@ -160,8 +178,11 @@ def validate_vehicle(
     baseline_parts = conversion.get("parts") or {}
     mismatch_rows: Counter[tuple[str, str, str]] = Counter()
     mismatch_trims: dict[tuple[str, str, str], list[str]] = defaultdict(list)
+    mismatch_methods: dict[
+        tuple[str, str, str], Counter[str]
+    ] = defaultdict(Counter)
     transition_counts: Counter[tuple[str, str]] = Counter()
-    observations: list[tuple[str, str, str, str, str, bool]] = []
+    observations: list[tuple[str, str, str, str, str, bool, str]] = []
     checks = 0
 
     used_by_trim = {
@@ -175,6 +196,7 @@ def validate_vehicle(
     all_used = set().union(*used_by_trim.values()) if used_by_trim else set()
     recommendations = build_mode_recommendations(context, sorted(all_used))
     functional_skip_reasons = functionally_sided_skip_reasons(context)
+    detection_methods = classifier_detection_methods(context)
 
     for trim, used in used_by_trim.items():
         actual_verdicts = recommendation_modes_for_trim(recommendations, used)
@@ -183,9 +205,25 @@ def validate_vehicle(
             actual, reason, structural_fallback = actual_verdicts[object_id]
             if actual == core.MODE_SKIP and object_id in functional_skip_reasons:
                 reason = functional_skip_reasons[object_id]
+            detection_method = detection_methods.get(
+                object_id,
+                "not admitted by spatial scope or vetoed",
+            )
+            if actual == core.MODE_MIRROR_STRUCTURAL:
+                detection_method += ", structural pair resolution"
+            elif structural_fallback:
+                detection_method += ", structural pair with twin absent"
             checks += 1
             observations.append(
-                (trim, object_id, expected, actual, reason, structural_fallback)
+                (
+                    trim,
+                    object_id,
+                    expected,
+                    actual,
+                    reason,
+                    structural_fallback,
+                    detection_method,
+                )
             )
 
     ignored_structural_fallbacks = 0
@@ -197,6 +235,7 @@ def validate_vehicle(
         actual,
         reason,
         structural_fallback,
+        detection_method,
     ) in observations:
         if expected == actual:
             continue
@@ -213,6 +252,7 @@ def validate_vehicle(
         key = (object_id, expected, actual)
         mismatch_rows[key] += 1
         mismatch_trims[key].append(trim)
+        mismatch_methods[key][detection_method] += 1
         transition_counts[(expected, actual)] += 1
 
     rows = [
@@ -222,6 +262,14 @@ def validate_vehicle(
             "recommended": recommended,
             "trim_count": mismatch_rows[(object_id, baseline, recommended)],
             "trims": mismatch_trims[(object_id, baseline, recommended)],
+            "detection_method": "; ".join(
+                method
+                if count == mismatch_rows[(object_id, baseline, recommended)]
+                else f"{method} ({count} trims)"
+                for method, count in sorted(
+                    mismatch_methods[(object_id, baseline, recommended)].items()
+                )
+            ),
         }
         for object_id, baseline, recommended in sorted(
             mismatch_rows,
@@ -275,8 +323,8 @@ def markdown_report(results: list[dict[str, Any]], show_trims: bool) -> str:
             lines.extend([
                 f"### `{key[0]} → {key[1]}` — {transition['count']} checks",
                 "",
-                "| Part | Affected trims | Trims |",
-                "|---|---:|---|",
+                "| Part | Detection method | Affected trims | Trims |",
+                "|---|---|---:|---|",
             ])
             for row in grouped[key]:
                 trims = row["trims"]
@@ -286,7 +334,8 @@ def markdown_report(results: list[dict[str, Any]], show_trims: bool) -> str:
                     trim_text = ", ".join(f"`{trim}`" for trim in trims[:3])
                     trim_text += f", +{len(trims) - 3} more"
                 lines.append(
-                    f"| `{row['object_id']}` | {row['trim_count']} | {trim_text} |"
+                    f"| `{row['object_id']}` | {row['detection_method']} | "
+                    f"{row['trim_count']} | {trim_text} |"
                 )
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"

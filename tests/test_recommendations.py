@@ -170,10 +170,26 @@ class ScopeTests(unittest.TestCase):
             "backed": 1.0,
             "lined": 0.95,
             "depth": 0.21,
+            "front_backed": 1.0,
+            "front_lined": 0.95,
+            "front_depth": 0.21,
         }
         self.assertTrue(tool._is_enclosed_candidate(stats, 0.792, 0.803))
-        stats["lined"] = 0.30
+        stats["front_lined"] = 0.30
         self.assertFalse(tool._is_enclosed_candidate(stats, 0.792, 0.803))
+
+    def test_rear_shell_evidence_cannot_trigger_enclosure(self) -> None:
+        stats = {
+            "vf": 1.0,
+            "front_vf": 0.0,
+            "backed": 1.0,
+            "lined": 1.0,
+            "depth": 0.0,
+            "front_backed": 0.0,
+            "front_lined": 0.0,
+            "front_depth": float("inf"),
+        }
+        self.assertFalse(tool._is_enclosed_candidate(stats, 0.40, 0.80))
 
     def test_filled_triangle_occludes_ray_through_its_interior(self) -> None:
         points = np.array(((0.0, 0.0, 2.0), (2.0, 0.0, 2.0)))
@@ -269,8 +285,10 @@ class ScopeTests(unittest.TestCase):
         )
         self.assertGreater(stats["front"]["front_vf"], 0.80)
         self.assertEqual(stats["rear"]["front_vf"], 0.0)
-        # The enclosure shell remains spherical; only driver-visible
-        # admission is field-of-view limited.
+        self.assertEqual(stats["rear"]["front_backed"], 0.0)
+        self.assertTrue(np.isinf(stats["rear"]["front_depth"]))
+        # The raw shell remains spherical for other diagnostics, but
+        # enclosure admission now consumes only its forward evidence.
         self.assertGreater(stats["rear"]["vf"], 0.70)
 
     def test_gpu_visibility_shell_matches_cpu_reference_when_available(self) -> None:
@@ -378,6 +396,15 @@ class ControlConeTests(unittest.TestCase):
         recs = recommend(make_context(meshes))
         self.assertEqual(recs["veh_footbrake"]["mode"], core.MODE_TRANSLATE)
 
+    def test_far_dashboard_edge_is_outside_tapered_control_volume(self) -> None:
+        meshes = base_cabin()
+        meshes["veh_dash_edge_handle"] = box_cloud(
+            (0.687, -0.50, 0.847), (0.03, 0.05, 0.06), n=60, seed=63
+        )
+        recs = recommend(make_context(meshes))
+        self.assertEqual(recs["veh_dash_edge_handle"]["mode"], core.MODE_MIRROR)
+        self.assertNotIn("control cone", recs["veh_dash_edge_handle"]["reason"])
+
     def test_pedals_translate_and_mirror_named_part_in_cone_translates(self) -> None:
         meshes = base_cabin()
         meshes["veh_pedalbox"] = box_cloud((0.40, -0.82, 0.55), (0.22, 0.20, 0.26), n=110, seed=14)
@@ -410,7 +437,12 @@ class ControlConeTests(unittest.TestCase):
         # no exposure. The passenger cone must request an exact surface scan,
         # then obey that scan instead of granting x-ray admission.
         eye = np.asarray(EYE, dtype=float)
-        meshes["passenger_ray_blocker"] = eye + 0.60 * (plate - eye)
+        passenger_eye = eye.copy()
+        passenger_eye[0] *= -1.0
+        meshes["passenger_ray_blocker"] = np.concatenate((
+            eye + 0.60 * (plate - eye),
+            passenger_eye + 0.60 * (plate - passenger_eye),
+        ))
         context = make_context(meshes)
         frame = core.driver_frame_for_context(context)
         present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
@@ -439,22 +471,23 @@ class ControlConeTests(unittest.TestCase):
         self.assertEqual(visible["passenger_blind_plate"][0], "pairable")
 
         cover_triangles = []
-        for point in plate:
-            direction = point - eye
-            direction /= np.linalg.norm(direction)
-            reference = np.array((0.0, 0.0, 1.0))
-            if abs(float(direction @ reference)) > 0.9:
-                reference = np.array((0.0, 1.0, 0.0))
-            across = np.cross(direction, reference)
-            across /= np.linalg.norm(across)
-            upward = np.cross(direction, across)
-            centre = eye + 0.60 * (point - eye)
-            radius = 0.004
-            cover_triangles.append((
-                centre + radius * across,
-                centre - radius * across + radius * upward,
-                centre - radius * across - radius * upward,
-            ))
+        for view_eye in (eye, passenger_eye):
+            for point in plate:
+                direction = point - view_eye
+                direction /= np.linalg.norm(direction)
+                reference = np.array((0.0, 0.0, 1.0))
+                if abs(float(direction @ reference)) > 0.9:
+                    reference = np.array((0.0, 1.0, 0.0))
+                across = np.cross(direction, reference)
+                across /= np.linalg.norm(across)
+                upward = np.cross(direction, across)
+                centre = view_eye + 0.60 * (point - view_eye)
+                radius = 0.004
+                cover_triangles.append((
+                    centre + radius * across,
+                    centre - radius * across + radius * upward,
+                    centre - radius * across - radius * upward,
+                ))
         hidden, _ = tool._classify_meshes_for_trim(
             context,
             frame,
@@ -465,6 +498,54 @@ class ControlConeTests(unittest.TestCase):
             surface_np={"opaque_cover": np.asarray(cover_triangles)},
         )
         self.assertNotIn("passenger_blind_plate", hidden)
+
+    def test_passenger_forward_view_sees_around_driver_a_pillar(self) -> None:
+        meshes = base_cabin()
+        target = box_cloud(
+            (-0.48, -0.48, 1.02), (0.14, 0.12, 0.18), n=90, seed=61
+        )
+        meshes["passenger_visible_fixture"] = target
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+
+        # Cover every driver-eye ray to the target with a tiny filled triangle.
+        # These triangles are not on the corresponding passenger-eye rays, so
+        # the virtual passenger view sees the fixture without x-ray admission.
+        driver_eye = np.asarray(frame.eye, dtype=float)
+        cover_triangles = []
+        for point in target:
+            direction = point - driver_eye
+            direction /= np.linalg.norm(direction)
+            reference = np.array((0.0, 0.0, 1.0))
+            if abs(float(direction @ reference)) > 0.9:
+                reference = np.array((0.0, 1.0, 0.0))
+            across = np.cross(direction, reference)
+            across /= np.linalg.norm(across)
+            upward = np.cross(direction, across)
+            centre = driver_eye + 0.55 * (point - driver_eye)
+            radius = 0.004
+            cover_triangles.append((
+                centre + radius * across,
+                centre - radius * across + radius * upward,
+                centre - radius * across - radius * upward,
+            ))
+
+        verdicts, _ = tool._classify_meshes_for_trim(
+            context,
+            frame,
+            present,
+            arrays,
+            ["passenger_visible_fixture"],
+            surface_np={"driver_a_pillar": np.asarray(cover_triangles)},
+        )
+
+        self.assertEqual(verdicts["passenger_visible_fixture"][0], "pairable")
+        channels = verdicts["passenger_visible_fixture"][3]["detection"].split(
+            ", "
+        )
+        self.assertIn("passenger forward visibility", channels)
+        self.assertNotIn("forward visibility", channels)
 
 
 class SymmetryAndPairingTests(unittest.TestCase):
@@ -549,6 +630,52 @@ class SymmetryAndPairingTests(unittest.TestCase):
 
         self.assertNotIn("offcentre", votes)
         self.assertEqual(memo["centred_latent"][0], "none")
+
+    def test_strongest_pair_wins_before_a_nearby_cross_match(self) -> None:
+        blank_l = box_cloud(
+            (0.20, -0.35, 0.50), (0.03, 0.03, 0.03), n=80, seed=71
+        )
+        meshes = {
+            "panel_button_TCS": blank_l + np.array((0.0, 0.0, 0.001)),
+            "panel_button_blank_L": blank_l,
+            "panel_button_blank_R": mirror_x(blank_l),
+        }
+        context = make_context(meshes)
+        frame = core.DriverFrame(
+            eye=EYE,
+            center_x=0.0,
+            side=1,
+            forward=(0.0, -1.0, 0.0),
+            wheel_id=None,
+            wheel_center=None,
+            source="fixture",
+        )
+        entries = {key: np.asarray(value) for key, value in meshes.items()}
+        memo = {
+            object_id: ("pairable", "fixture", "high", {})
+            for object_id in meshes
+        }
+        votes: dict[str, dict[str, int]] = {}
+
+        tool._resolve_trim_pairs(
+            context,
+            frame,
+            list(meshes),
+            entries,
+            memo,
+            set(),
+            votes,
+        )
+
+        self.assertEqual(
+            votes["panel_button_blank_L"],
+            {"panel_button_blank_R": 1},
+        )
+        self.assertEqual(
+            votes["panel_button_blank_R"],
+            {"panel_button_blank_L": 1},
+        )
+        self.assertNotIn("panel_button_TCS", votes)
 
     def test_front_bench_skips_but_buckets_pair(self) -> None:
         bench_meshes = base_cabin()
@@ -730,6 +857,35 @@ class MaterialTests(unittest.TestCase):
             self.assertEqual(memo[object_id][0], "functional_skip")
             self.assertIn("needs build-side material rebind", memo[object_id][1])
 
+    def test_geometric_twins_with_inert_material_aliases_can_pair(self) -> None:
+        meshes = base_cabin()
+        left = box_cloud(
+            (0.90, -0.42, 1.00), (0.14, 0.14, 0.12), n=110, seed=62
+        )
+        meshes["inert_alias_L"] = left
+        meshes["inert_alias_R"] = mirror_x(left)
+        context = make_context(
+            meshes,
+            materials={
+                "inert_alias_L": ("empty_alias_l",),
+                "inert_alias_R": ("empty_alias_r",),
+            },
+        )
+        with patch.object(
+            core,
+            "inert_material_alias_symbols",
+            return_value=frozenset(("empty_alias_l", "empty_alias_r")),
+        ):
+            recs = recommend(context)
+
+        pair = recs.get("inert_alias_L") or recs.get("inert_alias_R")
+        self.assertIsNotNone(pair)
+        self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(
+            {pair["object_id"], pair["source_id"]},
+            {"inert_alias_L", "inert_alias_R"},
+        )
+
     def test_directional_display_mirrors_with_texture_flip(self) -> None:
         meshes = base_cabin()
         meshes["veh_screen"] = box_cloud((0.02, -0.47, 0.95), (0.20, 0.02, 0.08), n=30, seed=24)
@@ -772,7 +928,7 @@ class SightlineInheritanceTests(unittest.TestCase):
             (0.30, -0.60, 0.70), (0.50, -0.60, 0.70),
             (0.30, -0.40, 0.70), (0.50, -0.40, 0.70),
         ))
-        satellite = host + np.array((0.0, 0.0, 0.03002))
+        satellite = host + np.array((0.0, 0.0, 0.00502))
         meshes["mirror_host"] = host
         meshes["mounted_satellite"] = satellite
         context = make_context(meshes)
@@ -792,8 +948,35 @@ class SightlineInheritanceTests(unittest.TestCase):
             {"mounted_satellite"},
         )
 
-        self.assertEqual(memo["mounted_satellite"][0], "mirror")
+        self.assertEqual(memo["mounted_satellite"][0], "pairable")
         self.assertIn("mounted on mirror_host", memo["mounted_satellite"][1])
+
+    def test_contact_inheritance_rejects_old_three_centimetre_gap(self) -> None:
+        meshes = base_cabin()
+        host = np.array((
+            (0.30, -0.60, 0.70), (0.50, -0.60, 0.70),
+            (0.30, -0.40, 0.70), (0.50, -0.40, 0.70),
+        ))
+        meshes["mirror_host"] = host
+        meshes["separate_part"] = host + np.array((0.0, 0.0, 0.03))
+        context = make_context(meshes)
+        frame = core.driver_frame_for_context(context)
+        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        memo = {object_id: ("none", "", "med", {}) for object_id in present}
+        memo["mirror_host"] = ("mirror", "fixture", "high", {})
+
+        tool._inherit_mounted_parts(
+            context,
+            frame,
+            present,
+            arrays,
+            memo,
+            set(),
+            {},
+            set(),
+        )
+
+        self.assertEqual(memo["separate_part"][0], "none")
 
     def test_unscoped_contact_outside_cabin_volume_cannot_inherit(self) -> None:
         meshes = base_cabin()
@@ -822,7 +1005,7 @@ class SightlineInheritanceTests(unittest.TestCase):
             (0.30, -0.40, 0.70), (0.50, -0.40, 0.70),
         ))
         meshes["mirror_host"] = host
-        meshes["hidden_button"] = host + np.array((0.0, 0.0, 0.01))
+        meshes["hidden_button"] = host + np.array((0.0, 0.0, 0.004))
         context = make_context(meshes)
         frame = core.driver_frame_for_context(context)
         present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
@@ -833,7 +1016,7 @@ class SightlineInheritanceTests(unittest.TestCase):
             context, frame, present, arrays, memo, set(), {}, set()
         )
 
-        self.assertEqual(memo["hidden_button"][0], "mirror")
+        self.assertEqual(memo["hidden_button"][0], "pairable")
 
     def test_floating_scoped_mesh_in_front_of_translate_inherits_mirror(self) -> None:
         meshes = base_cabin()

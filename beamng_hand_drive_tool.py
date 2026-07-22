@@ -129,10 +129,24 @@ STRUCTURAL_PROMPT_DELAY_MS = 300
 # Thresholds are metres or fractions, tuned against the hand-verified
 # etk800 / pickup / sunburst2 baselines.
 
-SPATIAL_PAIR_RESIDUAL = 0.10         # twin acceptance (normalised Chamfer)
+SPATIAL_PAIR_DISTANCE = 0.020        # reflected median Chamfer, metres
 SPATIAL_PAIR_MIN_OFFSET = 0.05        # bbox centre must be 5 cm off-centre
 SPATIAL_REACH_LIMIT = 1.35           # ergonomic: controls start within reach
-SPATIAL_CONTACT_LIMIT = 0.0301       # 3 cm contact plus 0.1 mm float dust
+SPATIAL_CONTACT_LIMIT = 0.0201       # 2 cm contact plus 0.1 mm float dust
+SPATIAL_VISIBLE_FRACTION = 0.28       # ordinary driver-eye visibility
+SPATIAL_PASSENGER_VISIBLE_FRACTION = 0.08  # meaningful passenger-eye sliver
+
+
+def _driver_control_outboard_limit(below_eye: float) -> float:
+    """Outboard reach of the control volume at a given height.
+
+    Dashboard controls cluster close to the steering column, while foot
+    controls legitimately spread farther towards the driver's door.  Blend
+    between those two widths so the volume follows the sloping control area
+    instead of treating the whole dashboard/footwell as a rectangular slab.
+    """
+    footwell_fraction = min(max((below_eye - 0.45) / 0.25, 0.0), 1.0)
+    return 0.24 + 0.09 * footwell_fraction
 
 
 def _is_enclosed_candidate(
@@ -144,15 +158,15 @@ def _is_enclosed_candidate(
     ordinarily_inboard = out80 <= half_width - 0.02
     lined_at_boundary = (
         stats["front_vf"] >= 0.25
-        and stats["backed"] >= 0.75
-        and stats["lined"] >= 0.75
+        and stats["front_backed"] >= 0.75
+        and stats["front_lined"] >= 0.75
         and out80 <= half_width
-        and stats["depth"] <= 0.35
+        and stats["front_depth"] <= 0.35
     )
     return (
-        stats["vf"] >= 0.08
-        and stats["backed"] >= 0.45
-        and stats["depth"] <= 0.45
+        stats["front_vf"] >= 0.08
+        and stats["front_backed"] >= 0.45
+        and stats["front_depth"] <= 0.45
         and (ordinarily_inboard or lined_at_boundary)
     )
 
@@ -169,16 +183,26 @@ def _unscoped_contact_is_cabin_furniture(
     cloud = np.asarray(points, dtype=float)
     if len(cloud) < 4:
         return False
-    eye = np.asarray(frame.eye, dtype=float)
-    forward = np.asarray(frame.forward, dtype=float)
     centroid = cloud.mean(axis=0)
-    ahead = float((centroid[:2] - eye[:2]) @ forward[:2])
     z70 = float(np.percentile(cloud[:, 2], 70))
-    range80 = float(np.percentile(np.linalg.norm(cloud - eye, axis=1), 80))
-    return (
-        -0.60 <= ahead <= 1.00
-        and frame.eye[2] - 0.70 <= z70 <= frame.eye[2] + 0.35
-        and range80 <= 1.60
+    driver_eye = np.asarray(frame.eye, dtype=float)
+    passenger_eye = driver_eye.copy()
+    passenger_eye[0] = 2.0 * frame.center_x - driver_eye[0]
+    driver_forward = np.asarray(frame.forward, dtype=float)
+    passenger_forward = driver_forward.copy()
+    passenger_forward[0] *= -1.0
+
+    def inside_from(eye: np.ndarray, forward: np.ndarray) -> bool:
+        ahead = float((centroid[:2] - eye[:2]) @ forward[:2])
+        range80 = float(np.percentile(np.linalg.norm(cloud - eye, axis=1), 80))
+        return (
+            -0.60 <= ahead <= 1.00
+            and eye[2] - 0.70 <= z70 <= eye[2] + 0.35
+            and range80 <= 1.60
+        )
+
+    return inside_from(driver_eye, driver_forward) or inside_from(
+        passenger_eye, passenger_forward
     )
 
 
@@ -312,6 +336,10 @@ def _classify_meshes_for_trim(
     eye = np.array(frame.eye)
     f = np.array(frame.forward)
     cx0 = frame.center_x
+    passenger_eye = eye.copy()
+    passenger_eye[0] = 2.0 * cx0 - eye[0]
+    passenger_f = f.copy()
+    passenger_f[0] *= -1.0
     wheel = np.array(frame.wheel_center) if frame.wheel_center is not None else None
 
     material_symbols = core.mesh_material_symbols(context)
@@ -325,16 +353,18 @@ def _classify_meshes_for_trim(
         return all(values) if require_all else any(values)
 
     glass_ids = {o for o in present if mesh_flag(o, "glass", require_all=True)}
-    transparent = {
+    base_transparent = {
         o for o in present
         if context.objects.get(o) is not None
         and core.steering_ref_score(o, context.objects[o]) >= 15
     }
+    transparent = set(base_transparent)
+    passenger_transparent = set(base_transparent)
     driver_seat_ids: set[str] = set()
-    # The eye camera sits inside the driver's seat volume.  Treat whichever
-    # furniture actually surrounds that eye as transparent so its cushion and
-    # backrest cannot hide rails/bases directly below it.  Geometry, not a
-    # seat token, identifies the host; this also handles benches and mod seats.
+    # Each eye camera may sit inside its seat volume. Treat the furniture
+    # surrounding that eye as transparent only to that eye, so the seat cannot
+    # hide nearby cabin parts. Geometry, not a seat token, identifies the host;
+    # this also handles benches and mod seats.
     for object_id in present:
         seat_points = entries_np.get(object_id)
         if seat_points is None or len(seat_points) < 4:
@@ -350,6 +380,14 @@ def _classify_meshes_for_trim(
         if float(under_eye.mean()) >= 0.20:
             transparent.add(object_id)
             driver_seat_ids.add(object_id)
+        under_passenger_eye = (
+            (np.abs(seat_points[:, 0] - passenger_eye[0]) < 0.25)
+            & (np.abs(seat_points[:, 1] - passenger_eye[1]) < 0.35)
+            & (seat_points[:, 2] > passenger_eye[2] - 0.75)
+            & (seat_points[:, 2] < passenger_eye[2] - 0.10)
+        )
+        if float(under_passenger_eye.mean()) >= 0.20:
+            passenger_transparent.add(object_id)
 
     # Rails/bases sit below the seat cushion and need conversion with it even
     # when the carpet or floor hides most of their eye rays.  This channel is
@@ -388,7 +426,11 @@ def _classify_meshes_for_trim(
     # ray test into large, bounded batches.  The extra scene excludes glass
     # and is consulted only by the narrow exterior-fitment channel.
     surface_scene = compiled_surface(transparent)
+    passenger_surface_scene = compiled_surface(passenger_transparent)
     surface_scene_no_glass = compiled_surface(transparent | glass_ids)
+    passenger_surface_scene_no_glass = compiled_surface(
+        passenger_transparent | glass_ids
+    )
     glass_chunks = [
         np.asarray(surface_np[object_id], dtype=float).reshape((-1, 3, 3))
         for object_id in glass_ids
@@ -404,6 +446,18 @@ def _classify_meshes_for_trim(
         frame.eye,
         transparent,
         frame.forward,
+    )
+    passenger_scan = core.visibility_scan(
+        {o: entries_np[o] for o in present},
+        passenger_eye,
+        passenger_transparent,
+        passenger_f,
+    )
+    passenger_scan_no_glass = core.visibility_scan(
+        {o: entries_np[o] for o in present if o not in glass_ids},
+        passenger_eye,
+        passenger_transparent,
+        passenger_f,
     )
     beyond = core.glass_beyond_fractions(entries_np, frame.eye, glass_ids, present)
 
@@ -456,21 +510,32 @@ def _classify_meshes_for_trim(
     # broad-phase superset into one GPU scene upload/dispatch.  The core
     # helper retains the previous bounded CPU thread pool as its fallback.
     exact_by_id: dict[str, dict[str, float] | None] = {}
+    passenger_exact_by_id: dict[str, dict[str, float] | None] = {}
     exact_no_glass_by_id: dict[str, dict[str, float] | None] = {}
+    passenger_exact_no_glass_by_id: dict[str, dict[str, float] | None] = {}
     exact_glass_by_id: dict[str, dict[str, float] | None] = {}
-    if surface_scene is not None:
+    if surface_scene is not None or passenger_surface_scene is not None:
         exact_ids = []
+        passenger_exact_ids = []
         fitment_ids = []
+        passenger_fitment_ids = []
         for object_id in want:
             points = entries_np.get(object_id)
             if points is None or len(points) < 4:
                 continue
             stats = scan[object_id]
             stats_ng = scan_no_glass.get(object_id, stats)
+            passenger_stats = passenger_scan[object_id]
+            passenger_stats_ng = passenger_scan_no_glass.get(
+                object_id, passenger_stats
+            )
             centroid = points.mean(axis=0)
             extents = np.ptp(points, axis=0)
             diagonal = float(np.linalg.norm(extents))
             ahead = float((centroid[:2] - eye[:2]) @ f[:2])
+            passenger_ahead = float(
+                (centroid[:2] - passenger_eye[:2]) @ passenger_f[:2]
+            )
             lat_signed = float(frame.side * (centroid[0] - wheel_x))
             below = frame.eye[2] - float(centroid[2])
             out80 = float(np.percentile(np.abs(points[:, 0] - cx0), 80))
@@ -479,7 +544,7 @@ def _classify_meshes_for_trim(
             )
             in_cone = (
                 0.20 <= ahead <= wheel_ahead + 1.0
-                and -0.22 <= lat_signed <= 0.33
+                and -0.22 <= lat_signed <= _driver_control_outboard_limit(below)
                 and -0.10 <= below <= 1.35
                 and not wall_lateral
             )
@@ -489,6 +554,13 @@ def _classify_meshes_for_trim(
                 and diagonal <= 0.60
                 and 0.15 <= ahead <= 1.5
                 and abs(float(centroid[2]) - frame.eye[2]) <= 0.7
+                and abs(float(centroid[0]) - cx0) >= half_width - 0.06
+            )
+            passenger_fitment = (
+                passenger_stats_ng["vf"] >= 0.12
+                and diagonal <= 0.60
+                and 0.15 <= passenger_ahead <= 1.5
+                and abs(float(centroid[2]) - passenger_eye[2]) <= 0.7
                 and abs(float(centroid[0]) - cx0) >= half_width - 0.06
             )
             buried = stats["backed"] >= 0.75 and stats["depth"] <= 0.35
@@ -504,25 +576,59 @@ def _classify_meshes_for_trim(
                     or enclosed
                 )
             )
+            passenger_visible = (
+                passenger_stats["front_vf"]
+                >= SPATIAL_PASSENGER_VISIBLE_FRACTION
+            )
             might_enter = (
-                stats["front_vf"] >= 0.28
+                stats["front_vf"] >= SPATIAL_VISIBLE_FRACTION
+                or passenger_visible
                 or enclosed
                 or fitment
+                or passenger_fitment
                 or cone
                 or object_id in under_seat_candidates
                 or object_id in forced
             )
             if might_enter:
                 exact_ids.append(object_id)
+                if passenger_visible or passenger_fitment:
+                    passenger_exact_ids.append(object_id)
                 if fitment:
                     fitment_ids.append(object_id)
-        if exact_ids:
+                if passenger_fitment:
+                    passenger_fitment_ids.append(object_id)
+        if exact_ids and surface_scene is not None:
             exact_by_id = core.surface_visibility_stats_batch(
                 {object_id: entries_np[object_id] for object_id in exact_ids},
                 frame.eye,
                 surface_scene,
                 frame.forward,
             )
+        if passenger_exact_ids and passenger_surface_scene is not None:
+            passenger_exact_by_id = core.surface_visibility_stats_batch(
+                {
+                    object_id: entries_np[object_id]
+                    for object_id in passenger_exact_ids
+                },
+                passenger_eye,
+                passenger_surface_scene,
+                passenger_f,
+            )
+        if (
+            passenger_fitment_ids
+            and passenger_surface_scene_no_glass is not None
+        ):
+            passenger_exact_no_glass_by_id = core.surface_visibility_stats_batch(
+                {
+                    object_id: entries_np[object_id]
+                    for object_id in passenger_fitment_ids
+                },
+                passenger_eye,
+                passenger_surface_scene_no_glass,
+                passenger_f,
+            )
+        if exact_ids:
             if fitment_ids and surface_scene_no_glass is not None:
                 exact_no_glass_by_id = core.surface_visibility_stats_batch(
                     {
@@ -562,16 +668,26 @@ def _classify_meshes_for_trim(
         if (core.is_default_steering_ref(object_id, obj) or object_id == frame.wheel_id) and near_eye:
             # the wheel anchor's mesh may span the whole steering shaft, so it
             # is exempt from every other test
-            verdicts[object_id] = ("translate", "steering wheel", "high", {})
+            verdicts[object_id] = (
+                "translate", "steering wheel", "high",
+                {"detection": "steering-wheel anchor"},
+            )
             continue
 
         extents = np.ptp(points, axis=0)
         diagonal = float(np.linalg.norm(extents))
         ahead = float((centroid[:2] - eye[:2]) @ f[:2])
+        passenger_ahead = float(
+            (centroid[:2] - passenger_eye[:2]) @ passenger_f[:2]
+        )
         lat_signed = float(frame.side * (centroid[0] - wheel_x))
         below = frame.eye[2] - float(centroid[2])
         out80 = float(np.percentile(np.abs(points[:, 0] - cx0), 80))
         stats_ng = scan_no_glass.get(object_id, stats)
+        passenger_stats = passenger_scan[object_id]
+        passenger_stats_ng = passenger_scan_no_glass.get(
+            object_id, passenger_stats
+        )
         z70 = float(np.percentile(points[:, 2], 70))
 
         # oriented control cone: forward-and-down of the eye, laterally from
@@ -579,7 +695,7 @@ def _classify_meshes_for_trim(
         wall_lateral = extents[0] < 0.22 and extents[1] > 0.45 and extents[2] > 0.45
         in_cone = (
             0.20 <= ahead <= wheel_ahead + 1.0
-            and -0.22 <= lat_signed <= 0.33
+            and -0.22 <= lat_signed <= _driver_control_outboard_limit(below)
             and -0.10 <= below <= 1.35
             and not wall_lateral
         )
@@ -592,8 +708,16 @@ def _classify_meshes_for_trim(
         def candidate_channels(
             candidate_stats: dict[str, float],
             candidate_stats_ng: dict[str, float],
-        ) -> tuple[bool, bool, bool, bool]:
-            visible = candidate_stats["front_vf"] >= 0.28
+            candidate_passenger_stats: dict[str, float],
+            candidate_passenger_stats_ng: dict[str, float],
+        ) -> tuple[bool, bool, bool, bool, bool, bool]:
+            visible = (
+                candidate_stats["front_vf"] >= SPATIAL_VISIBLE_FRACTION
+            )
+            passenger_visible = (
+                candidate_passenger_stats["front_vf"]
+                >= SPATIAL_PASSENGER_VISIBLE_FRACTION
+            )
             enclosed = _is_enclosed_candidate(
                 candidate_stats,
                 out80,
@@ -604,6 +728,13 @@ def _classify_meshes_for_trim(
                 and diagonal <= 0.60
                 and 0.15 <= ahead <= 1.5
                 and abs(float(centroid[2]) - frame.eye[2]) <= 0.7
+                and abs(float(centroid[0]) - cx0) >= half_width - 0.06
+            )
+            passenger_fitment = (
+                candidate_passenger_stats_ng["vf"] >= 0.12
+                and diagonal <= 0.60
+                and 0.15 <= passenger_ahead <= 1.5
+                and abs(float(centroid[2]) - passenger_eye[2]) <= 0.7
                 and abs(float(centroid[0]) - cx0) >= half_width - 0.06
             )
             buried = (
@@ -622,53 +753,135 @@ def _classify_meshes_for_trim(
                     or enclosed
                 )
             )
-            return visible, enclosed, fitment, cone
+            return (
+                visible,
+                passenger_visible,
+                enclosed,
+                fitment,
+                passenger_fitment,
+                cone,
+            )
 
-        cand_visible, cand_enclosed, cand_fitment, cand_cone = candidate_channels(
-            stats, stats_ng
+        (
+            cand_visible,
+            cand_passenger_visible,
+            cand_enclosed,
+            cand_fitment,
+            cand_passenger_fitment,
+            cand_cone,
+        ) = candidate_channels(
+            stats, stats_ng, passenger_stats, passenger_stats_ng
         )
         point_cand_fitment = cand_fitment
-        if surface_scene is not None and (
-            cand_visible or cand_enclosed or cand_fitment or cand_cone
+        if (surface_scene is not None or passenger_surface_scene is not None) and (
+            cand_visible or cand_passenger_visible or cand_enclosed
+            or cand_fitment or cand_passenger_fitment or cand_cone
             or object_id in under_seat_candidates
             or object_id in forced
         ):
-            exact = exact_by_id.get(object_id)
-            if object_id not in exact_by_id:
-                exact = core.surface_visibility_stats_batch(
-                    {object_id: points},
-                    frame.eye,
-                    surface_scene,
-                    frame.forward,
-                ).get(object_id)
-            if exact is not None:
-                stats = dict(stats)
-                stats.update({key: exact[key] for key in ("vf", "front_vf")})
-                stats_ng = stats
-                if point_cand_fitment and surface_scene_no_glass is not None:
-                    exact_ng = exact_no_glass_by_id.get(object_id)
-                    if object_id not in exact_no_glass_by_id:
-                        exact_ng = core.surface_visibility_stats_batch(
-                            {object_id: points},
-                            frame.eye,
-                            surface_scene_no_glass,
-                            frame.forward,
-                        ).get(object_id)
-                    if exact_ng is not None:
-                        stats_ng = dict(stats)
-                        stats_ng.update({
-                            key: exact_ng[key] for key in ("vf", "front_vf")
-                        })
-                cand_visible, cand_enclosed, cand_fitment, cand_cone = candidate_channels(
-                    stats, stats_ng
-                )
-        if not (cand_visible or cand_enclosed or cand_fitment or cand_cone
-                or object_id in under_seat_candidates):
+            if surface_scene is not None:
+                exact = exact_by_id.get(object_id)
+                if object_id not in exact_by_id:
+                    exact = core.surface_visibility_stats_batch(
+                        {object_id: points},
+                        frame.eye,
+                        surface_scene,
+                        frame.forward,
+                    ).get(object_id)
+                if exact is not None:
+                    stats = dict(stats)
+                    stats.update({key: exact[key] for key in ("vf", "front_vf")})
+                    stats_ng = stats
+                    if point_cand_fitment and surface_scene_no_glass is not None:
+                        exact_ng = exact_no_glass_by_id.get(object_id)
+                        if object_id not in exact_no_glass_by_id:
+                            exact_ng = core.surface_visibility_stats_batch(
+                                {object_id: points},
+                                frame.eye,
+                                surface_scene_no_glass,
+                                frame.forward,
+                            ).get(object_id)
+                        if exact_ng is not None:
+                            stats_ng = dict(stats)
+                            stats_ng.update({
+                                key: exact_ng[key] for key in ("vf", "front_vf")
+                            })
+            if passenger_surface_scene is not None and (
+                cand_passenger_visible or cand_passenger_fitment
+            ):
+                passenger_exact = passenger_exact_by_id.get(object_id)
+                if object_id not in passenger_exact_by_id:
+                    passenger_exact = core.surface_visibility_stats_batch(
+                        {object_id: points},
+                        passenger_eye,
+                        passenger_surface_scene,
+                        passenger_f,
+                    ).get(object_id)
+                if passenger_exact is not None:
+                    passenger_stats = dict(passenger_stats)
+                    passenger_stats.update({
+                        key: passenger_exact[key] for key in ("vf", "front_vf")
+                    })
+                    passenger_stats_ng = passenger_stats
+                    if (
+                        cand_passenger_fitment
+                        and passenger_surface_scene_no_glass is not None
+                    ):
+                        passenger_exact_ng = passenger_exact_no_glass_by_id.get(
+                            object_id
+                        )
+                        if object_id not in passenger_exact_no_glass_by_id:
+                            passenger_exact_ng = core.surface_visibility_stats_batch(
+                                {object_id: points},
+                                passenger_eye,
+                                passenger_surface_scene_no_glass,
+                                passenger_f,
+                            ).get(object_id)
+                        if passenger_exact_ng is not None:
+                            passenger_stats_ng = dict(passenger_stats)
+                            passenger_stats_ng.update({
+                                key: passenger_exact_ng[key]
+                                for key in ("vf", "front_vf")
+                            })
+            (
+                cand_visible,
+                cand_passenger_visible,
+                cand_enclosed,
+                cand_fitment,
+                cand_passenger_fitment,
+                cand_cone,
+            ) = candidate_channels(
+                stats, stats_ng, passenger_stats, passenger_stats_ng
+            )
+        if not (
+            cand_visible or cand_passenger_visible or cand_enclosed
+            or cand_fitment or cand_passenger_fitment or cand_cone
+            or object_id in under_seat_candidates
+        ):
             continue
         if scoped is not None:
             scoped.add(object_id)
 
-        if not cand_fitment:
+        detection_channels = []
+        if cand_visible:
+            detection_channels.append("forward visibility")
+        if cand_passenger_visible:
+            detection_channels.append("passenger forward visibility")
+        if cand_enclosed:
+            detection_channels.append("cabin enclosure shell")
+        if cand_fitment:
+            detection_channels.append("exterior driver fitment")
+        if cand_passenger_fitment:
+            detection_channels.append("exterior passenger fitment")
+        if cand_cone:
+            detection_channels.append("driver control cone")
+        if object_id in under_seat_candidates:
+            detection_channels.append("under-seat geometry")
+        if object_id in forced:
+            detection_channels.append("passenger-footwell forced candidate")
+        detection = ", ".join(detection_channels)
+
+        if not (cand_fitment or cand_passenger_fitment):
             beyond_fraction = beyond.get(object_id, 0.0)
             exact_glass = exact_glass_by_id.get(object_id)
             if exact_glass is not None:
@@ -725,15 +938,20 @@ def _classify_meshes_for_trim(
                 and "column" in lowered_name and ahead > wheel_ahead - 0.1):
             if "top" in lowered_name:
                 verdicts[object_id] = (
-                    "translate", "steering column top (resolution floor: name hint)", "low", {})
+                    "translate", "steering column top (resolution floor: name hint)", "low",
+                    {"detection": f"{detection}, steering-column name fallback"})
             else:
                 verdicts[object_id] = (
-                    "mirror", "steering column body (resolution floor: name hint)", "low", {})
+                    "mirror", "steering column body (resolution floor: name hint)", "low",
+                    {"detection": f"{detection}, steering-column name fallback"})
             continue
 
         if cand_cone:
             confidence = "high" if (abs(lat_signed) < 0.24 and ahead <= wheel_ahead + 0.75) else "med"
-            verdicts[object_id] = ("translate", "in the driver control cone", confidence, {})
+            verdicts[object_id] = (
+                "translate", "in the driver control cone", confidence,
+                {"detection": detection},
+            )
             continue
 
         emissive = mesh_flag(object_id, "emissive", require_all=False)
@@ -752,21 +970,38 @@ def _classify_meshes_for_trim(
                 and extents[2] >= 0.28 and stats["vf"] >= 0.30
             )
             if display:
-                verdicts[object_id] = ("mirror", "directional display", "med", {"flip": True})
+                verdicts[object_id] = (
+                    "mirror", "directional display", "med",
+                    {"flip": True, "detection": detection},
+                )
             elif fascia:
                 # Geometrically symmetric, but a fascia may carry directional
                 # materials or generated detail, so preserve the established
                 # dashboard transform.
-                verdicts[object_id] = ("mirror", "dashboard fascia", "med", {})
+                verdicts[object_id] = (
+                    "mirror", "dashboard fascia", "med",
+                    {"detection": detection},
+                )
+            else:
+                verdicts[object_id] = (
+                    "none", "perfectly symmetric", "high",
+                    {"detection": f"{detection}, exact self-symmetry"},
+                )
             # else: symmetric about the centreline, reflection changes nothing
             continue
 
+        visible_from_either_eye = cand_visible or cand_passenger_visible
         confidence = "low" if coarse_fraction < 0.05 else (
-            "med" if not cand_visible else "high")
-        reason = ("exterior driver fitment" if cand_fitment and not cand_visible
-                  else "one-sided interior part")
-        if (out80 >= half_width - 0.05 and stats["front_vf"] < 0.50
-                and not cand_fitment):
+            "med" if not visible_from_either_eye else "high")
+        if cand_fitment and not visible_from_either_eye:
+            reason = "exterior driver fitment"
+        elif cand_passenger_fitment and not visible_from_either_eye:
+            reason = "exterior passenger fitment"
+        else:
+            reason = "one-sided interior part"
+        if (out80 >= half_width - 0.05
+                and max(stats["front_vf"], passenger_stats["front_vf"]) < 0.50
+                and not (cand_fitment or cand_passenger_fitment)):
             confidence = "low"
             reason = "wall at the cabin shell (verify: possible exterior sheet)"
         lateral_center = float(
@@ -777,7 +1012,10 @@ def _classify_meshes_for_trim(
             if abs(lateral_center - cx0) >= SPATIAL_PAIR_MIN_OFFSET
             else "mirror"
         )
-        verdicts[object_id] = (mode, reason, confidence, {"flip": display})
+        verdicts[object_id] = (
+            mode, reason, confidence,
+            {"flip": display, "detection": detection},
+        )
     return verdicts, vetoed
 
 
@@ -861,13 +1099,13 @@ def _resolve_trim_pairs(
     import numpy as np
 
     material_symbols = core.mesh_material_symbols(context)
+    inert_material_aliases = core.inert_material_alias_symbols(context)
     pairables = [o for o in present if memo.get(o, ("none",))[0] == "pairable"]
     latent = [
         o for o in present
         if memo.get(o, ("none",))[0] == "none" and o not in vetoed
         and o in entries_np and len(entries_np[o]) >= 4
     ]
-    used: set[str] = set()
     cx0 = frame.center_x
     lateral_centers = {
         object_id: float(
@@ -877,65 +1115,91 @@ def _resolve_trim_pairs(
         for object_id in present
         if object_id in entries_np and len(entries_np[object_id])
     }
-    for object_id in sorted(
-        pairables, key=lambda o: (-frame.side * lateral_centers[o], o)
-    ):
-        if object_id in used:
-            continue
+    pairable_set = set(pairables)
+    pool = sorted(pairable_set | set(latent))
+    candidates: list[tuple[float, float, str, str]] = []
+    for index, object_id in enumerate(pool):
         points_a = entries_np[object_id]
         centroid_a = points_a.mean(axis=0)
         center_a_x = lateral_centers[object_id]
-        if abs(center_a_x - cx0) < SPATIAL_PAIR_MIN_OFFSET:
+        offset_a = center_a_x - cx0
+        if abs(offset_a) < SPATIAL_PAIR_MIN_OFFSET:
             continue  # centred asymmetric mesh: aesthetic Mirror, never a pair
-        best: tuple[float, str] | None = None
-        for twin_id in pairables + latent:
-            if twin_id == object_id or twin_id in used:
-                continue
+        diag_a = float(np.linalg.norm(np.ptp(points_a, axis=0)))
+        for twin_id in pool[index + 1:]:
+            if object_id not in pairable_set and twin_id not in pairable_set:
+                continue  # two under-admitted meshes cannot promote each other
             points_b = entries_np[twin_id]
             centroid_b = points_b.mean(axis=0)
             center_b_x = lateral_centers[twin_id]
-            if abs(center_b_x - cx0) < SPATIAL_PAIR_MIN_OFFSET:
+            offset_b = center_b_x - cx0
+            if abs(offset_b) < SPATIAL_PAIR_MIN_OFFSET or offset_a * offset_b >= 0.0:
                 continue
-            if abs((center_a_x - cx0) + (center_b_x - cx0)) > 0.14:
+            if abs(offset_a + offset_b) > 0.14:
                 continue
             if (abs(float(centroid_a[1]) - float(centroid_b[1])) > 0.35
                     or abs(float(centroid_a[2]) - float(centroid_b[2])) > 0.35):
                 continue
-            diag_a = float(np.linalg.norm(np.ptp(points_a, axis=0)))
             diag_b = float(np.linalg.norm(np.ptp(points_b, axis=0)))
             if max(diag_a, diag_b) / max(min(diag_a, diag_b), 1e-6) > 1.5:
                 continue
-            residual = core.mirror_pair_residual(points_a, points_b, cx0)
-            if residual <= SPATIAL_PAIR_RESIDUAL and (best is None or residual < best[0]):
-                best = (residual, twin_id)
-        if best is not None:
-            twin_id = best[1]
-            used.add(object_id)
-            used.add(twin_id)
-            symbols_a = set(material_symbols.get(object_id, ()))
-            symbols_b = set(material_symbols.get(twin_id, ()))
-            # Directional-material twins bind mutually exclusive symbols.
-            # Multi-material housings may legitimately share their body
-            # material while using a side-specific auxiliary symbol; those
-            # are still safe structural pairs.
-            if symbols_a and symbols_b and symbols_a.isdisjoint(symbols_b):
-                reason = (
-                    "functionally sided: materials differ, needs build-side material rebind"
-                )
-                memo[object_id] = ("functional_skip", reason, "high", {})
-                memo[twin_id] = ("functional_skip", reason, "high", {})
-                pair_votes.pop(object_id, None)
-                pair_votes.pop(twin_id, None)
-                for votes in pair_votes.values():
-                    votes.pop(object_id, None)
-                    votes.pop(twin_id, None)
+            distance = core.mirror_pair_distance(points_a, points_b, cx0)
+            if distance > SPATIAL_PAIR_DISTANCE:
                 continue
-            if memo.get(twin_id, ("none",))[0] == "none":
-                memo[twin_id] = ("pairable", "geometric twin across the centreline", "med", {})
-            pair_votes.setdefault(object_id, {})[twin_id] = (
-                pair_votes.get(object_id, {}).get(twin_id, 0) + 1)
-            pair_votes.setdefault(twin_id, {})[object_id] = (
-                pair_votes.get(twin_id, {}).get(object_id, 0) + 1)
+            combined_diagonal = float(np.linalg.norm(np.ptp(
+                np.concatenate((points_a, points_b)), axis=0
+            )))
+            residual = distance / max(combined_diagonal, 0.05)
+            candidates.append((residual, distance, object_id, twin_id))
+
+    # Consider the complete candidate graph before consuming either endpoint.
+    # This makes exact/strong reflected twins win over an earlier approximate
+    # match while retaining the latter when no stronger pairing exists.
+    used: set[str] = set()
+    for _residual, _distance, object_id, twin_id in sorted(candidates):
+        if object_id in used or twin_id in used:
+            continue
+        used.add(object_id)
+        used.add(twin_id)
+        symbols_a = set(material_symbols.get(object_id, ()))
+        symbols_b = set(material_symbols.get(twin_id, ()))
+        # Directional-material twins bind mutually exclusive symbols.
+        # Multi-material housings may legitimately share their body material
+        # while using a side-specific auxiliary symbol; those are still safe
+        # structural pairs.
+        distinct_symbols = symbols_a | symbols_b
+        if (
+            symbols_a
+            and symbols_b
+            and symbols_a.isdisjoint(symbols_b)
+            and not distinct_symbols.issubset(inert_material_aliases)
+        ):
+            reason = (
+                "functionally sided: materials differ, needs build-side material rebind"
+            )
+            memo[object_id] = (
+                "functional_skip", reason, "high",
+                {"detection": "structural twin, material-symbol veto"},
+            )
+            memo[twin_id] = (
+                "functional_skip", reason, "high",
+                {"detection": "structural twin, material-symbol veto"},
+            )
+            pair_votes.pop(object_id, None)
+            pair_votes.pop(twin_id, None)
+            for votes in pair_votes.values():
+                votes.pop(object_id, None)
+                votes.pop(twin_id, None)
+            continue
+        if memo.get(twin_id, ("none",))[0] == "none":
+            memo[twin_id] = (
+                "pairable", "geometric twin across the centreline", "med",
+                {"detection": "structural geometric twin"},
+            )
+        pair_votes.setdefault(object_id, {})[twin_id] = (
+            pair_votes.get(object_id, {}).get(twin_id, 0) + 1)
+        pair_votes.setdefault(twin_id, {})[object_id] = (
+            pair_votes.get(twin_id, {}).get(object_id, 0) + 1)
 
 
 def _inherit_mounted_parts(
@@ -963,6 +1227,15 @@ def _inherit_mounted_parts(
     import numpy as np
 
     eye = np.array(frame.eye)
+    passenger_eye = eye.copy()
+    passenger_eye[0] = 2.0 * frame.center_x - eye[0]
+
+    def centre_within_cabin_radius(points: object) -> bool:
+        centre = points.mean(axis=0)
+        return min(
+            float(np.linalg.norm(centre - eye)),
+            float(np.linalg.norm(centre - passenger_eye)),
+        ) <= 1.6
 
     def is_mirror_host(object_id: str) -> bool:
         mode = memo.get(object_id, ("none",))[0]
@@ -979,7 +1252,7 @@ def _inherit_mounted_parts(
             if is_mirror_host(o)
             and o in entries_np
             and float(np.linalg.norm(np.ptp(entries_np[o], axis=0))) >= 0.15
-            and float(np.linalg.norm(entries_np[o].mean(axis=0) - eye)) <= 1.6
+            and centre_within_cabin_radius(entries_np[o])
         ]
         if not hosts:
             break
@@ -1005,14 +1278,24 @@ def _inherit_mounted_parts(
                 continue  # furniture-sized: judged on its own evidence
             if diag < 0.14 and len(points) < 40:
                 continue  # sub-resolution marker/dummy (engine light helpers)
-            if float(np.linalg.norm(points.mean(axis=0) - eye)) > 1.6:
+            if not centre_within_cabin_radius(points):
                 continue  # outside the cabin radius: not interior furniture
             for host in hosts:
                 host_points = entries_np[host]
                 gap2 = ((points[:, None, :] - host_points[None, :, :]) ** 2).sum(axis=2)
                 if float(np.sqrt(gap2.min())) <= SPATIAL_CONTACT_LIMIT:
+                    lateral_center = float(
+                        (np.min(points[:, 0]) + np.max(points[:, 0])) / 2.0
+                    )
+                    inherited_mode = (
+                        "pairable"
+                        if abs(lateral_center - frame.center_x)
+                        >= SPATIAL_PAIR_MIN_OFFSET
+                        else "mirror"
+                    )
                     memo[object_id] = (
-                        "mirror", f"mounted on {host}", "low", {})
+                        inherited_mode, f"mounted on {host}", "low",
+                        {"detection": f"contact mount within 2 cm of {host}"})
                     changed = True
                     break
         if not changed:
@@ -1020,8 +1303,8 @@ def _inherit_mounted_parts(
 
     # A genuinely floating scoped mesh can still be recognised by occlusion:
     # if its eye rays continue into any transformed cabin/mirror furniture,
-    # the floater is cabin furniture too.  Contact inheritance above has
-    # already consumed anything mounted within 3 cm.
+    # the floater is cabin furniture too. Contact inheritance above has
+    # already consumed anything mounted within 2 cm.
     floaters: list[str] = []
     sightline_entries = dict(entries_np)
     forward = np.asarray(frame.forward, dtype=float)
@@ -1067,7 +1350,8 @@ def _inherit_mounted_parts(
             continue
         behind_class = max(classes, key=lambda name: (classes[name], name))
         memo[object_id] = (
-            "mirror", f"floating in front of {behind_class} geometry", "low", {}
+            "mirror", f"floating in front of {behind_class} geometry", "low",
+            {"detection": f"forward sightline backed by {behind_class} geometry"},
         )
 
 
@@ -1164,6 +1448,12 @@ def build_mode_recommendations(
             )
             _inherit_mounted_parts(
                 context, frame, present, entries_np, memo, vetoed, pair_votes, scoped
+            )
+            # Contact inheritance may expose an off-centre L/R satellite pair
+            # after the initial structural pass. Resolve those new pairables
+            # now; lone satellites retain the normal aesthetic-Mirror fallback.
+            _resolve_trim_pairs(
+                context, frame, present, entries_np, memo, vetoed, pair_votes
             )
             state["trims_done"].add(trim)
 
