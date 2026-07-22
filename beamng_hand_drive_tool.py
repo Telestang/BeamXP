@@ -76,6 +76,23 @@ def mode_label(mode: str) -> str:
     }.get(mode, "Skip")
 
 
+def part_type_label(
+    object_id: str,
+    flexbody_meshes: set[str],
+    prop_meshes: set[str],
+) -> str:
+    """JBeam rendering role across the currently selected variants."""
+    is_flexbody = object_id in flexbody_meshes
+    is_prop = object_id in prop_meshes
+    if is_flexbody and is_prop:
+        return "Flexbody + Prop"
+    if is_flexbody:
+        return "Flexbody"
+    if is_prop:
+        return "Prop"
+    return "Unknown"
+
+
 MODE_CYCLE_VALUES = [core.MODE_SKIP, core.MODE_MIRROR, core.MODE_MIRROR_STRUCTURAL, core.MODE_TRANSLATE]
 MODE_VALUES_BY_LABEL = {mode_label(mode): mode for mode in MODE_CYCLE_VALUES}
 MODE_HOTKEYS = {
@@ -1775,11 +1792,15 @@ class HandDriveToolApp(tk.Tk):
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        columns = ("visible", "solo", "active", "mode", "offset", "fliptex", "steering", "x", "y", "z")
+        columns = (
+            "parttype", "visible", "solo", "active", "mode", "offset",
+            "fliptex", "steering", "x", "y", "z",
+        )
         self.part_tree = ttk.Treeview(frame, columns=columns, show=("tree", "headings"), selectmode="extended")
         self.part_tree.heading("#0", text="Part", anchor="w")
         self.part_tree.column("#0", width=250, minwidth=150, stretch=True, anchor="w")
         headings = {
+            "parttype": "Part Type",
             "mode": "Mode",
             "offset": "Offset X",
             "fliptex": "Flip Tex",
@@ -1792,6 +1813,7 @@ class HandDriveToolApp(tk.Tk):
             "z": "Z",
         }
         widths = {
+            "parttype": 112,
             "mode": 132,
             "offset": 82,
             "fliptex": 74,
@@ -2794,6 +2816,11 @@ class HandDriveToolApp(tk.Tk):
         parts = self.conversion.setdefault("parts", {})
         ids = self.resolved_part_ids
         active_ids = self._preview_active_ids()
+        selected_variants = self._selected_variant_names()
+        flexbody_meshes, prop_meshes, _all_meshes = core.selected_mesh_roles(
+            self.context,
+            selected_variants,
+        )
         displayed: list[str] = []
         row_index = 0
         for object_id in ids:
@@ -2816,11 +2843,13 @@ class HandDriveToolApp(tk.Tk):
                 continue
             mode = str(settings.get("mode", core.MODE_SKIP))
             display_name = self._part_display_name(object_id)
+            part_type = part_type_label(object_id, flexbody_meshes, prop_meshes)
             if (
                 query
                 and query not in object_id.lower()
                 and query not in display_name.lower()
                 and query not in mode
+                and query not in part_type.lower()
             ):
                 continue
             displayed.append(object_id)
@@ -2831,6 +2860,7 @@ class HandDriveToolApp(tk.Tk):
                 text=display_name,
                 tags=self._row_tags(row_index),
                 values=(
+                    part_type,
                     yn_label(settings.get("viewerVisible", True)),
                     yn_label(settings.get("viewerSolo")),
                     yn_label(object_id in active_ids),

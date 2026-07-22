@@ -456,5 +456,20 @@ class PositionLabelTests(unittest.TestCase):
         )
 
 
+class PartTypeLabelTests(unittest.TestCase):
+    def test_jbeam_rendering_roles_are_labelled(self) -> None:
+        import beamng_hand_drive_tool as tool
+
+        flexbodies = {"flex", "both"}
+        props = {"prop", "both"}
+        self.assertEqual(tool.part_type_label("flex", flexbodies, props), "Flexbody")
+        self.assertEqual(tool.part_type_label("prop", flexbodies, props), "Prop")
+        self.assertEqual(
+            tool.part_type_label("both", flexbodies, props),
+            "Flexbody + Prop",
+        )
+        self.assertEqual(tool.part_type_label("missing", flexbodies, props), "Unknown")
+
+
 if __name__ == "__main__":
     unittest.main()
