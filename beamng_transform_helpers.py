@@ -210,7 +210,113 @@ def flip_texcoord_s_float_array(source: ET.Element) -> None:
     float_array.text = " ".join(format_num(v) for v in values)
 
 
-def mirrored_geometry(geometry: ET.Element, new_id: str, *, flip_texture: bool = False) -> ET.Element:
+def flip_texcoord_s_for_indices(source: ET.Element, element_indices: set[int]) -> None:
+    """Reflect S for specific texcoord entries within THEIR OWN S range.
+
+    Unlike flip_texcoord_s_float_array (whole source), this flips one UV island
+    that shares a texcoord source with the rest of the mesh -- a nav screen
+    whose 4 polys occupy a separate UV tile from the surrounding cluster.
+    Reflecting within the island's own [min,max] keeps it on its own texels and
+    never disturbs the other island's coordinates."""
+    float_array = source.find("c:float_array", NS)
+    accessor = source.find(".//c:accessor", NS)
+    if float_array is None or accessor is None or not float_array.text:
+        return
+    values = [float(v) for v in float_array.text.split()]
+    stride = int(accessor.get("stride", "2"))
+    offset = int(accessor.get("offset", "0"))
+    if stride < 1:
+        return
+    params = [p.get("name", "").upper() for p in accessor.findall("c:param", NS)]
+    s_slot = params.index("S") if "S" in params else 0
+    positions = [
+        offset + element_index * stride + s_slot
+        for element_index in element_indices
+        if 0 <= offset + element_index * stride + s_slot < len(values)
+    ]
+    if not positions:
+        return
+    pivot = min(values[p] for p in positions) + max(values[p] for p in positions)
+    for p in positions:
+        values[p] = pivot - values[p]
+    float_array.text = " ".join(format_num(v) for v in values)
+
+
+def _primitive_material_symbol(primitive: ET.Element) -> str | None:
+    material = primitive.get("material")
+    if not material:
+        return None
+    return re.sub(r"-material$", "", material).lower()
+
+
+def _primitive_texcoord_ref(primitive: ET.Element) -> tuple[str, int, int] | None:
+    """(source_id, stride, offset) of a primitive's TEXCOORD input, or None."""
+    inputs = primitive.findall("c:input", NS)
+    if not inputs:
+        return None
+    stride = max(int(inp.get("offset", "0")) for inp in inputs) + 1
+    for inp in inputs:
+        if inp.get("semantic") != "TEXCOORD":
+            continue
+        source_url = inp.get("source", "")
+        if source_url.startswith("#"):
+            return source_url[1:], stride, int(inp.get("offset", "0"))
+    return None
+
+
+def _primitive_texcoord_indices(primitive: ET.Element, stride: int, offset: int) -> set[int]:
+    indices: set[int] = set()
+    for p in primitive.findall("c:p", NS):
+        if not p.text:
+            continue
+        values = p.text.split()
+        indices.update(int(values[i]) for i in range(offset, len(values), stride))
+    return indices
+
+
+_PRIMITIVE_TAGS = ("triangles", "polylist", "polygons", "trifans", "tristrips")
+
+
+def flip_texcoord_islands(mesh: ET.Element, flip_materials: set[str]) -> None:
+    """Flip S only for the UV islands owned by ``flip_materials``.
+
+    Primitives are bucketed by whether their material is targeted; an index
+    used by any non-targeted primitive is protected and left alone, so a shared
+    texcoord source is only reflected where the two islands are disjoint (they
+    are, in practice -- each material occupies its own UV region)."""
+    sources_by_id = {
+        source.get("id"): source for source in mesh.findall("c:source", NS)
+    }
+    targeted: dict[str, set[int]] = {}
+    protected: dict[str, set[int]] = {}
+    for tag in _PRIMITIVE_TAGS:
+        for primitive in mesh.findall(f"c:{tag}", NS):
+            ref = _primitive_texcoord_ref(primitive)
+            if ref is None:
+                continue
+            source_id, stride, offset = ref
+            indices = _primitive_texcoord_indices(primitive, stride, offset)
+            if not indices:
+                continue
+            symbol = _primitive_material_symbol(primitive)
+            bucket = targeted if (symbol is not None and symbol in flip_materials) else protected
+            bucket.setdefault(source_id, set()).update(indices)
+    for source_id, indices in targeted.items():
+        source = sources_by_id.get(source_id)
+        if source is None:
+            continue
+        flippable = indices - protected.get(source_id, set())
+        if flippable:
+            flip_texcoord_s_for_indices(source, flippable)
+
+
+def mirrored_geometry(
+    geometry: ET.Element,
+    new_id: str,
+    *,
+    flip_texture: bool = False,
+    flip_materials: set[str] | None = None,
+) -> ET.Element:
     out = copy.deepcopy(geometry)
     old_id = out.get("id")
     out.set("id", new_id)
@@ -233,10 +339,16 @@ def mirrored_geometry(geometry: ET.Element, new_id: str, *, flip_texture: bool =
             reverse_vertex_order(polygons)
             break
     if flip_texture:
-        texcoords = texcoord_source_ids(mesh)
-        for source in mesh.findall("c:source", NS):
-            if source.get("id") in texcoords:
-                flip_texcoord_s_float_array(source)
+        if flip_materials:
+            # Scoped flip: only the nav-screen island(s), leaving the rest of a
+            # shared mesh (bezel, cluster) untouched.
+            flip_texcoord_islands(mesh, flip_materials)
+        else:
+            # Whole-mesh flip: a dedicated display mesh with one UV island.
+            texcoords = texcoord_source_ids(mesh)
+            for source in mesh.findall("c:source", NS):
+                if source.get("id") in texcoords:
+                    flip_texcoord_s_float_array(source)
 
     if old_id:
         for elem in out.iter():

@@ -1372,8 +1372,13 @@ def build_mode_recommendations(
     available = {o for o in object_ids if o in context.objects and o in context.preview_by_id}
     if not available:
         return []
-    frame = core.driver_frame_for_context(context)
-    if frame is None:
+    # A vehicle with no camera and no wheel anywhere is untrustworthy; bail
+    # before any work. The frame is then recomputed per trim inside the loop so
+    # each trim's driver camera carries that trim's cab nodeMove: multi-cab
+    # vehicles (us_semi cabover vs conventional) and LHD/RHD splits (bx, covet)
+    # get the correct driver-side eye instead of a meaningless average of both
+    # cabs'/sides' cameras.
+    if core.driver_frame_for_context(context) is None:
         return []
 
     state = getattr(context, "_spatial_recommendation_state", None)
@@ -1393,6 +1398,9 @@ def build_mode_recommendations(
     for trim in trims:
         present, entries_np = _spatial_entries_for_trim(context, trim, available)
         if not present:
+            continue
+        frame = core.driver_frame_for_context(context, config_name=trim)
+        if frame is None:
             continue
         surface_np: dict[str, object] = {}
         todo = [
@@ -1502,8 +1510,6 @@ def build_mode_recommendations(
                     "reason": f"{reason}; twin absent in this trim",
                     "confidence": confidence,
                 }
-                if extra.get("flip"):
-                    entry["textureFlip"] = True
                 recommendations.append(entry)
         else:
             entry = {
@@ -1514,8 +1520,6 @@ def build_mode_recommendations(
                 "reason": reason,
                 "confidence": confidence,
             }
-            if mode == "mirror" and extra.get("flip"):
-                entry["textureFlip"] = True
             recommendations.append(entry)
 
     mode_order = {
@@ -1549,12 +1553,6 @@ def offset_display(mode: str, value: object, *, manual_delta: bool) -> str:
     if explicit:
         return explicit
     return "Manual" if manual_delta else "Auto"
-
-
-def fliptex_display(mode: str, value: object) -> str:
-    if mode != core.MODE_MIRROR:
-        return "N/A"
-    return yn_label(value)
 
 
 def existing_initial_dir(path: object, fallback: Path) -> str:
@@ -2112,7 +2110,7 @@ class HandDriveToolApp(tk.Tk):
 
         columns = (
             "parttype", "visible", "solo", "active", "mode", "offset",
-            "fliptex", "steering", "x", "y", "z",
+            "steering", "x", "y", "z",
         )
         self.part_tree = ttk.Treeview(frame, columns=columns, show=("tree", "headings"), selectmode="extended")
         self.part_tree.heading("#0", text="Part", anchor="w")
@@ -2121,7 +2119,6 @@ class HandDriveToolApp(tk.Tk):
             "parttype": "Part Type",
             "mode": "Mode",
             "offset": "Offset X",
-            "fliptex": "Flip Tex",
             "steering": "Steering Ref",
             "visible": "Visible",
             "solo": "Solo",
@@ -2134,7 +2131,6 @@ class HandDriveToolApp(tk.Tk):
             "parttype": 112,
             "mode": 132,
             "offset": 82,
-            "fliptex": 74,
             "steering": 96,
             "visible": 70,
             "solo": 60,
@@ -2154,7 +2150,7 @@ class HandDriveToolApp(tk.Tk):
                 width=widths[col],
                 minwidth=50,
                 stretch=False,
-                anchor="center" if col in {"fliptex", "steering", "visible", "solo", "active"} else "w",
+                anchor="center" if col in {"steering", "visible", "solo", "active"} else "w",
             )
         self._register_tree_headings(self.part_tree, {"#0": "Part", **headings})
         yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.part_tree.yview)
@@ -3151,7 +3147,6 @@ class HandDriveToolApp(tk.Tk):
                     "mode": core.MODE_SKIP,
                     "mirrorSource": None,
                     "translateOffset": None,
-                    "textureFlip": False,
                     "steeringRef": False,
                     "viewerVisible": True,
                     "viewerSolo": False,
@@ -3188,7 +3183,6 @@ class HandDriveToolApp(tk.Tk):
                         settings.get("translateOffset"),
                         manual_delta=self.manual_delta_enabled.get(),
                     ),
-                    fliptex_display(mode, settings.get("textureFlip")),
                     yn_label(settings.get("steeringRef")),
                     *position_labels(*self._table_position(object_id)),
                 ),
@@ -3423,16 +3417,9 @@ class HandDriveToolApp(tk.Tk):
                     if mode == core.MODE_TRANSLATE
                     else "N/A"
                 )
-                flip_note = (
-                    ", texture flip on"
-                    if mode == core.MODE_MIRROR
-                    and isinstance(settings, dict)
-                    and settings.get("textureFlip")
-                    else ""
-                )
                 position, varies = self._table_position(object_id)
                 self.detail_var.set(
-                    f"{display_name}: {mode_label(mode)}{flip_note}, "
+                    f"{display_name}: {mode_label(mode)}, "
                     f"full id {object_id}, x {fmt_float(position[0])}, offset {part_offset}, "
                     f"dae {obj.dae_path}{self._variant_position_note(object_id) if varies else ''}"
                 )
@@ -4139,11 +4126,7 @@ class HandDriveToolApp(tk.Tk):
                 self._apply_structural_pair(object_id, source_id)
                 applied += 2
             else:
-                self._apply_single_part_mode(
-                    object_id,
-                    mode,
-                    texture_flip=recommendation.get("textureFlip"),
-                )
+                self._apply_single_part_mode(object_id, mode)
                 applied += 1
 
         self._refresh_parts()
@@ -4159,15 +4142,13 @@ class HandDriveToolApp(tk.Tk):
         self.recommendation_rows = {}
         self.status_var.set(f"Applied {len(selected_rows)} recommendation(s) to {applied} part setting(s)")
 
-    def _apply_single_part_mode(self, object_id: str, mode: str, *, texture_flip: bool | None = None) -> None:
+    def _apply_single_part_mode(self, object_id: str, mode: str) -> None:
         settings = self._part_settings(object_id)
         if settings.get("mode") == core.MODE_MIRROR_STRUCTURAL:
             self._clear_structural_pair(object_id)
             settings = self._part_settings(object_id)
         settings["mode"] = mode
         settings["mirrorSource"] = None
-        if texture_flip is not None:
-            settings["textureFlip"] = bool(texture_flip)
 
     def _apply_structural_pair(self, object_id: str, source_id: str) -> None:
         self._clear_structural_pair(object_id)
@@ -4217,18 +4198,6 @@ class HandDriveToolApp(tk.Tk):
                 column,
                 offset_label(self._get_part_setting(item, "translateOffset", None)),
                 lambda value: self._set_part_offset(item, value),
-            )
-            return "break"
-        if name == "fliptex":
-            mode = str(self._get_part_setting(item, "mode", core.MODE_SKIP))
-            if mode != core.MODE_MIRROR:
-                self.status_var.set("Flip Tex only applies to Mirror Aesthetic")
-                return "break"
-            self._toggle_part_bool(item, "textureFlip")
-            flipped = bool(self._get_part_setting(item, "textureFlip", False))
-            self.status_var.set(
-                f"{self._part_display_name(item)}: texture flip "
-                + ("on (un-mirrors the image, e.g. nav screens)" if flipped else "off")
             )
             return "break"
         if name == "steering":
@@ -4674,7 +4643,6 @@ class HandDriveToolApp(tk.Tk):
                 "mode": core.MODE_SKIP,
                 "mirrorSource": None,
                 "translateOffset": None,
-                "textureFlip": False,
                 "steeringRef": False,
                 "viewerVisible": True,
                 "viewerSolo": False,

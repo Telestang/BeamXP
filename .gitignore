@@ -48,3 +48,10 @@ examples/converted_mods/*.zip
 # Editor metadata
 .idea/
 .vscode/
+
+# Spatial classifier — in-development successor, kept as its own local git repo
+# (has its own .git), not part of the main tool's history yet.
+spatial classifier/
+
+# Working docs / handover notes — kept local only.
+docs/

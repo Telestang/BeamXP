@@ -1396,6 +1396,19 @@ def trailing_options_object(values: list[str]) -> str | None:
     value = values[-1].strip()
     if value.startswith("{") and value.endswith("}"):
         return value
+    # Missing comma before the options dict glues it onto the description, so
+    # split_top_level_values yields one value like  "Rear Wheels" {"nodeOffset":..}
+    # instead of two. Recover the trailing {...} object (the Bolide's centre-lug
+    # wheel slot loses its nodeOffset otherwise, parking the wheel at the origin).
+    if value.endswith("}"):
+        brace = value.find("{")
+        if brace > 0 and value[:brace].rstrip().endswith('"'):
+            try:
+                end = transform_helpers.find_matching(value, brace, "{", "}")
+            except ValueError:
+                return None
+            if value[end:].strip() == "":
+                return value[brace:end].strip()
     return None
 
 
@@ -3749,7 +3762,6 @@ def default_part_settings(context: VehicleContext) -> dict[str, dict[str, object
             "mode": MODE_SKIP,
             "mirrorSource": None,
             "translateOffset": None,
-            "textureFlip": False,
             "steeringRef": is_default_steering_ref(object_id, obj),
             "viewerVisible": True,
             "viewerSolo": False,
@@ -3889,7 +3901,6 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
                             "mode",
                             "mirrorSource",
                             "translateOffset",
-                            "textureFlip",
                             "steeringRef",
                             "viewerVisible",
                             "viewerSolo",
@@ -3982,7 +3993,6 @@ def import_matching_conversion(
                             "mode",
                             "mirrorSource",
                             "translateOffset",
-                            "textureFlip",
                             "steeringRef",
                             "viewerVisible",
                             "viewerSolo",
@@ -4364,23 +4374,25 @@ def active_part_modes(conversion: dict[str, object]) -> dict[str, str]:
 
 
 def texture_flip_mesh_ids(
-    conversion: dict[str, object],
+    context: VehicleContext,
     object_modes: dict[str, str],
 ) -> set[str]:
-    """Mirrored parts whose texture must keep its left/right reading (nav
-    screens, decals with text): their DAE copies get the TEXCOORD S axis
-    reflected alongside the geometric mirror. Mirror Aesthetic only —
-    Mirror Structural swaps in an opposite-side mesh that already carries
-    its own correct mapping."""
-    parts = conversion.get("parts", {})
-    if not isinstance(parts, dict):
+    """Aesthetic-mirror meshes carrying a beamNavigator screen island, whose
+    texture must keep its left/right reading after the geometric mirror.
+
+    Derived entirely from the vehicle's own data (nav_screen_mesh_scope reads
+    the navigator controller and its glowMap) — there is no manual flag. A nav
+    screen only reads backwards once its mesh is actually reflected, so this is
+    gated on MODE_MIRROR: MODE_TRANSLATE keeps the texture as authored, and
+    MODE_MIRROR_STRUCTURAL swaps in the opposite-side mesh, which already
+    carries the correct mapping."""
+    nav_scope = nav_screen_mesh_scope(context)
+    if not nav_scope:
         return set()
     return {
         object_id
         for object_id, mode in object_modes.items()
-        if mode == MODE_MIRROR
-        and isinstance(parts.get(object_id), dict)
-        and bool(parts[object_id].get("textureFlip"))
+        if mode == MODE_MIRROR and object_id in nav_scope
     }
 
 
@@ -5310,6 +5322,10 @@ def generate_daes(
     texture_flip_ids: set[str] | None = None,
 ) -> list[Path]:
     texture_flip_ids = texture_flip_ids or set()
+    # Per-mesh nav-screen material scope: which UV island(s) to reflect. A
+    # dedicated screen mesh maps to all its symbols (whole-mesh flip); a shared
+    # mesh (nav screen + cluster) maps to only the screen island.
+    nav_flip_scope = nav_screen_mesh_scope(context)
     generated: list[Path] = []
     objects_by_dae: dict[tuple[Path, str], list[tuple[str, str]]] = {}
     for object_id in object_modes:
@@ -5410,6 +5426,7 @@ def generate_daes(
                                 old_geom,
                                 new_geom_id,
                                 flip_texture=object_id in texture_flip_ids,
+                                flip_materials=nav_flip_scope.get(object_id),
                             )
                         elif (
                             mode == MODE_TRANSLATE
@@ -5464,6 +5481,7 @@ def generate_daes(
                             old_geom,
                             new_geom_id,
                             flip_texture=spec.configured_mesh in texture_flip_ids,
+                            flip_materials=nav_flip_scope.get(spec.configured_mesh),
                         )
                     else:
                         generated_geometry[new_geom_id] = transform_helpers.copied_geometry(old_geom, new_geom_id)
@@ -6352,7 +6370,7 @@ def build_batch(
             selected_configs=selected_configs,
         )
         structural_sources = structural_mirror_sources(context, conversion, object_modes)
-        texture_flip_ids = texture_flip_mesh_ids(conversion, object_modes)
+        texture_flip_ids = texture_flip_mesh_ids(context, object_modes)
         node_mirror_map = build_node_mirror_map(context.node_positions)
         translated_prop_meshes = {
             mesh for mesh, mode in object_modes.items() if mode == MODE_TRANSLATE and mesh in prop_meshes
@@ -6606,24 +6624,77 @@ def parse_internal_camera_positions(
     return rows
 
 
-def driver_frame_for_context(
+def _camera_bearing_parts(
     context: VehicleContext,
-    object_ids: Iterable[str] | None = None,
-) -> DriverFrame | None:
-    """Anchor the classifier on the driver's eye.
+) -> dict[str, list[tuple[float, float, float]]]:
+    """{part_id: [(x, y, z), ...]} for every part that defines a driver/dash
+    internal camera, scanned once per context and cached.
 
-    Camera rows give the eye; the steering wheel corroborates it and fixes the
-    forward direction. Camera without wheel keeps BeamNG's -y-forward
-    convention; wheel without camera estimates the eye behind/above the rim
-    (degraded); neither means the spatial frame is untrustworthy and callers
-    must emit nothing rather than guess."""
+    Only a handful of a vehicle's thousands of parts carry a camera, so this
+    lets camera_positions_for_config check just those instead of re-scanning
+    every selected part on every config."""
+    cached = getattr(context, "_camera_parts_cache", None)
+    if cached is not None:
+        return cached
+    result: dict[str, list[tuple[float, float, float]]] = {}
+    index = getattr(context, "part_body_index", None)
+    for part_id in (list(index.keys()) if isinstance(index, dict) else []):
+        body = part_body_for_context(context, part_id)
+        if body is None or "camerasInternal" not in body[0]:
+            continue
+        cameras = parse_internal_camera_positions(
+            {part_id: body[0]}, context.node_positions
+        )
+        if cameras:
+            result[part_id] = cameras
+    context._camera_parts_cache = result
+    return result
+
+
+def camera_positions_for_config(
+    context: VehicleContext,
+    config_name: str,
+) -> list[tuple[float, float, float]]:
+    """Driver/dash camera eyes for one config, with each camera-bearing part's
+    nodeMove/nodeOffset slot transform applied.
+
+    The flexbody pipeline already moves a part's meshes by its slot transform;
+    the camera must get the same move or the eye lands in the unmoved frame. The
+    us_semi cabover cab is nodeMove'd +1.94 m (conventional +2.05 m), so its raw
+    camera at y=-1.2 would otherwise sit ~2 m behind the moved seats and dash."""
+    selected = selected_parts_for_config(context, config_name)
+    selected_ids = {str(item) for item in selected.get("parts", set())}
+    slot_options = selected.get("part_slot_options", {})
+    if not isinstance(slot_options, dict):
+        slot_options = {}
+    rows: list[tuple[float, float, float]] = []
+    for part_id, cameras in _camera_bearing_parts(context).items():
+        if part_id not in selected_ids:
+            continue
+        options = slot_options.get(part_id, ())
+        ops = node_transform_ops(
+            tuple(str(item) for item in options if item)
+            if isinstance(options, (list, tuple))
+            else ()
+        )
+        for x, y, z in cameras:
+            dx, dy, dz = node_translation_offset(ops, sign_number(x))
+            rows.append((x + dx, y + dy, z + dz))
+    return rows
+
+
+def _driver_frame_core(
+    context: VehicleContext,
+    object_ids: Iterable[str] | None,
+) -> tuple[str | None, float, "np.ndarray | None"]:
+    """Config-independent parts of the driver frame: the steering-ref wheel id,
+    the lateral centre, and the wheel's raw sample points.
+
+    These depend only on the context, never on the trim, so
+    driver_frame_for_context caches this once per context (when the full object
+    set is used) and reuses it for every trim -- only the eye and the
+    eye-dependent rim/forward differ between trims."""
     candidates = list(object_ids) if object_ids is not None else list(context.objects)
-    camera_rows = parse_internal_camera_positions(context.jbeam_texts, context.node_positions)
-    eye: tuple[float, float, float] | None = None
-    if camera_rows:
-        arr = np.array(camera_rows, dtype=float)
-        eye = tuple(float(v) for v in np.median(arr, axis=0))
-
     best: tuple[int, int, str] | None = None
     for object_id in candidates:
         obj = context.objects.get(object_id)
@@ -6637,9 +6708,29 @@ def driver_frame_for_context(
             if best is None or (rank[0], -rank[1]) > (best[0], -best[1]):
                 best = (rank[0], rank[1], object_id)
     wheel_id = best[2] if best else None
+    center_x = median_value([p[0] for p in context.node_positions.values()]) or 0.0
+    wheel_points = (
+        np.array(context.preview_by_id[wheel_id]["sample_points"], dtype=float)
+        if wheel_id is not None
+        else None
+    )
+    return wheel_id, center_x, wheel_points
+
+
+def _assemble_driver_frame(
+    eye: tuple[float, float, float] | None,
+    wheel_id: str | None,
+    center_x: float,
+    wheel_points: "np.ndarray | None",
+) -> DriverFrame | None:
+    """Build the DriverFrame from the eye plus the config-independent core.
+
+    Eye-dependent only: the wheel rim filter (isolating the hub near/below the
+    eye), the forward direction, and the side. A pure function of its inputs, so
+    driver_frame_for_context memoises the result by eye."""
     wheel_center: tuple[float, float, float] | None = None
-    if wheel_id is not None:
-        points = np.array(context.preview_by_id[wheel_id]["sample_points"], dtype=float)
+    if wheel_points is not None:
+        points = wheel_points
         if eye is not None:
             # Wheel meshes may include the whole steering shaft; keep the rim
             # (near and below the eye) so the centre is the hub, not the rack.
@@ -6651,7 +6742,6 @@ def driver_frame_for_context(
 
     if eye is None and wheel_center is None:
         return None
-    center_x = median_value([p[0] for p in context.node_positions.values()]) or 0.0
     if eye is None:
         eye = (wheel_center[0], wheel_center[1] + 0.60, wheel_center[2] + 0.35)
         source = "wheel"
@@ -6674,6 +6764,61 @@ def driver_frame_for_context(
         wheel_center=wheel_center,
         source=source,
     )
+
+
+def driver_frame_for_context(
+    context: VehicleContext,
+    object_ids: Iterable[str] | None = None,
+    config_name: str | None = None,
+) -> DriverFrame | None:
+    """Anchor the classifier on the driver's eye.
+
+    Camera rows give the eye; the steering wheel corroborates it and fixes the
+    forward direction. Camera without wheel keeps BeamNG's -y-forward
+    convention; wheel without camera estimates the eye behind/above the rim
+    (degraded); neither means the spatial frame is untrustworthy and callers
+    must emit nothing rather than guess.
+
+    When config_name is given, camera eyes carry that config's per-part nodeMove
+    (see camera_positions_for_config) so the eye stays with the moved cab;
+    otherwise the raw camera rows across all parts are used (context-level).
+
+    The config-independent core (steering-ref wheel, centre-x, wheel points) is
+    computed once and cached on the context; assembled frames are memoised by
+    eye. So the many trims of a vehicle that share a camera position -- e.g. a
+    single-cab car's whole trim list -- reuse one frame instead of rescanning
+    every object per trim. An explicit object_ids subset bypasses both caches."""
+    cache_ok = object_ids is None
+
+    core = getattr(context, "_driver_frame_core", None) if cache_ok else None
+    if core is None:
+        core = _driver_frame_core(context, object_ids)
+        if cache_ok:
+            context._driver_frame_core = core
+    wheel_id, center_x, wheel_points = core
+
+    if config_name is not None:
+        camera_rows = camera_positions_for_config(context, config_name)
+    else:
+        camera_rows = parse_internal_camera_positions(context.jbeam_texts, context.node_positions)
+    eye: tuple[float, float, float] | None = None
+    if camera_rows:
+        arr = np.array(camera_rows, dtype=float)
+        eye = tuple(float(v) for v in np.median(arr, axis=0))
+
+    frame_cache = None
+    if cache_ok:
+        frame_cache = getattr(context, "_driver_frame_by_eye", None)
+        if frame_cache is None:
+            frame_cache = {}
+            context._driver_frame_by_eye = frame_cache
+        if eye in frame_cache:
+            return frame_cache[eye]
+
+    result = _assemble_driver_frame(eye, wheel_id, center_x, wheel_points)
+    if frame_cache is not None:
+        frame_cache[eye] = result
+    return result
 
 
 def spatial_spherical_bins(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -7347,6 +7492,96 @@ def material_flags_for_context(context: VehicleContext) -> dict[str, dict[str, b
                     flags[material_name.lower()] = {"emissive": emissive, "glass": glass}
     context._material_flags = flags
     return flags
+
+
+# A beamNavigator controller row: ["beamNavigator", {"screenMaterialName": "@mat", ...}].
+_NAV_SCREEN_MATERIAL_RE = re.compile(
+    r'"beamNavigator"\s*,\s*\{[^{}]*?"screenMaterialName"\s*:\s*"@?([^"]+)"'
+)
+# A quoted material value inside a glowMap state ("on_intense":"@mat").
+_GLOW_STATE_VALUE_RE = re.compile(r':\s*"@?([^"]+)"')
+# A glowMap base-material key ("etk800_gauges_screen":{...}).
+_GLOW_BASE_KEY_RE = re.compile(r'"([A-Za-z0-9_]+)"\s*:[\s,]*\{')
+
+
+def nav_screen_materials_for_context(context: VehicleContext) -> frozenset[str]:
+    """DAE material symbols a beamNavigator controller drives as a live screen
+    (the sat-nav / infotainment display).
+
+    Two authoring patterns both resolve here, so a mirrored screen mesh can be
+    texture-flipped from the vehicle data alone with no manual flag:
+      * direct  -- the controller's screenMaterialName IS the mesh material
+        (etk800: "@etk800_screen" and the mesh binds etk800_screen).
+      * via glowMap -- the mesh binds a base material the same part's glowMap
+        swaps to the screenMaterialName when lit (sunburst2: the mesh binds
+        sunburst2_display_nav, whose glowMap on_intense is sunburst2_naviscreen_on
+        == the screenMaterialName). The base is what the DAE actually binds, so
+        it must be resolved back or the screen is never recognised.
+
+    Only glow bases that reach THIS part's screen material count, so a dash
+    part's unrelated gauge-cluster glowMap (etk800_gauges_screen) is not swept
+    in. Names are lowercased to match mesh_material_symbols. Cached on the
+    context; a vehicle with no navigator yields an empty set."""
+    cached = getattr(context, "_nav_screen_materials", None)
+    if cached is not None:
+        return cached
+    nav: set[str] = set()
+    for part_body, _filename in context.part_body_index.values():
+        controller = transform_helpers.extract_named_array(part_body, "controller")
+        if not controller or "beamNavigator" not in controller:
+            continue
+        screen_mats = {
+            match.group(1).strip().lower()
+            for match in _NAV_SCREEN_MATERIAL_RE.finditer(controller)
+        }
+        if not screen_mats:
+            continue
+        nav |= screen_mats
+        glow = transform_helpers.extract_keyed_object(part_body, "glowMap")
+        if not glow:
+            continue
+        # Scan the glowMap body (past its own "glowMap":{ wrapper) so the outer
+        # key is not mistaken for a base material.
+        outer = glow.find("{")
+        inner = glow[outer + 1:] if outer >= 0 else glow
+        for key_match in _GLOW_BASE_KEY_RE.finditer(inner):
+            base = key_match.group(1).strip().lower()
+            brace = inner.find("{", key_match.start(), key_match.end())
+            try:
+                end = transform_helpers.find_matching(inner, brace, "{", "}")
+            except ValueError:
+                continue
+            block = inner[brace:end]
+            if any(
+                value.group(1).strip().lower() in screen_mats
+                for value in _GLOW_STATE_VALUE_RE.finditer(block)
+            ):
+                nav.add(base)
+    result = frozenset(nav)
+    context._nav_screen_materials = result
+    return result
+
+
+def nav_screen_mesh_scope(context: VehicleContext) -> dict[str, frozenset[str]]:
+    """Mesh id -> the nav-screen material symbols it binds.
+
+    A mesh appears only when it binds at least one beamNavigator screen
+    material. The value is the subset of that mesh's material symbols to
+    texture-flip; on a dedicated screen mesh (etk800_screen) it is every
+    symbol, on a shared mesh (sunburst2_nav, which also carries the gauge
+    cluster) it is only the screen island. Cached on the context."""
+    cached = getattr(context, "_nav_screen_mesh_scope", None)
+    if cached is not None:
+        return cached
+    nav_materials = nav_screen_materials_for_context(context)
+    scope: dict[str, frozenset[str]] = {}
+    if nav_materials:
+        for object_id, symbols in mesh_material_symbols(context).items():
+            matched = frozenset(sym for sym in symbols if sym in nav_materials)
+            if matched:
+                scope[object_id] = matched
+    context._nav_screen_mesh_scope = scope
+    return scope
 
 
 def mesh_material_symbols(context: VehicleContext) -> dict[str, tuple[str, ...]]:

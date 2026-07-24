@@ -886,7 +886,10 @@ class MaterialTests(unittest.TestCase):
             {"inert_alias_L", "inert_alias_R"},
         )
 
-    def test_directional_display_mirrors_with_texture_flip(self) -> None:
+    def test_directional_display_mirrors(self) -> None:
+        # A centred emissive display mirrors. The texture flip that keeps it
+        # readable is no longer a recommendation field: it is derived at build
+        # time from the beamNavigator controller (see test_texture_flip).
         meshes = base_cabin()
         meshes["veh_screen"] = box_cloud((0.02, -0.47, 0.95), (0.20, 0.02, 0.08), n=30, seed=24)
         context = make_context(
@@ -896,7 +899,7 @@ class MaterialTests(unittest.TestCase):
         )
         recs = recommend(context)
         self.assertEqual(recs["veh_screen"]["mode"], core.MODE_MIRROR)
-        self.assertTrue(recs["veh_screen"].get("textureFlip"))
+        self.assertNotIn("textureFlip", recs["veh_screen"])
 
     def test_cluster_screen_in_cone_translates_and_windscreen_skips(self) -> None:
         meshes = base_cabin()

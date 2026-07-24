@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 import unittest
 from xml.etree import ElementTree as ET
 
@@ -96,24 +97,162 @@ class TextureFlipTests(unittest.TestCase):
         values = [float(v) for v in positions.find("c:float_array", th.NS).text.split()]
         self.assertEqual(values[0::3], [0.5, -0.5, -0.5, 0.5])
 
-    def test_texture_flip_mesh_ids_requires_mirror_aesthetic_mode(self) -> None:
-        # Mirror Structural is deliberately excluded: it swaps in the
-        # opposite-side mesh, which already has its own correct mapping.
-        conversion = {
-            "parts": {
-                "screen": {"mode": core.MODE_MIRROR, "textureFlip": True},
-                "dash": {"mode": core.MODE_MIRROR, "textureFlip": False},
-                "gauge": {"mode": core.MODE_TRANSLATE, "textureFlip": True},
-                "panel": {"mode": core.MODE_MIRROR_STRUCTURAL, "textureFlip": True},
+    def test_texture_flip_mesh_ids_is_nav_screens_in_mirror_aesthetic(self) -> None:
+        # Derived from nav detection (no manual flag) and gated to Mirror
+        # Aesthetic: Mirror Structural swaps in the opposite-side mesh, which
+        # already reads correctly, and Translate never reflects the geometry.
+        context = types.SimpleNamespace(
+            _nav_screen_mesh_scope={
+                "screen": frozenset({"screen"}),
+                "gauge": frozenset({"gauge_screen"}),
+                "panel": frozenset({"panel_screen"}),
             }
-        }
+        )
         modes = {
-            "screen": core.MODE_MIRROR,
-            "dash": core.MODE_MIRROR,
-            "gauge": core.MODE_TRANSLATE,
-            "panel": core.MODE_MIRROR_STRUCTURAL,
+            "screen": core.MODE_MIRROR,           # nav + mirror -> flipped
+            "dash": core.MODE_MIRROR,             # mirror but not a nav screen
+            "gauge": core.MODE_TRANSLATE,         # nav but translated, not reflected
+            "panel": core.MODE_MIRROR_STRUCTURAL, # nav but swaps in the twin
         }
-        self.assertEqual(core.texture_flip_mesh_ids(conversion, modes), {"screen"})
+        self.assertEqual(core.texture_flip_mesh_ids(context, modes), {"screen"})
+
+
+class NavScreenDetectionTests(unittest.TestCase):
+    """The beamNavigator screen material resolves to what the DAE binds, both
+    directly (etk800) and through the same part's glowMap (sunburst2)."""
+
+    def _context(self, part_bodies: dict[str, str], symbols: dict[str, tuple[str, ...]]):
+        context = types.SimpleNamespace(
+            part_body_index={name: (body, f"{name}.jbeam") for name, body in part_bodies.items()},
+            preview_by_id={
+                object_id: {"materials": mats} for object_id, mats in symbols.items()
+            },
+        )
+        return context
+
+    def test_direct_screen_material_match(self) -> None:
+        # etk800: screenMaterialName IS the bound material.
+        body = """
+        "etk800_dash": { "slotType": "etk800_dash",
+          "controller": [ ["fileName"],
+            ["beamNavigator", {"screenMaterialName": "@etk800_screen", "name": "etk800_navi"}] ]
+        }
+        """
+        context = self._context({"etk800_dash": body}, {"etk800_screen": ("etk800_screen",)})
+        self.assertEqual(core.nav_screen_materials_for_context(context), frozenset({"etk800_screen"}))
+        self.assertEqual(
+            core.nav_screen_mesh_scope(context),
+            {"etk800_screen": frozenset({"etk800_screen"})},
+        )
+
+    def test_glowmap_resolves_runtime_base_material(self) -> None:
+        # sunburst2: the mesh binds sunburst2_display_nav; the glowMap swaps it
+        # to the screenMaterialName when lit, so the base must be resolved back.
+        body = """
+        "sunburst2_nav": { "slotType": "sunburst2_radio",
+          "controller": [ ["fileName"],
+            ["beamNavigator", {"screenMaterialName": "@sunburst2_naviscreen_on", "name": "sunburst2_navi"}] ],
+          "glowMap": {
+            "sunburst2_display_nav": {"simpleFunction": {"ignitionLevel": 0.5},
+               "off": "screen_off", "on": "sunburst2_naviscreen_accessory",
+               "on_intense": "sunburst2_naviscreen_on"}
+          }
+        }
+        """
+        context = self._context(
+            {"sunburst2_nav": body},
+            {"sunburst2_nav": ("sunburst2_gauges", "sunburst2_display_nav")},
+        )
+        materials = core.nav_screen_materials_for_context(context)
+        self.assertIn("sunburst2_display_nav", materials)
+        # Only the screen island is scoped; the gauge cluster material is not.
+        self.assertEqual(
+            core.nav_screen_mesh_scope(context),
+            {"sunburst2_nav": frozenset({"sunburst2_display_nav"})},
+        )
+
+    def test_no_navigator_yields_empty(self) -> None:
+        body = '"plain_dash": { "slotType": "plain_dash", "flexbodies": [["mesh"]] }'
+        context = self._context({"plain_dash": body}, {"plain_dash": ("dash_mat",)})
+        self.assertEqual(core.nav_screen_materials_for_context(context), frozenset())
+        self.assertEqual(core.nav_screen_mesh_scope(context), {})
+
+
+class ScopedTextureFlipTests(unittest.TestCase):
+    """A nav screen sharing a mesh (and one texcoord source) with a cluster,
+    like sunburst2_nav: only the screen's UV island may be reflected."""
+
+    def build_shared_geometry(self) -> ET.Element:
+        # Two islands in one map source: cluster in U[0,1), nav screen in U[1,2).
+        xml = f"""
+        <geometry xmlns="{th.NS['c']}" id="nav-mesh" name="nav">
+          <mesh>
+            <source id="nav-mesh-positions">
+              <float_array id="nav-mesh-positions-array" count="24">
+                -0.5 0 0  0.5 0 0  0.5 0 1  -0.5 0 1
+                -0.5 0 0  0.5 0 0  0.5 0 1  -0.5 0 1
+              </float_array>
+              <technique_common>
+                <accessor source="#nav-mesh-positions-array" count="8" stride="3">
+                  <param name="X" type="float"/>
+                  <param name="Y" type="float"/>
+                  <param name="Z" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <source id="nav-mesh-map-0">
+              <float_array id="nav-mesh-map-0-array" count="16">
+                0.1 0.2  0.9 0.2  0.9 0.8  0.1 0.8
+                1.1 0.2  1.9 0.2  1.9 0.8  1.1 0.8
+              </float_array>
+              <technique_common>
+                <accessor source="#nav-mesh-map-0-array" count="8" stride="2">
+                  <param name="S" type="float"/>
+                  <param name="T" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <vertices id="nav-mesh-vertices">
+              <input semantic="POSITION" source="#nav-mesh-positions"/>
+            </vertices>
+            <triangles material="cluster-material" count="2">
+              <input semantic="VERTEX" source="#nav-mesh-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#nav-mesh-map-0" offset="1" set="0"/>
+              <p>0 0 1 1 2 2  0 0 2 2 3 3</p>
+            </triangles>
+            <triangles material="display_nav-material" count="2">
+              <input semantic="VERTEX" source="#nav-mesh-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#nav-mesh-map-0" offset="1" set="0"/>
+              <p>4 4 5 5 6 6  4 4 6 6 7 7</p>
+            </triangles>
+          </mesh>
+        </geometry>
+        """
+        return ET.fromstring(xml)
+
+    def test_scoped_flip_reflects_only_nav_island(self) -> None:
+        geometry = self.build_shared_geometry()
+        out = th.mirrored_geometry(
+            geometry, "new", flip_texture=True, flip_materials={"display_nav"}
+        )
+        s, t = uv_pairs(out)
+        # Cluster island (indices 0-3) is untouched.
+        self.assertEqual(s[0:4], [0.1, 0.9, 0.9, 0.1])
+        # Nav island (indices 4-7) reflects within its own tile: u' = 3.0 - u.
+        for got, expected in zip(s[4:8], [1.9, 1.1, 1.1, 1.9]):
+            self.assertAlmostEqual(got, expected)
+        # T (vertical) is never touched.
+        self.assertEqual(t, [0.2, 0.2, 0.8, 0.8, 0.2, 0.2, 0.8, 0.8])
+
+    def test_scoped_flip_keeps_nav_island_in_its_own_tile(self) -> None:
+        geometry = self.build_shared_geometry()
+        out = th.mirrored_geometry(
+            geometry, "new", flip_texture=True, flip_materials={"display_nav"}
+        )
+        s, _t = uv_pairs(out)
+        # The reflection stays within U[1,2); it must not land on the cluster.
+        self.assertGreaterEqual(min(s[4:8]), 1.0)
+        self.assertLessEqual(max(s[4:8]), 2.0)
 
 
 if __name__ == "__main__":

@@ -42,10 +42,36 @@ CLASSIFIER_CACHE_ATTRS = (
     "_authored_surface_triangles",
     "_surface_triangle_files",
 )
+CONTEXT_DEFAULT_FACTORIES = {
+    "part_body_index": dict,
+    "jbeam_positioned_flexbodies": set,
+    "mesh_pivots": dict,
+    "mesh_authored_centers": dict,
+    "variant_dependent_meshes": set,
+    "selected_parts_cache": dict,
+    "resolved_positions_cache": dict,
+    "mesh_roles_cache": dict,
+    "selected_node_positions_cache": dict,
+    "part_array_cache": dict,
+    "variant_hands_cache": dict,
+}
+CONTEXT_RUNTIME_CACHE_ATTRS = (
+    "selected_parts_cache",
+    "resolved_positions_cache",
+    "mesh_roles_cache",
+    "selected_node_positions_cache",
+    "part_array_cache",
+    "variant_hands_cache",
+)
 
 
-def reset_classifier_caches(context: core.VehicleContext) -> None:
-    """Discard recommendation state that must not leak between validations."""
+def prepare_vehicle_context(context: core.VehicleContext) -> None:
+    """Restore older pickle defaults and discard transient validation state."""
+    for attr, factory in CONTEXT_DEFAULT_FACTORIES.items():
+        if not hasattr(context, attr):
+            setattr(context, attr, factory())
+    for attr in CONTEXT_RUNTIME_CACHE_ATTRS:
+        setattr(context, attr, {})
     for attr in CLASSIFIER_CACHE_ATTRS:
         if hasattr(context, attr):
             delattr(context, attr)
@@ -173,7 +199,7 @@ def validate_vehicle(
     context = payload.get("context") if isinstance(payload, dict) else None
     if not isinstance(context, core.VehicleContext):
         raise ValueError(f"invalid context payload: {context_path}")
-    reset_classifier_caches(context)
+    prepare_vehicle_context(context)
 
     baseline_parts = conversion.get("parts") or {}
     mismatch_rows: Counter[tuple[str, str, str]] = Counter()
