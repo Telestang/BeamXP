@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -1952,53 +1953,244 @@ _EXPR_NAMESPACE: dict[str, object] = {
 _EXPR_VAR_RE = re.compile(r"\$[A-Za-z0-9_][A-Za-z0-9_.]*")
 
 
-def evaluate_jbeam_expression(
-    value: str, variables: dict[str, float] | None
-) -> float | None:
-    """Resolve a jbeam value that may reference variables, mirroring
-    expressionParser: a bare ``$name`` yields the variable's value, and ``$=expr``
-    evaluates an arithmetic expression with ``$name`` substituted for its value.
+# BEAMXP_PART_INSTANCE_FIX_V1: typed, side-effect-free evaluation for the
+# geometry-affecting JBeam expression subset. This adds string concatenation
+# and namespace variables without exposing Python eval() to mod archives.
+def _lua_truthy(value: object) -> bool:
+    return value is not None and value is not False
 
-    The Lua idioms stock content uses -- ``$x==nil and a or b`` guards, ``~=``,
-    the flattened math functions -- translate directly to Python once ``$name``
-    becomes its number (or ``None`` when unset) and ``nil`` maps to ``None``.
-    Returns None when the value is not an expression or cannot be evaluated, so
-    callers can fall back to approximate_expression_number.
-    """
+
+def _split_top_level_lua_concat(expression: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char in "([{":
+            depth += 1
+            index += 1
+            continue
+        if char in ")]}":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if depth == 0 and expression.startswith("..", index):
+            parts.append(expression[start:index].strip())
+            index += 2
+            start = index
+            continue
+        index += 1
+    if parts:
+        parts.append(expression[start:].strip())
+        return parts
+    return [expression.strip()]
+
+
+def _safe_jbeam_ast_eval(node: ast.AST, values: dict[str, object]) -> object:
+    if isinstance(node, ast.Expression):
+        return _safe_jbeam_ast_eval(node.body, values)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id in values:
+            return values[node.id]
+        if node.id in _EXPR_NAMESPACE and not callable(_EXPR_NAMESPACE[node.id]):
+            return _EXPR_NAMESPACE[node.id]
+        raise ValueError(f"unknown name {node.id}")
+    if isinstance(node, ast.UnaryOp):
+        value = _safe_jbeam_ast_eval(node.operand, values)
+        if isinstance(node.op, ast.USub):
+            return -value
+        if isinstance(node.op, ast.UAdd):
+            return +value
+        if isinstance(node.op, ast.Not):
+            return not _lua_truthy(value)
+        raise ValueError("unsupported unary operator")
+    if isinstance(node, ast.BinOp):
+        left = _safe_jbeam_ast_eval(node.left, values)
+        right = _safe_jbeam_ast_eval(node.right, values)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Mod):
+            return left % right
+        if isinstance(node.op, ast.Pow):
+            return left ** right
+        raise ValueError("unsupported binary operator")
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            result: object = True
+            for child in node.values:
+                result = _safe_jbeam_ast_eval(child, values)
+                if not _lua_truthy(result):
+                    return result
+            return result
+        if isinstance(node.op, ast.Or):
+            result: object = None
+            for child in node.values:
+                result = _safe_jbeam_ast_eval(child, values)
+                if _lua_truthy(result):
+                    return result
+            return result
+        raise ValueError("unsupported boolean operator")
+    if isinstance(node, ast.Compare):
+        left = _safe_jbeam_ast_eval(node.left, values)
+        for operator, comparator in zip(node.ops, node.comparators):
+            right = _safe_jbeam_ast_eval(comparator, values)
+            if isinstance(operator, ast.Eq):
+                ok = left == right
+            elif isinstance(operator, ast.NotEq):
+                ok = left != right
+            elif isinstance(operator, ast.Lt):
+                ok = left < right
+            elif isinstance(operator, ast.LtE):
+                ok = left <= right
+            elif isinstance(operator, ast.Gt):
+                ok = left > right
+            elif isinstance(operator, ast.GtE):
+                ok = left >= right
+            else:
+                raise ValueError("unsupported comparison")
+            if not ok:
+                return False
+            left = right
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        args = [_safe_jbeam_ast_eval(arg, values) for arg in node.args]
+        if node.func.id == "case":
+            if len(args) != 3:
+                raise ValueError("case expects three arguments")
+            return args[1] if _lua_truthy(args[0]) else args[2]
+        function = _EXPR_NAMESPACE.get(node.func.id)
+        if not callable(function):
+            raise ValueError(f"unsupported function {node.func.id}")
+        return function(*args)
+    raise ValueError(f"unsupported expression node {type(node).__name__}")
+
+
+def _evaluate_lua_expression(expression: str, variables: dict[str, object]) -> object:
+    concat = _split_top_level_lua_concat(expression)
+    if len(concat) > 1:
+        values: list[object] = []
+        for part in concat:
+            value = _evaluate_lua_expression(part, variables)
+            if value is None:
+                raise ValueError("nil cannot be concatenated")
+            values.append(value)
+        return "".join(str(value) for value in values)
+
+    replacements: dict[str, object] = {}
+
+    def substitute(match: re.Match[str]) -> str:
+        key = match.group(0)
+        placeholder = f"_jv_{len(replacements)}"
+        replacements[placeholder] = variables.get(key)
+        return placeholder
+
+    python_expression = _EXPR_VAR_RE.sub(substitute, expression)
+    python_expression = python_expression.replace("~=", "!=").replace("^", "**")
+    python_expression = re.sub(r"\bnil\b", "None", python_expression)
+    python_expression = re.sub(r"\btrue\b", "True", python_expression, flags=re.IGNORECASE)
+    python_expression = re.sub(r"\bfalse\b", "False", python_expression, flags=re.IGNORECASE)
+    tree = ast.parse(python_expression, mode="eval")
+    return _safe_jbeam_ast_eval(tree, replacements)
+
+
+def resolve_jbeam_value(value: str, variables: dict[str, object] | None = None) -> object:
+    text = value.strip()
+    variables = variables or {}
+    if text.startswith("$."):
+        prefix = variables.get("$prefix")
+        suffix = variables.get("$suffix")
+        prefix_text = "" if prefix is None else str(prefix)
+        suffix_text = "" if suffix is None else str(suffix)
+        return f"{prefix_text}{text[2:]}{suffix_text}"
+    if not text.startswith("$"):
+        return value
+    return evaluate_jbeam_expression(text, variables)
+
+
+_JBEAM_STRING_TOKEN_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def resolve_jbeam_row_strings(
+    row: str,
+    variables: dict[str, object] | None = None,
+) -> str:
+    """Resolve dynamic strings/numbers inside one JBeam table row."""
+    variables = variables or {}
+
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        # A quoted token followed by a colon is an object key, not a value.
+        # Slot-variable names such as "$prefix" must remain keys.
+        if re.match(r"\s*:", row[match.end():]):
+            return raw
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        if not isinstance(decoded, str) or not decoded.startswith("$"):
+            return raw
+        try:
+            resolved = resolve_jbeam_value(decoded, variables)
+        except Exception:
+            return raw
+        if resolved is None:
+            return raw
+        return json.dumps(resolved, ensure_ascii=False)
+
+    return _JBEAM_STRING_TOKEN_RE.sub(replace, row)
+
+def evaluate_jbeam_expression(
+    value: str, variables: dict[str, object] | None
+) -> object:
+    """Resolve a direct variable or a side-effect-free JBeam expression."""
     text = value.strip()
     if not text.startswith("$"):
         return None
     variables = variables or {}
     if not text.startswith("$="):
-        resolved = variables.get(text)
-        return float(resolved) if isinstance(resolved, (int, float)) and not isinstance(resolved, bool) else None
-
-    def _sub(match: re.Match[str]) -> str:
-        resolved = variables.get(match.group(0))
-        if isinstance(resolved, (int, float)) and not isinstance(resolved, bool):
-            return repr(float(resolved))
-        return "None"
-
-    expr = _EXPR_VAR_RE.sub(_sub, text[2:]).replace("~=", "!=")
+        return variables.get(text)
     try:
-        result = eval(expr, {"__builtins__": {}}, _EXPR_NAMESPACE)  # noqa: S307
+        return _evaluate_lua_expression(text[2:].strip(), variables)
     except Exception:
         return None
-    if isinstance(result, bool) or not isinstance(result, (int, float)):
-        return None
-    return float(result)
 
 
-def expression_number(value: str, variables: dict[str, float] | None = None) -> float | None:
-    """A jbeam numeric value: the real variable-resolved result when a variable
-    table is supplied and the expression evaluates, otherwise the constant-sum
-    approximation (which is correct for the common ``$var+const`` case when the
-    variable defaults to 0)."""
+
+def expression_number(
+    value: str, variables: dict[str, object] | None = None
+) -> float | None:
+    """Resolve a numeric JBeam value, retaining the existing approximation only
+    when exact typed evaluation is unavailable."""
     if variables is not None and value.strip().startswith("$"):
         resolved = evaluate_jbeam_expression(value, variables)
-        if resolved is not None:
-            return resolved
+        if isinstance(resolved, (int, float)) and not isinstance(resolved, bool):
+            return float(resolved)
     return approximate_expression_number(value)
+
 
 
 def parse_part_variable_defs(part_body: str) -> dict[str, tuple[float, float, float]]:
@@ -2187,6 +2379,65 @@ def build_part_variable_scopes(
         scopes[part_id] = scope
     return scopes
 
+
+# BEAMXP_PART_INSTANCE_FIX_V1: selected state belongs to the slot-tree occurrence,
+# not merely to the source part ID.
+def build_part_instance_variable_scopes(
+    part_instances: Iterable[dict[str, object]],
+    jbeam_texts: dict[str, str],
+    part_body_index: dict[str, tuple[str, str]] | None,
+    user_vars: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    instances = list(part_instances)
+    unique_parts: list[str] = []
+    for instance in instances:
+        part_id = str(instance.get("part_id") or "")
+        if part_id and part_id not in unique_parts:
+            unique_parts.append(part_id)
+
+    base_scopes = build_part_variable_scopes(
+        unique_parts, {}, jbeam_texts, part_body_index, user_vars
+    )
+    defaults: dict[str, tuple[float, float, float]] = {}
+    for part_id in unique_parts:
+        found = find_part_body(part_id, jbeam_texts, part_body_index)
+        if found is not None:
+            for name, spec in parse_part_variable_defs(found[0]).items():
+                defaults.setdefault(name, spec)
+
+    scopes: dict[str, dict[str, object]] = {}
+    for instance in instances:
+        instance_id = str(instance.get("instance_id") or "")
+        part_id = str(instance.get("part_id") or "")
+        scope: dict[str, object] = dict(base_scopes.get(part_id, {}))
+        for name, raw in user_vars.items():
+            name = str(name)
+            if name.startswith("$") and isinstance(raw, (str, bool)):
+                scope[name] = raw
+
+        raw_options = instance.get("inherited_options", ())
+        options = raw_options if isinstance(raw_options, (list, tuple)) else ()
+        for options_json in options:
+            for name, raw in parse_slot_variable_overrides(str(options_json)).items():
+                if name in user_vars:
+                    continue
+                if isinstance(raw, str) and raw.startswith("$"):
+                    resolved = evaluate_jbeam_expression(raw, scope)
+                    if resolved is None:
+                        continue
+                    value: object = resolved
+                else:
+                    value = raw
+                if (
+                    name in defaults
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                ):
+                    _default, low, high = defaults[name]
+                    value = clamp_value(float(value), low, high)
+                scope[name] = value
+        scopes[instance_id] = scope
+    return scopes
 
 def object_number_property(
     object_text: str, key: str, variables: dict[str, float] | None = None
@@ -3320,7 +3571,7 @@ def hand_from_text(text: str) -> str:
 # Bump whenever context-building logic changes in a way that affects cached
 # VehicleContext content (parsing, pivots, common indexing, ...). Structural
 # dataclass changes are caught automatically via the field-name fingerprint.
-CONTEXT_CACHE_VERSION = 9  # 9: load subdirectory DAEs (us_semi upfit bodies: tanker, cargobox, dump, ...)
+CONTEXT_CACHE_VERSION = 10  # 10: path-specific duplicate part instances and namespace variables
 
 
 def context_cache_path(source_zip: Path, vehicle_id: str) -> Path:
@@ -3961,27 +4212,18 @@ def selected_flexbody_mesh_placements(
     config_name: str,
     mesh_ids: set[str],
 ) -> dict[str, list[MeshPlacement]]:
-    """Flexbody placements for the parts ONE config actually selects.
-
-    Unlike collect_flexbody_mesh_placements this never mixes parts that cannot
-    coexist. Positions are measured from the authored pivot (or, for a mesh
-    whose row authors no pos of its own, the authored geometry centre -- see
-    flexbody_mesh_reference_point), so it is safe to call after DaeObject
-    coordinates have been resolved."""
+    """Flexbody placements for every selected part occurrence in one config."""
     selected = selected_parts_for_config(context, config_name)
     placements: dict[str, list[MeshPlacement]] = {}
-    part_slot_options = selected.get("part_slot_options", {})
-    for part_id in sorted(str(item) for item in selected.get("parts", set())):
+    for instance in selected_part_instances(selected):
+        part_id = str(instance.get("part_id") or "")
         flexbodies = part_named_array_for_context(context, part_id, "flexbodies")
         if not flexbodies:
             continue
-        inherited_options = ()
-        if isinstance(part_slot_options, dict):
-            raw_options = part_slot_options.get(part_id, ())
-            if isinstance(raw_options, (list, tuple)):
-                inherited_options = tuple(str(item) for item in raw_options if item)
-        variables = part_variable_scope(selected, part_id)
-        for row in iter_active_top_level_rows(flexbodies):
+        inherited_options = part_instance_options(instance)
+        variables = part_instance_variable_scope(selected, instance)
+        for raw_row in iter_active_top_level_rows(flexbodies):
+            row = resolve_jbeam_row_strings(raw_row, variables)
             mesh = flexbody_row_mesh(row)
             if mesh not in mesh_ids:
                 continue
@@ -3997,6 +4239,7 @@ def selected_flexbody_mesh_placements(
                 )
             )
     return placements
+
 
 
 def selected_flexbody_mesh_positions(
@@ -4543,10 +4786,6 @@ def resolve_selected_parts(
     vehicle_id: str,
     part_body_index: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, object]:
-    # A .pc value of "none" means the user deliberately emptied the slot (jbeam
-    # maps "none" -> ""); normalize it so an emptied slot is an empty string
-    # rather than a phantom part literally named "none" that then pollutes the
-    # selected/missing sets.
     explicit_parts = {
         str(slot_type): ("" if str(part_id) == "none" else str(part_id))
         for slot_type, part_id in dict(pc.get("parts", {})).items()
@@ -4556,109 +4795,128 @@ def resolve_selected_parts(
         or vehicle_namespace_main_part(vehicle_id, part_body_index)
         or vehicle_id
     )
+
     selected: set[str] = set()
     missing_parts: set[str] = set()
-    # Each queue entry carries the slot PATH of the part being processed, so a
-    # slot can be resolved by its full path ('/miramar_body/.../slotId/') and
-    # not just its bare id. A .pc may key a pick either way, and the same slot id
-    # can appear at two tree positions with different picks (miramar's ute plate
-    # sits on the body OR the tailgate); only the path disambiguates them. Paths
-    # start at '/' (the main part is not a segment) and each segment is a slot
-    # id, mirroring jbeam slotSystem's newPath = path .. slotId .. '/'.
-    queue: list[tuple[str, tuple[str, ...], str]] = [(main_part, tuple(), "/")]
-    selected_by_slot: dict[str, str] = {"main": main_part}
-    part_slot_options: dict[str, tuple[str, ...]] = {main_part: tuple()}
-    # Traversal order (parent before child). Sections merge in this order so a
-    # child part's node redefinition overrides the parent's, mirroring how jbeam
-    # unifyParts appends child sections after the parent's (later id wins).
     parts_order: list[str] = []
-    # Pre-seed only bare-id picks; path-keyed picks are resolved by traversal
-    # (seeding a raw path string as a slot type would pollute selected_by_slot).
+    selected_by_slot: dict[str, str] = {"main": main_part}
+    selected_by_path: dict[str, str] = {"/": main_part}
+    part_slot_options: dict[str, tuple[str, ...]] = {main_part: tuple()}
+    part_instances: list[dict[str, object]] = []
+    cycles: list[dict[str, object]] = []
+    instance_id_counts: dict[str, int] = {}
+
+    queue: list[
+        tuple[str, tuple[str, ...], str, str | None, str, tuple[str, ...]]
+    ] = [(main_part, tuple(), "/", None, "main", tuple())]
+
     for slot_type, part_id in explicit_parts.items():
-        if not part_id or "/" in slot_type:
-            continue
-        selected_by_slot[slot_type] = part_id
+        if part_id and "/" not in slot_type:
+            selected_by_slot[slot_type] = part_id
 
     def user_choice_for(slot_id: str, slot_path: str) -> str | None:
-        """The .pc's pick for a slot, id first then path (jbeam order); None if
-        the slot is unspecified, "" if the user emptied it."""
         if slot_id in explicit_parts:
             return explicit_parts[slot_id]
         if slot_path in explicit_parts:
             return explicit_parts[slot_path]
         return None
 
-    def process_queue() -> None:
-        while queue:
-            part_id, inherited_options, part_path = queue.pop(0)
-            if not part_id or part_id in selected:
-                continue
-            selected.add(part_id)
+    while queue:
+        part_id, inherited_options, part_path, parent_instance_id, slot_id, ancestry = queue.pop(0)
+        if not part_id:
+            continue
+        if part_id in ancestry:
+            cycles.append({"part_id": part_id, "slot_path": part_path, "ancestry": ancestry})
+            continue
+
+        base_instance_id = f"{part_path}{part_id}"
+        count = instance_id_counts.get(base_instance_id, 0)
+        instance_id_counts[base_instance_id] = count + 1
+        instance_id = base_instance_id if count == 0 else f"{base_instance_id}#{count + 1}"
+
+        found = find_part_body(part_id, jbeam_texts, part_body_index)
+        source_file = found[1] if found is not None else None
+        part_instances.append(
+            {
+                "instance_id": instance_id,
+                "part_id": part_id,
+                "slot_id": slot_id,
+                "slot_path": part_path,
+                "parent_instance_id": parent_instance_id,
+                "inherited_options": inherited_options,
+                "source_file": source_file,
+            }
+        )
+
+        selected.add(part_id)
+        if part_id not in parts_order:
             parts_order.append(part_id)
-            part_slot_options.setdefault(part_id, inherited_options)
+        part_slot_options.setdefault(part_id, inherited_options)
 
-            found = find_part_body(part_id, jbeam_texts, part_body_index)
-            if found is None:
-                missing_parts.add(part_id)
-                continue
-            part_body, _filename = found
+        if found is None:
+            missing_parts.add(part_id)
+            continue
+        part_body, _filename = found
+        next_ancestry = ancestry + (part_id,)
 
-            for slot_def in extract_slot_defs(part_body):
-                slot_path = part_path + slot_def.slot_type + "/"
-                user_choice = user_choice_for(slot_def.slot_type, slot_path)
-                if user_choice is not None:
-                    if user_choice == "":
-                        # Explicitly emptied: leave the slot empty, do NOT fall
-                        # back to the slot default (jbeam user-empty behaviour).
-                        continue
-                    chosen = user_choice
-                    picked = find_part_body(user_choice, jbeam_texts, part_body_index)
-                    if picked is None or not part_fits_slot(
-                        transform_helpers.extract_part_slot_types(picked[0]), slot_def
-                    ):
-                        # Wrong slot type or unknown part -> reset to default,
-                        # exactly as slotSystem.fillSlots_rec does.
-                        chosen = slot_def.default_part
-                else:
-                    chosen = slot_def.default_part
-                if not chosen:
+        for slot_def in extract_slot_defs(part_body):
+            slot_path = part_path + slot_def.slot_type + "/"
+            user_choice = user_choice_for(slot_def.slot_type, slot_path)
+            if user_choice is not None:
+                if user_choice == "":
                     continue
-                selected_by_slot[slot_def.slot_type] = chosen
-                child_options = list(inherited_options)
-                if slot_def.options:
-                    child_options.append(slot_def.options)
-                child_options_tuple = tuple(child_options)
-                part_slot_options.setdefault(chosen, child_options_tuple)
-                if chosen not in selected:
-                    queue.append((chosen, child_options_tuple, slot_path))
+                chosen = user_choice
+                picked = find_part_body(chosen, jbeam_texts, part_body_index)
+                if picked is None or not part_fits_slot(
+                    transform_helpers.extract_part_slot_types(picked[0]), slot_def
+                ):
+                    chosen = slot_def.default_part
+            else:
+                chosen = slot_def.default_part
+            if not chosen:
+                continue
 
-    process_queue()
-    # NOTE: intentionally NO force-add of every .pc part here. BeamNG selects a
-    # part only when slot traversal actually reaches its slot (slotSystem's
-    # fillSlots_rec); a .pc entry for a slot that isn't present in the resolved
-    # tree is ignored. Stock .pc files carry such leftover entries (e.g. the
-    # miramar race trim lists race_seat_FR though its slot is never reached),
-    # and force-adding them spawns orphaned parts/meshes that float in the
-    # preview. Selection now strictly follows the slot tree, matching the game.
+            selected_by_slot[slot_def.slot_type] = chosen
+            selected_by_path[slot_path] = chosen
+            child_options = list(inherited_options)
+            if slot_def.options:
+                child_options.append(slot_def.options)
+            child_options_tuple = tuple(child_options)
+            part_slot_options.setdefault(chosen, child_options_tuple)
+            queue.append(
+                (
+                    chosen,
+                    child_options_tuple,
+                    slot_path,
+                    instance_id,
+                    slot_def.slot_type,
+                    next_ancestry,
+                )
+            )
 
     user_vars = pc.get("vars")
+    user_variable_map = user_vars if isinstance(user_vars, dict) else {}
     part_variables = build_part_variable_scopes(
-        parts_order,
-        part_slot_options,
-        jbeam_texts,
-        part_body_index,
-        user_vars if isinstance(user_vars, dict) else {},
+        parts_order, part_slot_options, jbeam_texts, part_body_index, user_variable_map
+    )
+    part_instance_variables = build_part_instance_variable_scopes(
+        part_instances, jbeam_texts, part_body_index, user_variable_map
     )
 
     return {
         "main_part": main_part,
         "parts": selected,
         "parts_order": parts_order,
+        "part_instances": part_instances,
         "selected_by_slot": selected_by_slot,
+        "selected_by_path": selected_by_path,
         "part_slot_options": part_slot_options,
         "part_variables": part_variables,
+        "part_instance_variables": part_instance_variables,
         "missing_parts": missing_parts,
+        "cycles": cycles,
     }
+
 
 
 def selected_parts_for_config(context: VehicleContext, config_name: str) -> dict[str, object]:
@@ -4694,22 +4952,76 @@ _NODE_ROW_RE = re.compile(
 )
 
 
-def iter_node_rows(node_array: str) -> Iterable[tuple[str, tuple[float, float, float], str]]:
-    """(node_id, (x, y, z), raw_row) for each ACTIVE node row.
+# BEAMXP_PART_INSTANCE_FIX_V1: compatibility accessors for path-specific selected
+# part occurrences.
+def selected_part_instances(selected: dict[str, object]) -> list[dict[str, object]]:
+    raw = selected.get("part_instances")
+    if isinstance(raw, list):
+        valid = [dict(item) for item in raw if isinstance(item, dict)]
+        if valid:
+            return valid
 
-    Commented-out rows are skipped -- the game does not load them, so a node
-    whose live definition is preceded by a commented-out one (common in stock
-    content) must read the live position, not the commented number. Rows are
-    yielded in file order so the caller can apply jbeam's last-write-wins."""
-    for row in iter_active_top_level_rows(node_array):
+    part_slot_options = selected.get("part_slot_options", {})
+    result: list[dict[str, object]] = []
+    for index, part_id in enumerate(selected_parts_in_merge_order(selected)):
+        options: tuple[str, ...] = ()
+        if isinstance(part_slot_options, dict):
+            raw_options = part_slot_options.get(part_id, ())
+            if isinstance(raw_options, (list, tuple)):
+                options = tuple(str(item) for item in raw_options if item)
+        result.append(
+            {
+                "instance_id": f"legacy:{index}:{part_id}",
+                "part_id": part_id,
+                "slot_id": "legacy",
+                "slot_path": "/",
+                "parent_instance_id": None,
+                "inherited_options": options,
+                "source_file": None,
+            }
+        )
+    return result
+
+
+def part_instance_options(instance: dict[str, object]) -> tuple[str, ...]:
+    raw = instance.get("inherited_options", ())
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(str(item) for item in raw if item)
+
+
+def part_instance_variable_scope(
+    selected: dict[str, object],
+    instance: dict[str, object],
+) -> dict[str, object]:
+    instance_scopes = selected.get("part_instance_variables")
+    instance_id = str(instance.get("instance_id") or "")
+    if isinstance(instance_scopes, dict):
+        scope = instance_scopes.get(instance_id)
+        if isinstance(scope, dict):
+            return scope
+    return dict(part_variable_scope(selected, str(instance.get("part_id") or "")))
+
+def iter_node_rows(
+    node_array: str,
+    variables: dict[str, object] | None = None,
+) -> Iterable[tuple[str, tuple[float, float, float], str]]:
+    """Yield active node rows after resolving instance-specific expressions."""
+    for raw_row in iter_active_top_level_rows(node_array):
+        row = resolve_jbeam_row_strings(raw_row, variables)
         match = _NODE_ROW_RE.match(row)
         if match is None:
             continue
         node_id = match.group("id")
         if node_id in {"id", "type", "mesh", "func"}:
             continue
-        position = (float(match.group("x")), float(match.group("y")), float(match.group("z")))
+        position = (
+            float(match.group("x")),
+            float(match.group("y")),
+            float(match.group("z")),
+        )
         yield node_id, position, row
+
 
 
 def selected_parts_in_merge_order(selected: dict[str, object]) -> list[str]:
@@ -4738,20 +5050,14 @@ def selected_node_positions_for_config(
 
     selected = selected_parts_for_config(context, config_name)
     nodes: dict[str, tuple[float, float, float]] = {}
-    part_slot_options = selected.get("part_slot_options", {})
-    for part_id in selected_parts_in_merge_order(selected):
+    for instance in selected_part_instances(selected):
+        part_id = str(instance.get("part_id") or "")
         node_array = part_named_array_for_context(context, part_id, "nodes")
         if not node_array:
             continue
-        inherited_options = ()
-        if isinstance(part_slot_options, dict):
-            raw_options = part_slot_options.get(part_id, ())
-            if isinstance(raw_options, (list, tuple)):
-                inherited_options = tuple(str(item) for item in raw_options if item)
-        variables = part_variable_scope(selected, part_id)
-        for node_id, position, row in iter_node_rows(node_array):
-            # Last write wins: a later active row (in this part or a
-            # deeper-merged one) is jbeam's redefinition of the node.
+        inherited_options = part_instance_options(instance)
+        variables = part_instance_variable_scope(selected, instance)
+        for node_id, position, row in iter_node_rows(node_array, variables):
             nodes[node_id] = pos_after_node_transforms(
                 row, position, inherited_options, variables
             )
@@ -4760,14 +5066,15 @@ def selected_node_positions_for_config(
     return nodes
 
 
+
 def selected_node_positions_for_parts(
     selected: dict[str, object],
     jbeam_texts: dict[str, str],
     part_body_index: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, tuple[float, float, float]]:
     nodes: dict[str, tuple[float, float, float]] = {}
-    part_slot_options = selected.get("part_slot_options", {})
-    for part_id in selected_parts_in_merge_order(selected):
+    for instance in selected_part_instances(selected):
+        part_id = str(instance.get("part_id") or "")
         found = find_part_body(part_id, jbeam_texts, part_body_index)
         if found is None:
             continue
@@ -4775,17 +5082,14 @@ def selected_node_positions_for_parts(
         node_array = transform_helpers.extract_named_array(part_body, "nodes")
         if not node_array:
             continue
-        inherited_options = ()
-        if isinstance(part_slot_options, dict):
-            raw_options = part_slot_options.get(part_id, ())
-            if isinstance(raw_options, (list, tuple)):
-                inherited_options = tuple(str(item) for item in raw_options if item)
-        variables = part_variable_scope(selected, part_id)
-        for node_id, position, row in iter_node_rows(node_array):
+        inherited_options = part_instance_options(instance)
+        variables = part_instance_variable_scope(selected, instance)
+        for node_id, position, row in iter_node_rows(node_array, variables):
             nodes[node_id] = pos_after_node_transforms(
                 row, position, inherited_options, variables
             )
     return nodes
+
 
 
 def prop_row_mesh(row: str) -> str | None:
@@ -4819,18 +5123,15 @@ def selected_prop_mesh_positions(
     selected = selected_parts_for_config(context, config_name)
     node_positions = selected_node_positions_for_config(context, config_name)
     positions: dict[str, list[tuple[float, float, float]]] = {}
-    part_slot_options = selected.get("part_slot_options", {})
-    for part_id in sorted(str(item) for item in selected.get("parts", set())):
+    for instance in selected_part_instances(selected):
+        part_id = str(instance.get("part_id") or "")
         props = part_named_array_for_context(context, part_id, "props")
         if not props:
             continue
-        inherited_options = ()
-        if isinstance(part_slot_options, dict):
-            raw_options = part_slot_options.get(part_id, ())
-            if isinstance(raw_options, (list, tuple)):
-                inherited_options = tuple(str(item) for item in raw_options if item)
-        variables = part_variable_scope(selected, part_id)
-        for row in iter_active_top_level_rows(props):
+        inherited_options = part_instance_options(instance)
+        variables = part_instance_variable_scope(selected, instance)
+        for raw_row in iter_active_top_level_rows(props):
+            row = resolve_jbeam_row_strings(raw_row, variables)
             mesh = prop_row_mesh(row)
             if mesh not in mesh_ids:
                 continue
@@ -4843,7 +5144,11 @@ def selected_prop_mesh_positions(
     return positions
 
 
-def mesh_roles_for_config(context: VehicleContext, config_name: str) -> tuple[set[str], set[str], set[str]]:
+
+def mesh_roles_for_config(
+    context: VehicleContext,
+    config_name: str,
+) -> tuple[set[str], set[str], set[str]]:
     cached = context.mesh_roles_cache.get(config_name)
     if cached is not None:
         return cached
@@ -4852,24 +5157,28 @@ def mesh_roles_for_config(context: VehicleContext, config_name: str) -> tuple[se
     prop_meshes: set[str] = set()
     all_meshes: set[str] = set()
     selected = selected_parts_for_config(context, config_name)
-    for part_id in selected["parts"]:
-        part_id = str(part_id)
+    for instance in selected_part_instances(selected):
+        part_id = str(instance.get("part_id") or "")
+        variables = part_instance_variable_scope(selected, instance)
         flexbodies = part_named_array_for_context(context, part_id, "flexbodies")
         if flexbodies:
-            for mesh in re.findall(r'\[\s*"((?:[^"\\]|\\.)*)"\s*(?=,|\[|\{)', flexbodies):
-                if mesh and mesh != "mesh":
+            for raw_row in iter_active_top_level_rows(flexbodies):
+                mesh = flexbody_row_mesh(resolve_jbeam_row_strings(raw_row, variables))
+                if mesh:
                     flexbody_meshes.add(mesh)
                     all_meshes.add(mesh)
         props = part_named_array_for_context(context, part_id, "props")
         if props:
-            for _full, _func, mesh in transform_helpers.PROP_FUNC_MESH_RE.findall(props):
-                if mesh and mesh != "mesh":
+            for raw_row in iter_active_top_level_rows(props):
+                mesh = prop_row_mesh(resolve_jbeam_row_strings(raw_row, variables))
+                if mesh:
                     prop_meshes.add(mesh)
                     all_meshes.add(mesh)
 
     roles = (flexbody_meshes, prop_meshes, all_meshes)
     context.mesh_roles_cache[config_name] = roles
     return roles
+
 
 
 def selected_mesh_roles(
@@ -6461,24 +6770,25 @@ def output_vehicle_preview_payload(
     )
     node_positions = build_node_position_index(combined_jbeam_texts)
     node_positions.update(selected_nodes)
-    part_slot_options = selected.get("part_slot_options", {})
-
     rotation_counts: dict[str, int] = {}
 
-    for part_id in sorted(str(part) for part in selected.get("parts", set())):
+    for part_instance in selected_part_instances(selected):
+        part_id = str(part_instance.get("part_id") or "")
+        instance_id = str(part_instance.get("instance_id") or "")
+        slot_path = str(part_instance.get("slot_path") or "/")
         found = find_part_body(part_id, combined_jbeam_texts, combined_part_index)
         if found is None:
-            skipped.setdefault(part_id, "part body not found")
+            skipped.setdefault(instance_id or part_id, "part body not found")
             continue
         part_body, _filename = found
-        raw_options = part_slot_options.get(part_id, ()) if isinstance(part_slot_options, dict) else ()
-        opts = tuple(str(item) for item in raw_options if item) if isinstance(raw_options, (list, tuple)) else ()
-        variables = part_variable_scope(selected, part_id)
+        opts = part_instance_options(part_instance)
+        variables = part_instance_variable_scope(selected, part_instance)
         for kind, array_key in (("flex", "flexbodies"), ("prop", "props")):
             array_text = transform_helpers.extract_named_array(part_body, array_key)
             if not array_text:
                 continue
-            for row in iter_active_top_level_rows(array_text):
+            for raw_row in iter_active_top_level_rows(array_text):
+                row = resolve_jbeam_row_strings(raw_row, variables)
                 mesh = flexbody_row_mesh(row) if kind == "flex" else prop_row_mesh(row)
                 if not mesh or mesh in ("SPOTLIGHT", "POINTLIGHT"):
                     continue
@@ -6487,9 +6797,6 @@ def output_vehicle_preview_payload(
                     skipped.setdefault(mesh, "no DAE geometry indexed")
                     continue
                 if kind == "prop" and not prop_row_nodes_present(row, selected_nodes):
-                    # the engine only spawns a prop when its idRef/idX/idY nodes
-                    # exist in the assembled config; other rows (e.g. the manual
-                    # vs sequential handbrake mounts) stay dormant
                     skipped.setdefault(mesh, "inactive row (prop nodes not in this config)")
                     continue
                 rotation_source = None
@@ -6513,12 +6820,11 @@ def output_vehicle_preview_payload(
                         "node_names": preview_node_names(obj),
                         "mesh": mesh,
                         "part": part_id,
+                        "part_instance": instance_id,
+                        "slot_path": slot_path,
                         "kind": kind,
                         "mode": "output" if is_generated else MODE_SKIP,
                         "matrix": matrix4_flat(world),
-                        # Our own generated geometry always means what its node
-                        # says; source geometry follows the row-authorship rule
-                        # (see flexbody_row_needs_node_translation).
                         "keep_node_translation": is_generated
                         or (kind == "flex" and flexbody_row_needs_node_translation(context, mesh)),
                         **({"rotation_source": rotation_source} if rotation_source else {}),
@@ -6588,8 +6894,11 @@ def full_vehicle_preview_payload(
         vehicle_id=context.vehicle_id,
         part_body_index=preview_part_index,
     )
-    part_slot_options = selected.get("part_slot_options", {})
-    selected_nodes = selected_node_positions_for_config(context, config_name)
+    selected_nodes = selected_node_positions_for_parts(
+        selected,
+        context.jbeam_texts,
+        preview_part_index,
+    )
     node_positions = dict(context.node_positions)
     node_positions.update(selected_nodes)
     mirror = mirror_x_matrix4()
@@ -6628,15 +6937,18 @@ def full_vehicle_preview_payload(
             return transform_helpers.extract_named_array(body, array_key)
         return part_named_array_for_context(context, part_id, array_key)
 
-    for part_id in sorted(str(part) for part in selected.get("parts", set())):
-        raw_options = part_slot_options.get(part_id, ()) if isinstance(part_slot_options, dict) else ()
-        opts = tuple(str(item) for item in raw_options if item) if isinstance(raw_options, (list, tuple)) else ()
-        variables = part_variable_scope(selected, part_id)
+    for part_instance in selected_part_instances(selected):
+        part_id = str(part_instance.get("part_id") or "")
+        instance_id = str(part_instance.get("instance_id") or "")
+        slot_path = str(part_instance.get("slot_path") or "/")
+        opts = part_instance_options(part_instance)
+        variables = part_instance_variable_scope(selected, part_instance)
         for kind, array_key in (("flex", "flexbodies"), ("prop", "props")):
             array_text = preview_part_array(part_id, array_key)
             if not array_text:
                 continue
-            for row in iter_active_top_level_rows(array_text):
+            for raw_row in iter_active_top_level_rows(array_text):
+                row = resolve_jbeam_row_strings(raw_row, variables)
                 mesh = flexbody_row_mesh(row) if kind == "flex" else prop_row_mesh(row)
                 if not mesh or mesh in ("SPOTLIGHT", "POINTLIGHT"):
                     continue
@@ -6649,6 +6961,7 @@ def full_vehicle_preview_payload(
                 if kind == "prop" and not prop_row_nodes_present(row, selected_nodes):
                     skipped.setdefault(mesh, "inactive row (prop nodes not in this config)")
                     continue
+                rotation_source = None
                 if kind == "flex":
                     world = flexbody_row_source_matrix(row, opts, variables)
                 else:
@@ -6659,8 +6972,6 @@ def full_vehicle_preview_payload(
                         row, node_positions, pivot, opts, rotation_override, variables
                     )
                 if world is None:
-                    # matches the engine: prop rows whose reference nodes are
-                    # absent from this config never render
                     skipped.setdefault(mesh, "placement unresolved (inactive row?)")
                     continue
                 if math.hypot(world[0][3], world[1][3], world[2][3]) > PREVIEW_FAR_LIMIT:
@@ -6673,6 +6984,8 @@ def full_vehicle_preview_payload(
                         "node_names": preview_node_names(obj),
                         "mesh": mesh,
                         "part": part_id,
+                        "part_instance": instance_id,
+                        "slot_path": slot_path,
                         "kind": kind,
                         "mode": mode if target_hand is not None else MODE_SKIP,
                         "matrix": matrix4_flat(final_matrix(mesh, mode, world)),
@@ -6680,6 +6993,7 @@ def full_vehicle_preview_payload(
                         "keep_node_translation": (
                             kind != "flex" or flexbody_row_needs_node_translation(context, geometry_mesh)
                         ),
+                        **({"rotation_source": rotation_source} if rotation_source else {}),
                     }
                 )
 
