@@ -3320,7 +3320,7 @@ def hand_from_text(text: str) -> str:
 # Bump whenever context-building logic changes in a way that affects cached
 # VehicleContext content (parsing, pivots, common indexing, ...). Structural
 # dataclass changes are caught automatically via the field-name fingerprint.
-CONTEXT_CACHE_VERSION = 8  # 8: resolve $components.* references (us_semi dual-wheel spacing etc.)
+CONTEXT_CACHE_VERSION = 9  # 9: load subdirectory DAEs (us_semi upfit bodies: tanker, cargobox, dump, ...)
 
 
 def context_cache_path(source_zip: Path, vehicle_id: str) -> Path:
@@ -3599,9 +3599,15 @@ def load_vehicle_context(
             cached.loaded_from_cache = True
             return cached
 
+    # Top-level DAEs first (they hold the main body and keep priority on any
+    # duplicate mesh id via objects.setdefault), then DAEs in subdirectories.
+    # Upfit bodies live under e.g. vehicles/us_semi/tanker/tanker.dae; without
+    # the subdir DAEs those meshes (tanker, cargobox, dump, flatbed, ...) have no
+    # geometry and vanish from the preview.
     dae_paths = direct_vehicle_files(source_zip, selected_vehicle_id, ".dae")
-    if not dae_paths:
-        dae_paths = list_vehicle_files(source_zip, selected_vehicle_id, ".dae")
+    for path in list_vehicle_files(source_zip, selected_vehicle_id, ".dae"):
+        if path not in dae_paths:
+            dae_paths.append(path)
     if not dae_paths:
         raise RuntimeError(f"No DAE files found for vehicles/{selected_vehicle_id}")
 
