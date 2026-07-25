@@ -121,9 +121,16 @@ class ResolvedMeshPosition:
 
 @dataclass(frozen=True)
 class SlotDef:
+    # slot_type is the slot IDENTIFIER: the type for a slots(v1) row, the name
+    # for a slots2 row (which is what a .pc keys its parts map by). allow_types/
+    # deny_types drive fitment (jbeam partFitsSlot): a v1 slot allows exactly its
+    # type; a slots2 slot allows any of allow_types unless the part also matches
+    # a deny_type.
     slot_type: str
     default_part: str
     options: str | None = None
+    allow_types: tuple[str, ...] = ()
+    deny_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -313,6 +320,30 @@ def parse_dae(source_zip: Path, dae_path: str) -> ET.ElementTree:
             return ET.parse(fh)
 
 
+def dae_unit_scale(root: ET.Element) -> float:
+    """The COLLADA asset's <unit meter="..."> factor (metres per unit).
+
+    Some stock geometry is authored in centimetres (e.g.
+    common/tires/bolide_80s_tires.dae carries <unit meter="0.01"> with no scale
+    in its node transforms), so its vertex coordinates are 100x too large unless
+    this factor is applied -- which is what made the bolide's tyres render metres
+    wide. DAEs authored in metres report meter="1" (a no-op), and DAEs that carry
+    a scale in the node matrix instead (e.g. gavrilsteeringwheels.dae) report
+    meter="1", so applying this on top of the node transform never double-scales.
+    """
+    for elem in root.iter():
+        tag = elem.tag.rsplit("}", 1)[-1]
+        if tag == "unit":
+            try:
+                value = float(elem.get("meter"))
+            except (TypeError, ValueError):
+                return 1.0
+            return value if value > 0 else 1.0
+        if tag == "library_geometries":
+            break  # <unit> lives in <asset> near the top; stop once past it
+    return 1.0
+
+
 def dae_objects_from_tree(
     tree: ET.ElementTree,
     dae_path: str,
@@ -320,6 +351,7 @@ def dae_objects_from_tree(
     dae_source_zip: Path | None = None,
 ) -> dict[str, DaeObject]:
     objects: dict[str, DaeObject] = {}
+    unit = dae_unit_scale(tree.getroot())
     for node in tree.getroot().findall(".//c:node", NS):
         object_id = node.get("id")
         if not object_id:
@@ -340,9 +372,9 @@ def dae_objects_from_tree(
             id=object_id,
             name=(node.get("name") or object_id).strip(),
             dae_path=dae_path,
-            x=matrix[0][3],
-            y=matrix[1][3],
-            z=matrix[2][3],
+            x=matrix[0][3] * unit,
+            y=matrix[1][3] * unit,
+            z=matrix[2][3] * unit,
             geometry_ids=geometry_ids,
             dae_source_zip=dae_source_zip,
         )
@@ -614,6 +646,7 @@ def preview_data_from_tree(
     if library_geometries is None:
         return {}
 
+    unit = dae_unit_scale(root)
     geometries_by_id = {
         geom.get("id"): geom
         for geom in library_geometries.findall("c:geometry", NS)
@@ -643,7 +676,9 @@ def preview_data_from_tree(
             geometry_id = url[1:]
             geometry_ids.append(geometry_id)
             local_points = local_points_by_geometry.get(geometry_id, [])
-            object_points.extend(transform_helpers.transform_point(matrix, point) for point in local_points)
+            for point in local_points:
+                wx, wy, wz = transform_helpers.transform_point(matrix, point)
+                object_points.append((wx * unit, wy * unit, wz * unit))
 
         if not object_points:
             continue
@@ -683,6 +718,7 @@ def surface_triangles_from_tree(
     if library_geometries is None:
         return {}
 
+    unit = dae_unit_scale(root)
     local_by_geometry: dict[str, np.ndarray] = {}
     for geometry in library_geometries.findall("c:geometry", NS):
         geometry_id = geometry.get("id")
@@ -709,7 +745,7 @@ def surface_triangles_from_tree(
             homogeneous = np.concatenate(
                 [flat, np.ones((len(flat), 1), dtype=float)], axis=1
             )
-            chunks.append((homogeneous @ matrix.T)[:, :3].reshape((-1, 3, 3)))
+            chunks.append(((homogeneous @ matrix.T)[:, :3] * unit).reshape((-1, 3, 3)))
         if not chunks:
             continue
         triangles = np.concatenate(chunks)
@@ -1141,6 +1177,43 @@ def prop_engine_rest_rotation(
     )
 
 
+def load_resolver_inputs(
+    source_zip: Path,
+    vehicle_id: str,
+    *,
+    common_texts: dict[str, str] | None = None,
+    common_index: dict[str, tuple[str, str]] | None = None,
+) -> tuple[dict[str, str], dict[str, tuple[str, str]], dict[str, tuple[float, float, float]]]:
+    """Assemble the jbeam inputs the slot/part resolver needs, independent of
+    any DAE/visibility work.
+
+    Returns (jbeam_texts, part_body_index, node_positions). The vehicle's own
+    jbeam is indexed first; parts under vehicles/common are pulled in only when
+    the vehicle's slot graph can reach them (reachable_common_part_index). This
+    is the single seam load_vehicle_context and the resolver regression harness
+    share, so changes to namespace scoping land in one place.
+
+    common_texts/common_index let a caller supply an already-parsed vehicles/common
+    index (it is vehicle-independent for a given source folder), so a batch tool
+    parses common once instead of per vehicle. The app path passes neither and
+    behaves exactly as before.
+    """
+    jbeam_texts = load_jbeam_texts(source_zip, vehicle_id)
+    part_body_index = build_part_body_index(jbeam_texts)
+    if common_texts is None:
+        common_texts = load_common_jbeam_texts(source_zip)
+    if common_index is None:
+        common_index = build_part_body_index(common_texts) if common_texts else {}
+    if common_index:
+        reachable_common = reachable_common_part_index(part_body_index, common_index)
+        if reachable_common:
+            part_body_index.update(reachable_common)
+            for _body, filename in reachable_common.values():
+                jbeam_texts.setdefault(filename, common_texts[filename])
+    node_positions = build_node_position_index(jbeam_texts)
+    return jbeam_texts, part_body_index, node_positions
+
+
 def load_common_jbeam_texts(source_zip: Path) -> dict[str, str]:
     texts: dict[str, str] = {}
     for candidate_zip in common_zip_candidates(source_zip):
@@ -1426,7 +1499,15 @@ def extract_slot_defs(part_body: str) -> list[SlotDef]:
             default_part = quoted_string_value(values[1])
             if not slot_type or slot_type in {"type", "name"} or default_part is None:
                 continue
-            out.append(SlotDef(slot_type, default_part, trailing_options_object(values)))
+            # v1 slot: a part fits iff its slotType equals this slot's type.
+            out.append(
+                SlotDef(
+                    slot_type,
+                    default_part,
+                    trailing_options_object(values),
+                    allow_types=(slot_type,),
+                )
+            )
             seen.add(slot_type)
 
     slots2 = transform_helpers.extract_named_array(part_body, "slots2")
@@ -1439,25 +1520,60 @@ def extract_slot_defs(part_body: str) -> list[SlotDef]:
             default_part = quoted_string_value(values[3])
             if not slot_type or slot_type in {"type", "name"} or default_part is None or slot_type in seen:
                 continue
-            out.append(SlotDef(slot_type, default_part, trailing_options_object(values)))
+            # slots2 row: ["name", "allowTypes", "denyTypes", "default", ...].
+            allow_types = tuple(re.findall(r'"((?:[^"\\]|\\.)*)"', values[1]))
+            deny_types = tuple(re.findall(r'"((?:[^"\\]|\\.)*)"', values[2]))
+            out.append(
+                SlotDef(
+                    slot_type,
+                    default_part,
+                    trailing_options_object(values),
+                    allow_types=allow_types,
+                    deny_types=deny_types,
+                )
+            )
             seen.add(slot_type)
 
     return out
 
 
-def vector_from_row(row: str, key: str) -> tuple[float, float, float] | None:
+def part_fits_slot(part_slot_types: Iterable[str], slot: SlotDef) -> bool:
+    """Whether a part with these slotTypes may fill this slot, mirroring jbeam
+    slotSystem.partFitsSlot: it must match one of the slot's allow_types and
+    none of its deny_types. A part declares one or more slotTypes; the vehicle
+    author-side .pc is normally valid, so this only bites on invalid/mod configs
+    (a mismatched pick is reset to the slot default, as the engine does)."""
+    types = set(part_slot_types)
+    if not types:
+        return False
+    allow = set(slot.allow_types) or {slot.slot_type}
+    if types.isdisjoint(allow):
+        return False
+    if slot.deny_types and not types.isdisjoint(slot.deny_types):
+        return False
+    return True
+
+
+def vector_from_row(
+    row: str, key: str, variables: dict[str, float] | None = None
+) -> tuple[float, float, float] | None:
     """A row's "pos"/"rot"/"scale" vector, one component at a time.
 
     Some stock content makes a component a jbeam variable expression instead
     of a literal -- e.g. the D-Series heavy hub's spacer:
     "pos":{"x":"$=-$trackoffset_F-0.885", "y":-1.463, "z":0.46}. Reading x/y/z
-    independently via object_number_property (which already falls back to
-    approximate_expression_number, the same machinery node_transform_ops uses
-    for nodeOffset/nodeMove) means a literal y and z are recovered even when x
-    is an expression. The previous all-three-or-nothing regex discarded the
-    whole vector in that case -- not just the unparseable x, but the entirely
-    literal y and z along with it -- and any node_translation_offset that
-    reads this vector's sign lost the L/R distinction it exists to make."""
+    independently via object_number_property (which resolves the expression when
+    a variable scope is supplied, else falls back to approximate_expression_number)
+    means a literal y and z are recovered even when x is an expression. The
+    previous all-three-or-nothing regex discarded the whole vector in that case
+    -- not just the unparseable x, but the entirely literal y and z along with
+    it -- and any node_translation_offset that reads this vector's sign lost the
+    L/R distinction it exists to make.
+
+    variables is passed by the config-specific preview/position readers so
+    expressions resolve to real values; the build/rewrite path leaves it None so
+    it keeps working on the authored expression text (it must not bake a variable
+    value into rewritten jbeam)."""
     match = re.search(rf'"{re.escape(key)}"\s*:\s*\{{', row)
     if match is None:
         return None
@@ -1467,9 +1583,9 @@ def vector_from_row(row: str, key: str) -> tuple[float, float, float] | None:
     except ValueError:
         return None
     object_text = row[brace:end]
-    x = object_number_property(object_text, "x")
-    y = object_number_property(object_text, "y")
-    z = object_number_property(object_text, "z")
+    x = object_number_property(object_text, "x", variables)
+    y = object_number_property(object_text, "y", variables)
+    z = object_number_property(object_text, "z", variables)
     if x is None or y is None or z is None:
         return None
     return (x, y, z)
@@ -1810,7 +1926,271 @@ def approximate_expression_number(value: str) -> float | None:
     return sum(constants)
 
 
-def object_number_property(object_text: str, key: str) -> float | None:
+# Functions BeamNG's expressionParser exposes to $= expressions (math.* is
+# flattened into the context, plus a few helpers). Enough to cover stock jbeam;
+# anything referencing something outside this set falls back to the constant-sum
+# approximation.
+_EXPR_NAMESPACE: dict[str, object] = {
+    "abs": abs, "min": min, "max": max, "round": round, "pow": pow,
+    "sqrt": math.sqrt, "exp": math.exp, "log": math.log,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "asin": math.asin, "acos": math.acos, "atan": math.atan, "atan2": math.atan2,
+    "floor": math.floor, "ceil": math.ceil, "fmod": math.fmod,
+    "rad": math.radians, "deg": math.degrees, "pi": math.pi, "huge": math.inf,
+    "square": lambda v: v * v,
+    "sign": lambda v: (v > 0) - (v < 0),
+    "clamp": lambda v, lo, hi: max(lo, min(hi, v)),
+    "smoothstep": lambda v: v * v * (3 - 2 * v),
+    "nil": None,
+}
+
+# Matches $variable and dotted $components.path.field references. Variable names
+# may start with a digit (us_semi's $5wheelPos fifth-wheel slide), so the first
+# char after $ allows digits too. The dotted form only occurs for $components in
+# stock jbeam; ordinary variables have no dots, so including '.' is safe and lets
+# a whole component path resolve as one token from the (flattened) scope.
+_EXPR_VAR_RE = re.compile(r"\$[A-Za-z0-9_][A-Za-z0-9_.]*")
+
+
+def evaluate_jbeam_expression(
+    value: str, variables: dict[str, float] | None
+) -> float | None:
+    """Resolve a jbeam value that may reference variables, mirroring
+    expressionParser: a bare ``$name`` yields the variable's value, and ``$=expr``
+    evaluates an arithmetic expression with ``$name`` substituted for its value.
+
+    The Lua idioms stock content uses -- ``$x==nil and a or b`` guards, ``~=``,
+    the flattened math functions -- translate directly to Python once ``$name``
+    becomes its number (or ``None`` when unset) and ``nil`` maps to ``None``.
+    Returns None when the value is not an expression or cannot be evaluated, so
+    callers can fall back to approximate_expression_number.
+    """
+    text = value.strip()
+    if not text.startswith("$"):
+        return None
+    variables = variables or {}
+    if not text.startswith("$="):
+        resolved = variables.get(text)
+        return float(resolved) if isinstance(resolved, (int, float)) and not isinstance(resolved, bool) else None
+
+    def _sub(match: re.Match[str]) -> str:
+        resolved = variables.get(match.group(0))
+        if isinstance(resolved, (int, float)) and not isinstance(resolved, bool):
+            return repr(float(resolved))
+        return "None"
+
+    expr = _EXPR_VAR_RE.sub(_sub, text[2:]).replace("~=", "!=")
+    try:
+        result = eval(expr, {"__builtins__": {}}, _EXPR_NAMESPACE)  # noqa: S307
+    except Exception:
+        return None
+    if isinstance(result, bool) or not isinstance(result, (int, float)):
+        return None
+    return float(result)
+
+
+def expression_number(value: str, variables: dict[str, float] | None = None) -> float | None:
+    """A jbeam numeric value: the real variable-resolved result when a variable
+    table is supplied and the expression evaluates, otherwise the constant-sum
+    approximation (which is correct for the common ``$var+const`` case when the
+    variable defaults to 0)."""
+    if variables is not None and value.strip().startswith("$"):
+        resolved = evaluate_jbeam_expression(value, variables)
+        if resolved is not None:
+            return resolved
+    return approximate_expression_number(value)
+
+
+def parse_part_variable_defs(part_body: str) -> dict[str, tuple[float, float, float]]:
+    """{'$name': (default, min, max)} for each range variable a part declares.
+
+    Columns are read by the section header (``["name","type",...,"default",
+    "min","max",...]``) rather than fixed positions, since parts vary the extra
+    trailing columns. Non-numeric defaults/min/max are skipped."""
+    array = transform_helpers.extract_named_array(part_body, "variables")
+    if not array:
+        return {}
+    rows = [split_top_level_values(row) for row in iter_active_top_level_rows(array)]
+    if not rows:
+        return {}
+    header = [quoted_string_value(v) for v in rows[0]]
+    try:
+        i_name = header.index("name")
+        i_def = header.index("default")
+        i_min = header.index("min")
+        i_max = header.index("max")
+    except ValueError:
+        return {}
+    out: dict[str, tuple[float, float, float]] = {}
+    for row in rows[1:]:
+        if len(row) <= max(i_name, i_def, i_min, i_max):
+            continue
+        name = quoted_string_value(row[i_name])
+        if not name or not name.startswith("$"):
+            continue
+        try:
+            out[name] = (
+                float(approximate_expression_number(row[i_def]) if "$" in row[i_def] else row[i_def]),
+                float(row[i_min]),
+                float(row[i_max]),
+            )
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def parse_slot_variable_overrides(options_json: str | None) -> dict[str, str]:
+    """A slot option object's ``"variables"`` map ({'$name': value_or_expr}),
+    which sets variable values for the slot's subtree."""
+    if not options_json:
+        return {}
+    try:
+        parsed = parse_beamng_json(options_json, label="slot options")
+    except Exception:
+        return {}
+    variables = parsed.get("variables") if isinstance(parsed, dict) else None
+    if not isinstance(variables, dict):
+        return {}
+    return {str(k): v for k, v in variables.items() if str(k).startswith("$")}
+
+
+def clamp_value(value: float, lo: float, hi: float) -> float:
+    return max(min(lo, hi), min(max(lo, hi), value))
+
+
+def _deep_merge_into(target: dict, source: dict) -> None:
+    """Recursively merge source into target (later source wins), like jbeam's
+    unifyComponents accumulation of the components tree across parts."""
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge_into(target[key], value)
+        else:
+            target[key] = value
+
+
+def collect_components(
+    parts: Iterable[str],
+    jbeam_texts: dict[str, str],
+    part_body_index: dict[str, tuple[str, str]] | None,
+) -> dict[str, object]:
+    """Merged ``components`` tree across the selected parts.
+
+    jbeam parts define a nested ``components`` dict (e.g. a wheel's
+    ``dualyOffsets_R`` carrying offsetInner/offsetOuter); references like
+    ``$components.dualyOffsets_R.offsetInner`` read from the accumulation of all
+    selected parts' components. Merged in tree order so a deeper part overrides.
+    """
+    order = list(parts)
+    merged: dict[str, object] = {}
+    for part_id in order:
+        found = find_part_body(part_id, jbeam_texts, part_body_index)
+        if found is None:
+            continue
+        raw = transform_helpers.extract_keyed_object(found[0], "components")
+        if not raw:
+            continue
+        # extract_keyed_object returns the `"components": {...}` pair; wrap it so
+        # the tolerant parser sees a document, then take the value.
+        try:
+            parsed = parse_beamng_json("{" + raw + "}", label=f"{part_id} components")
+        except Exception:
+            continue
+        section = parsed.get("components")
+        if isinstance(section, dict):
+            _deep_merge_into(merged, section)
+    return merged
+
+
+def flatten_component_values(
+    components: dict[str, object], variables: dict[str, float]
+) -> dict[str, float]:
+    """Flatten the components tree to ``$components.a.b.c -> number`` entries,
+    evaluating expression-valued leaves against ``variables``. Non-numeric,
+    unresolvable leaves are dropped (callers fall back to the approximation)."""
+    out: dict[str, float] = {}
+
+    def walk(prefix: str, value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                walk(f"{prefix}.{key}", child)
+        elif isinstance(value, bool):
+            return
+        elif isinstance(value, (int, float)):
+            out[prefix] = float(value)
+        elif isinstance(value, str):
+            resolved = expression_number(value, variables)
+            if resolved is not None:
+                out[prefix] = resolved
+
+    walk("$components", components)
+    return out
+
+
+def build_part_variable_scopes(
+    parts: Iterable[str],
+    part_slot_options: dict[str, tuple[str, ...]],
+    jbeam_texts: dict[str, str],
+    part_body_index: dict[str, tuple[str, str]] | None,
+    user_vars: dict[str, object],
+) -> dict[str, dict[str, float]]:
+    """The resolved variable value map in force inside each selected part.
+
+    Mirrors jbeam's variable pipeline for the geometry that needs it: every
+    selected part contributes its variable DEFINITIONS (default/min/max); the
+    effective value is the .pc's user value if given, else the default, clamped
+    to range. A slot may then OVERRIDE a variable for its subtree (slot
+    "variables"), so each part's scope re-applies the overrides collected along
+    its slot path (root -> part order, deepest wins), evaluating override
+    expressions against the scope built so far.
+    """
+    parts = list(parts)
+    defaults: dict[str, tuple[float, float, float]] = {}
+    for part_id in parts:
+        found = find_part_body(part_id, jbeam_texts, part_body_index)
+        if found is not None:
+            # first definition wins; duplicate variable names across parts are
+            # expected to agree on range, as in stock content
+            for name, spec in parse_part_variable_defs(found[0]).items():
+                defaults.setdefault(name, spec)
+
+    def resolved_default(name: str, spec: tuple[float, float, float]) -> float:
+        default, lo, hi = spec
+        raw = user_vars.get(name)
+        value = float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else default
+        return clamp_value(value, lo, hi)
+
+    base = {name: resolved_default(name, spec) for name, spec in defaults.items()}
+
+    # Fold the merged components tree in as $components.a.b.c entries, so
+    # expressions like $=$components.dualyOffsets_R.offsetInner+0.814 (the
+    # us_semi dual-wheel spacing) resolve instead of collapsing to a constant.
+    components = collect_components(parts, jbeam_texts, part_body_index)
+    base.update(flatten_component_values(components, base))
+
+    scopes: dict[str, dict[str, float]] = {}
+    for part_id in parts:
+        scope = dict(base)
+        for options_json in part_slot_options.get(part_id, ()):  # root -> part order
+            for name, raw in parse_slot_variable_overrides(options_json).items():
+                if name in user_vars:  # user value always wins over slot override
+                    continue
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                    value: float | None = float(raw)
+                else:
+                    value = expression_number(str(raw), scope)
+                if value is None:
+                    continue
+                if name in defaults:
+                    _d, lo, hi = defaults[name]
+                    value = clamp_value(value, lo, hi)
+                scope[name] = value
+        scopes[part_id] = scope
+    return scopes
+
+
+def object_number_property(
+    object_text: str, key: str, variables: dict[str, float] | None = None
+) -> float | None:
     match = re.search(
         rf'"{re.escape(key)}"\s*:\s*(?P<value>{NUMBER_RE}|"(?:[^"\\]|\\.)*")',
         object_text,
@@ -1823,7 +2203,7 @@ def object_number_property(object_text: str, key: str) -> float | None:
             decoded = json.loads(raw)
         except json.JSONDecodeError:
             decoded = raw.strip('"')
-        return approximate_expression_number(str(decoded))
+        return expression_number(str(decoded), variables)
     return float(raw)
 
 
@@ -1837,7 +2217,9 @@ def node_transform_kind(key: str) -> tuple[str, int] | None:
     return None
 
 
-def node_transform_ops(texts: Iterable[str]) -> dict[tuple[str, int], dict[str, float]]:
+def node_transform_ops(
+    texts: Iterable[str], variables: dict[str, float] | None = None
+) -> dict[tuple[str, int], dict[str, float]]:
     ops: dict[tuple[str, int], dict[str, float]] = {}
     for text in texts:
         for match in NODE_TRANSFORM_KEY_RE.finditer(text):
@@ -1856,15 +2238,28 @@ def node_transform_ops(texts: Iterable[str]) -> dict[tuple[str, int], dict[str, 
                 ops.pop(parsed_key, None)
                 continue
             object_text = text[idx:end]
-            x = object_number_property(object_text, "x")
-            y = object_number_property(object_text, "y")
-            z = object_number_property(object_text, "z")
+            x = object_number_property(object_text, "x", variables)
+            y = object_number_property(object_text, "y", variables)
+            z = object_number_property(object_text, "z", variables)
             if x is None and y is None and z is None:
                 ops.pop(parsed_key, None)
                 continue
-            op = {"x": x or 0.0, "y": y or 0.0, "z": z or 0.0}
+            # Merge component-wise onto any inherited value for this same
+            # transform, mirroring jbeam slotSystem's tableMerge: a child slot's
+            # option overrides the parent's for the components it specifies and
+            # leaves the rest intact, rather than replacing the whole vector.
+            # (texts arrive parent-first, then the node row, so later specified
+            # components win.) Unspecified components stay absent and default to
+            # 0 at read time.
+            op = dict(ops.get(parsed_key, {}))
+            if x is not None:
+                op["x"] = x
+            if y is not None:
+                op["y"] = y
+            if z is not None:
+                op["z"] = z
             for pivot_key in ("px", "py", "pz"):
-                pivot_value = object_number_property(object_text, pivot_key)
+                pivot_value = object_number_property(object_text, pivot_key, variables)
                 if pivot_value is not None:
                     op[pivot_key] = pivot_value
             ops[parsed_key] = op
@@ -1890,14 +2285,14 @@ def node_translation_offset(
     for idx in node_op_indices(ops):
         offset = ops.get(("nodeOffset", idx))
         if offset is not None:
-            x += pos_x_sign * offset["x"]
-            y += offset["y"]
-            z += offset["z"]
+            x += pos_x_sign * offset.get("x", 0.0)
+            y += offset.get("y", 0.0)
+            z += offset.get("z", 0.0)
         move = ops.get(("nodeMove", idx))
         if move is not None:
-            x += move["x"]
-            y += move["y"]
-            z += move["z"]
+            x += move.get("x", 0.0)
+            y += move.get("y", 0.0)
+            z += move.get("z", 0.0)
     return x, y, z
 
 
@@ -1930,7 +2325,9 @@ def node_transform_matrix(
         rotation = ops.get(("nodeRotate", idx))
         if rotation is not None:
             rotation_matrix = matrix4_from_matrix3(
-                euler_matrix3((-rotation["x"], -rotation["y"], -rotation["z"]))
+                euler_matrix3(
+                    (-rotation.get("x", 0.0), -rotation.get("y", 0.0), -rotation.get("z", 0.0))
+                )
             )
             if any(key in rotation for key in ("px", "py", "pz")):
                 pivot = (
@@ -1948,12 +2345,19 @@ def node_transform_matrix(
         if offset is not None:
             matrix = multiply_matrix(
                 matrix,
-                translation_matrix((pos_x_sign * offset["x"], offset["y"], offset["z"])),
+                translation_matrix(
+                    (pos_x_sign * offset.get("x", 0.0), offset.get("y", 0.0), offset.get("z", 0.0))
+                ),
             )
 
         move = ops.get(("nodeMove", idx))
         if move is not None:
-            matrix = multiply_matrix(matrix, translation_matrix((move["x"], move["y"], move["z"])))
+            matrix = multiply_matrix(
+                matrix,
+                translation_matrix(
+                    (move.get("x", 0.0), move.get("y", 0.0), move.get("z", 0.0))
+                ),
+            )
     return matrix
 
 
@@ -1968,8 +2372,9 @@ def pos_after_node_transforms(
     row: str,
     position: tuple[float, float, float],
     inherited_options: Iterable[str] = (),
+    variables: dict[str, float] | None = None,
 ) -> tuple[float, float, float]:
-    ops = node_transform_ops(node_transform_source_texts(row, inherited_options))
+    ops = node_transform_ops(node_transform_source_texts(row, inherited_options), variables)
     if not ops:
         return position
     if not has_node_rotations(ops):
@@ -1982,8 +2387,9 @@ def pos_before_node_transforms(
     row: str,
     position: tuple[float, float, float],
     inherited_options: Iterable[str] = (),
+    variables: dict[str, float] | None = None,
 ) -> tuple[float, float, float]:
-    ops = node_transform_ops(node_transform_source_texts(row, inherited_options))
+    ops = node_transform_ops(node_transform_source_texts(row, inherited_options), variables)
     if not ops:
         return position
 
@@ -2115,6 +2521,7 @@ def prop_row_pivot_position(
     node_positions: dict[str, tuple[float, float, float]],
     pivot: tuple[float, float, float] | None,
     inherited_options: Iterable[str] = (),
+    variables: dict[str, float] | None = None,
 ) -> tuple[float, float, float] | None:
     """World rest position of the prop mesh's DAE pivot.
 
@@ -2126,15 +2533,15 @@ def prop_row_pivot_position(
       3. neither                      -> the mesh's authored DAE pivot (identity rest).
     Hand conversion must mirror/translate this position.
     """
-    global_translation = vector_from_row(row, "baseTranslationGlobal")
+    global_translation = vector_from_row(row, "baseTranslationGlobal", variables)
     if global_translation is not None:
-        return pos_after_node_transforms(row, global_translation, inherited_options)
+        return pos_after_node_transforms(row, global_translation, inherited_options, variables)
 
-    base_translation = vector_from_row(row, "baseTranslation")
+    base_translation = vector_from_row(row, "baseTranslation", variables)
     if base_translation is None:
         if pivot is None:
             return None
-        return pos_after_node_transforms(row, pivot, inherited_options)
+        return pos_after_node_transforms(row, pivot, inherited_options, variables)
 
     frame = prop_frame_axes(row, node_positions)
     if frame is None:
@@ -2175,10 +2582,12 @@ def prop_row_source_matrix(
     return matrix4_with_rotation_translation(rotation, position)
 
 
-def flexbody_row_matrix(row: str) -> list[list[float]]:
-    pos = vector_from_row(row, "pos") or (0.0, 0.0, 0.0)
-    rot = vector_from_row(row, "rot") or (0.0, 0.0, 0.0)
-    scale = vector_from_row(row, "scale") or (1.0, 1.0, 1.0)
+def flexbody_row_matrix(
+    row: str, variables: dict[str, float] | None = None
+) -> list[list[float]]:
+    pos = vector_from_row(row, "pos", variables) or (0.0, 0.0, 0.0)
+    rot = vector_from_row(row, "rot", variables) or (0.0, 0.0, 0.0)
+    scale = vector_from_row(row, "scale", variables) or (1.0, 1.0, 1.0)
     matrix = translation_matrix(pos)
     # Game flexbody rot euler is "+Z +X +Y intrinsic" (meshs.lua) with the
     # sequence listed innermost-first: Z is applied to the mesh first, then X,
@@ -2200,16 +2609,17 @@ def flexbody_row_matrix(row: str) -> list[list[float]]:
 def flexbody_row_source_matrix(
     row: str,
     inherited_options: Iterable[str] = (),
+    variables: dict[str, float] | None = None,
 ) -> list[list[float]]:
-    matrix = flexbody_row_matrix(row)
-    ops = node_transform_ops(node_transform_source_texts(row, inherited_options))
+    matrix = flexbody_row_matrix(row, variables)
+    ops = node_transform_ops(node_transform_source_texts(row, inherited_options), variables)
     if not ops:
         return matrix
     if not has_node_rotations(ops):
-        pos = vector_from_row(row, "pos") or (0.0, 0.0, 0.0)
+        pos = vector_from_row(row, "pos", variables) or (0.0, 0.0, 0.0)
         dx, dy, dz = node_translation_offset(ops, sign_number(pos[0]))
         return multiply_matrix(translation_matrix((dx, dy, dz)), matrix)
-    pos = vector_from_row(row, "pos") or (0.0, 0.0, 0.0)
+    pos = vector_from_row(row, "pos", variables) or (0.0, 0.0, 0.0)
     return multiply_matrix(node_transform_matrix(ops, pos[0]), matrix)
 
 
@@ -2910,7 +3320,7 @@ def hand_from_text(text: str) -> str:
 # Bump whenever context-building logic changes in a way that affects cached
 # VehicleContext content (parsing, pivots, common indexing, ...). Structural
 # dataclass changes are caught automatically via the field-name fingerprint.
-CONTEXT_CACHE_VERSION = 5  # 5: bare flexbody rows resolve position without the node's own translation
+CONTEXT_CACHE_VERSION = 8  # 8: resolve $components.* references (us_semi dual-wheel spacing etc.)
 
 
 def context_cache_path(source_zip: Path, vehicle_id: str) -> Path:
@@ -3219,17 +3629,9 @@ def load_vehicle_context(
             display_name=display_name,
         )
 
-    jbeam_texts = load_jbeam_texts(source_zip, selected_vehicle_id)
-    part_body_index = build_part_body_index(jbeam_texts)
-    common_jbeam_texts = load_common_jbeam_texts(source_zip)
-    if common_jbeam_texts:
-        common_part_index = build_part_body_index(common_jbeam_texts)
-        reachable_common = reachable_common_part_index(part_body_index, common_part_index)
-        if reachable_common:
-            part_body_index.update(reachable_common)
-            for _body, filename in reachable_common.values():
-                jbeam_texts.setdefault(filename, common_jbeam_texts[filename])
-    node_positions = build_node_position_index(jbeam_texts)
+    jbeam_texts, part_body_index, node_positions = load_resolver_inputs(
+        source_zip, selected_vehicle_id
+    )
     common_objects, common_previews, common_daes = load_common_dae_objects(
         source_zip,
         referenced_mesh_names(part_body_index),
@@ -3572,6 +3974,7 @@ def selected_flexbody_mesh_placements(
             raw_options = part_slot_options.get(part_id, ())
             if isinstance(raw_options, (list, tuple)):
                 inherited_options = tuple(str(item) for item in raw_options if item)
+        variables = part_variable_scope(selected, part_id)
         for row in iter_active_top_level_rows(flexbodies):
             mesh = flexbody_row_mesh(row)
             if mesh not in mesh_ids:
@@ -3580,7 +3983,7 @@ def selected_flexbody_mesh_placements(
             if obj is None:
                 continue
             pivot = flexbody_mesh_reference_point(context, mesh, obj)
-            matrix = flexbody_row_source_matrix(row, inherited_options)
+            matrix = flexbody_row_source_matrix(row, inherited_options, variables)
             placements.setdefault(mesh, []).append(
                 MeshPlacement(
                     position=transform_helpers.transform_point(matrix, pivot),
@@ -4100,6 +4503,33 @@ def part_named_array_for_context(context: VehicleContext, part_id: str, array_ke
     return array_text
 
 
+def vehicle_namespace_main_part(
+    vehicle_id: str,
+    part_body_index: dict[str, tuple[str, str]] | None,
+) -> str | None:
+    """The part with slotType ``main`` declared in the vehicle's own namespace,
+    mirroring jbeam ``io.getMainPartName``.
+
+    BeamNG picks the root part by slot type, not by name: ``getMainPartName``
+    returns ``partSlotMap[vehicleDir]['main'][1]``. The main part is usually
+    named after the vehicle, but not always (mods especially), and many .pc
+    files omit ``mainPartName`` entirely -- those must still find the right root
+    instead of assuming a part literally named after the vehicle id exists.
+    Scan is scoped to ``vehicles/<id>/`` so a common part never becomes the
+    root, and sorted for a deterministic pick if a vehicle ships more than one.
+    """
+    if not part_body_index:
+        return None
+    prefix = f"vehicles/{vehicle_id}/"
+    candidates = [
+        part_id
+        for part_id, (body, filename) in part_body_index.items()
+        if filename.replace("\\", "/").startswith(prefix)
+        and "main" in transform_helpers.extract_part_slot_types(body)
+    ]
+    return min(candidates) if candidates else None
+
+
 def resolve_selected_parts(
     pc: dict[str, object],
     jbeam_texts: dict[str, str],
@@ -4107,27 +4537,58 @@ def resolve_selected_parts(
     vehicle_id: str,
     part_body_index: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, object]:
+    # A .pc value of "none" means the user deliberately emptied the slot (jbeam
+    # maps "none" -> ""); normalize it so an emptied slot is an empty string
+    # rather than a phantom part literally named "none" that then pollutes the
+    # selected/missing sets.
     explicit_parts = {
-        str(slot_type): str(part_id)
+        str(slot_type): ("" if str(part_id) == "none" else str(part_id))
         for slot_type, part_id in dict(pc.get("parts", {})).items()
     }
-    main_part = str(pc.get("mainPartName") or vehicle_id)
+    main_part = str(
+        pc.get("mainPartName")
+        or vehicle_namespace_main_part(vehicle_id, part_body_index)
+        or vehicle_id
+    )
     selected: set[str] = set()
     missing_parts: set[str] = set()
-    queue: list[tuple[str, tuple[str, ...]]] = [(main_part, tuple())]
+    # Each queue entry carries the slot PATH of the part being processed, so a
+    # slot can be resolved by its full path ('/miramar_body/.../slotId/') and
+    # not just its bare id. A .pc may key a pick either way, and the same slot id
+    # can appear at two tree positions with different picks (miramar's ute plate
+    # sits on the body OR the tailgate); only the path disambiguates them. Paths
+    # start at '/' (the main part is not a segment) and each segment is a slot
+    # id, mirroring jbeam slotSystem's newPath = path .. slotId .. '/'.
+    queue: list[tuple[str, tuple[str, ...], str]] = [(main_part, tuple(), "/")]
     selected_by_slot: dict[str, str] = {"main": main_part}
     part_slot_options: dict[str, tuple[str, ...]] = {main_part: tuple()}
+    # Traversal order (parent before child). Sections merge in this order so a
+    # child part's node redefinition overrides the parent's, mirroring how jbeam
+    # unifyParts appends child sections after the parent's (later id wins).
+    parts_order: list[str] = []
+    # Pre-seed only bare-id picks; path-keyed picks are resolved by traversal
+    # (seeding a raw path string as a slot type would pollute selected_by_slot).
     for slot_type, part_id in explicit_parts.items():
-        if not part_id:
+        if not part_id or "/" in slot_type:
             continue
         selected_by_slot[slot_type] = part_id
 
+    def user_choice_for(slot_id: str, slot_path: str) -> str | None:
+        """The .pc's pick for a slot, id first then path (jbeam order); None if
+        the slot is unspecified, "" if the user emptied it."""
+        if slot_id in explicit_parts:
+            return explicit_parts[slot_id]
+        if slot_path in explicit_parts:
+            return explicit_parts[slot_path]
+        return None
+
     def process_queue() -> None:
         while queue:
-            part_id, inherited_options = queue.pop(0)
+            part_id, inherited_options, part_path = queue.pop(0)
             if not part_id or part_id in selected:
                 continue
             selected.add(part_id)
+            parts_order.append(part_id)
             part_slot_options.setdefault(part_id, inherited_options)
 
             found = find_part_body(part_id, jbeam_texts, part_body_index)
@@ -4137,7 +4598,23 @@ def resolve_selected_parts(
             part_body, _filename = found
 
             for slot_def in extract_slot_defs(part_body):
-                chosen = explicit_parts.get(slot_def.slot_type, slot_def.default_part)
+                slot_path = part_path + slot_def.slot_type + "/"
+                user_choice = user_choice_for(slot_def.slot_type, slot_path)
+                if user_choice is not None:
+                    if user_choice == "":
+                        # Explicitly emptied: leave the slot empty, do NOT fall
+                        # back to the slot default (jbeam user-empty behaviour).
+                        continue
+                    chosen = user_choice
+                    picked = find_part_body(user_choice, jbeam_texts, part_body_index)
+                    if picked is None or not part_fits_slot(
+                        transform_helpers.extract_part_slot_types(picked[0]), slot_def
+                    ):
+                        # Wrong slot type or unknown part -> reset to default,
+                        # exactly as slotSystem.fillSlots_rec does.
+                        chosen = slot_def.default_part
+                else:
+                    chosen = slot_def.default_part
                 if not chosen:
                     continue
                 selected_by_slot[slot_def.slot_type] = chosen
@@ -4147,20 +4624,33 @@ def resolve_selected_parts(
                 child_options_tuple = tuple(child_options)
                 part_slot_options.setdefault(chosen, child_options_tuple)
                 if chosen not in selected:
-                    queue.append((chosen, child_options_tuple))
+                    queue.append((chosen, child_options_tuple, slot_path))
 
     process_queue()
-    for part_id in explicit_parts.values():
-        if part_id and part_id not in selected:
-            part_slot_options.setdefault(part_id, tuple())
-            queue.append((part_id, tuple()))
-    process_queue()
+    # NOTE: intentionally NO force-add of every .pc part here. BeamNG selects a
+    # part only when slot traversal actually reaches its slot (slotSystem's
+    # fillSlots_rec); a .pc entry for a slot that isn't present in the resolved
+    # tree is ignored. Stock .pc files carry such leftover entries (e.g. the
+    # miramar race trim lists race_seat_FR though its slot is never reached),
+    # and force-adding them spawns orphaned parts/meshes that float in the
+    # preview. Selection now strictly follows the slot tree, matching the game.
+
+    user_vars = pc.get("vars")
+    part_variables = build_part_variable_scopes(
+        parts_order,
+        part_slot_options,
+        jbeam_texts,
+        part_body_index,
+        user_vars if isinstance(user_vars, dict) else {},
+    )
 
     return {
         "main_part": main_part,
         "parts": selected,
+        "parts_order": parts_order,
         "selected_by_slot": selected_by_slot,
         "part_slot_options": part_slot_options,
+        "part_variables": part_variables,
         "missing_parts": missing_parts,
     }
 
@@ -4181,6 +4671,57 @@ def selected_parts_for_config(context: VehicleContext, config_name: str) -> dict
     return selected
 
 
+def part_variable_scope(selected: dict[str, object], part_id: str) -> dict[str, float]:
+    """The resolved variable values in force inside a selected part (empty when
+    the part declares/inherits none), used to evaluate its $ expressions."""
+    scopes = selected.get("part_variables")
+    if isinstance(scopes, dict):
+        scope = scopes.get(part_id)
+        if isinstance(scope, dict):
+            return scope
+    return {}
+
+
+_NODE_ROW_RE = re.compile(
+    rf'^\s*\[\s*"(?P<id>(?:[^"\\]|\\.)*)"\s*,\s*'
+    rf'(?P<x>{NUMBER_RE})\s*,\s*(?P<y>{NUMBER_RE})\s*,\s*(?P<z>{NUMBER_RE})'
+)
+
+
+def iter_node_rows(node_array: str) -> Iterable[tuple[str, tuple[float, float, float], str]]:
+    """(node_id, (x, y, z), raw_row) for each ACTIVE node row.
+
+    Commented-out rows are skipped -- the game does not load them, so a node
+    whose live definition is preceded by a commented-out one (common in stock
+    content) must read the live position, not the commented number. Rows are
+    yielded in file order so the caller can apply jbeam's last-write-wins."""
+    for row in iter_active_top_level_rows(node_array):
+        match = _NODE_ROW_RE.match(row)
+        if match is None:
+            continue
+        node_id = match.group("id")
+        if node_id in {"id", "type", "mesh", "func"}:
+            continue
+        position = (float(match.group("x")), float(match.group("y")), float(match.group("z")))
+        yield node_id, position, row
+
+
+def selected_parts_in_merge_order(selected: dict[str, object]) -> list[str]:
+    """Selected part ids in tree (parent-before-child) order, so a later part's
+    node redefinition overrides an earlier one -- the order jbeam merges
+    sections in. Falls back to a stable sort for older results (or caches) that
+    predate parts_order."""
+    order = selected.get("parts_order")
+    parts = {str(item) for item in selected.get("parts", set())}
+    if isinstance(order, list) and order:
+        seen: set[str] = set()
+        result = [str(p) for p in order if str(p) in parts and not (str(p) in seen or seen.add(str(p)))]
+        # include any part missing from the recorded order (defensive)
+        result.extend(sorted(parts - set(result)))
+        return result
+    return sorted(parts)
+
+
 def selected_node_positions_for_config(
     context: VehicleContext,
     config_name: str,
@@ -4192,7 +4733,7 @@ def selected_node_positions_for_config(
     selected = selected_parts_for_config(context, config_name)
     nodes: dict[str, tuple[float, float, float]] = {}
     part_slot_options = selected.get("part_slot_options", {})
-    for part_id in sorted(str(item) for item in selected.get("parts", set())):
+    for part_id in selected_parts_in_merge_order(selected):
         node_array = part_named_array_for_context(context, part_id, "nodes")
         if not node_array:
             continue
@@ -4201,23 +4742,13 @@ def selected_node_positions_for_config(
             raw_options = part_slot_options.get(part_id, ())
             if isinstance(raw_options, (list, tuple)):
                 inherited_options = tuple(str(item) for item in raw_options if item)
-        node_re = re.compile(
-            rf'^\s*\[\s*"(?P<id>(?:[^"\\]|\\.)*)"\s*,\s*'
-            rf'(?P<x>{NUMBER_RE})\s*,\s*(?P<y>{NUMBER_RE})\s*,\s*(?P<z>{NUMBER_RE})'
-        )
-        for row in iter_top_level_rows(node_array):
-            match = node_re.match(row)
-            if match is None:
-                continue
-            node_id = match.group("id")
-            if node_id in {"id", "type", "mesh", "func"}:
-                continue
-            position = (
-                float(match.group("x")),
-                float(match.group("y")),
-                float(match.group("z")),
+        variables = part_variable_scope(selected, part_id)
+        for node_id, position, row in iter_node_rows(node_array):
+            # Last write wins: a later active row (in this part or a
+            # deeper-merged one) is jbeam's redefinition of the node.
+            nodes[node_id] = pos_after_node_transforms(
+                row, position, inherited_options, variables
             )
-            nodes.setdefault(node_id, pos_after_node_transforms(row, position, inherited_options))
 
     context.selected_node_positions_cache[config_name] = nodes
     return nodes
@@ -4230,7 +4761,7 @@ def selected_node_positions_for_parts(
 ) -> dict[str, tuple[float, float, float]]:
     nodes: dict[str, tuple[float, float, float]] = {}
     part_slot_options = selected.get("part_slot_options", {})
-    for part_id in sorted(str(item) for item in selected.get("parts", set())):
+    for part_id in selected_parts_in_merge_order(selected):
         found = find_part_body(part_id, jbeam_texts, part_body_index)
         if found is None:
             continue
@@ -4243,23 +4774,11 @@ def selected_node_positions_for_parts(
             raw_options = part_slot_options.get(part_id, ())
             if isinstance(raw_options, (list, tuple)):
                 inherited_options = tuple(str(item) for item in raw_options if item)
-        node_re = re.compile(
-            rf'^\s*\[\s*"(?P<id>(?:[^"\\]|\\.)*)"\s*,\s*'
-            rf'(?P<x>{NUMBER_RE})\s*,\s*(?P<y>{NUMBER_RE})\s*,\s*(?P<z>{NUMBER_RE})'
-        )
-        for row in iter_top_level_rows(node_array):
-            match = node_re.match(row)
-            if match is None:
-                continue
-            node_id = match.group("id")
-            if node_id in {"id", "type", "mesh", "func"}:
-                continue
-            position = (
-                float(match.group("x")),
-                float(match.group("y")),
-                float(match.group("z")),
+        variables = part_variable_scope(selected, part_id)
+        for node_id, position, row in iter_node_rows(node_array):
+            nodes[node_id] = pos_after_node_transforms(
+                row, position, inherited_options, variables
             )
-            nodes.setdefault(node_id, pos_after_node_transforms(row, position, inherited_options))
     return nodes
 
 
@@ -4304,12 +4823,15 @@ def selected_prop_mesh_positions(
             raw_options = part_slot_options.get(part_id, ())
             if isinstance(raw_options, (list, tuple)):
                 inherited_options = tuple(str(item) for item in raw_options if item)
-        for row in iter_top_level_rows(props):
+        variables = part_variable_scope(selected, part_id)
+        for row in iter_active_top_level_rows(props):
             mesh = prop_row_mesh(row)
             if mesh not in mesh_ids:
                 continue
             pivot = context.mesh_pivots.get(mesh)
-            position = prop_row_pivot_position(row, node_positions, pivot, inherited_options)
+            position = prop_row_pivot_position(
+                row, node_positions, pivot, inherited_options, variables
+            )
             if position is not None:
                 positions.setdefault(mesh, []).append(position)
     return positions
@@ -5798,6 +6320,7 @@ def prop_row_world_matrix(
     pivot: tuple[float, float, float] | None,
     inherited_options: Iterable[str] = (),
     rotation_override: list[list[float]] | None = None,
+    variables: dict[str, float] | None = None,
 ) -> list[list[float]] | None:
     """Affine map from DAE-world coordinates to vehicle space for a prop row
     at rest: W = T(anchor) * R * T(-pivot), per the engine model verified
@@ -5805,7 +6328,7 @@ def prop_row_world_matrix(
 
     rotation_override supplies the resolved engine rest rotation (authored
     baseRotationGlobal or analytic engine model)."""
-    anchor = prop_row_pivot_position(row, node_positions, pivot, inherited_options)
+    anchor = prop_row_pivot_position(row, node_positions, pivot, inherited_options, variables)
     if anchor is None:
         return None
     rotation = rotation_override
@@ -5944,6 +6467,7 @@ def output_vehicle_preview_payload(
         part_body, _filename = found
         raw_options = part_slot_options.get(part_id, ()) if isinstance(part_slot_options, dict) else ()
         opts = tuple(str(item) for item in raw_options if item) if isinstance(raw_options, (list, tuple)) else ()
+        variables = part_variable_scope(selected, part_id)
         for kind, array_key in (("flex", "flexbodies"), ("prop", "props")):
             array_text = transform_helpers.extract_named_array(part_body, array_key)
             if not array_text:
@@ -5964,12 +6488,14 @@ def output_vehicle_preview_payload(
                     continue
                 rotation_source = None
                 if kind == "flex":
-                    world = flexbody_row_source_matrix(row, opts)
+                    world = flexbody_row_source_matrix(row, opts, variables)
                 else:
                     pivot = output_pivots.get(mesh) or context.mesh_pivots.get(mesh)
                     rotation_override, rotation_source = prop_rest_rotation_override(row, node_positions)
                     rotation_counts[rotation_source] = rotation_counts.get(rotation_source, 0) + 1
-                    world = prop_row_world_matrix(row, node_positions, pivot, opts, rotation_override)
+                    world = prop_row_world_matrix(
+                        row, node_positions, pivot, opts, rotation_override, variables
+                    )
                 if world is None:
                     skipped.setdefault(mesh, "placement unresolved (inactive row?)")
                     continue
@@ -6099,6 +6625,7 @@ def full_vehicle_preview_payload(
     for part_id in sorted(str(part) for part in selected.get("parts", set())):
         raw_options = part_slot_options.get(part_id, ()) if isinstance(part_slot_options, dict) else ()
         opts = tuple(str(item) for item in raw_options if item) if isinstance(raw_options, (list, tuple)) else ()
+        variables = part_variable_scope(selected, part_id)
         for kind, array_key in (("flex", "flexbodies"), ("prop", "props")):
             array_text = preview_part_array(part_id, array_key)
             if not array_text:
@@ -6117,12 +6644,14 @@ def full_vehicle_preview_payload(
                     skipped.setdefault(mesh, "inactive row (prop nodes not in this config)")
                     continue
                 if kind == "flex":
-                    world = flexbody_row_source_matrix(row, opts)
+                    world = flexbody_row_source_matrix(row, opts, variables)
                 else:
                     pivot = context.mesh_pivots.get(mesh)
                     rotation_override, rotation_source = prop_rest_rotation_override(row, node_positions)
                     rotation_counts[rotation_source] = rotation_counts.get(rotation_source, 0) + 1
-                    world = prop_row_world_matrix(row, node_positions, pivot, opts, rotation_override)
+                    world = prop_row_world_matrix(
+                        row, node_positions, pivot, opts, rotation_override, variables
+                    )
                 if world is None:
                     # matches the engine: prop rows whose reference nodes are
                     # absent from this config never render

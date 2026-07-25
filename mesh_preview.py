@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-GEOMETRY_CACHE_VERSION = 2  # 2: node_matrices field for prop derotation
+GEOMETRY_CACHE_VERSION = 3  # 3: apply COLLADA <unit> scale (cm-authored DAEs)
 
 MODE_COLORS = {
     "skip": (0.62, 0.64, 0.67),
@@ -63,6 +63,25 @@ def _floats(text: str) -> np.ndarray:
 def _ints(text: str) -> np.ndarray:
     parts = text.split() if text else []
     return np.array(parts, dtype=np.int64) if parts else np.zeros(0, dtype=np.int64)
+
+
+def _dae_unit_scale(root: ET.Element) -> float:
+    """The COLLADA asset's <unit meter="..."> factor (metres per unit).
+
+    Some stock geometry is authored in centimetres (bolide_80s_tires.dae has
+    <unit meter="0.01">); the node transforms carry no scale in that case, so
+    the vertex coordinates are 100x too large unless this factor is applied.
+    DAEs authored in metres report meter="1" (a no-op)."""
+    for elem in root.iter():
+        if _local(elem.tag) == "unit":
+            try:
+                value = float(elem.get("meter"))
+            except (TypeError, ValueError):
+                return 1.0
+            return value if value > 0 else 1.0
+        if _local(elem.tag) == "library_geometries":
+            break  # <unit> lives in <asset> near the top; stop once past it
+    return 1.0
 
 
 def _node_local_matrix(node: ET.Element) -> np.ndarray:
@@ -240,11 +259,13 @@ def parse_dae_geometry(path: Path) -> DaeGeometry:
                     node_matrices[candidate] = world
         return collected
 
+    unit = _dae_unit_scale(root)
+    root_matrix = np.diag([unit, unit, unit, 1.0])  # cm->m for cm-authored DAEs
     for elem in root.iter():
         if _local(elem.tag) == "visual_scene":
             for child in elem:
                 if _local(child.tag) == "node":
-                    walk(child, np.eye(4))
+                    walk(child, root_matrix)
             break
     return DaeGeometry(geoms=geoms, nodes=nodes, node_matrices=node_matrices)
 
