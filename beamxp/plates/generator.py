@@ -785,7 +785,7 @@ def _normal_from_alpha(image, emboss_strength: float):
     length = np.sqrt(gx * gx + gy * gy + nz * nz)
     encode = lambda component: ((component / length) * 0.5 + 0.5) * 255.0
     rgb = np.stack([encode(-gx), encode(gy), encode(nz)], axis=-1).astype(np.uint8)
-    out = Image.fromarray(rgb, "RGB").convert("RGBA")
+    out = Image.fromarray(rgb).convert("RGBA")
     out.putalpha(image.getchannel("A"))
     return out
 

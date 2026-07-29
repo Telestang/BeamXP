@@ -1,27 +1,25 @@
 from __future__ import annotations
 
 import copy
-import csv
 import json
 import math
 import os
 import queue
 import shutil
+import tempfile
 import threading
 import time
+import tkinter as tk
 import traceback
-import tempfile
 import zipfile
 from collections import defaultdict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from tkinter import filedialog, messagebox, ttk
 from xml.etree import ElementTree as ET
 
 import numpy as np
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-
 
 APP_NAME = "BeamXP Vehicle ZIP Mesh Transform POC"
 PRIMITIVE_TAGS = {"triangles", "polylist", "polygons", "trifans", "tristrips"}
@@ -142,7 +140,7 @@ class LoadedDae:
     parts: list[DaePart]
     geometries: dict[str, ET.Element]
     geometry_cache: dict[str, RawGeometry] = field(default_factory=dict)
-    topology_cache: dict[str, "Topology"] = field(default_factory=dict)
+    topology_cache: dict[str, Topology] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -216,7 +214,7 @@ class ActiveRegion:
     island_index: int
     faces: tuple[int, ...]
     area: float
-    area_perimeter_ratio: float
+    pseudo_aspect_ratio: float
     boundary: RegionBoundary
     role: str
     eligible: bool
@@ -253,6 +251,7 @@ class ChildAdoption:
     area: float
     area_ratio: float
     projected_overlap: float
+    extruded_perimeter_sample_ratio: float
     median_surface_gap: float
     p90_surface_gap: float
     adoption_mode: str = "eager_island"
@@ -272,7 +271,7 @@ class AcceptedCandidate:
     accepted_angle: float
     faces: tuple[int, ...]
     area: float
-    area_perimeter_ratio: float
+    pseudo_aspect_ratio: float
     boundary_edges: tuple[tuple[int, int], ...]
     boundary_loops: tuple[tuple[int, ...], ...]
     perimeter: float
@@ -293,32 +292,13 @@ class IslandCandidate:
     accepted_angle: float
     faces: tuple[int, ...]
     area: float
-    area_perimeter_ratio: float
+    pseudo_aspect_ratio: float
     boundary_edges: tuple[tuple[int, int], ...]
     boundary_loops: tuple[tuple[int, ...], ...]
     perimeter: float
     measurement: SymmetryMeasurement
     host_faces: tuple[int, ...] = ()
     adoptions: tuple[ChildAdoption, ...] = ()
-
-
-@dataclass(slots=True)
-class IslandLevelResult:
-    level_index: int
-    threshold: float
-    recursion_passes: int
-    tested_candidates: int
-    accepted_keys: tuple[tuple[int, int], ...]
-    active_faces: tuple[int, ...]
-    active_regions: tuple[ActiveRegion, ...]
-
-
-@dataclass(slots=True)
-class IslandSweepResult:
-    island_index: int
-    accepted: tuple[IslandCandidate, ...]
-    remaining_faces: tuple[int, ...]
-    levels: tuple[IslandLevelResult, ...]
 
 
 @dataclass(slots=True)
@@ -330,8 +310,6 @@ class SweepLevelResult:
     accepted_this_level: tuple[int, ...]
     accepted_cumulative: tuple[int, ...]
     active_regions: list[ActiveRegion]
-    active_face_labels: np.ndarray
-    candidate_face_labels: np.ndarray
 
 
 @dataclass(slots=True)
@@ -343,7 +321,7 @@ class SymmetrySweepResult:
     threshold_steps: int
     thresholds: tuple[float, ...]
     min_region_faces: int
-    min_area_perimeter_ratio_metres: float
+    max_pseudo_aspect_ratio: float
     symmetry_tolerance_metres: float
     direct_symmetry_tolerance_metres: float
     sample_spacing_metres: float
@@ -354,6 +332,7 @@ class SymmetrySweepResult:
     levels: list[SweepLevelResult]
     adopted_island_count: int
     late_adopted_candidate_count: int
+    touching_union_candidate_count: int
     adopted_child_count: int
     adopted_triangle_count: int
     processing_seconds: float
@@ -563,9 +542,12 @@ def extract_archive_member(archive: VehicleArchive, member: str) -> Path:
     if target.is_file() and target.stat().st_size == archive.member_sizes.get(actual, -1):
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive.path, "r") as source, source.open(actual, "r") as handle:
-        with target.open("wb") as output:
-            shutil.copyfileobj(handle, output, length=1024 * 1024)
+    with (
+        zipfile.ZipFile(archive.path, "r") as source,
+        source.open(actual, "r") as handle,
+        target.open("wb") as output,
+    ):
+        shutil.copyfileobj(handle, output, length=1024 * 1024)
     return target
 
 
@@ -695,8 +677,7 @@ def _blend_archive_preview_texture(
 def _normalise_material_alias(value: str) -> str:
     value = value.strip().lstrip("#").lower()
     for suffix in ("-material", "_material"):
-        if value.endswith(suffix):
-            value = value[: -len(suffix)]
+        value = value.removesuffix(suffix)
     return value
 
 
@@ -1131,7 +1112,7 @@ def parse_geometry(loaded: LoadedDae, geometry_id: str) -> RawGeometry:
             continue
         vertex_base = ensure_source(position_source_id)
 
-        def rows_from_p(p_element: ET.Element) -> np.ndarray:
+        def rows_from_p(p_element: ET.Element, stride: int = stride) -> np.ndarray:
             values = np.asarray(parse_int_list(p_element.text), dtype=np.int64)
             if len(values) < stride:
                 return np.empty((0, stride), dtype=np.int64)
@@ -1208,7 +1189,7 @@ def weld_vertices(
     remap = np.empty(len(vertices), dtype=np.int64)
 
     for old_index, point in enumerate(vertices):
-        key = tuple(int(round(value * inverse)) for value in point)
+        key = tuple(round(value * inverse) for value in point)
         found: int | None = None
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
@@ -1478,7 +1459,7 @@ def sample_closed_polyline(polyline: ClosedPolyline, distances: np.ndarray) -> n
 def resample_closed_loop_at_rate(polyline: ClosedPolyline, spacing: float) -> np.ndarray:
     if polyline.total_length <= 1e-15:
         return np.repeat(polyline.points[:1], 1, axis=0)
-    count = max(8, int(math.ceil(polyline.total_length / max(spacing, 1e-12))))
+    count = max(8, math.ceil(polyline.total_length / max(spacing, 1e-12)))
     targets = np.linspace(0.0, polyline.total_length, count, endpoint=False)
     return sample_closed_polyline(polyline, targets)
 
@@ -1589,7 +1570,8 @@ def measure_perimeter_symmetry(
     corresponding double-angle rigid correction to the exported submesh.
 
     Candidates above ``rms_tolerance`` are rejected and are never rescued by the
-    tilt search.
+    tilt search. Searched candidates are accepted only when their final RMS is
+    at or below ``direct_rms_tolerance``.
     """
     polylines = [closed_polyline(vertices, loop) for loop in loops]
     whole_sample_chunks = [
@@ -1695,7 +1677,7 @@ def measure_perimeter_symmetry(
 
             interval_count = max(
                 1,
-                int(math.ceil(longest_half / max(sample_spacing, 1e-12))),
+                math.ceil(longest_half / max(sample_spacing, 1e-12)),
             )
             travelled = np.linspace(0.0, longest_half, interval_count + 1)
 
@@ -1839,8 +1821,8 @@ def measure_perimeter_symmetry(
             passed=passed,
         )
 
-    # The outer threshold remains the acceptance gate. The Y-tilt search only
-    # corrects already acceptable, nearly symmetric candidates.
+    # The outer threshold decides whether the Y-tilt search is allowed. The
+    # stricter direct threshold remains the final acceptance gate.
     if not math.isfinite(initial_rms) or initial_rms > rms_tolerance:
         return finalise(
             initial_result,
@@ -1923,7 +1905,10 @@ def measure_perimeter_symmetry(
 
     return finalise(
         best_result,
-        passed=True,
+        passed=(
+            math.isfinite(best_result.rms_error)
+            and best_result.rms_error <= direct_rms_tolerance
+        ),
         tilt_applied=True,
         tilt_degrees=best_tilt_degrees,
     )
@@ -2048,6 +2033,20 @@ def _region_boundary(
     )
 
 
+def pseudo_aspect_ratio_from_area_perimeter(area: float, perimeter: float) -> float:
+    """Map area/perimeter to the equivalent rectangle aspect ratio >= 1."""
+    if area <= 1e-30 or perimeter <= 1e-15:
+        return float("inf")
+    b = (perimeter * perimeter) / area
+    if b <= 16.0:
+        return 1.0
+    c = 2.0 - b * 0.25
+    discriminant = c * c - 4.0
+    if discriminant <= 0.0:
+        return 1.0
+    return float((-c + math.sqrt(discriminant)) * 0.5)
+
+
 def _classify_region(
     topology: Topology,
     island_index: int,
@@ -2056,12 +2055,15 @@ def _classify_region(
     active: set[int],
     threshold: float,
     fallback_carrier_faces: set[int],
-    min_area_perimeter_ratio: float,
+    max_pseudo_aspect_ratio: float,
     edge_lookup: dict[tuple[int, int], tuple[tuple[int, ...], float | None]],
 ) -> ActiveRegion:
     boundary = _region_boundary(topology, faces, active, threshold, edge_lookup)
     area = float(topology.face_areas[list(faces)].sum())
-    area_perimeter_ratio = area / boundary.perimeter if boundary.perimeter > 1e-15 else 0.0
+    pseudo_aspect_ratio = pseudo_aspect_ratio_from_area_perimeter(
+        area,
+        boundary.perimeter,
+    )
     role = "candidate"
     eligible = True
     if len(faces) == 0:
@@ -2072,16 +2074,16 @@ def _classify_region(
         role, eligible = "open/rejected", False
     elif boundary.cut_edges:
         role, eligible = "cut boundary", False
-    elif is_main and (boundary.mesh_edges > 0 or bool(set(faces) & fallback_carrier_faces)):
+    elif is_main and bool(set(faces) & fallback_carrier_faces):
         role, eligible = "main carrier", False
-    elif area_perimeter_ratio < min_area_perimeter_ratio:
+    elif pseudo_aspect_ratio > max_pseudo_aspect_ratio:
         role, eligible = "thin/rejected", False
     return ActiveRegion(
         region_index=0,
         island_index=island_index,
         faces=faces,
         area=area,
-        area_perimeter_ratio=area_perimeter_ratio,
+        pseudo_aspect_ratio=pseudo_aspect_ratio,
         boundary=boundary,
         role=role,
         eligible=eligible,
@@ -2131,6 +2133,43 @@ def _nearest_sample_distances(points: np.ndarray, samples: np.ndarray) -> np.nda
     return np.concatenate(chunks)
 
 
+def _point_in_polygon_mask(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    if len(points) == 0 or len(polygon) < 3:
+        return np.zeros(len(points), dtype=bool)
+    x = points[:, 0]
+    y = points[:, 1]
+    inside = np.zeros(len(points), dtype=bool)
+    previous = polygon[-1]
+    for current in polygon:
+        x0, y0 = previous
+        x1, y1 = current
+        crosses = (y0 > y) != (y1 > y)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            intersection_x = (x1 - x0) * (y - y0) / (y1 - y0) + x0
+        inside ^= crosses & (x < intersection_x)
+        previous = current
+    return inside
+
+
+def _largest_boundary_loop(
+    vertices: np.ndarray,
+    loops: tuple[tuple[int, ...], ...],
+) -> tuple[int, ...]:
+    if not loops:
+        return ()
+
+    def loop_length(loop: tuple[int, ...]) -> float:
+        if len(loop) < 2:
+            return 0.0
+        total = 0.0
+        for index, first in enumerate(loop):
+            second = loop[(index + 1) % len(loop)]
+            total += float(np.linalg.norm(vertices[first] - vertices[second]))
+        return total
+
+    return max(loops, key=loop_length)
+
+
 def _host_projection_frame(
     host_points: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float] | None:
@@ -2159,9 +2198,8 @@ def _projected_child_overlap(
 ) -> float:
     """Return the proportion of the child's PCA-plane bbox over the host.
 
-    The two broad in-plane PCA axes define the facade footprint. The smallest
-    PCA axis is used only as a planarity guard; final attachment evidence still
-    comes from actual sampled host-surface distance.
+    The two broad in-plane PCA axes define the facade footprint before the
+    extruded-perimeter containment check decides physical support.
     """
     if len(child_points) == 0:
         return 0.0
@@ -2177,9 +2215,53 @@ def _projected_child_overlap(
     return float(np.prod(overlap_span / child_span))
 
 
+def _extruded_perimeter_sample_ratio(
+    topology: Topology,
+    frame: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float],
+    host_boundary_loops: tuple[tuple[int, ...], ...],
+    child_samples: np.ndarray,
+    half_depth: float = 0.05,
+) -> float:
+    if len(child_samples) == 0:
+        return 0.0
+    host_loop = _largest_boundary_loop(topology.vertices, host_boundary_loops)
+    if len(host_loop) < 3:
+        return 0.0
+
+    centroid, in_plane_axes, _host_min, _host_max, _planarity_rms = frame
+    normal = np.cross(in_plane_axes[:, 0], in_plane_axes[:, 1])
+    normal_norm = float(np.linalg.norm(normal))
+    if normal_norm <= 1e-15:
+        return 0.0
+    normal /= normal_norm
+
+    loop_points = topology.vertices[np.asarray(host_loop, dtype=np.int64)]
+    loop_projected = (loop_points - centroid) @ in_plane_axes
+    sample_offsets = child_samples - centroid
+    depth_mask = np.abs(sample_offsets @ normal) <= half_depth
+    if not np.any(depth_mask):
+        return 0.0
+
+    samples_projected = sample_offsets[depth_mask] @ in_plane_axes
+    polygon_min = loop_projected.min(axis=0) - 1e-9
+    polygon_max = loop_projected.max(axis=0) + 1e-9
+    bbox_mask = np.all(
+        (samples_projected >= polygon_min) & (samples_projected <= polygon_max),
+        axis=1,
+    )
+    inside_depth = np.zeros(len(samples_projected), dtype=bool)
+    inside_depth[bbox_mask] = _point_in_polygon_mask(
+        samples_projected[bbox_mask],
+        loop_projected,
+    )
+    inside_count = int(np.count_nonzero(inside_depth))
+    return float(inside_count / len(child_samples))
+
+
 def _find_eager_child_adoptions(
     topology: Topology,
     host_faces: tuple[int, ...],
+    host_boundary_loops: tuple[tuple[int, ...], ...],
     host_area: float,
     host_island_index: int,
     islands: tuple[tuple[int, ...], ...],
@@ -2197,7 +2279,7 @@ def _find_eager_child_adoptions(
     if len(host_points) < 3 or len(host_samples) == 0 or host_area <= 1e-15:
         return ()
     frame = _host_projection_frame(host_points)
-    if frame is None or frame[4] > 0.006:
+    if frame is None:
         return ()
 
     adopted: list[ChildAdoption] = []
@@ -2214,19 +2296,23 @@ def _find_eager_child_adoptions(
 
         child = island_geometry[child_offset]
         area_ratio = child.area / host_area
-        if area_ratio > 0.8:
-            continue
 
         projected_overlap = _projected_child_overlap(frame, child.points)
         if projected_overlap < 0.8:
             continue
 
+        containment_ratio = _extruded_perimeter_sample_ratio(
+            topology,
+            frame,
+            host_boundary_loops,
+            child.samples,
+        )
+        if containment_ratio < 0.05:
+            continue
+
         distances = _nearest_sample_distances(child.samples, host_samples)
         median_gap = float(np.median(distances))
         p90_gap = float(np.percentile(distances, 90.0))
-        if median_gap > 0.015 or p90_gap > 0.025:
-            continue
-
         adopted.append(
             ChildAdoption(
                 island_index=child_island_index,
@@ -2234,6 +2320,7 @@ def _find_eager_child_adoptions(
                 area=child.area,
                 area_ratio=area_ratio,
                 projected_overlap=projected_overlap,
+                extruded_perimeter_sample_ratio=containment_ratio,
                 median_surface_gap=median_gap,
                 p90_surface_gap=p90_gap,
             )
@@ -2250,41 +2337,47 @@ def _late_candidate_adoption(
     child: IslandCandidate,
     source_candidate_id: int,
 ) -> ChildAdoption | None:
-    """Return a late-host adoption when a later, larger facade supports an earlier root.
+    """Return a late-host adoption when a later facade supports an earlier root.
 
     Eager adoption cannot see a parent that only separates from a connected carrier at
-    a lower crease threshold. This conservative recovery uses the same physical tests
-    after the sweep, but only allows a later accepted, larger candidate from another
-    geometric island to absorb the earlier candidate.
+    a lower crease threshold. This conservative recovery uses the same physical
+    overlap and extruded-perimeter containment tests after the sweep, but only allows
+    a later accepted candidate from another geometric island to absorb the earlier
+    candidate.
     """
     if host.accepted_level <= child.accepted_level:
         return None
     if host.island_index == child.island_index:
         return None
-    if host.area <= 1e-15 or child.area >= host.area:
+    if host.area <= 1e-15:
         return None
 
     area_ratio = child.area / host.area
-    if area_ratio > 0.8:
-        return None
 
     host_points, host_samples = _surface_points_and_samples(topology, host.host_faces)
     child_points, child_samples = _surface_points_and_samples(topology, child.faces)
     if len(host_points) < 3 or len(host_samples) == 0 or len(child_points) == 0:
         return None
     frame = _host_projection_frame(host_points)
-    if frame is None or frame[4] > 0.006:
+    if frame is None:
         return None
 
     projected_overlap = _projected_child_overlap(frame, child_points)
     if projected_overlap < 0.8:
         return None
 
+    containment_ratio = _extruded_perimeter_sample_ratio(
+        topology,
+        frame,
+        host.boundary_loops,
+        child_samples,
+    )
+    if containment_ratio < 0.05:
+        return None
+
     distances = _nearest_sample_distances(child_samples, host_samples)
     median_gap = float(np.median(distances))
     p90_gap = float(np.percentile(distances, 90.0))
-    if median_gap > 0.015 or p90_gap > 0.025:
-        return None
 
     return ChildAdoption(
         island_index=child.island_index,
@@ -2292,6 +2385,7 @@ def _late_candidate_adoption(
         area=child.area,
         area_ratio=area_ratio,
         projected_overlap=projected_overlap,
+        extruded_perimeter_sample_ratio=containment_ratio,
         median_surface_gap=median_gap,
         p90_surface_gap=p90_gap,
         adoption_mode="late_candidate",
@@ -2316,7 +2410,7 @@ def _resolve_late_host_adoptions(
     adoption_for: dict[tuple[int, int], ChildAdoption] = {}
 
     for child in candidates:
-        best: tuple[tuple[float, float, float, float], IslandCandidate, ChildAdoption] | None = None
+        best: tuple[tuple[float, float, float, float, float], IslandCandidate, ChildAdoption] | None = None
         for host in candidates:
             if host.key == child.key:
                 continue
@@ -2326,6 +2420,7 @@ def _resolve_late_host_adoptions(
             if adoption is None:
                 continue
             score = (
+                adoption.extruded_perimeter_sample_ratio,
                 adoption.projected_overlap,
                 -adoption.p90_surface_gap,
                 -adoption.median_surface_gap,
@@ -2363,152 +2458,185 @@ def _resolve_late_host_adoptions(
     return survivors, absorbed_to_root
 
 
-def _sweep_one_island(
+def _candidate_union_boundary(
     topology: Topology,
-    island_index: int,
-    island_faces: tuple[int, ...],
-    island_edges: tuple[tuple[tuple[int, int], tuple[int, ...], float | None], ...],
-    is_main: bool,
-    thresholds: tuple[float, ...],
-    min_faces: int,
-    min_area_perimeter_ratio: float,
+    faces: Iterable[int],
+) -> RegionBoundary:
+    face_set = set(faces)
+    candidate_edges: set[tuple[int, int]] = set()
+    for face in face_set:
+        a, b, c = (int(value) for value in topology.triangles[face])
+        candidate_edges.update((canonical_edge(a, b), canonical_edge(b, c), canonical_edge(c, a)))
+
+    boundary: set[tuple[int, int]] = set()
+    mesh_count = nonmanifold_count = 0
+    for edge in candidate_edges:
+        adjacent = topology.edge_faces[edge]
+        inside = sum(face in face_set for face in adjacent)
+        if inside == 0:
+            continue
+        if len(adjacent) == 2 and inside == 2:
+            continue
+        boundary.add(edge)
+        if len(adjacent) == 1:
+            mesh_count += 1
+        elif len(adjacent) > 2:
+            nonmanifold_count += 1
+
+    loops, closed = ordered_boundary_loops(boundary)
+    perimeter = sum(
+        float(np.linalg.norm(topology.vertices[first] - topology.vertices[second]))
+        for first, second in boundary
+    )
+    return RegionBoundary(
+        edges=tuple(sorted(boundary)),
+        loops=loops,
+        perimeter=perimeter,
+        crease_edges=0,
+        mesh_edges=mesh_count,
+        cut_edges=0,
+        nonmanifold_edges=nonmanifold_count,
+        closed=closed,
+    )
+
+
+def _resolve_touching_symmetric_unions(
+    topology: Topology,
+    candidates: list[IslandCandidate],
+    premerge_id_by_key: dict[tuple[int, int], int],
+    sample_spacing: float,
     rms_tolerance: float,
     direct_rms_tolerance: float,
-    sample_spacing: float,
-) -> IslandSweepResult:
-    edge_lookup = {edge: (faces, angle) for edge, faces, angle in island_edges}
-    original_boundary_faces = {
-        face
-        for _edge, faces, _angle in island_edges
-        if len(faces) == 1
-        for face in faces
+) -> tuple[list[IslandCandidate], dict[tuple[int, int], tuple[int, int]]]:
+    """Merge same-island accepted regions that share topology boundary edges."""
+    if len(candidates) < 2:
+        return candidates, {}
+
+    parent: dict[tuple[int, int], tuple[int, int]] = {
+        candidate.key: candidate.key for candidate in candidates
     }
 
-    active = set(island_faces)
-    accepted: list[IslandCandidate] = []
-    level_results: list[IslandLevelResult] = []
-    local_candidate_number = 0
+    def find(key: tuple[int, int]) -> tuple[int, int]:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
 
-    for level_index, threshold in enumerate(thresholds, start=1):
-        tested_signatures: set[tuple[int, ...]] = set()
-        accepted_this_level: list[tuple[int, int]] = []
-        tested_count = 0
-        recursion_passes = 0
+    def union(first: tuple[int, int], second: tuple[int, int]) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
 
-        while active:
-            recursion_passes += 1
-            components = _segment_active_faces(
-                active, threshold, island_edges, topology.face_areas
-            )
-            if not components:
-                break
-            if is_main and not original_boundary_faces:
-                fallback_carrier_faces = set(components[0])
-            else:
-                fallback_carrier_faces = original_boundary_faces
+    boundary_owner: dict[tuple[int, int], list[IslandCandidate]] = defaultdict(list)
+    for candidate in candidates:
+        for edge in candidate.boundary_edges:
+            boundary_owner[edge].append(candidate)
 
-            candidate_regions: list[ActiveRegion] = []
-            for component in components:
-                if len(component) < min_faces:
-                    continue
-                region = _classify_region(
-                    topology,
-                    island_index,
-                    is_main,
-                    component,
-                    active,
-                    threshold,
-                    fallback_carrier_faces,
-                    min_area_perimeter_ratio,
-                    edge_lookup,
-                )
-                if region.eligible and component not in tested_signatures:
-                    candidate_regions.append(region)
-            candidate_regions.sort(key=lambda region: (-region.area, -len(region.faces), region.faces[0]))
-            if not candidate_regions:
-                break
+    for owners in boundary_owner.values():
+        if len(owners) < 2:
+            continue
+        for index, first in enumerate(owners):
+            for second in owners[index + 1 :]:
+                if first.island_index == second.island_index:
+                    union(first.key, second.key)
 
-            passed_regions: list[tuple[ActiveRegion, SymmetryMeasurement]] = []
-            for region in candidate_regions:
-                tested_signatures.add(region.faces)
-                tested_count += 1
-                measurement = measure_perimeter_symmetry(
-                    topology.vertices,
-                    region.boundary.loops,
-                    sample_spacing,
-                    rms_tolerance,
-                    direct_rms_tolerance,
-                )
-                if measurement.passed:
-                    passed_regions.append((region, measurement))
-            if not passed_regions:
-                break
+    groups_by_root: dict[tuple[int, int], list[IslandCandidate]] = defaultdict(list)
+    for candidate in candidates:
+        groups_by_root[find(candidate.key)].append(candidate)
 
-            for region, measurement in passed_regions:
-                local_candidate_number += 1
-                key = (island_index, local_candidate_number)
-                accepted.append(
-                    IslandCandidate(
-                        key=key,
-                        island_index=island_index,
-                        accepted_level=level_index,
-                        accepted_angle=threshold,
-                        faces=region.faces,
-                        area=region.area,
-                        area_perimeter_ratio=region.area_perimeter_ratio,
-                        boundary_edges=region.boundary.edges,
-                        boundary_loops=region.boundary.loops,
-                        perimeter=region.boundary.perimeter,
-                        measurement=measurement,
-                    )
-                )
-                accepted_this_level.append(key)
-                active.difference_update(region.faces)
+    absorbed_to_parent: dict[tuple[int, int], tuple[int, int]] = {}
+    survivors: list[IslandCandidate] = []
 
-        components = (
-            _segment_active_faces(active, threshold, island_edges, topology.face_areas)
-            if active
-            else []
+    for group in groups_by_root.values():
+        if len(group) < 2:
+            survivors.extend(group)
+            continue
+
+        union_host_faces = tuple(
+            sorted({face for candidate in group for face in candidate.host_faces})
         )
-        if is_main and components and not original_boundary_faces:
-            fallback_carrier_faces = set(components[0])
-        else:
-            fallback_carrier_faces = original_boundary_faces
-        display_regions: list[ActiveRegion] = []
-        for component in components:
-            region = _classify_region(
-                topology,
-                island_index,
-                is_main,
-                component,
-                active,
-                threshold,
-                fallback_carrier_faces,
-                min_area_perimeter_ratio,
-                edge_lookup,
-            )
-            display_regions.append(region)
-        for index, region in enumerate(display_regions, start=1):
-            region.region_index = index
+        boundary = _candidate_union_boundary(topology, union_host_faces)
+        if not boundary.edges or not boundary.closed or boundary.nonmanifold_edges:
+            survivors.extend(group)
+            continue
 
-        level_results.append(
-            IslandLevelResult(
-                level_index=level_index,
-                threshold=threshold,
-                recursion_passes=recursion_passes,
-                tested_candidates=tested_count,
-                accepted_keys=tuple(accepted_this_level),
-                active_faces=tuple(sorted(active)),
-                active_regions=tuple(display_regions),
+        measurement = measure_perimeter_symmetry(
+            topology.vertices,
+            boundary.loops,
+            sample_spacing,
+            rms_tolerance,
+            direct_rms_tolerance,
+        )
+        if not measurement.passed:
+            survivors.extend(group)
+            continue
+
+        union_area = float(topology.face_areas[list(union_host_faces)].sum())
+        group.sort(
+            key=lambda candidate: (
+                -boundary.perimeter,
+                -candidate.perimeter,
+                -candidate.area,
+                candidate.accepted_level,
+                candidate.key,
             )
         )
+        host = group[0]
+        children = group[1:]
+        child_adoptions = [
+            ChildAdoption(
+                island_index=child.island_index,
+                faces=child.host_faces,
+                area=child.area,
+                area_ratio=(child.area / union_area if union_area > 1e-15 else 0.0),
+                projected_overlap=1.0,
+                extruded_perimeter_sample_ratio=1.0,
+                median_surface_gap=0.0,
+                p90_surface_gap=0.0,
+                adoption_mode="touching_union",
+                source_candidate_id=premerge_id_by_key.get(child.key),
+            )
+            for child in children
+        ]
+        host.host_faces = union_host_faces
+        host.faces = tuple(
+            sorted({face for candidate in group for face in candidate.faces})
+        )
+        host.area = union_area
+        host.pseudo_aspect_ratio = pseudo_aspect_ratio_from_area_perimeter(
+            union_area,
+            boundary.perimeter,
+        )
+        host.boundary_edges = boundary.edges
+        host.boundary_loops = boundary.loops
+        host.perimeter = boundary.perimeter
+        host.measurement = measurement
+        host.adoptions = tuple(
+            sorted(
+                (
+                    *host.adoptions,
+                    *child_adoptions,
+                    *(adoption for child in children for adoption in child.adoptions),
+                ),
+                key=lambda item: (item.adoption_mode, item.island_index, item.faces[0]),
+            )
+        )
+        survivors.append(host)
+        for child in children:
+            absorbed_to_parent[child.key] = host.key
 
-    return IslandSweepResult(
-        island_index=island_index,
-        accepted=tuple(accepted),
-        remaining_faces=tuple(sorted(active)),
-        levels=tuple(level_results),
-    )
+    return survivors, absorbed_to_parent
+
+
+def _fallback_carrier_faces(
+    island_index: int,
+    components: list[tuple[int, ...]],
+    original_boundary_faces: set[int],
+) -> set[int]:
+    if island_index == 1 and components and not original_boundary_faces:
+        return set(components[0])
+    return set()
 
 
 def analyse_symmetry_sweep(
@@ -2518,7 +2646,7 @@ def analyse_symmetry_sweep(
     crease_min: float,
     threshold_steps: int,
     min_region_faces: int,
-    min_area_perimeter_ratio_metres: float,
+    max_pseudo_aspect_ratio: float,
     symmetry_tolerance_metres: float,
     direct_symmetry_tolerance_metres: float,
     sample_spacing_metres: float,
@@ -2581,10 +2709,11 @@ def analyse_symmetry_sweep(
                     island_edge_groups[island_offset],
                     topology.face_areas,
                 )
-                if island_index == 1 and components and not original_boundary_faces[island_offset]:
-                    fallback_carrier_faces = set(components[0])
-                else:
-                    fallback_carrier_faces = original_boundary_faces[island_offset]
+                fallback_carrier_faces = _fallback_carrier_faces(
+                    island_index,
+                    components,
+                    original_boundary_faces[island_offset],
+                )
                 for component in components:
                     if len(component) < min_region_faces:
                         continue
@@ -2596,7 +2725,7 @@ def analyse_symmetry_sweep(
                         active,
                         threshold,
                         fallback_carrier_faces,
-                        min_area_perimeter_ratio_metres,
+                        max_pseudo_aspect_ratio,
                         edge_lookups[island_offset],
                     )
                     if (
@@ -2636,6 +2765,7 @@ def analyse_symmetry_sweep(
                 adoptions = _find_eager_child_adoptions(
                     topology,
                     region.faces,
+                    region.boundary.loops,
                     region.area,
                     region.island_index,
                     islands,
@@ -2656,7 +2786,7 @@ def analyse_symmetry_sweep(
                         accepted_angle=threshold,
                         faces=all_faces,
                         area=region.area,
-                        area_perimeter_ratio=region.area_perimeter_ratio,
+                        pseudo_aspect_ratio=region.pseudo_aspect_ratio,
                         boundary_edges=region.boundary.edges,
                         boundary_loops=region.boundary.loops,
                         perimeter=region.boundary.perimeter,
@@ -2683,10 +2813,11 @@ def analyse_symmetry_sweep(
                 island_edge_groups[island_offset],
                 topology.face_areas,
             )
-            if island_index == 1 and components and not original_boundary_faces[island_offset]:
-                fallback_carrier_faces = set(components[0])
-            else:
-                fallback_carrier_faces = original_boundary_faces[island_offset]
+            fallback_carrier_faces = _fallback_carrier_faces(
+                island_index,
+                components,
+                original_boundary_faces[island_offset],
+            )
             for component in components:
                 active_regions.append(
                     _classify_region(
@@ -2697,7 +2828,7 @@ def analyse_symmetry_sweep(
                         active,
                         threshold,
                         fallback_carrier_faces,
-                        min_area_perimeter_ratio_metres,
+                        max_pseudo_aspect_ratio,
                         edge_lookups[island_offset],
                     )
                 )
@@ -2723,11 +2854,18 @@ def analyse_symmetry_sweep(
             candidate.host_faces[0],
         )
     )
-    premerge_faces_by_key = {candidate.key: candidate.faces for candidate in accepted_candidates}
     premerge_id_by_key = {
         candidate.key: index
         for index, candidate in enumerate(accepted_candidates, start=1)
     }
+    accepted_candidates, touching_absorbed_key_to_host_key = _resolve_touching_symmetric_unions(
+        topology,
+        accepted_candidates,
+        premerge_id_by_key,
+        sample_spacing_metres,
+        symmetry_tolerance_metres,
+        direct_symmetry_tolerance_metres,
+    )
     accepted_candidates, absorbed_key_to_host_key = _resolve_late_host_adoptions(
         topology, accepted_candidates, premerge_id_by_key
     )
@@ -2745,7 +2883,12 @@ def analyse_symmetry_sweep(
     }
 
     def surviving_key(key: tuple[int, int]) -> tuple[int, int]:
-        return absorbed_key_to_host_key.get(key, key)
+        while True:
+            next_key = touching_absorbed_key_to_host_key.get(key, key)
+            next_key = absorbed_key_to_host_key.get(next_key, next_key)
+            if next_key == key:
+                return key
+            key = next_key
     candidates = [
         AcceptedCandidate(
             key=candidate.key,
@@ -2755,7 +2898,7 @@ def analyse_symmetry_sweep(
             accepted_angle=candidate.accepted_angle,
             faces=candidate.faces,
             area=candidate.area,
-            area_perimeter_ratio=candidate.area_perimeter_ratio,
+            pseudo_aspect_ratio=candidate.pseudo_aspect_ratio,
             boundary_edges=candidate.boundary_edges,
             boundary_loops=candidate.boundary_loops,
             perimeter=candidate.perimeter,
@@ -2765,8 +2908,6 @@ def analyse_symmetry_sweep(
         )
         for candidate in accepted_candidates
     ]
-    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
-
     levels: list[SweepLevelResult] = []
     cumulative_ids: list[int] = []
     for (
@@ -2781,18 +2922,6 @@ def analyse_symmetry_sweep(
             sorted({key_to_id[surviving_key(key)] for key in accepted_keys})
         )
         cumulative_ids.extend(accepted_ids)
-        active_labels = np.full(len(topology.triangles), -1, dtype=np.int64)
-        for region in active_regions:
-            active_labels[list(region.faces)] = region.region_index - 1
-        candidate_labels = np.full(len(topology.triangles), -1, dtype=np.int64)
-        cumulative_keys = [
-            key
-            for previous in raw_levels[:level_index]
-            for key in previous[4]
-        ]
-        for historical_key in cumulative_keys:
-            candidate_id = key_to_id[surviving_key(historical_key)]
-            candidate_labels[list(premerge_faces_by_key[historical_key])] = candidate_id - 1
         levels.append(
             SweepLevelResult(
                 level_index=level_index,
@@ -2802,8 +2931,6 @@ def analyse_symmetry_sweep(
                 accepted_this_level=accepted_ids,
                 accepted_cumulative=tuple(sorted(set(cumulative_ids))),
                 active_regions=active_regions,
-                active_face_labels=active_labels,
-                candidate_face_labels=candidate_labels,
             )
         )
 
@@ -2818,7 +2945,15 @@ def analyse_symmetry_sweep(
         for candidate in candidates
         for adoption in candidate.adoptions
     )
-    adopted_child_count = adopted_island_count + late_adopted_candidate_count
+    touching_union_candidate_count = sum(
+        adoption.adoption_mode == "touching_union"
+        for candidate in candidates
+        for adoption in candidate.adoptions
+    )
+    adopted_child_count = sum(
+        len(candidate.adoptions)
+        for candidate in candidates
+    )
     adopted_triangle_count = sum(
         adoption.triangle_count
         for candidate in candidates
@@ -2834,7 +2969,7 @@ def analyse_symmetry_sweep(
         threshold_steps=threshold_steps,
         thresholds=thresholds,
         min_region_faces=min_region_faces,
-        min_area_perimeter_ratio_metres=min_area_perimeter_ratio_metres,
+        max_pseudo_aspect_ratio=max_pseudo_aspect_ratio,
         symmetry_tolerance_metres=symmetry_tolerance_metres,
         direct_symmetry_tolerance_metres=direct_symmetry_tolerance_metres,
         sample_spacing_metres=sample_spacing_metres,
@@ -2845,6 +2980,7 @@ def analyse_symmetry_sweep(
         levels=levels,
         adopted_island_count=adopted_island_count,
         late_adopted_candidate_count=late_adopted_candidate_count,
+        touching_union_candidate_count=touching_union_candidate_count,
         adopted_child_count=adopted_child_count,
         adopted_triangle_count=adopted_triangle_count,
         processing_seconds=processing_seconds,
@@ -3875,12 +4011,8 @@ def export_transformed_part_dae(
     used_ids = {element.get("id") for element in root.iter() if element.get("id")}
     used_ids.discard(None)
 
-    candidate_for_face = np.full(len(result.topology.triangles), -1, dtype=np.int64)
-    for candidate in result.candidates:
-        candidate_for_face[list(candidate.faces)] = candidate.candidate_id
-
     accepted_by_source: dict[tuple[int, int, int], int] = {}
-    for face_index, candidate_id in enumerate(candidate_for_face):
+    for face_index, candidate_id in enumerate(_candidate_ids_by_face(result)):
         if candidate_id < 0:
             continue
         source = result.topology.source_faces[face_index]
@@ -4098,15 +4230,18 @@ def _candidate_transform_metres(candidate: AcceptedCandidate) -> np.ndarray:
     return _global_x_reflection() @ local
 
 
+def _candidate_ids_by_face(result: SymmetrySweepResult) -> np.ndarray:
+    labels = np.full(len(result.topology.triangles), -1, dtype=np.int64)
+    for candidate in result.candidates:
+        labels[list(candidate.faces)] = candidate.candidate_id
+    return labels
+
+
 def write_transformed_result_obj(path: Path, result: SymmetrySweepResult) -> None:
     """Small geometry-only companion preview; COLLADA remains authoritative."""
-    candidate_by_face = np.full(len(result.topology.triangles), -1, dtype=np.int64)
     candidate_by_id = {candidate.candidate_id: candidate for candidate in result.candidates}
-    for candidate in result.candidates:
-        candidate_by_face[list(candidate.faces)] = candidate.candidate_id
-
     grouped_faces: dict[int, list[int]] = defaultdict(list)
-    for face_index, candidate_id in enumerate(candidate_by_face):
+    for face_index, candidate_id in enumerate(_candidate_ids_by_face(result)):
         grouped_faces[int(candidate_id)].append(face_index)
 
     vertex_offset = 1
@@ -4153,8 +4288,7 @@ def _candidate_json(candidate: AcceptedCandidate) -> dict[str, object]:
         "adopted_child_count": len(candidate.adoptions),
         "area_square_metres": candidate.area,
         "perimeter_metres": candidate.perimeter,
-        "area_perimeter_ratio_metres": candidate.area_perimeter_ratio,
-        "area_perimeter_ratio_millimetres": candidate.area_perimeter_ratio * 1000.0,
+        "pseudo_aspect_ratio": candidate.pseudo_aspect_ratio,
         "boundary_edge_count": len(candidate.boundary_edges),
         "boundary_loop_count": len(candidate.boundary_loops),
         "symmetry": {
@@ -4189,6 +4323,7 @@ def _candidate_json(candidate: AcceptedCandidate) -> dict[str, object]:
                 "area_square_metres": adoption.area,
                 "child_to_host_area_ratio": adoption.area_ratio,
                 "projected_footprint_overlap": adoption.projected_overlap,
+                "extruded_perimeter_sample_ratio": adoption.extruded_perimeter_sample_ratio,
                 "median_surface_gap_metres": adoption.median_surface_gap,
                 "median_surface_gap_millimetres": adoption.median_surface_gap * 1000.0,
                 "p90_surface_gap_metres": adoption.p90_surface_gap,
@@ -4224,8 +4359,7 @@ def write_report(
             "threshold_steps_inclusive": result.threshold_steps,
             "thresholds_descending": list(result.thresholds),
             "minimum_region_faces": result.min_region_faces,
-            "minimum_area_perimeter_ratio_metres": result.min_area_perimeter_ratio_metres,
-            "minimum_area_perimeter_ratio_millimetres": result.min_area_perimeter_ratio_metres * 1000.0,
+            "maximum_pseudo_aspect_ratio": result.max_pseudo_aspect_ratio,
             "symmetry_rms_tolerance_metres": result.symmetry_tolerance_metres,
             "symmetry_rms_tolerance_millimetres": result.symmetry_tolerance_metres * 1000.0,
             "direct_symmetry_rms_tolerance_metres": result.direct_symmetry_tolerance_metres,
@@ -4236,15 +4370,16 @@ def write_report(
         "method": {
             "segmentation": "at each global threshold, active adjacent triangles join when their dihedral angle is below the threshold",
             "recursion": "passing host faces and confidently adopted whole child islands are removed globally, then the same threshold is segmented again until no further host passes",
-            "main_island": "largest surface-area island; regions touching its original mesh perimeter are never tested",
-            "shape_filter": "before symmetry testing, candidate surface area divided by total closed-boundary perimeter must meet the configured absolute minimum; this characteristic length rejects thin bands",
+            "main_island": "largest surface-area island; explicit fallback carrier regions are not tested",
+            "shape_filter": "before symmetry testing, the candidate's area and closed-boundary perimeter are mapped to the equivalent rectangle aspect ratio; candidates above the configured maximum pseudo aspect ratio are rejected as thin bands",
             "symmetry_scope": "closed perimeter samples only; interior triangles, normals, materials and UVs are ignored",
             "plane": "first pass resamples complete closed perimeters at a fixed physical spacing; PCA gives the best-fit perimeter-plane normal; crossing it with global Z gives the deterministic vertical mirror-plane normal through the sample centroid",
             "comparison": "second pass inserts exact mirror-plane crossings, walks opposite half-perimeters in opposite directions, resamples sibling positions at equal travelled arc distance, reflects one half and averages the full 3-D squared sibling residuals",
-            "acceptance": "candidate A/P characteristic length must meet the configured minimum and the initial post-reflection RMS must not exceed the outer tolerance; candidates below the stricter direct threshold use the deterministic plane unchanged",
-            "borderline_tilt_correction": "accepted candidates between the direct and outer RMS thresholds sweep the original mirror-plane normal about global Y over +/-6 degrees, refine the local minimum, and store the corrected plane; composing that reflection with the global X reflection applies the corresponding double-angle rigid correction",
-            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when child area is at most 80% of host area, host PCA thickness RMS is at most 6 mm, at least 80% of the child projected footprint lies over the host, median sampled surface gap is at most 15 mm, and the 90th percentile gap is at most 25 mm; only one direct child generation is used",
-            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, planarity, footprint-overlap and sampled-gap tests; this recovers parents that only separate from the main carrier at low crease angles",
+            "acceptance": "candidate pseudo aspect ratio must not exceed the configured maximum, initial post-reflection RMS must not exceed the outer tolerance, and final RMS must not exceed the stricter direct threshold; candidates initially below the direct threshold use the deterministic plane unchanged",
+            "borderline_tilt_correction": "candidates initially between the direct and outer RMS thresholds sweep the original mirror-plane normal about global Y over +/-6 degrees, refine the local minimum, and pass only if the corrected final RMS reaches the direct threshold; composing that reflection with the global X reflection applies the corresponding double-angle rigid correction",
+            "touching_union_recovery": "after the sweep, accepted symmetric segmentations in the same geometric island that share boundary edges are grouped when their union has a closed symmetric perimeter; the parent is retained with the largest available union perimeter and absorbs the touching symmetric children",
+            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host and at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal; only one direct child generation is used",
+            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, footprint-overlap and extruded-perimeter containment tests; this recovers parents that only separate from the main carrier at low crease angles",
         },
         "timing": {
             "processing_seconds": result.processing_seconds,
@@ -4260,6 +4395,7 @@ def write_report(
             "adopted_children": result.adopted_child_count,
             "eager_adopted_islands": result.adopted_island_count,
             "late_adopted_candidates": result.late_adopted_candidate_count,
+            "touching_union_candidates": result.touching_union_candidate_count,
             "adopted_triangles": result.adopted_triangle_count,
             "remaining_mirror_triangles": len(result.remaining_faces),
         },
@@ -4273,7 +4409,7 @@ def write_report(
                 "accepted_this_level": list(level.accepted_this_level),
                 "accepted_cumulative": list(level.accepted_cumulative),
                 "remaining_active_regions": len(level.active_regions),
-                "remaining_active_faces": int(np.count_nonzero(level.active_face_labels >= 0)),
+                "remaining_active_faces": sum(len(region.faces) for region in level.active_regions),
             }
             for level in result.levels
         ],
@@ -4290,26 +4426,6 @@ def write_report(
 # ---------------------------------------------------------------------------
 
 
-def colour_for_candidate(candidate_id: int) -> str:
-    # Stable high-contrast palette generated arithmetically without dependencies.
-    hue = (candidate_id * 0.61803398875) % 1.0
-    sector = int(hue * 6)
-    fraction = hue * 6 - sector
-    value = 230
-    low = 85
-    middle = round(low + (value - low) * fraction)
-    options = [
-        (value, middle, low),
-        (middle, value, low),
-        (low, value, middle),
-        (low, middle, value),
-        (middle, low, value),
-        (value, low, middle),
-    ]
-    red, green, blue = options[sector % 6]
-    return f"#{red:02x}{green:02x}{blue:02x}"
-
-
 class SymmetrySweepProbeApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -4324,8 +4440,6 @@ class SymmetrySweepProbeApp(tk.Tk):
         self.archive_texture_bindings: tuple[ArchiveTextureBinding, ...] = ()
         self.archive_texture_choices: tuple[ArchiveTextureBinding, ...] = ()
         self.trim_texture_by_label: dict[str, ArchiveTextureBinding] = {}
-        self.current_level_index = 0
-        self.selected_candidate_id: int | None = None
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.dialog_settings_path = application_settings_path()
         self.dialog_directories = load_dialog_directories(self.dialog_settings_path)
@@ -4336,18 +4450,14 @@ class SymmetrySweepProbeApp(tk.Tk):
         self.part_var = tk.StringVar()
         self.trim_texture_var = tk.StringVar()
         self.search_var = tk.StringVar()
-        self.crease_max_var = tk.StringVar(value="180")
+        self.crease_max_var = tk.StringVar(value="120")
         self.crease_min_var = tk.StringVar(value="15")
-        self.steps_var = tk.StringVar(value="20")
-        self.min_faces_var = tk.StringVar(value="10")
-        self.min_area_perimeter_var = tk.StringVar(value="4.5")
+        self.steps_var = tk.StringVar(value="10")
+        self.min_faces_var = tk.StringVar(value="6")
+        self.max_pseudo_aspect_var = tk.StringVar(value="20")
         self.tolerance_var = tk.StringVar(value="1")
         self.direct_tolerance_var = tk.StringVar(value="0.5")
         self.spacing_var = tk.StringVar(value="2.0")
-        self.threshold_var = tk.StringVar()
-        self.projection_var = tk.StringVar(value="Front (X–Z)")
-        self.show_boundaries_var = tk.BooleanVar(value=True)
-        self.show_wireframe_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Select a BeamNG vehicle ZIP or COLLADA DAE to begin.")
         self.stats_var = tk.StringVar()
 
@@ -4410,7 +4520,7 @@ class SymmetrySweepProbeApp(tk.Tk):
             ("Min angle (°)", self.crease_min_var, 7),
             ("Steps", self.steps_var, 6),
             ("Minimum faces", self.min_faces_var, 7),
-            ("Min A/P (mm)", self.min_area_perimeter_var, 7),
+            ("Max aspect", self.max_pseudo_aspect_var, 7),
             ("RMS tol. (mm)", self.tolerance_var, 7),
             ("Direct RMS (mm)", self.direct_tolerance_var, 7),
             ("Sample spacing (mm)", self.spacing_var, 7),
@@ -4426,7 +4536,7 @@ class SymmetrySweepProbeApp(tk.Tk):
         self.run_button.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(7, 0))
 
         left = ttk.Frame(outer)
-        left.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
+        left.grid(row=2, column=0, columnspan=2, sticky="nsew")
         left.rowconfigure(1, weight=1)
         left.columnconfigure(0, weight=1)
         ttk.Label(left, textvariable=self.stats_var, justify="left").grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -4440,7 +4550,7 @@ class SymmetrySweepProbeApp(tk.Tk):
             "id": "ID", "island": "Island", "angle": "Accepted °", "faces": "Faces",
             "children": "Children",
             "loops": "Loops", "initial_rms": "Initial RMS", "rms": "Final RMS",
-            "ytilt": "Plane Y°", "max": "Max mm", "ap": "A/P mm", "area": "Area m²",
+            "ytilt": "Plane Y°", "max": "Max mm", "ap": "Aspect", "area": "Area m²",
         }
         widths = {
             "id": 38, "island": 48, "angle": 72, "faces": 58, "children": 58, "loops": 48,
@@ -4453,39 +4563,11 @@ class SymmetrySweepProbeApp(tk.Tk):
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.bind("<<TreeviewSelect>>", self._select_candidate)
 
         buttons = ttk.Frame(left)
         buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.export_button = ttk.Button(buttons, text="Export transformed part DAE…", command=self._export, state="disabled")
         self.export_button.pack(side="left")
-        ttk.Button(buttons, text="Clear selection", command=self._clear_selection).pack(side="left", padx=(8, 0))
-
-        preview = ttk.LabelFrame(outer, text="Recursive sweep preview", padding=6)
-        preview.grid(row=2, column=1, sticky="nsew")
-        preview.rowconfigure(1, weight=1)
-        preview.columnconfigure(0, weight=1)
-        preview_controls = ttk.Frame(preview)
-        preview_controls.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(preview_controls, text="Threshold").pack(side="left")
-        self.threshold_combo = ttk.Combobox(preview_controls, textvariable=self.threshold_var, state="readonly", width=18)
-        self.threshold_combo.pack(side="left", padx=(6, 14))
-        self.threshold_combo.bind("<<ComboboxSelected>>", self._select_threshold)
-        ttk.Label(preview_controls, text="View").pack(side="left")
-        projection = ttk.Combobox(
-            preview_controls,
-            textvariable=self.projection_var,
-            state="readonly",
-            width=15,
-            values=("Front (X–Z)", "Top (X–Y)", "Side (Y–Z)"),
-        )
-        projection.pack(side="left", padx=(6, 14))
-        projection.bind("<<ComboboxSelected>>", lambda _event: self._draw())
-        ttk.Checkbutton(preview_controls, text="Boundaries", variable=self.show_boundaries_var, command=self._draw).pack(side="left")
-        ttk.Checkbutton(preview_controls, text="Wireframe", variable=self.show_wireframe_var, command=self._draw).pack(side="left", padx=(8, 0))
-        self.canvas = tk.Canvas(preview, background="#171a1f", highlightthickness=0)
-        self.canvas.grid(row=1, column=0, sticky="nsew")
-        self.canvas.bind("<Configure>", lambda _event: self._draw())
 
         status = ttk.Frame(outer)
         status.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -4604,7 +4686,6 @@ class SymmetrySweepProbeApp(tk.Tk):
         self.trim_texture_var.set("")
         self.trim_texture_combo.configure(values=(), state="disabled")
         self.tree.delete(*self.tree.get_children())
-        self.canvas.delete("all")
         self.auto_texture_var.set(
             "Archive loaded; select a DAE and part." if self.archive else "No ZIP material resolution active."
         )
@@ -4621,23 +4702,29 @@ class SymmetrySweepProbeApp(tk.Tk):
         else:
             messagebox.showerror(APP_NAME, "Choose a .zip vehicle archive or .dae file.")
 
+    def _start_worker(self, job: Callable[[], tuple[str, object]]) -> None:
+        def work() -> None:
+            try:
+                self.worker_queue.put(job())
+            except Exception:
+                self.worker_queue.put(("error", traceback.format_exc()))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _start_archive_scan(self, path: Path) -> None:
         self._cleanup_archive()
         self._reset_loaded_mesh()
         self._set_busy(True, f"Indexing {path.name} without extracting it…")
 
-        def work() -> None:
-            workspace: Path | None = None
+        def job() -> tuple[str, object]:
+            workspace = Path(tempfile.mkdtemp(prefix="beamxp_vehicle_zip_"))
             try:
-                workspace = Path(tempfile.mkdtemp(prefix="beamxp_vehicle_zip_"))
-                archive = scan_vehicle_archive(path, workspace)
-                self.worker_queue.put(("archive_scanned", archive))
+                return "archive_scanned", scan_vehicle_archive(path, workspace)
             except Exception:
-                if workspace is not None:
-                    shutil.rmtree(workspace, ignore_errors=True)
-                self.worker_queue.put(("error", traceback.format_exc()))
+                shutil.rmtree(workspace, ignore_errors=True)
+                raise
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_worker(job)
 
     def _select_archive_dae(self, _event: object = None) -> None:
         label = self.archive_dae_var.get()
@@ -4660,15 +4747,11 @@ class SymmetrySweepProbeApp(tk.Tk):
         self._reset_loaded_mesh()
         self._set_busy(True, f"Extracting and loading {PurePosixPath(member).name}…")
 
-        def work() -> None:
-            try:
-                dae_path = extract_archive_member(archive, member)
-                loaded = load_dae(dae_path)
-                self.worker_queue.put(("loaded", (loaded, member)))
-            except Exception:
-                self.worker_queue.put(("error", traceback.format_exc()))
+        def job() -> tuple[str, object]:
+            dae_path = extract_archive_member(archive, member)
+            return "loaded", (load_dae(dae_path), member)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_worker(job)
 
     def _start_load(self, path: Path, archive_member: str | None = None) -> None:
         if not path.is_file():
@@ -4677,13 +4760,10 @@ class SymmetrySweepProbeApp(tk.Tk):
         self._reset_loaded_mesh()
         self._set_busy(True, f"Loading {path.name}…")
 
-        def work() -> None:
-            try:
-                self.worker_queue.put(("loaded", (load_dae(path), archive_member)))
-            except Exception:
-                self.worker_queue.put(("error", traceback.format_exc()))
+        def job() -> tuple[str, object]:
+            return "loaded", (load_dae(path), archive_member)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_worker(job)
 
     def _filter_parts(self) -> None:
         query = self.search_var.get().strip().lower()
@@ -4769,7 +4849,7 @@ class SymmetrySweepProbeApp(tk.Tk):
             minimum = float(self.crease_min_var.get())
             steps = int(self.steps_var.get())
             min_faces = int(self.min_faces_var.get())
-            min_area_perimeter_mm = float(self.min_area_perimeter_var.get())
+            max_pseudo_aspect_ratio = float(self.max_pseudo_aspect_var.get())
             tolerance_mm = float(self.tolerance_var.get())
             direct_tolerance_mm = float(self.direct_tolerance_var.get())
             spacing_mm = float(self.spacing_var.get())
@@ -4785,8 +4865,8 @@ class SymmetrySweepProbeApp(tk.Tk):
         if min_faces < 1:
             messagebox.showerror(APP_NAME, "Minimum faces must be at least 1.")
             return None
-        if not (0.0 <= min_area_perimeter_mm <= 1000.0):
-            messagebox.showerror(APP_NAME, "Minimum area/perimeter must be between 0 and 1000 mm. Use 0 to disable it.")
+        if not (1.0 <= max_pseudo_aspect_ratio <= 10_000.0):
+            messagebox.showerror(APP_NAME, "Maximum pseudo aspect ratio must be between 1 and 10000.")
             return None
         if not (0.001 <= tolerance_mm <= 100.0):
             messagebox.showerror(APP_NAME, "RMS symmetry tolerance must be between 0.001 mm and 100 mm.")
@@ -4801,7 +4881,7 @@ class SymmetrySweepProbeApp(tk.Tk):
             messagebox.showerror(APP_NAME, "Perimeter sample spacing must be between 0.05 mm and 100 mm.")
             return None
         return (
-            maximum, minimum, steps, min_faces, min_area_perimeter_mm / 1000.0,
+            maximum, minimum, steps, min_faces, max_pseudo_aspect_ratio,
             tolerance_mm / 1000.0, direct_tolerance_mm / 1000.0,
             spacing_mm / 1000.0,
         )
@@ -4818,37 +4898,30 @@ class SymmetrySweepProbeApp(tk.Tk):
         if parameters is None:
             return
         (
-            maximum, minimum, steps, min_faces, min_area_perimeter,
+            maximum, minimum, steps, min_faces, max_pseudo_aspect_ratio,
             tolerance, direct_tolerance, spacing,
         ) = parameters
         self.result = None
-        self.current_level_index = 0
-        self.selected_candidate_id = None
         self.tree.delete(*self.tree.get_children())
-        self.threshold_combo.configure(values=())
-        self.canvas.delete("all")
+        self.stats_var.set("")
         self._set_busy(True, f"Running recursive symmetry sweep on {part.node_name}…")
 
-        def work() -> None:
-            try:
-                assert self.loaded is not None
-                result = analyse_symmetry_sweep(
-                    self.loaded,
-                    part,
-                    maximum,
-                    minimum,
-                    steps,
-                    min_faces,
-                    min_area_perimeter,
-                    tolerance,
-                    direct_tolerance,
-                    spacing,
-                )
-                self.worker_queue.put(("analysed", result))
-            except Exception:
-                self.worker_queue.put(("error", traceback.format_exc()))
+        def job() -> tuple[str, object]:
+            assert self.loaded is not None
+            return "analysed", analyse_symmetry_sweep(
+                self.loaded,
+                part,
+                maximum,
+                minimum,
+                steps,
+                min_faces,
+                max_pseudo_aspect_ratio,
+                tolerance,
+                direct_tolerance,
+                spacing,
+            )
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_worker(job)
 
     def _poll_worker(self) -> None:
         try:
@@ -4908,10 +4981,6 @@ class SymmetrySweepProbeApp(tk.Tk):
 
     def _populate_result(self) -> None:
         assert self.result is not None
-        labels = [f"{level.level_index}: {level.crease_angle:.6g}°" for level in self.result.levels]
-        self.threshold_combo.configure(values=labels)
-        self.current_level_index = 0
-        self.threshold_var.set(labels[0] if labels else "")
         self.tree.delete(*self.tree.get_children())
         for candidate in self.result.candidates:
             self.tree.insert(
@@ -4927,127 +4996,26 @@ class SymmetrySweepProbeApp(tk.Tk):
                     f"{candidate.measurement.rms_error * 1000.0:.4f}",
                     f"{candidate.measurement.mirror_plane_y_tilt_degrees:.3f}",
                     f"{candidate.measurement.max_error * 1000.0:.4f}",
-                    f"{candidate.area_perimeter_ratio * 1000.0:.4f}",
+                    f"{candidate.pseudo_aspect_ratio:.3f}",
                     f"{candidate.area:.6g}",
                 ),
             )
-        self._refresh_level()
-
-    def _current_level(self) -> SweepLevelResult | None:
-        if self.result is None or not self.result.levels:
-            return None
-        return self.result.levels[self.current_level_index]
-
-    def _select_threshold(self, _event: object = None) -> None:
-        selected = self.threshold_combo.current()
-        if selected >= 0:
-            self.current_level_index = selected
-            self._refresh_level()
-
-    def _refresh_level(self) -> None:
         result = self.result
-        level = self._current_level()
-        if result is None or level is None:
-            return
+        tested = sum(level.tested_candidates for level in result.levels)
+        residual_regions = len(result.levels[-1].active_regions) if result.levels else 0
         self.stats_var.set(
             f"{len(result.topology.vertices):,} vertices   {len(result.topology.triangles):,} triangles   "
             f"{len(result.island_faces):,} islands\n"
-            f"Level {level.level_index}/{len(result.levels)}   {level.crease_angle:.6g}°   "
-            f"{level.tested_candidates:,} tested   {len(level.accepted_this_level):,} accepted here\n"
-            f"{len(level.accepted_cumulative):,} accepted cumulatively   "
+            f"{len(result.thresholds):,} thresholds   {tested:,} candidates tested   "
+            f"{len(result.candidates):,} accepted symmetric candidates\n"
             f"{result.adopted_child_count:,} adopted children / {result.adopted_triangle_count:,} triangles "
-            f"({result.adopted_island_count:,} eager, {result.late_adopted_candidate_count:,} late)   "
-            f"{len(level.active_regions):,} residual regions\n"
+            f"({result.adopted_island_count:,} eager, "
+            f"{result.touching_union_candidate_count:,} touching, "
+            f"{result.late_adopted_candidate_count:,} late)   "
+            f"{residual_regions:,} residual regions   {len(result.remaining_faces):,} mirror triangles\n"
             f"Processed in {result.processing_seconds:.3f} s   "
             f"topology {result.topology_seconds:.3f} s   sweep/adoption {result.sweep_seconds:.3f} s"
         )
-        self._draw()
-
-    def _select_candidate(self, _event: object = None) -> None:
-        selected = self.tree.selection()
-        self.selected_candidate_id = int(selected[0]) if selected else None
-        self._draw()
-
-    def _clear_selection(self) -> None:
-        for item in self.tree.selection():
-            self.tree.selection_remove(item)
-        self.selected_candidate_id = None
-        self._draw()
-
-    def _projection_axes(self) -> tuple[tuple[int, int], int]:
-        view = self.projection_var.get()
-        if view.startswith("Top"):
-            return (0, 1), 2
-        if view.startswith("Side"):
-            return (1, 2), 0
-        return (0, 2), 1
-
-    def _draw(self) -> None:
-        self.canvas.delete("all")
-        result = self.result
-        level = self._current_level()
-        if result is None or level is None or self.canvas.winfo_width() < 20:
-            return
-        topology = result.topology
-        axes, depth_axis = self._projection_axes()
-        projected = topology.vertices[:, list(axes)]
-        minimum, maximum = projected.min(axis=0), projected.max(axis=0)
-        extent = np.maximum(maximum - minimum, 1e-12)
-        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        margin = 24.0
-        scale = min((width - 2 * margin) / extent[0], (height - 2 * margin) / extent[1])
-        centre = (minimum + maximum) * 0.5
-        screen = np.empty_like(projected)
-        screen[:, 0] = (projected[:, 0] - centre[0]) * scale + width * 0.5
-        screen[:, 1] = height * 0.5 - (projected[:, 1] - centre[1]) * scale
-        depths = topology.vertices[topology.triangles][:, :, depth_axis].mean(axis=1)
-
-        for face_index in np.argsort(depths):
-            face_index = int(face_index)
-            candidate_label = int(level.candidate_face_labels[face_index])
-            active_label = int(level.active_face_labels[face_index])
-            if candidate_label >= 0:
-                candidate_id = candidate_label + 1
-                fill = colour_for_candidate(candidate_id)
-                selected = candidate_id == self.selected_candidate_id
-            elif active_label >= 0:
-                region = level.active_regions[active_label]
-                if region.role == "main carrier":
-                    fill = "#46515d"
-                elif region.role == "thin/rejected":
-                    fill = "#5a3939"
-                else:
-                    fill = "#303942"
-                selected = False
-            else:
-                fill = "#24292f"
-                selected = False
-            coordinates: list[float] = []
-            for vertex in topology.triangles[face_index]:
-                point = screen[int(vertex)]
-                coordinates.extend((float(point[0]), float(point[1])))
-            self.canvas.create_polygon(
-                *coordinates,
-                fill=("#ffe18a" if selected else fill),
-                outline=("#fff4c2" if selected else fill),
-                width=(2 if selected else 1),
-            )
-
-        def point(vertex: int) -> tuple[float, float]:
-            value = screen[vertex]
-            return float(value[0]), float(value[1])
-
-        if self.show_wireframe_var.get():
-            for first, second in topology.edge_faces:
-                self.canvas.create_line(*point(first), *point(second), fill="#343b44")
-        if self.show_boundaries_var.get():
-            boundary_edges: set[tuple[int, int]] = set()
-            for region in level.active_regions:
-                boundary_edges.update(region.boundary.edges)
-            for candidate_id in level.accepted_cumulative:
-                boundary_edges.update(result.candidates[candidate_id - 1].boundary_edges)
-            for first, second in boundary_edges:
-                self.canvas.create_line(*point(first), *point(second), fill="#111418", width=2)
 
     def _export(self) -> None:
         if self.loaded is None or self.result is None:
@@ -5154,28 +5122,6 @@ class SymmetrySweepProbeApp(tk.Tk):
             messagebox.showerror(APP_NAME, traceback.format_exc())
             return
         self.status_var.set(f"Exported transformed selected-part DAE to {output}")
-        exported_lines = [
-            str(output),
-            str(output.with_suffix('.transform.json')),
-            str(output.with_suffix('.transform.obj')),
-        ]
-        texture_info = export_info.get("blender_texture")
-        warning_text = ""
-        if isinstance(texture_info, dict):
-            if texture_info.get("output_texture"):
-                exported_lines.append(str(texture_info["output_texture"]))
-            for item in texture_info.get("wired_materials", []):
-                if isinstance(item, dict) and item.get("output_texture"):
-                    value = str(item["output_texture"])
-                    if value not in exported_lines:
-                        exported_lines.append(value)
-            if texture_info.get("enabled") is False:
-                warning_text = (
-                    "\n\nTexture preview warning:\n"
-                    + str(texture_info.get("details") or texture_info.get("reason") or "Automatic texture wiring failed.")
-                    + "\nThe transformed DAE was still exported normally."
-                )
-        messagebox.showinfo(APP_NAME, "Exported:\n" + "\n".join(exported_lines) + warning_text)
 
     def destroy(self) -> None:
         archive = self.archive
