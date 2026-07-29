@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-import beamng_hand_drive_core as core
-import beamng_transform_helpers as th
+from beamxp import hand_drive_core as core
+from beamxp import transform_helpers as th
 
 
 # Stock content ships part keys with a stray comma between the colon and the

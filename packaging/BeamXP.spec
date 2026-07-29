@@ -6,15 +6,15 @@ from pathlib import Path
 ROOT = Path(SPECPATH).parent
 
 a = Analysis(
-    [str(ROOT / "beamng_hand_drive_tool.py")],
+    [str(ROOT / "beamxp" / "hand_drive_tool.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[
-        (str(ROOT / "blender_preview_backend.py"), "."),
-        (str(ROOT / "BeamXP_icon.ico"), "."),
+        (str(ROOT / "beamxp" / "blender_preview_backend.py"), "."),
+        (str(ROOT / "assets" / "BeamXP_icon.ico"), "assets"),
         # Composited onto generated config previews; xp_sticker_path() looks
         # for it in sys._MEIPASS in frozen builds.
-        (str(ROOT / "xp_sticker.png"), "."),
+        (str(ROOT / "assets" / "xp_sticker.png"), "assets"),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -46,5 +46,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(ROOT / "BeamXP_icon.ico"),
+    icon=str(ROOT / "assets" / "BeamXP_icon.ico"),
 )

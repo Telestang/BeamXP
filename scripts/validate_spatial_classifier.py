@@ -26,8 +26,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import beamng_hand_drive_core as core  # noqa: E402
-from beamng_hand_drive_tool import build_mode_recommendations  # noqa: E402
+from beamxp import hand_drive_core as core  # noqa: E402
+from beamxp.hand_drive_tool import build_mode_recommendations  # noqa: E402
 
 
 DEFAULT_VEHICLES = ("etk800", "pickup", "sunburst2")

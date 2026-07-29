@@ -43,7 +43,7 @@ PICK_MOVE_THRESHOLD = 4
 # Geometry whose placement lands further than this from the origin is a
 # hide-it-far-away modding hack; it is dropped so one hidden mesh cannot
 # destroy the auto-framed camera. Keep in sync with PREVIEW_FAR_LIMIT in
-# beamng_hand_drive_core.py (mesh_preview stays import-independent of core).
+# beamxp.hand_drive_core (mesh_preview stays import-independent of core).
 FAR_LIMIT = 100.0
 # BeamNG vehicle axes commonly place +X to the left and -Y to the front.
 # The old 2.4 rad default looked from +X/+Y, so mirror that around +X.

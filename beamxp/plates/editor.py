@@ -14,10 +14,10 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import TYPE_CHECKING
 
-import plate_generator
+from beamxp.plates import generator as plate_generator
 
 if TYPE_CHECKING:
-    from beamng_hand_drive_tool import HandDriveToolApp
+    from beamxp.hand_drive_tool import HandDriveToolApp
 
 PLATE_MODE_LABELS = {
     "general": "Use vehicle plate setting",

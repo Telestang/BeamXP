@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-import beamng_hand_drive_core as core
+from beamxp import hand_drive_core as core
 
 
 def obj(object_id: str, position: tuple[float, float, float]) -> core.DaeObject:
@@ -438,7 +438,7 @@ class SteeringAxisDeltaTests(unittest.TestCase):
 
 class PositionLabelTests(unittest.TestCase):
     def test_variant_dependent_x_is_marked(self) -> None:
-        import beamng_hand_drive_tool as tool
+        from beamxp import hand_drive_tool as tool
 
         # All three cells carry the mark: it is the coordinate as a whole that
         # is trim-specific, and the axis that moves is often not x.
@@ -448,7 +448,7 @@ class PositionLabelTests(unittest.TestCase):
         )
 
     def test_single_placement_x_is_unmarked(self) -> None:
-        import beamng_hand_drive_tool as tool
+        from beamxp import hand_drive_tool as tool
 
         self.assertEqual(
             tool.position_labels((0.4, 1.5, -0.2), False),
@@ -458,7 +458,7 @@ class PositionLabelTests(unittest.TestCase):
 
 class PartTypeLabelTests(unittest.TestCase):
     def test_jbeam_rendering_roles_are_labelled(self) -> None:
-        import beamng_hand_drive_tool as tool
+        from beamxp import hand_drive_tool as tool
 
         flexbodies = {"flex", "both"}
         props = {"prop", "both"}

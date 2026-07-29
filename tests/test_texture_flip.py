@@ -4,8 +4,8 @@ import types
 import unittest
 from xml.etree import ElementTree as ET
 
-import beamng_hand_drive_core as core
-import beamng_transform_helpers as th
+from beamxp import hand_drive_core as core
+from beamxp import transform_helpers as th
 
 
 def build_geometry(uv_values: str) -> ET.Element:

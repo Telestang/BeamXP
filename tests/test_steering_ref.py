@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-import beamng_hand_drive_core as core
+from beamxp import hand_drive_core as core
 
 
 def make_context(vehicle_id: str, objects: dict[str, core.DaeObject]) -> core.VehicleContext:

@@ -5,8 +5,8 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-import beamng_hand_drive_core as core
-import beamng_transform_helpers as transform_helpers
+from beamxp import hand_drive_core as core
+from beamxp import transform_helpers
 
 
 class DaeSurfaceTriangleTests(unittest.TestCase):
@@ -109,7 +109,7 @@ class ReachableCommonOrderTests(unittest.TestCase):
 
 class MaskCommentsCacheTests(unittest.TestCase):
     def test_cached_mask_still_matches_a_fresh_computation(self) -> None:
-        import beamng_transform_helpers as th
+        from beamxp import transform_helpers as th
 
         text = '{"a": 1, // note "b"\n "c": [1, 2], /* "d" */ "e": "f"}'
         first = th.mask_comments_preserve_offsets(text)

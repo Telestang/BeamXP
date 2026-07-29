@@ -8,8 +8,8 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-import beamng_hand_drive_core as core
-import plate_generator
+from beamxp import hand_drive_core as core
+from beamxp.plates import generator as plate_generator
 
 
 class PlateXpTests(unittest.TestCase):

@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import beamng_hand_drive_core as core  # noqa: E402
+from beamxp import hand_drive_core as core  # noqa: E402
 
 STOCK_DIR = Path("G:/SteamLibrary/steamapps/common/BeamNG.drive/content/vehicles")
 VEHICLE_LIST = REPO_ROOT / "spatial classifier" / "vanilla_cars_trucks.txt"

@@ -22,9 +22,11 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-import beamng_transform_helpers as transform_helpers
-import plate_generator
-import spatial_visibility_backend
+from beamxp import spatial_visibility_backend
+from beamxp import transform_helpers
+from beamxp.core import dae
+from beamxp.core import mesh_resolution
+from beamxp.plates import generator as plate_generator
 
 
 def default_user_data_dir() -> Path:
@@ -39,7 +41,7 @@ def default_beamng_mods_dir() -> Path:
 
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-SOURCE_ROOT_DIR = APP_DIR.parent if APP_DIR.name == "beamng-hand-drive-converter" else APP_DIR
+SOURCE_ROOT_DIR = APP_DIR if getattr(sys, "frozen", False) else APP_DIR.parent
 USER_DATA_DIR = Path(os.environ.get("BEAMXP_DATA_DIR") or os.environ.get("BEAMHDC_DATA_DIR") or default_user_data_dir())
 WORKSPACE_DIR = USER_DATA_DIR
 THIS_DIR = APP_DIR
@@ -70,7 +72,7 @@ BUILD_CHOICES = (BUILD_OFF, BUILD_CONVERTED, BUILD_ORIGINAL, BUILD_BOTH)
 # Meshes placed further than this from the vehicle origin are treated as
 # deliberately hidden (mods "remove" unwanted meshes by offsetting them
 # thousands of km away) and are left out of previews so they cannot wreck
-# the camera framing. Keep in sync with FAR_LIMIT in mesh_preview.py.
+# the camera framing. Keep in sync with FAR_LIMIT in beamxp.mesh_preview.
 PREVIEW_FAR_LIMIT = 100.0
 NUMBER_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 STEERING_NAME_EXCLUDES = (
@@ -89,16 +91,43 @@ STEERING_NAME_EXCLUDES = (
 NS = transform_helpers.NS
 
 
-@dataclass(frozen=True)
-class DaeObject:
-    id: str
-    name: str
-    dae_path: str
-    x: float
-    y: float
-    z: float
-    geometry_ids: tuple[str, ...]
-    dae_source_zip: Path | None = None
+# ---------------------------------------------------------------------------
+# DAE loading/parsing now lives in beamng_dae.  Re-exported here so existing
+# call sites keep working unchanged -- and so pickled context caches, which
+# record the class as beamng_hand_drive_core.DaeObject, still unpickle.
+# ---------------------------------------------------------------------------
+DaeObject = dae.DaeObject
+parse_dae = dae.parse_dae
+dae_unit_scale = dae.dae_unit_scale
+dae_objects_from_tree = dae.dae_objects_from_tree
+dae_node_aliases = dae.dae_node_aliases
+find_dae_node = dae.find_dae_node
+list_dae_objects_for_file = dae.list_dae_objects_for_file
+list_dae_objects_for_path = dae.list_dae_objects_for_path
+common_dae_paths = dae.common_dae_paths
+DAE_ALIAS_ATTR_RE = dae.DAE_ALIAS_ATTR_RE
+dae_alias_candidates = dae.dae_alias_candidates
+geometry_position_points = dae.geometry_position_points
+preview_data_for_file = dae.preview_data_for_file
+preview_data_from_tree = dae.preview_data_from_tree
+surface_triangles_from_tree = dae.surface_triangles_from_tree
+
+
+def load_common_dae_objects(
+    source_zip: Path,
+    wanted_meshes: set[str],
+    existing_objects: dict[str, DaeObject],
+) -> tuple[dict[str, DaeObject], dict[str, dict[str, object]], list[str]]:
+    """Resolve meshes this vehicle references but does not ship.
+
+    Thin wrapper that supplies the common-zip search path; the scan itself
+    lives in :func:`beamng_dae.load_common_dae_objects`.
+    """
+    return dae.load_common_dae_objects(
+        common_zip_candidates(source_zip),
+        wanted_meshes,
+        existing_objects,
+    )
 
 
 @dataclass(frozen=True)
@@ -315,105 +344,6 @@ def direct_vehicle_files(source_zip: Path, vehicle_id: str, suffix: str) -> list
     return sorted(out)
 
 
-def parse_dae(source_zip: Path, dae_path: str) -> ET.ElementTree:
-    with zipfile.ZipFile(source_zip) as zf:
-        with zf.open(dae_path) as fh:
-            return ET.parse(fh)
-
-
-def dae_unit_scale(root: ET.Element) -> float:
-    """The COLLADA asset's <unit meter="..."> factor (metres per unit).
-
-    Some stock geometry is authored in centimetres (e.g.
-    common/tires/bolide_80s_tires.dae carries <unit meter="0.01"> with no scale
-    in its node transforms), so its vertex coordinates are 100x too large unless
-    this factor is applied -- which is what made the bolide's tyres render metres
-    wide. DAEs authored in metres report meter="1" (a no-op), and DAEs that carry
-    a scale in the node matrix instead (e.g. gavrilsteeringwheels.dae) report
-    meter="1", so applying this on top of the node transform never double-scales.
-    """
-    for elem in root.iter():
-        tag = elem.tag.rsplit("}", 1)[-1]
-        if tag == "unit":
-            try:
-                value = float(elem.get("meter"))
-            except (TypeError, ValueError):
-                return 1.0
-            return value if value > 0 else 1.0
-        if tag == "library_geometries":
-            break  # <unit> lives in <asset> near the top; stop once past it
-    return 1.0
-
-
-def dae_objects_from_tree(
-    tree: ET.ElementTree,
-    dae_path: str,
-    *,
-    dae_source_zip: Path | None = None,
-) -> dict[str, DaeObject]:
-    objects: dict[str, DaeObject] = {}
-    unit = dae_unit_scale(tree.getroot())
-    for node in tree.getroot().findall(".//c:node", NS):
-        object_id = node.get("id")
-        if not object_id:
-            continue
-        instance_geometries = node.findall(".//c:instance_geometry", NS)
-        if not instance_geometries:
-            continue
-        matrix_elem = node.find("c:matrix", NS)
-        if matrix_elem is None or not matrix_elem.text:
-            continue
-        matrix = transform_helpers.parse_matrix(matrix_elem.text)
-        geometry_ids = tuple(
-            inst.get("url", "")[1:]
-            for inst in instance_geometries
-            if inst.get("url", "").startswith("#")
-        )
-        obj = DaeObject(
-            id=object_id,
-            name=(node.get("name") or object_id).strip(),
-            dae_path=dae_path,
-            x=matrix[0][3] * unit,
-            y=matrix[1][3] * unit,
-            z=matrix[2][3] * unit,
-            geometry_ids=geometry_ids,
-            dae_source_zip=dae_source_zip,
-        )
-        for alias in dae_node_aliases(node):
-            objects.setdefault(alias, obj)
-    return objects
-
-
-def dae_node_aliases(node: ET.Element) -> list[str]:
-    aliases: list[str] = []
-    for value in (node.get("id"), node.get("name")):
-        if not value:
-            continue
-        for alias in (value, value.strip()):
-            if alias and alias not in aliases:
-                aliases.append(alias)
-    return aliases
-
-
-def find_dae_node(root: ET.Element, object_id: str) -> ET.Element | None:
-    node = root.find(f".//c:node[@id='{object_id}']", NS)
-    if node is not None:
-        return node
-    for candidate in root.findall(".//c:node", NS):
-        if object_id in dae_node_aliases(candidate):
-            return candidate
-    return None
-
-
-def list_dae_objects_for_file(source_zip: Path, dae_path: str) -> dict[str, DaeObject]:
-    tree = parse_dae(source_zip, dae_path)
-    return dae_objects_from_tree(tree, dae_path, dae_source_zip=source_zip)
-
-
-def list_dae_objects_for_path(path: Path) -> dict[str, DaeObject]:
-    return dae_objects_from_tree(ET.parse(path), str(path), dae_source_zip=None)
-
-
 _game_common_zips_cache: list[Path] | None = None
 
 
@@ -509,250 +439,11 @@ def common_zip_candidates(source_zip: Path) -> list[Path]:
     return candidates
 
 
-def common_dae_paths(source_zip: Path) -> list[str]:
-    try:
-        with zipfile.ZipFile(source_zip) as zf:
-            return sorted(
-                name.replace("\\", "/")
-                for name in zf.namelist()
-                if name.replace("\\", "/").lower().startswith("vehicles/common/")
-                and name.lower().endswith(".dae")
-            )
-    except Exception:
-        return []
-
-
 def referenced_mesh_names(part_body_index: dict[str, tuple[str, str]]) -> set[str]:
     meshes: set[str] = set()
     for part_body, _filename in part_body_index.values():
         meshes.update(transform_helpers.extract_part_mesh_names(part_body))
     return meshes
-
-
-DAE_ALIAS_ATTR_RE = re.compile(rb'(?:id|name)="([^"]*)"')
-
-
-def dae_alias_candidates(data: bytes) -> set[str]:
-    """Every id/name attribute value in a raw DAE, plus stripped forms.
-
-    A superset of what dae_node_aliases can key an object by, so using it to
-    skip files is safe: it can only ever over-select. Matching on attributes
-    rather than searching for each wanted mesh name matters a great deal --
-    a combined ``mesh1|mesh2|...`` regex over a 680 MB common.zip is O(bytes
-    x alternatives) in Python's re (no Aho-Corasick) and measured 211s on
-    pickup, versus 0.4s for one attribute pass plus a set intersection.
-    """
-    names: set[str] = set()
-    for raw in DAE_ALIAS_ATTR_RE.findall(data):
-        try:
-            value = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        names.add(value)
-        stripped = value.strip()
-        if stripped:
-            names.add(stripped)
-    return names
-
-
-def load_common_dae_objects(
-    source_zip: Path,
-    wanted_meshes: set[str],
-    existing_objects: dict[str, DaeObject],
-) -> tuple[dict[str, DaeObject], dict[str, dict[str, object]], list[str]]:
-    still_missing = wanted_meshes - set(existing_objects)
-    if not still_missing:
-        return {}, {}, []
-
-    found_objects: dict[str, DaeObject] = {}
-    found_previews: dict[str, dict[str, object]] = {}
-    found_paths: set[str] = set()
-
-    for candidate_zip in common_zip_candidates(source_zip):
-        if not still_missing:
-            break
-        paths = common_dae_paths(candidate_zip)
-        if not paths:
-            continue
-        try:
-            zf = zipfile.ZipFile(candidate_zip)
-        except Exception:
-            continue
-        # One handle for the whole zip: reopening per DAE re-reads the
-        # central directory of a multi-hundred-MB archive every time.
-        with zf:
-            for dae_path in paths:
-                if not still_missing:
-                    break
-                try:
-                    data = zf.read(dae_path)
-                except Exception:
-                    continue
-                if still_missing.isdisjoint(dae_alias_candidates(data)):
-                    continue
-
-                try:
-                    tree = ET.ElementTree(ET.fromstring(data))
-                    file_objects = dae_objects_from_tree(
-                        tree, dae_path, dae_source_zip=candidate_zip
-                    )
-                except Exception:
-                    continue
-                matched_ids = sorted(
-                    object_id for object_id in file_objects if object_id in still_missing
-                )
-                if not matched_ids:
-                    continue
-
-                try:
-                    file_previews = preview_data_from_tree(tree)
-                except Exception:
-                    file_previews = {}
-                for object_id in matched_ids:
-                    found_objects.setdefault(object_id, file_objects[object_id])
-                    if object_id in file_previews:
-                        found_previews.setdefault(object_id, file_previews[object_id])
-                    still_missing.discard(object_id)
-                found_paths.add(dae_path)
-
-    return found_objects, found_previews, sorted(found_paths)
-
-
-def geometry_position_points(geometry: ET.Element) -> list[tuple[float, float, float]]:
-    return transform_helpers.geometry_position_points(geometry)
-
-
-def preview_data_for_file(
-    source_zip: Path,
-    dae_path: str,
-    max_points_per_object: int = 350,
-) -> dict[str, dict[str, object]]:
-    return preview_data_from_tree(
-        parse_dae(source_zip, dae_path),
-        max_points_per_object=max_points_per_object,
-    )
-
-
-def preview_data_from_tree(
-    tree: ET.ElementTree,
-    max_points_per_object: int = 350,
-) -> dict[str, dict[str, object]]:
-    """Preview payload from an already-parsed DAE.
-
-    Split out so callers that also need dae_objects_from_tree can parse the
-    file once instead of once per helper; a common DAE is tens of MB of XML.
-    """
-    root = tree.getroot()
-    library_geometries = root.find("c:library_geometries", NS)
-    if library_geometries is None:
-        return {}
-
-    unit = dae_unit_scale(root)
-    geometries_by_id = {
-        geom.get("id"): geom
-        for geom in library_geometries.findall("c:geometry", NS)
-        if geom.get("id")
-    }
-    local_points_by_geometry = {
-        geom_id: geometry_position_points(geom)
-        for geom_id, geom in geometries_by_id.items()
-    }
-
-    preview: dict[str, dict[str, object]] = {}
-    for node in root.findall(".//c:node", NS):
-        object_id = node.get("id")
-        if not object_id:
-            continue
-        matrix_elem = node.find("c:matrix", NS)
-        if matrix_elem is None or not matrix_elem.text:
-            continue
-        matrix = transform_helpers.parse_matrix(matrix_elem.text)
-
-        object_points: list[tuple[float, float, float]] = []
-        geometry_ids: list[str] = []
-        for inst in node.findall(".//c:instance_geometry", NS):
-            url = inst.get("url", "")
-            if not url.startswith("#"):
-                continue
-            geometry_id = url[1:]
-            geometry_ids.append(geometry_id)
-            local_points = local_points_by_geometry.get(geometry_id, [])
-            for point in local_points:
-                wx, wy, wz = transform_helpers.transform_point(matrix, point)
-                object_points.append((wx * unit, wy * unit, wz * unit))
-
-        if not object_points:
-            continue
-        # Material bindings feed the spatial classifier (glass panes bound the
-        # cabin; emissive surfaces are displays that need a texture flip).
-        material_symbols = sorted({
-            re.sub(r"-material$", "", symbol).lower()
-            for inst_mat in node.findall(".//c:instance_material", NS)
-            for symbol in (inst_mat.get("symbol") or inst_mat.get("target", "").lstrip("#"),)
-            if symbol
-        })
-        bounds = transform_helpers.bounds_from_points(object_points)
-        min_point, max_point = bounds
-        center = (
-            (min_point[0] + max_point[0]) / 2,
-            (min_point[1] + max_point[1]) / 2,
-            (min_point[2] + max_point[2]) / 2,
-        )
-        item = {
-            "bounds": bounds,
-            "center": center,
-            "sample_points": transform_helpers.sample_points(object_points, max_points_per_object),
-            "geometry_ids": geometry_ids,
-            "materials": tuple(material_symbols),
-        }
-        for alias in dae_node_aliases(node):
-            preview.setdefault(alias, item)
-    return preview
-
-
-def surface_triangles_from_tree(
-    tree: ET.ElementTree,
-) -> dict[str, np.ndarray]:
-    """Filled triangle surfaces for each object in an already-parsed DAE."""
-    root = tree.getroot()
-    library_geometries = root.find("c:library_geometries", NS)
-    if library_geometries is None:
-        return {}
-
-    unit = dae_unit_scale(root)
-    local_by_geometry: dict[str, np.ndarray] = {}
-    for geometry in library_geometries.findall("c:geometry", NS):
-        geometry_id = geometry.get("id")
-        if not geometry_id:
-            continue
-        triangles = transform_helpers.geometry_surface_triangles(geometry)
-        local_by_geometry[geometry_id] = np.asarray(triangles, dtype=float).reshape((-1, 3, 3))
-
-    surfaces: dict[str, np.ndarray] = {}
-    for node in root.findall(".//c:node", NS):
-        matrix_elem = node.find("c:matrix", NS)
-        if matrix_elem is None or not matrix_elem.text:
-            continue
-        matrix = np.asarray(transform_helpers.parse_matrix(matrix_elem.text), dtype=float)
-        chunks: list[np.ndarray] = []
-        for instance in node.findall(".//c:instance_geometry", NS):
-            url = instance.get("url", "")
-            if not url.startswith("#"):
-                continue
-            local = local_by_geometry.get(url[1:])
-            if local is None or len(local) == 0:
-                continue
-            flat = local.reshape((-1, 3))
-            homogeneous = np.concatenate(
-                [flat, np.ones((len(flat), 1), dtype=float)], axis=1
-            )
-            chunks.append(((homogeneous @ matrix.T)[:, :3] * unit).reshape((-1, 3, 3)))
-        if not chunks:
-            continue
-        triangles = np.concatenate(chunks)
-        for alias in dae_node_aliases(node):
-            surfaces.setdefault(alias, triangles)
-    return surfaces
 
 
 def dae_source_index(
@@ -3439,8 +3130,11 @@ def xp_sticker_path() -> Path | None:
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         candidates.append(Path(meipass) / "xp_sticker.png")
+        candidates.append(Path(meipass) / "assets" / "xp_sticker.png")
     candidates.append(APP_DIR / "xp_sticker.png")
+    candidates.append(APP_DIR / "assets" / "xp_sticker.png")
     candidates.append(SOURCE_ROOT_DIR / "xp_sticker.png")
+    candidates.append(SOURCE_ROOT_DIR / "assets" / "xp_sticker.png")
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -4938,12 +4632,7 @@ def selected_parts_for_config(context: VehicleContext, config_name: str) -> dict
 def part_variable_scope(selected: dict[str, object], part_id: str) -> dict[str, float]:
     """The resolved variable values in force inside a selected part (empty when
     the part declares/inherits none), used to evaluate its $ expressions."""
-    scopes = selected.get("part_variables")
-    if isinstance(scopes, dict):
-        scope = scopes.get(part_id)
-        if isinstance(scope, dict):
-            return scope
-    return {}
+    return mesh_resolution.part_variable_scope(selected, part_id)
 
 
 _NODE_ROW_RE = re.compile(
@@ -4955,52 +4644,18 @@ _NODE_ROW_RE = re.compile(
 # BEAMXP_PART_INSTANCE_FIX_V1: compatibility accessors for path-specific selected
 # part occurrences.
 def selected_part_instances(selected: dict[str, object]) -> list[dict[str, object]]:
-    raw = selected.get("part_instances")
-    if isinstance(raw, list):
-        valid = [dict(item) for item in raw if isinstance(item, dict)]
-        if valid:
-            return valid
-
-    part_slot_options = selected.get("part_slot_options", {})
-    result: list[dict[str, object]] = []
-    for index, part_id in enumerate(selected_parts_in_merge_order(selected)):
-        options: tuple[str, ...] = ()
-        if isinstance(part_slot_options, dict):
-            raw_options = part_slot_options.get(part_id, ())
-            if isinstance(raw_options, (list, tuple)):
-                options = tuple(str(item) for item in raw_options if item)
-        result.append(
-            {
-                "instance_id": f"legacy:{index}:{part_id}",
-                "part_id": part_id,
-                "slot_id": "legacy",
-                "slot_path": "/",
-                "parent_instance_id": None,
-                "inherited_options": options,
-                "source_file": None,
-            }
-        )
-    return result
+    return mesh_resolution.selected_part_instances(selected)
 
 
 def part_instance_options(instance: dict[str, object]) -> tuple[str, ...]:
-    raw = instance.get("inherited_options", ())
-    if not isinstance(raw, (list, tuple)):
-        return ()
-    return tuple(str(item) for item in raw if item)
+    return mesh_resolution.part_instance_options(instance)
 
 
 def part_instance_variable_scope(
     selected: dict[str, object],
     instance: dict[str, object],
 ) -> dict[str, object]:
-    instance_scopes = selected.get("part_instance_variables")
-    instance_id = str(instance.get("instance_id") or "")
-    if isinstance(instance_scopes, dict):
-        scope = instance_scopes.get(instance_id)
-        if isinstance(scope, dict):
-            return scope
-    return dict(part_variable_scope(selected, str(instance.get("part_id") or "")))
+    return mesh_resolution.part_instance_variable_scope(selected, instance)
 
 def iter_node_rows(
     node_array: str,
@@ -5029,15 +4684,7 @@ def selected_parts_in_merge_order(selected: dict[str, object]) -> list[str]:
     node redefinition overrides an earlier one -- the order jbeam merges
     sections in. Falls back to a stable sort for older results (or caches) that
     predate parts_order."""
-    order = selected.get("parts_order")
-    parts = {str(item) for item in selected.get("parts", set())}
-    if isinstance(order, list) and order:
-        seen: set[str] = set()
-        result = [str(p) for p in order if str(p) in parts and not (str(p) in seen or seen.add(str(p)))]
-        # include any part missing from the recorded order (defensive)
-        result.extend(sorted(parts - set(result)))
-        return result
-    return sorted(parts)
+    return mesh_resolution.selected_parts_in_merge_order(selected)
 
 
 def selected_node_positions_for_config(

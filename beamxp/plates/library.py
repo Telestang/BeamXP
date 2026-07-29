@@ -8,10 +8,10 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from typing import TYPE_CHECKING
 
-import plate_generator
+from beamxp.plates import generator as plate_generator
 
 if TYPE_CHECKING:
-    from beamng_hand_drive_tool import HandDriveToolApp
+    from beamxp.hand_drive_tool import HandDriveToolApp
 
 
 class PlateLibraryDialog(tk.Toplevel):

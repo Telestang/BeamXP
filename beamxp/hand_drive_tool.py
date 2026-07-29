@@ -14,22 +14,23 @@ from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
 
-import beamng_hand_drive_core as core
-import plate_generator
-from model_preview import ModelPreview
-from plate_editor import PlateEditorDialog
-from plate_library import PlateLibraryDialog
+from beamxp.model_preview import ModelPreview
+from beamxp import hand_drive_core as core
+from beamxp.plates import generator as plate_generator
+from beamxp.plates.editor import PlateEditorDialog
+from beamxp.plates.library import PlateLibraryDialog
 
 try:  # GPU mesh preview; the box viewer remains the fallback
-    import mesh_preview
+    from beamxp import mesh_preview
 except Exception:
     mesh_preview = None
 
 
 THIS_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+SOURCE_ROOT_DIR = Path(__file__).resolve().parent.parent
 BLENDER_PREVIEW_SCRIPT = RESOURCE_DIR / "blender_preview_backend.py"
-APP_ICON_NAME = "BeamXP_icon.ico"
+APP_ICON_NAME = "assets/BeamXP_icon.ico"
 BLENDER_CANDIDATES = (
     Path(r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe"),
     Path(r"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe"),
@@ -1565,7 +1566,11 @@ def existing_initial_dir(path: object, fallback: Path) -> str:
 
 
 def app_icon_path() -> Path | None:
-    for candidate in (RESOURCE_DIR / APP_ICON_NAME, THIS_DIR / APP_ICON_NAME):
+    for candidate in (
+        RESOURCE_DIR / APP_ICON_NAME,
+        THIS_DIR / APP_ICON_NAME,
+        SOURCE_ROOT_DIR / APP_ICON_NAME,
+    ):
         if candidate.exists():
             return candidate
     return None

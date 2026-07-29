@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-import beamng_transform_helpers as transform_helpers
+from beamxp import transform_helpers
 
 PLATE_SIZE_EU = "EU"
 PLATE_SIZE_US = "US"
@@ -1332,7 +1332,7 @@ def _design_key(cfg: dict[str, object], font_key: str) -> str:
 def _save_png(image, path: Path) -> None:
     import io
 
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
@@ -1598,7 +1598,7 @@ def _emit_design(
     *,
     set_id: str | None = None,
 ) -> _DesignOutput:
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     font_path = resolve_font_path(cfg.get("font"))
     glyphs = _pattern_glyphs(active_pattern(cfg))
@@ -1893,7 +1893,7 @@ def _model_plate_part_catalog(context) -> list[_ModelPlatePart]:
     models.  Parts from any slot family in this model remain eligible so a
     donor can be cloned into the trim's active plate slot at build time.
     """
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     cached = getattr(context, "_bhdc_model_plate_parts", None)
     if isinstance(cached, list):
@@ -1978,7 +1978,7 @@ def _vanilla_plate_mesh_sort_key(item: _VanillaPlateMesh) -> tuple[object, ...]:
 
 def _vanilla_plate_mesh_catalog(context) -> list[_VanillaPlateMesh]:
     """Discover the shared physical plate meshes from BeamNG's common.zip."""
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     cached = getattr(context, "_bhdc_vanilla_plate_meshes", None)
     if isinstance(cached, list):
@@ -2029,7 +2029,7 @@ def _plate_slots_by_side_for_config(context, config_name: str) -> dict[str, list
     Unlike the old detector this retains explicitly empty slots, which is how
     trims such as the Sunburst's US configurations express "no front plate".
     """
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     cache = getattr(context, "_bhdc_plate_slots_by_config", None)
     if not isinstance(cache, dict):
@@ -2105,7 +2105,7 @@ def _iter_selected_plate_parts(
 ):
     """Yield (slot_type, part_id, part_body) for a config's licence plate
     parts, skipping the design slot and parts without a resolvable body."""
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     selected = core.selected_parts_for_config(context, config_name)
     selected_by_slot = selected.get("selected_by_slot", {}) if isinstance(selected, dict) else {}
@@ -2438,7 +2438,7 @@ def _requested_plate_part(
 
 
 def _plate_part_alias_id(part_id: str, slot_type: str, mesh: str) -> str:
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     digest = hashlib.sha1(f"{slot_type}|{mesh}".encode("utf-8", errors="replace")).hexdigest()[:8]
     return core.safe_id(f"bhdc_plate_{part_id}_{digest}")
@@ -2524,7 +2524,7 @@ def preview_pc_with_plate_parts(
     Plate-design textures and rear-colour clones do not alter preview geometry
     and are therefore intentionally omitted here.
     """
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     variant = context.variants[config_name]
     pc = core.load_pc(context.source_zip, variant.pc_path)
@@ -2640,7 +2640,7 @@ def _offset_plate_y(part_body: str, amount: float) -> str:
 
 
 def _rear_clone_mesh_name(context, source_mesh: str, obj) -> str:
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     source_zip = obj.dae_source_zip or context.source_zip
     digest = hashlib.sha1(
@@ -2730,7 +2730,7 @@ def _write_rear_clone_daes(
     clone_sources: dict[str, _RearMeshClone],
     summary: dict[str, object],
 ) -> None:
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     grouped: dict[tuple[Path, str], list[_RearMeshClone]] = {}
     for clone in clone_sources.values():
@@ -3104,7 +3104,7 @@ return M
 
 def _write_rear_design_compat(output_root: Path, prefix: str, rear_formats_used: set[str]) -> None:
     """Ship the vanilla-design compatibility files alongside the rear clones."""
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     fallback_dir = output_root / "vehicles" / "common" / "licenseplates" / "default"
     for rear_fmt in sorted(rear_formats_used):
@@ -3142,7 +3142,7 @@ def _visible_rear_plate_donor(
     rear plate part with the same plate format and a plausible vehicle-space
     position, then force it into the active slot.
     """
-    import beamng_transform_helpers as transform_helpers
+    from beamxp import transform_helpers
 
     selected_wide = _part_uses_wide_plate(selected_body)
     selected_prefix = _plate_part_prefix(selected_part_id)
@@ -3194,7 +3194,7 @@ def apply_to_build(
 ) -> dict[str, object]:
     """Generate plate assets for the built configs and update the written .pc
     files with a per-config random registration and the generated design."""
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     summary: dict[str, object] = {
         "configsUpdated": 0,
@@ -3325,7 +3325,7 @@ def apply_to_build(
 
 def export_plate_sets(records: list[dict[str, object]], target_zip: Path) -> dict[str, object]:
     """Write selected reusable designs as one universal BeamXP plates mod."""
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     if not records:
         raise PlateError("Select at least one plate set to export")
@@ -3396,7 +3396,7 @@ def _clone_rear_parts_for_config(
     parts: dict[str, object],
     summary: dict[str, object],
 ) -> bool:
-    import beamng_hand_drive_core as core
+    from beamxp import hand_drive_core as core
 
     cloned_any = False
     for slot_text, part_text, part_body in _iter_selected_plate_parts(

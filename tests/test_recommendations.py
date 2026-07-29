@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-import beamng_hand_drive_core as core
-import beamng_hand_drive_tool as tool
-import spatial_visibility_backend
+from beamxp import hand_drive_core as core
+from beamxp import hand_drive_tool as tool
+from beamxp import spatial_visibility_backend
 
 
 # ---------------------------------------------------------------------------

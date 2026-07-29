@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-import beamng_hand_drive_core as core
+from beamxp import hand_drive_core as core
 from scripts.validate_spatial_classifier import (
     classifier_detection_methods,
     functionally_sided_skip_reasons,
