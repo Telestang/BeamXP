@@ -3,18 +3,16 @@ from __future__ import annotations
 import ast
 import copy
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import io
 import json
 import math
 import os
-import pickle
 import re
 import shutil
 import sys
 import textwrap
 import zipfile
-from dataclasses import dataclass, fields as dataclass_fields, replace as dataclass_replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -25,6 +23,7 @@ import numpy as np
 from beamxp import spatial_visibility_backend
 from beamxp import transform_helpers
 from beamxp.core import dae
+from beamxp.core import cache as context_cache
 from beamxp.core import mesh_resolution
 from beamxp.core.beam_json import (
     add_missing_json_commas,
@@ -91,6 +90,23 @@ from beamxp.core.files import (
     write_text_file,
     write_xml_tree,
     zip_member_path,
+)
+from beamxp.core.cache import (
+    CONTEXT_CACHE_VERSION,
+    HAND_DETECTION_CACHE_VERSION,
+    clear_parts_cache,
+    clear_variant_hands_cache,
+    context_cache_fingerprint,
+    context_cache_path,
+    context_fingerprint_hash,
+    load_cached_part_ids,
+    load_cached_vehicle_context,
+    parts_cache_path,
+    save_cached_part_ids,
+    save_vehicle_context_cache,
+    selection_cache_key,
+    variant_hands_cache_fingerprint,
+    variant_hands_cache_path,
 )
 from beamxp.core.geometry import (
     PROP_VECTOR_RE,
@@ -2568,187 +2584,20 @@ def hand_from_text(text: str) -> str:
     return HAND_UNKNOWN
 
 
-# Bump whenever context-building logic changes in a way that affects cached
-# VehicleContext content (parsing, pivots, common indexing, ...). Structural
-# dataclass changes are caught automatically via the field-name fingerprint.
-CONTEXT_CACHE_VERSION = 10  # 10: path-specific duplicate part instances and namespace variables
-
-
-def context_cache_path(source_zip: Path, vehicle_id: str) -> Path:
-    return project_dir_for(source_zip, vehicle_id) / "context.cache"
-
-
-def context_cache_fingerprint(source_zip: Path) -> tuple:
-    parts: list[tuple] = [
-        ("cacheVersion", CONTEXT_CACHE_VERSION),
-        ("contextFields", tuple(f.name for f in dataclass_fields(VehicleContext))),
-        ("objectFields", tuple(f.name for f in dataclass_fields(DaeObject))),
-    ]
-    for candidate in common_zip_candidates(Path(source_zip)):
-        try:
-            stat = Path(candidate).stat()
-            parts.append((str(candidate), stat.st_size, stat.st_mtime_ns))
-        except OSError:
-            parts.append((str(candidate), None, None))
-    return tuple(parts)
-
-
-def load_cached_vehicle_context(source_zip: Path, vehicle_id: str) -> VehicleContext | None:
-    path = context_cache_path(source_zip, vehicle_id)
-    if not path.is_file():
-        return None
-    try:
-        with open(path, "rb") as handle:
-            payload = pickle.load(handle)
-    except Exception:
-        return None
-    if not isinstance(payload, dict) or payload.get("fingerprint") != context_cache_fingerprint(source_zip):
-        return None
-    context = payload.get("context")
-    if not isinstance(context, VehicleContext):
-        return None
-    context.project_dir = project_dir_for(source_zip, vehicle_id)
-    context.source_zip = Path(source_zip)
-    context.vehicle_id = vehicle_id
-    context.selected_parts_cache = {}
-    context.mesh_roles_cache = {}
-    context.selected_node_positions_cache = {}
-    context.part_array_cache = {}
-    context.variant_hands_cache = {}
-    context.resolved_positions_cache = {}
-    return context
-
-
-def save_vehicle_context_cache(context: VehicleContext) -> Path | None:
-    path = context_cache_path(context.source_zip, context.vehicle_id)
-    try:
-        payload = {
-            "fingerprint": context_cache_fingerprint(context.source_zip),
-            "context": dataclass_replace(
-                context,
-                selected_parts_cache={},
-                mesh_roles_cache={},
-                selected_node_positions_cache={},
-                part_array_cache={},
-                variant_hands_cache={},
-                resolved_positions_cache={},
-            ),
-        }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(path.name + ".tmp")
-        with open(tmp_path, "wb") as handle:
-            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp_path, path)
-        return path
-    except Exception:
-        return None
-
-
-def context_fingerprint_hash(source_zip: Path) -> str:
-    payload = json.dumps(context_cache_fingerprint(Path(source_zip)), default=str)
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-
-
-def parts_cache_path(context: VehicleContext) -> Path:
-    return context.project_dir / "parts_cache.json"
-
-
-def selection_cache_key(selected: Iterable[str]) -> str:
-    return "|".join(sorted(str(name) for name in selected))
-
-
-def load_cached_part_ids(context: VehicleContext, selected: Iterable[str]) -> list[str] | None:
-    """Resolved used-part ids for a variant selection, persisted across
-    sessions. Valid only while the source/common zips are unchanged (same
-    fingerprint as the context cache)."""
-    path = parts_cache_path(context)
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict) or data.get("fingerprint") != context_fingerprint_hash(context.source_zip):
-        return None
-    selections = data.get("selections")
-    if not isinstance(selections, dict):
-        return None
-    ids = selections.get(selection_cache_key(selected))
-    if not isinstance(ids, list):
-        return None
-    return [str(part_id) for part_id in ids]
-
-
-def save_cached_part_ids(
-    context: VehicleContext,
-    selected: Iterable[str],
-    part_ids: Iterable[str],
-    max_entries: int = 8,
-) -> None:
-    path = parts_cache_path(context)
-    fingerprint = context_fingerprint_hash(context.source_zip)
-    selections: dict[str, list[str]] = {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            isinstance(data, dict)
-            and data.get("fingerprint") == fingerprint
-            and isinstance(data.get("selections"), dict)
-        ):
-            selections = {str(k): list(v) for k, v in data["selections"].items() if isinstance(v, list)}
-    except Exception:
-        pass
-    key = selection_cache_key(selected)
-    selections.pop(key, None)
-    selections[key] = [str(part_id) for part_id in part_ids]
-    while len(selections) > max_entries:
-        selections.pop(next(iter(selections)))
-    try:
-        write_text_file(path, json.dumps({"fingerprint": fingerprint, "selections": selections}, indent=1))
-    except Exception:
-        pass
-
-
-def clear_parts_cache(context: VehicleContext) -> None:
-    try:
-        parts_cache_path(context).unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-HAND_DETECTION_CACHE_VERSION = 1
-
-
-def variant_hands_cache_path(context: VehicleContext) -> Path:
-    return context.project_dir / "variant_hands_cache.json"
-
-
 def variant_hand_detection_signature(conversion: dict[str, object]) -> tuple[str, ...]:
     """Inputs from a conversion that can change stock-hand detection."""
     return tuple(sorted(selected_steering_refs(conversion)))
 
 
 def variant_hands_cache_key(conversion: dict[str, object]) -> str:
-    payload = json.dumps(variant_hand_detection_signature(conversion), separators=(",", ":"))
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-
-
-def variant_hands_cache_fingerprint(context: VehicleContext) -> str:
-    payload = f"{HAND_DETECTION_CACHE_VERSION}:{context_fingerprint_hash(context.source_zip)}"
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return context_cache.variant_hands_cache_key(variant_hand_detection_signature(conversion))
 
 
 def _normalized_cached_variant_hands(
     context: VehicleContext,
     value: object,
 ) -> dict[str, str]:
-    if not isinstance(value, dict):
-        return {}
-    return {
-        str(config_name): str(hand)
-        for config_name, hand in value.items()
-        if config_name in context.variants and hand in {HAND_LHD, HAND_RHD, HAND_UNKNOWN}
-    }
+    return context_cache.normalized_cached_variant_hands(context, value)
 
 
 def load_cached_variant_hands(
@@ -2760,28 +2609,10 @@ def load_cached_variant_hands(
     Results are kept in memory and persisted across sessions. The source/common
     zip fingerprint and detection version prevent stale model data being reused.
     """
-    key = variant_hands_cache_key(conversion)
-    memory = _normalized_cached_variant_hands(context, context.variant_hands_cache.get(key))
-    if memory:
-        return dict(memory)
-
-    path = variant_hands_cache_path(context)
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict) or data.get("fingerprint") != variant_hands_cache_fingerprint(context):
-        return None
-    detections = data.get("detections")
-    if not isinstance(detections, dict):
-        return None
-    hands = _normalized_cached_variant_hands(context, detections.get(key))
-    if not hands:
-        return None
-    context.variant_hands_cache[key] = hands
-    return dict(hands)
+    return context_cache.load_cached_variant_hands_by_key(
+        context,
+        variant_hands_cache_key(conversion),
+    )
 
 
 def save_cached_variant_hands(
@@ -2790,44 +2621,12 @@ def save_cached_variant_hands(
     hands: dict[str, str],
     max_entries: int = 8,
 ) -> None:
-    normalized = _normalized_cached_variant_hands(context, hands)
-    if not normalized:
-        return
-    key = variant_hands_cache_key(conversion)
-    context.variant_hands_cache[key] = dict(normalized)
-    path = variant_hands_cache_path(context)
-    fingerprint = variant_hands_cache_fingerprint(context)
-    detections: dict[str, dict[str, str]] = {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            isinstance(data, dict)
-            and data.get("fingerprint") == fingerprint
-            and isinstance(data.get("detections"), dict)
-        ):
-            detections = {
-                str(saved_key): _normalized_cached_variant_hands(context, saved_hands)
-                for saved_key, saved_hands in data["detections"].items()
-                if isinstance(saved_hands, dict)
-            }
-    except Exception:
-        pass
-    detections.pop(key, None)
-    detections[key] = normalized
-    while len(detections) > max_entries:
-        detections.pop(next(iter(detections)))
-    try:
-        write_text_file(path, json.dumps({"fingerprint": fingerprint, "detections": detections}, indent=1))
-    except Exception:
-        pass
-
-
-def clear_variant_hands_cache(context: VehicleContext) -> None:
-    context.variant_hands_cache = {}
-    try:
-        variant_hands_cache_path(context).unlink(missing_ok=True)
-    except OSError:
-        pass
+    context_cache.save_cached_variant_hands_by_key(
+        context,
+        variant_hands_cache_key(conversion),
+        hands,
+        max_entries=max_entries,
+    )
 
 
 def load_vehicle_context(
