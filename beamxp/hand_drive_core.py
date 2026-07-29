@@ -1,4 +1,5 @@
 from __future__ import annotations
+# pyright: reportUnsupportedDunderAll=false
 
 import ast
 import copy
