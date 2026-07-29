@@ -30,7 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 from beamxp import hand_drive_core as core  # noqa: E402
 
 STOCK_DIR = Path("G:/SteamLibrary/steamapps/common/BeamNG.drive/content/vehicles")
-VEHICLE_LIST = REPO_ROOT / "spatial classifier" / "vanilla_cars_trucks.txt"
+VEHICLE_LIST = REPO_ROOT / "spatial_classifier" / "vanilla_cars_trucks.txt"
 ROUND = 6  # positions rounded to micrometres before hashing/diffing
 
 

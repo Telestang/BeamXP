@@ -27,7 +27,6 @@ APP_NAME = "BeamXP Vehicle ZIP Mesh Transform POC"
 PRIMITIVE_TAGS = {"triangles", "polylist", "polygons", "trifans", "tristrips"}
 TRANSFORM_TAGS = {"matrix", "translate", "rotate", "scale", "lookat", "skew"}
 DIALOG_DIRECTORY_KEYS = frozenset({"source", "export"})
-MAIN_CARRIER_EDGE_WIDTH_FRACTION = 0.5
 
 
 def application_settings_path() -> Path:
@@ -209,7 +208,6 @@ class RegionBoundary:
     cut_edges: int
     nonmanifold_edges: int
     closed: bool
-    cut_boundary_edges: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(slots=True)
@@ -802,11 +800,11 @@ def archive_texture_choices_for_part(
     ] = set()
     for dae_material in requested:
         normalised_dae_material = _normalise_material_alias(dae_material)
-        records = records_by_alias.get(normalised_dae_material, [])
         records = sorted(
-            records,
+            records_by_alias.get(normalised_dae_material, ()),
             key=lambda record: (
                 _material_alias_match_rank(record, normalised_dae_material),
+                0 if _normalise_material_alias(record.map_to) == normalised_dae_material else 1,
                 record.materials_member.count("/"),
                 record.materials_member.lower(),
                 record.key.lower(),
@@ -1442,46 +1440,6 @@ def ordered_boundary_loops(
     return tuple(loops), True
 
 
-def _loop_edges(loop: tuple[int, ...]) -> set[tuple[int, int]]:
-    return {
-        canonical_edge(first, second)
-        for first, second in zip(loop, (*loop[1:], loop[0]))
-    }
-
-
-def _qualified_boundary_loops(
-    boundary_edges: set[tuple[int, int]],
-    threshold_edges: set[tuple[int, int]],
-    cut_edges: set[tuple[int, int]],
-) -> tuple[tuple[tuple[int, ...], ...], bool, set[tuple[int, int]]]:
-    raw_loops, closed = ordered_boundary_loops(boundary_edges)
-    if not closed:
-        return raw_loops, closed, set(boundary_edges)
-
-    connector_edges = boundary_edges.difference(threshold_edges)
-    loop_items = [(loop, _loop_edges(loop)) for loop in raw_loops]
-    mixed_loops = [
-        (loop, edges)
-        for loop, edges in loop_items
-        if edges & threshold_edges and edges & connector_edges
-    ]
-    if mixed_loops:
-        kept = mixed_loops
-    else:
-        kept = [
-            (loop, edges)
-            for loop, edges in loop_items
-            if not (edges & cut_edges) or edges & threshold_edges
-        ]
-
-    kept_edges: set[tuple[int, int]] = set()
-    kept_loops: list[tuple[int, ...]] = []
-    for loop, edges in kept:
-        kept_loops.append(loop)
-        kept_edges.update(edges)
-    return tuple(kept_loops), closed, kept_edges
-
-
 @dataclass(slots=True)
 class ClosedPolyline:
     points: np.ndarray
@@ -2051,10 +2009,7 @@ def _region_boundary(
         candidate_edges.update((canonical_edge(a, b), canonical_edge(b, c), canonical_edge(c, a)))
 
     boundary: set[tuple[int, int]] = set()
-    mesh_boundary: set[tuple[int, int]] = set()
-    threshold_boundary: set[tuple[int, int]] = set()
-    cut_boundary: set[tuple[int, int]] = set()
-    nonmanifold_boundary: set[tuple[int, int]] = set()
+    crease_count = mesh_count = cut_count = nonmanifold_count = 0
     for edge in candidate_edges:
         adjacent, angle = edge_lookup[edge]
         inside = sum(face in face_set for face in adjacent)
@@ -2062,87 +2017,35 @@ def _region_boundary(
             continue
         if len(adjacent) == 1:
             boundary.add(edge)
-            mesh_boundary.add(edge)
+            mesh_count += 1
         elif len(adjacent) > 2:
             boundary.add(edge)
-            nonmanifold_boundary.add(edge)
+            nonmanifold_count += 1
         elif len(adjacent) == 2:
             other = adjacent[0] if adjacent[1] in face_set else adjacent[1]
             boundary.add(edge)
-            if angle is not None and angle >= threshold:
-                threshold_boundary.add(edge)
             if other not in active:
-                cut_boundary.add(edge)
-            elif angle is None or angle < threshold:
-                cut_boundary.add(edge)
+                cut_count += 1
+            elif angle is not None and angle >= threshold:
+                crease_count += 1
+            else:
+                cut_count += 1
 
-    loops, closed, boundary_for_loops = _qualified_boundary_loops(
-        boundary,
-        threshold_boundary,
-        cut_boundary,
-    )
-    cut_for_loops = cut_boundary & boundary_for_loops
+    loops, closed = ordered_boundary_loops(boundary)
     perimeter = sum(
         float(np.linalg.norm(topology.vertices[first] - topology.vertices[second]))
-        for first, second in boundary_for_loops
+        for first, second in boundary
     )
     return RegionBoundary(
-        edges=tuple(sorted(boundary_for_loops)),
+        edges=tuple(sorted(boundary)),
         loops=loops,
         perimeter=perimeter,
-        crease_edges=len(threshold_boundary & boundary_for_loops),
-        mesh_edges=len(mesh_boundary & boundary_for_loops),
-        cut_edges=len(cut_for_loops),
-        nonmanifold_edges=len(nonmanifold_boundary & boundary_for_loops),
+        crease_edges=crease_count,
+        mesh_edges=mesh_count,
+        cut_edges=cut_count,
+        nonmanifold_edges=nonmanifold_count,
         closed=closed,
-        cut_boundary_edges=tuple(sorted(cut_for_loops)),
     )
-
-
-def _face_x_span_fraction(topology: Topology, faces: Iterable[int]) -> float:
-    face_list = list(faces)
-    part_width = float(topology.bounds_max[0] - topology.bounds_min[0])
-    if part_width <= 1e-15:
-        return 0.0
-    if not face_list:
-        return 0.0
-    vertices = topology.triangles[np.asarray(face_list, dtype=np.int64)].reshape(-1)
-    if len(vertices) == 0:
-        return 0.0
-    x_values = topology.vertices[vertices, 0]
-    return float(np.ptp(x_values) / part_width)
-
-
-def _mesh_boundary_x_span_fraction(
-    topology: Topology,
-    boundary: RegionBoundary,
-    edge_lookup: dict[tuple[int, int], tuple[tuple[int, ...], float | None]],
-) -> float:
-    part_width = float(topology.bounds_max[0] - topology.bounds_min[0])
-    if part_width <= 1e-15:
-        return 0.0
-    mesh_boundary_vertices: list[int] = []
-    for edge in boundary.edges:
-        adjacent, _angle = edge_lookup[edge]
-        if len(adjacent) == 1:
-            mesh_boundary_vertices.extend(edge)
-    if not mesh_boundary_vertices:
-        return 0.0
-    x_values = topology.vertices[np.asarray(mesh_boundary_vertices, dtype=np.int64), 0]
-    return float(np.ptp(x_values) / part_width)
-
-
-def _is_main_carrier_region(
-    topology: Topology,
-    faces: tuple[int, ...],
-    boundary: RegionBoundary,
-    fallback_carrier_faces: set[int],
-    edge_lookup: dict[tuple[int, int], tuple[tuple[int, ...], float | None]],
-) -> bool:
-    width_fraction = _mesh_boundary_x_span_fraction(topology, boundary, edge_lookup)
-    if set(faces) & fallback_carrier_faces:
-        width_fraction = max(width_fraction, _face_x_span_fraction(topology, faces))
-    return width_fraction >= MAIN_CARRIER_EDGE_WIDTH_FRACTION
 
 
 def _classify_region(
@@ -2167,18 +2070,12 @@ def _classify_region(
         role, eligible = "no perimeter", False
     elif not boundary.closed or boundary.nonmanifold_edges:
         role, eligible = "open/rejected", False
-    elif is_main and _is_main_carrier_region(
-        topology,
-        faces,
-        boundary,
-        fallback_carrier_faces,
-        edge_lookup,
-    ):
+    elif boundary.cut_edges:
+        role, eligible = "cut boundary", False
+    elif is_main and (boundary.mesh_edges > 0 or bool(set(faces) & fallback_carrier_faces)):
         role, eligible = "main carrier", False
     elif area_perimeter_ratio < min_area_perimeter_ratio:
         role, eligible = "thin/rejected", False
-    elif boundary.cut_edges:
-        role = "candidate/cut"
     return ActiveRegion(
         region_index=0,
         island_index=island_index,
@@ -2508,7 +2405,7 @@ def _sweep_one_island(
             if is_main and not original_boundary_faces:
                 fallback_carrier_faces = set(components[0])
             else:
-                fallback_carrier_faces = set()
+                fallback_carrier_faces = original_boundary_faces
 
             candidate_regions: list[ActiveRegion] = []
             for component in components:
@@ -2576,7 +2473,7 @@ def _sweep_one_island(
         if is_main and components and not original_boundary_faces:
             fallback_carrier_faces = set(components[0])
         else:
-            fallback_carrier_faces = set()
+            fallback_carrier_faces = original_boundary_faces
         display_regions: list[ActiveRegion] = []
         for component in components:
             region = _classify_region(
@@ -2687,7 +2584,7 @@ def analyse_symmetry_sweep(
                 if island_index == 1 and components and not original_boundary_faces[island_offset]:
                     fallback_carrier_faces = set(components[0])
                 else:
-                    fallback_carrier_faces = set()
+                    fallback_carrier_faces = original_boundary_faces[island_offset]
                 for component in components:
                     if len(component) < min_region_faces:
                         continue
@@ -2789,7 +2686,7 @@ def analyse_symmetry_sweep(
             if island_index == 1 and components and not original_boundary_faces[island_offset]:
                 fallback_carrier_faces = set(components[0])
             else:
-                fallback_carrier_faces = set()
+                fallback_carrier_faces = original_boundary_faces[island_offset]
             for component in components:
                 active_regions.append(
                     _classify_region(
@@ -4339,15 +4236,9 @@ def write_report(
         "method": {
             "segmentation": "at each global threshold, active adjacent triangles join when their dihedral angle is below the threshold",
             "recursion": "passing host faces and confidently adopted whole child islands are removed globally, then the same threshold is segmented again until no further host passes",
-            "main_island": (
-                "largest surface-area island; regions whose original mesh-edge boundary spans at least "
-                f"{MAIN_CARRIER_EDGE_WIDTH_FRACTION:.0%} of the source part X width are kept in the mirrored carrier"
-            ),
+            "main_island": "largest surface-area island; regions touching its original mesh perimeter are never tested",
             "shape_filter": "before symmetry testing, candidate surface area divided by total closed-boundary perimeter must meet the configured absolute minimum; this characteristic length rejects thin bands",
-            "symmetry_scope": (
-                "closed perimeter samples only; cut and mesh-edge segments may be part of a perimeter loop, "
-                "and when a mixed threshold-plus-connector perimeter loop exists, separate threshold-only or connector-only loops are treated as holes"
-            ),
+            "symmetry_scope": "closed perimeter samples only; interior triangles, normals, materials and UVs are ignored",
             "plane": "first pass resamples complete closed perimeters at a fixed physical spacing; PCA gives the best-fit perimeter-plane normal; crossing it with global Z gives the deterministic vertical mirror-plane normal through the sample centroid",
             "comparison": "second pass inserts exact mirror-plane crossings, walks opposite half-perimeters in opposite directions, resamples sibling positions at equal travelled arc distance, reflects one half and averages the full 3-D squared sibling residuals",
             "acceptance": "candidate A/P characteristic length must meet the configured minimum and the initial post-reflection RMS must not exceed the outer tolerance; candidates below the stricter direct threshold use the deterministic plane unchanged",

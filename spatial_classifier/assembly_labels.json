@@ -1,0 +1,462 @@
+{
+  "_comment": "Front-cabin assembly ground truth (flexbody MESH names, not part/slot names) for scoring the detectors. This is the CONFIDENT 26-vehicle torture-test set: every vehicle here has all three roles present AND every mesh confidently placed. Each category lists EVERY mesh that legitimately counts as that assembly across all trims; scoring intersects these with the meshes actually present in a given trim. Scope is the FRONT cabin only: driver+passenger seats (incl. shared racing/vintage seat bases), the dashboard/fascia, and the front (driver+passenger) door cards. Deliberately excluded: rear-row seats, seat bases/rails/legs, door glass/handles/frames/hinges, exterior door moldings/skirts/cladding, and dash accessories (radar, laptop, CB radio, wood/brushed trim, gauges/ornaments). Extracted from vehicles/<name>/**/*.jbeam flexbody rows and hand-curated. Dropped from the full 34: autobello/barstow/midtruck/pigeon/racetruck/wigeon (a role has no distinct mesh) and md_series/nine (seat or door-card meshes not confidently identifiable).",
+  "bastion": {
+    "seats": [
+      "bastion_seat_FL",
+      "bastion_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "bastion_dash"
+    ],
+    "door_cards": [
+      "bastion_doorpanel_FL",
+      "bastion_doorpanel_FR"
+    ]
+  },
+  "bluebuck": {
+    "seats": [
+      "bluebuck_seats_FL",
+      "bluebuck_seats_FR",
+      // "bluebuck_seats_FF",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "bluebuck_dash"
+    ],
+    "door_cards": [
+      "bluebuck_doorpanel_FL_2door",
+      "bluebuck_doorpanel_FL_4door",
+      "bluebuck_doorpanel_FR_2door",
+      "bluebuck_doorpanel_FR_4door"
+    ]
+  },
+  "bolide": {
+    "seats": [
+      "bolide_seat_L",
+      "bolide_seat_R",
+      "racingseat",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "bolide_dash",
+      "bolide_dash_race"
+    ],
+    "door_cards": [
+      "bolide_doorpanel_L",
+      "bolide_doorpanel_R",
+      "bolide_doorpanel_race_L",
+      "bolide_doorpanel_race_R"
+    ]
+  },
+  "burnside": {
+    "seats": [
+      "burnside_seats_F",
+      "burnside_seats_bucket_L_a",
+      "burnside_seats_bucket_L_b",
+      "burnside_seats_bucket_R_a",
+      "burnside_seats_bucket_R_b",
+      "racing_seat_FL",
+      "racing_seat_FR",
+      "vintageseat_01"
+    ],
+    "dashboard": [
+      "burnside_dash"
+    ],
+    "door_cards": [
+      "burnside_doorpanel_FL",
+      "burnside_doorpanel_FR",
+      "burnside_doorpanel_coupe_L",
+      "burnside_doorpanel_coupe_R",
+      "burnside_doorpanel_coupe_pillarless_L",
+      "burnside_doorpanel_coupe_pillarless_R"
+    ]
+  },
+  "bx": {
+    "seats": [
+      "bx_seat_FL",
+      "bx_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "bx_dash",
+      "bx_dash_rhd",
+      "bx_dash_rally",
+      "bx_dash_rhd_rally",
+      "bx_grp_dash",
+      "bx_grp_dash_rhd"
+    ],
+    "door_cards": [
+      "bx_doorpanel_L",
+      "bx_doorpanel_R"
+    ]
+  },
+  "covet": {
+    "seats": [
+      "covet_seat_FL",
+      "covet_seat_FR",
+      "covet_seat_sport_FL",
+      "covet_seat_sport_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "covet_dash",
+      "covet_dash_rally",
+      "covet_dash_rhd",
+      "covet_dash_rhd_rally",
+      "covet_grp_dash_lhd",
+      "covet_grp_dash_rhd"
+    ],
+    "door_cards": [
+      "covet_doorpanel_L",
+      "covet_doorpanel_R"
+    ]
+  },
+  "etk800": {
+    "seats": [
+      "etk800_seat_FL",
+      "etk800_seat_FR",
+      "etk800_seat_FL_sport",
+      "etk800_seat_FR_sport",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "etk800_dash"
+    ],
+    "door_cards": [
+      "etk800_doorpanel_FL",
+      "etk800_doorpanel_FR"
+    ]
+  },
+  "etkc": {
+    "seats": [
+      "etkc_seat_FL",
+      "etkc_seat_FR",
+      "etkc_seat_FL_sport",
+      "etkc_seat_FR_sport",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "etkc_dash",
+      "etkc_dash_race",
+      "etkc_dash_race_lower"
+    ],
+    "door_cards": [
+      "etkc_doorpanel_L",
+      "etkc_doorpanel_R",
+      "etkc_doorpanel_L_race",
+      "etkc_doorpanel_R_race"
+    ]
+  },
+  "etki": {
+    "seats": [
+      "etki_seat_FL",
+      "etki_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "etki_dash",
+      "etki_dash_rally"
+    ],
+    "door_cards": [
+      "etki_doorpanel_FL",
+      "etki_doorpanel_FR"
+    ]
+  },
+  "fullsize": {
+    "seats": [
+      "fullsize_seat_FL",
+      "fullsize_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "fullsize_dash"
+    ],
+    "door_cards": [
+      "fullsize_doorpanel_FL",
+      "fullsize_doorpanel_FR"
+    ]
+  },
+  "lansdale": {
+    "seats": [
+      "lansdale_seat_FL",
+      "lansdale_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "lansdale_dashboard"
+    ],
+    "door_cards": [
+      "lansdale_door_LF_panel_carpet",
+      "lansdale_door_RF_panel_carpet"
+    ]
+  },
+  "legran": {
+    "seats": [
+      "legran_seat_FL",
+      "legran_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "legran_dashboard_bottom"
+    ],
+    "door_cards": [
+      "legran_doorpanel_FL",
+      "legran_doorpanel_FR"
+    ]
+  },
+  "midsize": {
+    "seats": [
+      "midsize_seat_FL",
+      "midsize_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "midsize_dashboard",
+      "midsize_dashboard_racing"
+    ],
+    "door_cards": [
+      "midsize_doorpanel_FL",
+      "midsize_doorpanel_FR"
+    ]
+  },
+  "miramar": {
+    "seats": [
+      "miramar_seat_FL",
+      "miramar_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR",
+      "vintageseat_01"
+    ],
+    "dashboard": [
+      "miramar_dash",
+      "miramar_dash_LHD"
+    ],
+    "door_cards": [
+      "miramar_doorpanel_FL",
+      "miramar_doorpanel_FR",
+      "miramar_coupe_door_L_panel",
+      "miramar_coupe_door_R_panel"
+    ]
+  },
+  "moonhawk": {
+    "seats": [
+      "moonhawk_seat_FL",
+      "moonhawk_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "moonhawk_dashboard"
+    ],
+    "door_cards": [
+      "moonhawk_doorpanel_L",
+      "moonhawk_doorpanel_R"
+    ]
+  },
+  "pessima": {
+    "seats": [
+      "pessima_seat_FL",
+      "pessima_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "pessima_dash",
+      "pessima_dash_rally"
+    ],
+    "door_cards": [
+      "pessima_doorpanel_FL",
+      "pessima_doorpanel_FR"
+    ]
+  },
+  "sbr": {
+    "seats": [
+      "sbr_seat_FL",
+      "sbr_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "sbr_dash",
+      "sbr_dash_rally"
+    ],
+    "door_cards": [
+      "sbr_doorpanel_L",
+      "sbr_doorpanel_R",
+      "sbr_doorpanel_L_race",
+      "sbr_doorpanel_R_race"
+    ]
+  },
+  "scintilla": {
+    "seats": [
+      "scintilla_seat_L",
+      "scintilla_seat_R",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "scintilla_dashboard",
+      "scintilla_dashboard_race"
+    ],
+    "door_cards": [
+      "scintilla_door_panel_L",
+      "scintilla_door_panel_R",
+      "scintilla_door_panel_hardtop_L",
+      "scintilla_door_panel_hardtop_R",
+      "scintilla_door_panel_race_L",
+      "scintilla_door_panel_race_R",
+      "scintilla_door_panel_spider_L",
+      "scintilla_door_panel_spider_R",
+      "scintilla_darkowl_door_panel_L",
+      "scintilla_darkowl_door_panel_R"
+    ]
+  },
+  "sunburst2": {
+    "seats": [
+      "sunburst2_seats_FL",
+      "sunburst2_seats_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "sunburst2_dash",
+      "sunburst2_dash_racing"
+    ],
+    "door_cards": [
+      "sunburst2_doorpanel_FL",
+      "sunburst2_doorpanel_FR",
+      "sunburst2_doorpanel_raceing_FL",
+      "sunburst2_doorpanel_raceing_FR"
+    ]
+  },
+  "vivace": {
+    "seats": [
+      "vivace_seat_FL",
+      "vivace_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "vivace_dash",
+      "vivace_grp_dash"
+    ],
+    "door_cards": [
+      "vivace_doorpanel_FL",
+      "vivace_doorpanel_FR"
+    ]
+  },
+  "wendover": {
+    "seats": [
+      "wendover_seat_FL",
+      "wendover_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "wendover_dash"
+    ],
+    "door_cards": [
+      "wendover_doorpanel_FL",
+      "wendover_doorpanel_FR"
+    ]
+  },
+  "hopper": {
+    "seats": [
+      "hopper_seat_FL",
+      "hopper_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "hopper_dash"
+    ],
+    "door_cards": [
+      "hopper_doorpanel_FL",
+      "hopper_doorpanel_FR",
+      "hopper_doorpanel_half_FL",
+      "hopper_doorpanel_half_FR"
+    ]
+  },
+  "pickup": {
+    "seats": [
+      "pickup_facelift_seat_FL",
+      "pickup_facelift_seat_FR",
+      // "pickup_facelift_seats_F",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "pickup_dash",
+      "pickup_facelift_dash"
+    ],
+    "door_cards": [
+      "pickup_doorpanel_L",
+      "pickup_doorpanel_R",
+      "pickup_facelift_doorpanel_FL",
+      "pickup_facelift_doorpanel_FR"
+    ]
+  },
+  "roamer": {
+    "seats": [
+      "roamer_seat_FL",
+      "roamer_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "roamer_dash"
+    ],
+    "door_cards": [
+      "roamer_doorpanel_FL",
+      "roamer_doorpanel_FR"
+    ]
+  },
+  "us_semi": {
+    "seats": [
+      "cabover_seat_L",
+      "cabover_seat_R",
+      "longnose_seat_L",
+      "longnose_seat_R",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "cabover_dash",
+      "longnose_dash"
+    ],
+    "door_cards": [
+      "cabover_door_panel_L",
+      "cabover_door_panel_R",
+      "longnose_door_panel_L",
+      "longnose_door_panel_R"
+    ]
+  },
+  "van": {
+    "seats": [
+      "van_seat_FL",
+      "van_seat_FR",
+      "racing_seat_FL",
+      "racing_seat_FR"
+    ],
+    "dashboard": [
+      "van_dash"
+    ],
+    "door_cards": [
+      "van_doorpanel_FL",
+      "van_doorpanel_FR"
+    ]
+  }
+}

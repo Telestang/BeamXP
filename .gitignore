@@ -34,6 +34,10 @@ dist/
 release/*
 !release/*.zip
 *.spec.bak
+mesh_segmentation_transform/segmentation_outputs/
+beamng_file_tree.py
+spatial_classifier/.git_adopted_backup/
+spatial_classifier/.git_adopted_backup_from_old/
 
 # Generated converted mods may contain or derive from BeamNG or third-party assets.
 examples/converted_mods/*.zip
@@ -48,10 +52,6 @@ examples/converted_mods/*.zip
 # Editor metadata
 .idea/
 .vscode/
-
-# Spatial classifier — in-development successor, kept as its own local git repo
-# (has its own .git), not part of the main tool's history yet.
-spatial classifier/
 
 # Working docs / handover notes — kept local only.
 docs/

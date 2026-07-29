@@ -1,0 +1,46 @@
+# Vanilla BeamNG.drive conventional cars & trucks
+# Source: content/vehicles/*.zip, filtered by the vehicle info.json "Type" field.
+# Kept: Type=Car and Type=Truck. Dropped non-conventional bodies
+#   (ATV, Buggy, Bus, Heavy Machinery) and all Prop/Trailer/Traffic/Debug zips.
+#
+# Excluded edge cases for reference:
+#   atv.zip (Car/ATV), utv.zip (Car/Buggy), rockbouncer.zip (Truck/Buggy),
+#   citybus.zip (Truck/Bus), dumptruck.zip + wl40.zip (Heavy Machinery).
+
+# --- Cars ---
+autobello.zip
+barstow.zip
+bastion.zip
+bluebuck.zip
+bolide.zip
+burnside.zip
+bx.zip
+covet.zip
+etk800.zip
+etkc.zip
+etki.zip
+fullsize.zip
+lansdale.zip
+legran.zip
+midsize.zip
+miramar.zip
+moonhawk.zip
+nine.zip
+pessima.zip
+pigeon.zip
+sbr.zip
+scintilla.zip
+sunburst2.zip
+vivace.zip
+wendover.zip
+wigeon.zip
+
+# --- Trucks ---
+hopper.zip
+md_series.zip
+midtruck.zip
+pickup.zip
+racetruck.zip
+roamer.zip
+us_semi.zip
+van.zip

@@ -8,7 +8,7 @@ from beamxp.core import mesh_resolution
 
 
 def load_classifier_standalone_module():
-    path = Path(__file__).resolve().parents[1] / "spatial classifier" / "classifier_standalone.py"
+    path = Path(__file__).resolve().parents[1] / "spatial_classifier" / "classifier_standalone.py"
     spec = importlib.util.spec_from_file_location("classifier_standalone", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

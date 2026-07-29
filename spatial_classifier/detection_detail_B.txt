@@ -1,0 +1,269 @@
+=== Candidate B — assembly role detection — unique mismatches (deduped across trims) ===
+
+grid[...] repeats the console grid for the vehicle. Grading is strict: a role is ok only if EVERY trim is correct, so every role listed below is X in the grid.
+
+# bastion   grid[ driver:ok pass.:ok seatD:ok seatP:ok dash:X ]   (1 unique mismatch)
+    dashboard            got: police_search_light_pod
+                         exp: bastion_dash
+                         in 1/20 trims
+
+# bluebuck   grid[ driver:X pass.:X seatD:ok seatP:ok dash:ok ]   (4 unique mismatches)
+    driver door card     got: bluebuck_windowframe_FL_2door_hardtop
+                         exp: bluebuck_doorpanel_FL_2door
+                         in 6/31 trims
+    driver door card     got: bluebuck_windowframe_FL_4door_hardtop
+                         exp: bluebuck_doorpanel_FL_4door
+                         in 4/31 trims
+    passenger door card  got: bluebuck_windowframe_FR_2door_hardtop
+                         exp: bluebuck_doorpanel_FR_2door
+                         in 6/31 trims
+    passenger door card  got: bluebuck_windowframe_FR_4door_hardtop
+                         exp: bluebuck_doorpanel_FR_4door
+                         in 4/31 trims
+
+# bolide   grid[ driver:ok pass.:ok seatD:ok seatP:ok dash:X ]   (6 unique mismatches)
+    dashboard            got: bolide_intcarpet
+                         exp: bolide_dash
+                         in 7/21 trims
+    dashboard            got: bolide_intcarpet_targa
+                         exp: bolide_dash
+                         in 7/21 trims
+    dashboard            got: bolide_interior_race
+                         exp: bolide_dash_race
+                         in 4/21 trims
+    dashboard            got: bolide_intcarpet
+                         exp: bolide_dash_race
+                         in 1/21 trims
+    dashboard            got: bolide_intcarpet_stripped
+                         exp: bolide_dash
+                         in 1/21 trims
+    dashboard            got: bolide_intcarpet_stripped
+                         exp: bolide_dash_race
+                         in 1/21 trims
+
+# burnside   grid[ driver:X pass.:X seatD:ok seatP:ok dash:ok ]   (4 unique mismatches)
+    driver door card     got: burnside_doorglass_coupe_pillarless_FL_int
+                         exp: burnside_doorpanel_coupe_pillarless_L
+                         in 3/21 trims
+    driver door card     got: burnside_doorglass_coupe_pillarless_FL
+                         exp: burnside_doorpanel_coupe_pillarless_L
+                         in 2/21 trims
+    passenger door card  got: burnside_doorglass_coupe_pillarless_FR_int
+                         exp: burnside_doorpanel_coupe_pillarless_R
+                         in 3/21 trims
+    passenger door card  got: burnside_doorglass_coupe_pillarless_FR
+                         exp: burnside_doorpanel_coupe_pillarless_R
+                         in 2/21 trims
+
+# bx   grid[ driver:X pass.:X seatD:ok seatP:ok dash:X ]   (9 unique mismatches)
+    driver door card     got: (none)
+                         exp: bx_doorpanel_L
+                         in 10/29 trims
+    driver door card     got: bx_fender_R_fixed
+                         exp: bx_doorpanel_R
+                         in 10/29 trims
+    driver door card     got: bx_fender_R_popup
+                         exp: bx_doorpanel_R
+                         in 8/29 trims
+    driver door card     got: bx_door_L
+                         exp: bx_doorpanel_L
+                         in 1/29 trims
+    passenger door card  got: (none)
+                         exp: bx_doorpanel_L
+                         in 18/29 trims
+    passenger door card  got: (none)
+                         exp: bx_doorpanel_R
+                         in 10/29 trims
+    passenger door card  got: bx_door_R
+                         exp: bx_doorpanel_R
+                         in 1/29 trims
+    dashboard            got: bx_rollcage
+                         exp: bx_grp_dash_rhd
+                         in 1/36 trims
+    dashboard            got: bx_rollcage
+                         exp: bx_dash_rhd
+                         in 1/36 trims
+
+# covet   grid[ driver:X pass.:X seatD:ok seatP:ok dash:ok ]   (3 unique mismatches)
+    driver door card     got: covet_fender_R
+                         exp: covet_doorpanel_R
+                         in 15/30 trims
+    passenger door card  got: (none)
+                         exp: covet_doorpanel_L
+                         in 16/30 trims
+    passenger door card  got: covet_sideglass_L
+                         exp: covet_doorpanel_L
+                         in 1/30 trims
+
+# etkc   grid[ driver:ok pass.:ok seatD:ok seatP:ok dash:X ]   (2 unique mismatches)
+    dashboard            got: etkc_windshield_lightweight_int
+                         exp: etkc_dash_race
+                         in 1/17 trims
+    dashboard            got: etkc_windshield_lightweight
+                         exp: etkc_dash_race | etkc_dash_race_lower
+                         in 1/17 trims
+
+# etki   grid[ driver:ok pass.:X seatD:ok seatP:ok dash:ok ]   (1 unique mismatch)
+    passenger door card  got: etki_doorpanel_RR
+                         exp: etki_doorpanel_FR
+                         in 29/29 trims
+
+# fullsize   grid[ driver:ok pass.:ok seatD:X seatP:X dash:ok ]   (2 unique mismatches)
+    driver seat          got: fullsize_door_FL
+                         exp: fullsize_seat_FL
+                         in 5/24 trims
+    passenger seat       got: (none)
+                         exp: fullsize_seat_FR
+                         in 5/20 trims
+
+# hopper   grid[ driver:X pass.:X seatD:ok seatP:ok dash:X ]   (3 unique mismatches)
+    driver door card     got: hopper_doorglass_FL
+                         exp: hopper_doorpanel_FL
+                         in 11/23 trims
+    passenger door card  got: hopper_doorglass_FR
+                         exp: hopper_doorpanel_FR
+                         in 11/23 trims
+    dashboard            got: police_search_light_pod
+                         exp: hopper_dash
+                         in 2/26 trims
+
+# legran   grid[ driver:ok pass.:ok seatD:ok seatP:ok dash:X ]   (1 unique mismatch)
+    dashboard            got: legran_windshield_int
+                         exp: legran_dashboard_bottom
+                         in 30/32 trims
+
+# miramar   grid[ driver:X pass.:X seatD:ok seatP:ok dash:ok ]   (5 unique mismatches)
+    driver door card     got: miramar_coupe_doorglass_R_int
+                         exp: miramar_coupe_door_R_panel
+                         in 5/24 trims
+    passenger door card  got: miramar_coupe_doorglass_L_int
+                         exp: miramar_coupe_door_L_panel
+                         in 5/24 trims
+    passenger door card  got: miramar_doorglass_RR
+                         exp: miramar_doorpanel_FR
+                         in 4/24 trims
+    passenger door card  got: miramar_coupe_RR_glass
+                         exp: miramar_coupe_door_R_panel
+                         in 2/24 trims
+    passenger door card  got: (none)
+                         exp: miramar_doorpanel_FR
+                         in 2/24 trims
+
+# moonhawk   grid[ driver:ok pass.:ok seatD:ok seatP:ok dash:X ]   (2 unique mismatches)
+    dashboard            got: moonhawk_windshield
+                         exp: moonhawk_dashboard
+                         in 23/24 trims
+    dashboard            got: moonhawk_windshield_int
+                         exp: moonhawk_dashboard
+                         in 1/24 trims
+
+# pickup   grid[ driver:X pass.:X seatD:ok seatP:ok dash:X ]   (5 unique mismatches)
+    driver door card     got: pickup_doorglass_L
+                         exp: pickup_doorpanel_L
+                         in 25/65 trims
+    driver door card     got: pickup_doorglass_L
+                         exp: pickup_facelift_doorpanel_FL
+                         in 19/65 trims
+    passenger door card  got: pickup_doorglass_R
+                         exp: pickup_doorpanel_R
+                         in 25/65 trims
+    passenger door card  got: pickup_doorglass_R
+                         exp: pickup_facelift_doorpanel_FR
+                         in 19/65 trims
+    dashboard            got: police_search_light_pod
+                         exp: pickup_dash
+                         in 1/73 trims
+
+# roamer   grid[ driver:X pass.:X seatD:ok seatP:ok dash:X ]   (3 unique mismatches)
+    driver door card     got: roamer_doorglass_FL
+                         exp: roamer_doorpanel_FL
+                         in 33/33 trims
+    passenger door card  got: roamer_doorglass_FR
+                         exp: roamer_doorpanel_FR
+                         in 33/33 trims
+    dashboard            got: police_search_light_pod
+                         exp: roamer_dash
+                         in 3/35 trims
+
+# sbr   grid[ driver:ok pass.:X seatD:ok seatP:ok dash:X ]   (3 unique mismatches)
+    passenger door card  got: sbr_door_R
+                         exp: sbr_doorpanel_R
+                         in 17/19 trims
+    dashboard            got: sbr_windshield_int
+                         exp: sbr_dash
+                         in 21/23 trims
+    dashboard            got: sbr_windshield_int
+                         exp: sbr_dash_rally
+                         in 2/23 trims
+
+# scintilla   grid[ driver:X pass.:X seatD:ok seatP:ok dash:X ]   (4 unique mismatches)
+    driver door card     got: scintilla_widebody_door_FL
+                         exp: scintilla_door_panel_L | scintilla_door_panel_spider_L
+                         in 1/15 trims
+    passenger door card  got: scintilla_widebody_door_FR
+                         exp: scintilla_door_panel_R | scintilla_door_panel_spider_R
+                         in 1/15 trims
+    dashboard            got: scintilla_rollcage_hardtop
+                         exp: scintilla_dashboard_race
+                         in 4/16 trims
+    dashboard            got: scintilla_rollcage_spyder
+                         exp: scintilla_dashboard_race
+                         in 1/16 trims
+
+# sunburst2   grid[ driver:X pass.:ok seatD:ok seatP:ok dash:ok ]   (1 unique mismatch)
+    driver door card     got: (none)
+                         exp: sunburst2_doorpanel_raceing_FL
+                         in 4/39 trims
+
+# us_semi   grid[ driver:X pass.:X seatD:ok seatP:ok dash:X ]   (10 unique mismatches)
+    driver door card     got: longose_window_door_L_b
+                         exp: longnose_door_panel_L
+                         in 12/21 trims
+    driver door card     got: cabover_window_door_L_b
+                         exp: cabover_door_panel_L
+                         in 5/21 trims
+    driver door card     got: (none)
+                         exp: cabover_door_panel_L
+                         in 4/21 trims
+    passenger door card  got: longose_window_door_R_b
+                         exp: longnose_door_panel_R
+                         in 6/11 trims
+    passenger door card  got: cabover_window_door_R_b
+                         exp: cabover_door_panel_R
+                         in 3/11 trims
+    passenger door card  got: (none)
+                         exp: longnose_door_panel_R
+                         in 1/11 trims
+    passenger door card  got: (none)
+                         exp: cabover_door_panel_R
+                         in 1/11 trims
+    dashboard            got: longnose_daycab_passthrough
+                         exp: longnose_dash
+                         in 8/40 trims
+    dashboard            got: (none)
+                         exp: cabover_dash
+                         in 4/40 trims
+    dashboard            got: cabover_sleeper_cab_bed
+                         exp: cabover_dash
+                         in 3/40 trims
+
+# van   grid[ driver:X pass.:X seatD:ok seatP:ok dash:ok ]   (2 unique mismatches)
+    driver door card     got: van_doorglass_FL
+                         exp: van_doorpanel_FL
+                         in 35/35 trims
+    passenger door card  got: van_doorglass_FR
+                         exp: van_doorpanel_FR
+                         in 35/35 trims
+
+# vivace   grid[ driver:ok pass.:ok seatD:ok seatP:ok dash:X ]   (2 unique mismatches)
+    dashboard            got: vivace_windshield
+                         exp: vivace_dash
+                         in 34/35 trims
+    dashboard            got: vivace_windshield
+                         exp: vivace_grp_dash
+                         in 1/35 trims
+
+# wendover   grid[ driver:ok pass.:ok seatD:ok seatP:ok dash:X ]   (1 unique mismatch)
+    dashboard            got: wendover_windshield
+                         exp: wendover_dash
+                         in 25/26 trims
