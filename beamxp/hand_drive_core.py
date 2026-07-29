@@ -14,7 +14,7 @@ import shutil
 import sys
 import textwrap
 import zipfile
-from dataclasses import dataclass, field, fields as dataclass_fields, replace as dataclass_replace
+from dataclasses import dataclass, fields as dataclass_fields, replace as dataclass_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -26,69 +26,112 @@ from beamxp import spatial_visibility_backend
 from beamxp import transform_helpers
 from beamxp.core import dae
 from beamxp.core import mesh_resolution
-from beamxp.plates import generator as plate_generator
-
-
-def default_user_data_dir() -> Path:
-    # Shared with plate_generator so the one-time BeamHDC -> BeamXP data
-    # folder migration runs no matter which module resolves the path first.
-    return plate_generator.default_user_data_dir()
-
-
-def default_beamng_mods_dir() -> Path:
-    local_appdata = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-    return local_appdata / "BeamNG" / "BeamNG.drive" / "current" / "mods"
-
-
-APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-SOURCE_ROOT_DIR = APP_DIR if getattr(sys, "frozen", False) else APP_DIR.parent
-USER_DATA_DIR = Path(os.environ.get("BEAMXP_DATA_DIR") or os.environ.get("BEAMHDC_DATA_DIR") or default_user_data_dir())
-WORKSPACE_DIR = USER_DATA_DIR
-THIS_DIR = APP_DIR
-PROJECTS_DIR = USER_DATA_DIR / "handedness_conversion_projects"
-APP_SETTINGS_PATH = USER_DATA_DIR / "hand_drive_tool_settings.json"
-TOOL_VERSION = 2
-
-HAND_LHD = "LHD"
-HAND_RHD = "RHD"
-HAND_UNKNOWN = "Unknown"
-HAND_AUTO = "Auto"
-HAND_CHOICES = (HAND_AUTO, HAND_LHD, HAND_RHD, HAND_UNKNOWN)
-ACTION_OPPOSITE = "Opposite"
-ACTION_TO_RHD = "To RHD"
-ACTION_TO_LHD = "To LHD"
-ACTION_SKIP = "Skip"
-MODE_SKIP = "skip"
-MODE_MIRROR = "mirror"
-MODE_MIRROR_STRUCTURAL = "mirrorStructural"
-MODE_TRANSLATE = "translate"
-MODE_CHOICES = (MODE_SKIP, MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_TRANSLATE)
-BUILD_OFF = "off"
-BUILD_CONVERTED = "converted"
-BUILD_ORIGINAL = "original"
-BUILD_BOTH = "both"
-BUILD_CHOICES = (BUILD_OFF, BUILD_CONVERTED, BUILD_ORIGINAL, BUILD_BOTH)
-
-# Meshes placed further than this from the vehicle origin are treated as
-# deliberately hidden (mods "remove" unwanted meshes by offsetting them
-# thousands of km away) and are left out of previews so they cannot wreck
-# the camera framing. Keep in sync with FAR_LIMIT in beamxp.mesh_preview.
-PREVIEW_FAR_LIMIT = 100.0
-NUMBER_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
-STEERING_NAME_EXCLUDES = (
-    "airbag",
-    "box",
-    "button",
-    "buttons",
-    "cowl",
-    "cover",
-    "rack",
-    "shaft",
-    "stitch",
-    "column",
+from beamxp.core.beam_json import (
+    add_missing_json_commas,
+    display_name_for,
+    info_path_for_config,
+    json_line_needs_comma,
+    load_info,
+    load_pc,
+    parse_beamng_json,
+    strip_json_comments,
+    zip_json_by_name as _zip_json_by_name,
 )
-
-NS = transform_helpers.NS
+from beamxp.core.constants import (
+    ACTION_OPPOSITE,
+    ACTION_SKIP,
+    ACTION_TO_LHD,
+    ACTION_TO_RHD,
+    APP_DIR,
+    APP_SETTINGS_PATH,
+    BUILD_BOTH,
+    BUILD_CHOICES,
+    BUILD_CONVERTED,
+    BUILD_OFF,
+    BUILD_ORIGINAL,
+    HAND_AUTO,
+    HAND_CHOICES,
+    HAND_LHD,
+    HAND_RHD,
+    HAND_UNKNOWN,
+    MODE_CHOICES,
+    MODE_MIRROR,
+    MODE_MIRROR_STRUCTURAL,
+    MODE_SKIP,
+    MODE_TRANSLATE,
+    NS,
+    NUMBER_RE,
+    PREVIEW_FAR_LIMIT,
+    PROJECTS_DIR,
+    SOURCE_ROOT_DIR,
+    STEERING_NAME_EXCLUDES,
+    THIS_DIR,
+    TOOL_VERSION,
+    USER_DATA_DIR,
+    WORKSPACE_DIR,
+    default_beamng_mods_dir,
+    default_user_data_dir,
+)
+from beamxp.core.files import (
+    beamng_game_common_zips,
+    clean_dir,
+    common_zip_candidates,
+    direct_vehicle_files,
+    fs_path,
+    list_vehicle_files,
+    load_jbeam_texts,
+    make_zip,
+    project_dir_for,
+    read_json_file,
+    safe_id,
+    safe_project_segment,
+    vehicle_ids_in_zip,
+    vehicle_prefix,
+    write_bytes_file,
+    write_text_file,
+    write_xml_tree,
+    zip_member_path,
+)
+from beamxp.core.geometry import (
+    PROP_VECTOR_RE,
+    brg_rotation_matrix3,
+    clamp_value,
+    cross_product,
+    euler_from_matrix3,
+    euler_matrix3,
+    euler_yzx_from_matrix3,
+    identity_matrix,
+    matrix3_from_axes,
+    matrix3_from_matrix4,
+    matrix4_flat,
+    mirror_rotation_matrix_x,
+    mirror_x_matrix4,
+    multiply_matrix,
+    multiply_matrix3,
+    normalize_vector,
+    prop_base_rotation_matrix3,
+    prop_row_vector_objects,
+    rotation_transpose_matrix3,
+    rotation_transpose_matrix4,
+    rotation_x_matrix,
+    rotation_y_matrix,
+    rotation_z_matrix,
+    scale_matrix,
+    sign_number,
+    translation_matrix,
+    vector_subtract,
+)
+from beamxp.core.models import (
+    BakedMeshSpec,
+    BuildResult,
+    MeshPlacement,
+    ResolvedMeshPosition,
+    SharedBakeContext,
+    SlotDef,
+    VariantInfo,
+    VehicleContext,
+)
+from beamxp.plates import generator as plate_generator
 
 
 # ---------------------------------------------------------------------------
@@ -128,315 +171,6 @@ def load_common_dae_objects(
         wanted_meshes,
         existing_objects,
     )
-
-
-@dataclass(frozen=True)
-class MeshPlacement:
-    position: tuple[float, float, float]
-    matrix: list[list[float]]
-
-
-@dataclass(frozen=True)
-class ResolvedMeshPosition:
-    """Where a mesh sits in ONE configuration.
-
-    Several placements within a single config are simultaneous instances (a
-    wheel at four corners), so position is their average -- one DaeObject
-    cannot represent four. matrices are the flexbody row matrices for that
-    config, empty when the mesh is placed only as a prop."""
-
-    position: tuple[float, float, float]
-    matrices: tuple[tuple[tuple[float, ...], ...], ...] = ()
-
-
-@dataclass(frozen=True)
-class SlotDef:
-    # slot_type is the slot IDENTIFIER: the type for a slots(v1) row, the name
-    # for a slots2 row (which is what a .pc keys its parts map by). allow_types/
-    # deny_types drive fitment (jbeam partFitsSlot): a v1 slot allows exactly its
-    # type; a slots2 slot allows any of allow_types unless the part also matches
-    # a deny_type.
-    slot_type: str
-    default_part: str
-    options: str | None = None
-    allow_types: tuple[str, ...] = ()
-    deny_types: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class BakedMeshSpec:
-    configured_mesh: str
-    source_mesh: str
-    output_mesh: str
-    target_hand: str
-    mode: str
-    placement_matrix: list[list[float]]
-    bake_transform_into_dae: bool
-    is_prop: bool = False
-
-
-@dataclass
-class SharedBakeContext:
-    context: "VehicleContext"
-    config_name: str
-    target_hand: str
-    source_part_id: str
-    object_modes: dict[str, str]
-    structural_sources: dict[str, str]
-    translate_magnitudes: dict[str, float]
-    baked_specs: list[BakedMeshSpec]
-
-
-@dataclass(frozen=True)
-class VariantInfo:
-    name: str
-    pc_path: str
-    info_path: str | None
-    display_name: str
-
-
-@dataclass
-class VehicleContext:
-    source_zip: Path
-    vehicle_id: str
-    vehicle_path: str
-    dae_paths: list[str]
-    variants: dict[str, VariantInfo]
-    objects: dict[str, DaeObject]
-    preview_by_id: dict[str, dict[str, object]]
-    jbeam_texts: dict[str, str]
-    node_positions: dict[str, tuple[float, float, float]]
-    project_dir: Path
-    part_body_index: dict[str, tuple[str, str]] = field(default_factory=dict)
-    jbeam_positioned_flexbodies: set[str] = field(default_factory=set)
-    # Raw DAE node-matrix translations (mesh pivots), captured before mesh
-    # positions get resolved/averaged. Props anchor their mesh pivot in
-    # vehicle space, so hand conversion must transform pivot positions.
-    mesh_pivots: dict[str, tuple[float, float, float]] = field(default_factory=dict)
-    # Authored geometry centre per mesh (world space, node translation
-    # included), captured before apply_resolved_mesh_positions overwrites
-    # preview_by_id. A flexbody row that authors no pos of its own renders at
-    # this centre minus the node's own translation (see
-    # flexbody_row_needs_node_translation) -- the node offset is a leftover
-    # export artefact the game does not apply, not real placement.
-    mesh_authored_centers: dict[str, tuple[float, float, float]] = field(default_factory=dict)
-    # Meshes whose resolved position differs between trims -- i.e. declared by
-    # parts that can never coexist. The single position on DaeObject is only a
-    # representative for these; ask resolved_mesh_positions_for_config for the
-    # value that is true in a given trim.
-    variant_dependent_meshes: set[str] = field(default_factory=set)
-    selected_parts_cache: dict[str, dict[str, object]] = field(default_factory=dict)
-    # Per-config resolved positions; rebuilt on demand, never pickled (it is
-    # trims x meshes and would dwarf the rest of the cache).
-    resolved_positions_cache: dict[str, dict[str, ResolvedMeshPosition]] = field(default_factory=dict)
-    mesh_roles_cache: dict[str, tuple[set[str], set[str], set[str]]] = field(default_factory=dict)
-    selected_node_positions_cache: dict[str, dict[str, tuple[float, float, float]]] = field(default_factory=dict)
-    part_array_cache: dict[tuple[str, str], str | None] = field(default_factory=dict)
-    variant_hands_cache: dict[str, dict[str, str]] = field(default_factory=dict)
-
-
-@dataclass
-class BuildResult:
-    unpacked_dir: Path
-    package_zip: Path | None
-    installed_zip: Path | None
-    generated_configs: list[str]
-    generated_daes: list[Path]
-    skipped_variants: dict[str, str]
-    plate_summary: dict[str, object] = field(default_factory=dict)
-    installed_plates_zip: Path | None = None
-
-
-def vehicle_ids_in_zip(source_zip: Path) -> list[str]:
-    vehicles: dict[str, set[str]] = {}
-    with zipfile.ZipFile(source_zip) as zf:
-        for name in zf.namelist():
-            match = re.match(r"vehicles/([^/]+)/(.+)", name.replace("\\", "/"), re.IGNORECASE)
-            if not match:
-                continue
-            vehicle_id, rest = match.groups()
-            suffix = Path(rest).suffix.lower()
-            if suffix in {".dae", ".pc", ".jbeam"}:
-                vehicles.setdefault(vehicle_id, set()).add(suffix)
-    return sorted(
-        vehicle_id
-        for vehicle_id, suffixes in vehicles.items()
-        if ".dae" in suffixes and (".pc" in suffixes or ".jbeam" in suffixes)
-    )
-
-
-def safe_project_segment(value: object) -> str:
-    text = str(value or "").strip()
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
-    text = text.strip("._-")
-    return text or "vehicle"
-
-
-def project_dir_for(source_zip: Path, vehicle_id: str) -> Path:
-    source_segment = safe_project_segment(source_zip.stem)
-    vehicle_segment = safe_project_segment(vehicle_id)
-    if source_segment.lower() == vehicle_segment.lower():
-        return PROJECTS_DIR / vehicle_segment
-    return PROJECTS_DIR / f"{source_segment}_{vehicle_segment}"
-
-
-def fs_path(path: Path) -> str:
-    text = str(path.resolve(strict=False))
-    if os.name != "nt" or text.startswith("\\\\?\\"):
-        return text
-    if text.startswith("\\\\"):
-        return "\\\\?\\UNC\\" + text.lstrip("\\")
-    return "\\\\?\\" + text
-
-
-def write_text_file(path: Path, text: str, *, encoding: str = "utf-8") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(fs_path(path), "w", encoding=encoding) as fh:
-        fh.write(text)
-
-
-def write_bytes_file(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(fs_path(path), "wb") as fh:
-        fh.write(data)
-
-
-def write_xml_tree(tree: ET.ElementTree, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(fs_path(path), "wb") as fh:
-        tree.write(fh, encoding="utf-8", xml_declaration=True)
-
-
-def read_json_file(path: Path) -> dict[str, object]:
-    with open(fs_path(path), encoding="utf-8") as fh:
-        data = json.load(fh)
-    return data if isinstance(data, dict) else {}
-
-
-def vehicle_prefix(vehicle_id: str) -> str:
-    return f"vehicles/{vehicle_id}"
-
-
-def list_vehicle_files(source_zip: Path, vehicle_id: str, suffix: str) -> list[str]:
-    prefix = f"{vehicle_prefix(vehicle_id)}/"
-    wanted = suffix.lower()
-    with zipfile.ZipFile(source_zip) as zf:
-        return sorted(
-            name.replace("\\", "/")
-            for name in zf.namelist()
-            if name.replace("\\", "/").startswith(prefix)
-            and Path(name).suffix.lower() == wanted
-        )
-
-
-def direct_vehicle_files(source_zip: Path, vehicle_id: str, suffix: str) -> list[str]:
-    prefix = f"{vehicle_prefix(vehicle_id)}/"
-    wanted = suffix.lower()
-    with zipfile.ZipFile(source_zip) as zf:
-        out = []
-        for name in zf.namelist():
-            clean = name.replace("\\", "/")
-            if not clean.startswith(prefix) or Path(clean).suffix.lower() != wanted:
-                continue
-            if "/" in clean[len(prefix) :]:
-                continue
-            out.append(clean)
-    return sorted(out)
-
-
-_game_common_zips_cache: list[Path] | None = None
-
-
-def beamng_game_common_zips() -> list[Path]:
-    """The game install's content/vehicles/common.zip. Mod zips live in the
-    user's mods folder with no sibling common.zip, yet routinely reference
-    vanilla wheels/tires/props from vehicles/common - without this lookup
-    those parts have no jbeam bodies and no DAE geometry. Candidates come from
-    the app settings' recently opened game folders and from Steam's install
-    metadata (registry + libraryfolders.vdf). Cached per process."""
-    global _game_common_zips_cache
-    if _game_common_zips_cache is not None:
-        return _game_common_zips_cache
-    found: list[Path] = []
-    seen: set[str] = set()
-
-    def add(candidate: Path) -> None:
-        try:
-            resolved = str(candidate.resolve(strict=False)).lower()
-        except OSError:
-            return
-        if resolved in seen:
-            return
-        seen.add(resolved)
-        if candidate.is_file():
-            found.append(candidate)
-
-    # Folders vehicles were opened from before; the game's content folder is
-    # recorded here as soon as any vanilla vehicle has been opened.
-    try:
-        raw = json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
-        folders = [raw.get("lastVehicleZipFolder")]
-        recents = raw.get("recentVehicles")
-        if isinstance(recents, list):
-            for entry in recents:
-                if isinstance(entry, dict) and entry.get("zip"):
-                    folders.append(str(Path(str(entry["zip"])).parent))
-        for folder in folders:
-            if folder:
-                add(Path(str(folder)) / "common.zip")
-    except Exception:
-        pass
-
-    # Steam installs, including secondary library folders on other drives.
-    try:
-        steam_roots: list[Path] = []
-        if sys.platform == "win32":
-            import winreg
-
-            for hive, key, value_name in (
-                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
-            ):
-                try:
-                    with winreg.OpenKey(hive, key) as handle:
-                        value, _kind = winreg.QueryValueEx(handle, value_name)
-                    steam_roots.append(Path(str(value)))
-                except OSError:
-                    continue
-        for root in list(steam_roots):
-            try:
-                text = (root / "steamapps" / "libraryfolders.vdf").read_text(
-                    encoding="utf-8", errors="replace"
-                )
-            except OSError:
-                continue
-            for match in re.finditer(r'"path"\s+"((?:[^"\\]|\\.)*)"', text):
-                steam_roots.append(Path(match.group(1).replace("\\\\", "\\")))
-        for root in steam_roots:
-            add(root / "steamapps" / "common" / "BeamNG.drive" / "content" / "vehicles" / "common.zip")
-    except Exception:
-        pass
-
-    _game_common_zips_cache = found
-    return found
-
-
-def common_zip_candidates(source_zip: Path) -> list[Path]:
-    candidates = [source_zip]
-    resolved: set[str] = {str(source_zip.resolve(strict=False)).lower()}
-
-    def add(candidate: Path) -> None:
-        key = str(candidate.resolve(strict=False)).lower()
-        if key not in resolved:
-            resolved.add(key)
-            candidates.append(candidate)
-
-    sibling_common = source_zip.parent / "common.zip"
-    if sibling_common.exists():
-        add(sibling_common)
-    for game_common in beamng_game_common_zips():
-        add(game_common)
-    return candidates
 
 
 def referenced_mesh_names(part_body_index: dict[str, tuple[str, str]]) -> set[str]:
@@ -762,43 +496,6 @@ def surface_triangles_for_resolved_placement(
         if pivot is not None and max(abs(value) for value in pivot) > 1e-9:
             triangles = triangles - np.asarray(pivot, dtype=float)
     return triangles
-
-
-def load_jbeam_texts(source_zip: Path, vehicle_id: str) -> dict[str, str]:
-    prefix = f"{vehicle_prefix(vehicle_id)}/"
-    with zipfile.ZipFile(source_zip) as zf:
-        return {
-            name.replace("\\", "/"): zf.read(name).decode("utf-8", errors="replace")
-            for name in zf.namelist()
-            if name.replace("\\", "/").startswith(prefix)
-            and name.lower().endswith(".jbeam")
-        }
-
-
-def brg_rotation_matrix3(brg_rad: Iterable[float]) -> list[list[float]]:
-    """Engine getBaseRotationGlobal() euler (radians) -> rest rotation 3x3.
-
-    This is the prop's ENGINE rest rotation. The engine stores the base
-    orientation as a quaternion (always a proper rotation, det +1); for rows
-    without an authored baseRotationGlobal its value does NOT equal the
-    analytic frame*baseRotation composition, so dumped values are the only
-    exact source for those rows.
-
-    Convention: the engine's euler works in row-vector (transposed) matrix
-    convention, so the column-vector rest matrix is the TRANSPOSE of
-    Ry(y)*Rz(z)*Rx(x). Ground truth: grp_steerwheel_hub dumps x=+70deg and
-    its -z-authored quick-release boss must point forward-down along the
-    steering column (Rx(-70)); the wheel face likewise. All other validated
-    rows (identity, 180deg flips, symmetric discs) are sign-invariant."""
-    x, y, z = (math.degrees(float(v)) for v in brg_rad)
-    matrix = identity_matrix()
-    for next_matrix in (rotation_y_matrix(y), rotation_z_matrix(z), rotation_x_matrix(x)):
-        matrix = multiply_matrix(matrix, next_matrix)
-    return rotation_transpose_matrix3(matrix3_from_matrix4(matrix))
-
-
-def rotation_transpose_matrix3(matrix: list[list[float]]) -> list[list[float]]:
-    return [[matrix[col][row] for col in range(3)] for row in range(3)]
 
 
 def prop_rest_rotation_override(
@@ -1283,31 +980,6 @@ def vector_from_row(
     return (x, y, z)
 
 
-def vector_subtract(
-    left: tuple[float, float, float],
-    right: tuple[float, float, float],
-) -> tuple[float, float, float]:
-    return (left[0] - right[0], left[1] - right[1], left[2] - right[2])
-
-
-def cross_product(
-    left: tuple[float, float, float],
-    right: tuple[float, float, float],
-) -> tuple[float, float, float]:
-    return (
-        left[1] * right[2] - left[2] * right[1],
-        left[2] * right[0] - left[0] * right[2],
-        left[0] * right[1] - left[1] * right[0],
-    )
-
-
-def normalize_vector(value: tuple[float, float, float]) -> tuple[float, float, float]:
-    length = math.sqrt(value[0] * value[0] + value[1] * value[1] + value[2] * value[2])
-    if length <= 1e-12:
-        return (0.0, 0.0, 0.0)
-    return (value[0] / length, value[1] / length, value[2] / length)
-
-
 def prop_row_position(
     row: str,
     node_positions: dict[str, tuple[float, float, float]],
@@ -1420,188 +1092,7 @@ def flexbody_row_mesh(row: str) -> str | None:
     return None if mesh == "mesh" else mesh
 
 
-def identity_matrix() -> list[list[float]]:
-    return [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-def multiply_matrix(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
-    return [
-        [
-            sum(a[row][idx] * b[idx][col] for idx in range(4))
-            for col in range(4)
-        ]
-        for row in range(4)
-    ]
-
-
-def translation_matrix(values: tuple[float, float, float]) -> list[list[float]]:
-    out = identity_matrix()
-    out[0][3], out[1][3], out[2][3] = values
-    return out
-
-
-def scale_matrix(values: tuple[float, float, float]) -> list[list[float]]:
-    out = identity_matrix()
-    out[0][0], out[1][1], out[2][2] = values
-    return out
-
-
-def mirror_x_matrix4() -> list[list[float]]:
-    out = identity_matrix()
-    out[0][0] = -1.0
-    return out
-
-
-def rotation_x_matrix(degrees: float) -> list[list[float]]:
-    angle = math.radians(degrees)
-    c = math.cos(angle)
-    s = math.sin(angle)
-    return [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, c, -s, 0.0],
-        [0.0, s, c, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-def rotation_y_matrix(degrees: float) -> list[list[float]]:
-    angle = math.radians(degrees)
-    c = math.cos(angle)
-    s = math.sin(angle)
-    return [
-        [c, 0.0, s, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [-s, 0.0, c, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-def rotation_z_matrix(degrees: float) -> list[list[float]]:
-    angle = math.radians(degrees)
-    c = math.cos(angle)
-    s = math.sin(angle)
-    return [
-        [c, -s, 0.0, 0.0],
-        [s, c, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-PROP_VECTOR_RE = re.compile(
-    rf'\{{\s*"x"\s*:\s*(?P<x>{NUMBER_RE})\s*,?\s*'
-    rf'"y"\s*:\s*(?P<y>{NUMBER_RE})\s*,\s*"z"\s*:\s*(?P<z>{NUMBER_RE})\s*\}}'
-)
-
-
-def prop_row_vector_objects(row: str) -> list[tuple[float, float, float]]:
-    return [
-        (float(match.group("x")), float(match.group("y")), float(match.group("z")))
-        for match in PROP_VECTOR_RE.finditer(row)
-    ]
-
-
-def matrix3_from_matrix4(matrix: list[list[float]]) -> list[list[float]]:
-    return [[matrix[row][col] for col in range(3)] for row in range(3)]
-
-
-def multiply_matrix3(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
-    return [
-        [
-            sum(a[row][idx] * b[idx][col] for idx in range(3))
-            for col in range(3)
-        ]
-        for row in range(3)
-    ]
-
-
-def euler_matrix3(degrees: tuple[float, float, float]) -> list[list[float]]:
-    matrix = identity_matrix()
-    for next_matrix in (
-        rotation_z_matrix(degrees[2]),
-        rotation_y_matrix(degrees[1]),
-        rotation_x_matrix(degrees[0]),
-    ):
-        matrix = multiply_matrix(matrix, next_matrix)
-    return matrix3_from_matrix4(matrix)
-
-
-def prop_base_rotation_matrix3(degrees: tuple[float, float, float]) -> list[list[float]]:
-    # Game prop baseRotation euler order is -X -Z +Y intrinsic
-    # (lua/common/jbeam/sections/meshs.lua), i.e. B = Rx(-x)*Rz(-z)*Ry(+y).
-    matrix = identity_matrix()
-    for next_matrix in (
-        rotation_x_matrix(-degrees[0]),
-        rotation_z_matrix(-degrees[2]),
-        rotation_y_matrix(degrees[1]),
-    ):
-        matrix = multiply_matrix(matrix, next_matrix)
-    return matrix3_from_matrix4(matrix)
-
-
-def euler_yzx_from_matrix3(matrix: list[list[float]]) -> tuple[float, float, float]:
-    # Decompose M = Ry(y)*Rz(z)*Rx(x) — the game's baseRotationGlobal order
-    # ("YZX intrinsic" per lua/common/jbeam/sections/meshs.lua).
-    sz = max(-1.0, min(1.0, matrix[1][0]))
-    z = math.asin(sz)
-    cz = math.cos(z)
-    if abs(cz) > 1e-8:
-        x = math.atan2(-matrix[1][2], matrix[1][1])
-        y = math.atan2(-matrix[2][0], matrix[0][0])
-    else:
-        x = math.atan2(matrix[2][1], matrix[2][2])
-        y = 0.0
-    return (math.degrees(x), math.degrees(y), math.degrees(z))
-
-
-def matrix3_from_axes(
-    axis_x: tuple[float, float, float],
-    axis_y: tuple[float, float, float],
-    axis_z: tuple[float, float, float],
-) -> list[list[float]]:
-    return [
-        [axis_x[0], axis_y[0], axis_z[0]],
-        [axis_x[1], axis_y[1], axis_z[1]],
-        [axis_x[2], axis_y[2], axis_z[2]],
-    ]
-
-
-def mirror_rotation_matrix_x(matrix: list[list[float]]) -> list[list[float]]:
-    out = [row[:] for row in matrix]
-    for col in range(3):
-        out[0][col] *= -1
-    for row in range(3):
-        out[row][0] *= -1
-    return out
-
-
-def euler_from_matrix3(matrix: list[list[float]]) -> tuple[float, float, float]:
-    sy = max(-1.0, min(1.0, -matrix[2][0]))
-    y = math.asin(sy)
-    cy = math.cos(y)
-    if abs(cy) > 1e-8:
-        x = math.atan2(matrix[2][1], matrix[2][2])
-        z = math.atan2(matrix[1][0], matrix[0][0])
-    else:
-        x = math.atan2(-matrix[1][2], matrix[1][1])
-        z = 0.0
-    return (math.degrees(x), math.degrees(y), math.degrees(z))
-
-
 NODE_TRANSFORM_KEY_RE = re.compile(r'"(?P<key>node(?:Rotate|Offset|Move)(?P<index>\d*)?)"\s*:')
-
-
-def sign_number(value: float) -> int:
-    if value > 0:
-        return 1
-    if value < 0:
-        return -1
-    return 0
 
 
 def approximate_expression_number(value: str) -> float | None:
@@ -1935,10 +1426,6 @@ def parse_slot_variable_overrides(options_json: str | None) -> dict[str, str]:
     if not isinstance(variables, dict):
         return {}
     return {str(k): v for k, v in variables.items() if str(k).startswith("$")}
-
-
-def clamp_value(value: float, lo: float, hi: float) -> float:
-    return max(min(lo, hi), min(max(lo, hi), value))
 
 
 def _deep_merge_into(target: dict, source: dict) -> None:
@@ -2632,14 +2119,6 @@ def add_baked_shared_mesh(
     return output_mesh
 
 
-def rotation_transpose_matrix4(matrix: list[list[float]]) -> list[list[float]]:
-    out = identity_matrix()
-    for row in range(3):
-        for col in range(3):
-            out[row][col] = matrix[col][row]
-    return out
-
-
 def baked_dae_matrix(
     source_node_matrix: list[list[float]],
     spec: BakedMeshSpec,
@@ -2885,179 +2364,6 @@ def apply_resolved_mesh_positions(
                     entry.position[2] - obj.z,
                 ),
             )
-
-
-def strip_json_comments(text: str) -> str:
-    out: list[str] = []
-    in_string = False
-    escape = False
-    line_comment = False
-    block_comment = False
-    idx = 0
-    while idx < len(text):
-        ch = text[idx]
-        nxt = text[idx + 1] if idx + 1 < len(text) else ""
-        if line_comment:
-            if ch in "\r\n":
-                line_comment = False
-                out.append(ch)
-            idx += 1
-            continue
-        if block_comment:
-            if ch == "*" and nxt == "/":
-                block_comment = False
-                idx += 2
-            else:
-                out.append("\n" if ch in "\r\n" else " ")
-                idx += 1
-            continue
-        if in_string:
-            out.append(ch)
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            idx += 1
-            continue
-        if ch == "/" and nxt == "/":
-            line_comment = True
-            idx += 2
-            continue
-        if ch == "/" and nxt == "*":
-            block_comment = True
-            idx += 2
-            continue
-        out.append(ch)
-        if ch == '"':
-            in_string = True
-        idx += 1
-    return "".join(out)
-
-
-def json_line_needs_comma(current: str, next_line: str) -> bool:
-    current = current.strip()
-    next_line = next_line.strip()
-    if not current or not next_line:
-        return False
-    if current.endswith(",") or current.endswith("{") or current.endswith("["):
-        return False
-    if next_line[0] in "]}":
-        return False
-    if not re.search(r'(?:"|-?\d+(?:\.\d*)?|\.\d+|true|false|null|\]|\})$', current):
-        return False
-    return bool(re.match(r'(?:"|\{|\[|-?\d+(?:\.\d*)?|\.\d+|true|false|null)', next_line))
-
-
-def add_missing_json_commas(text: str) -> str:
-    lines = text.splitlines(keepends=True)
-    out: list[str] = []
-    for index, line in enumerate(lines):
-        next_line = ""
-        for candidate in lines[index + 1 :]:
-            if candidate.strip():
-                next_line = candidate
-                break
-        if next_line and json_line_needs_comma(line, next_line):
-            line_ending = ""
-            content = line
-            if content.endswith("\r\n"):
-                content, line_ending = content[:-2], "\r\n"
-            elif content.endswith("\n"):
-                content, line_ending = content[:-1], "\n"
-            line = content + "," + line_ending
-        out.append(line)
-    return "".join(out)
-
-
-def parse_beamng_json(text: str, *, label: str) -> dict[str, object]:
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as first_error:
-        cleaned = strip_json_comments(text.lstrip("\ufeff"))
-        cleaned = re.sub(r",\s*,+", ",", cleaned)
-        cleaned = add_missing_json_commas(cleaned)
-        cleaned = re.sub(r",(\s*[\]}])", r"\1", cleaned)
-        try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError as second_error:
-            try:
-                parsed, end = json.JSONDecoder().raw_decode(cleaned)
-                remainder = cleaned[end:].strip()
-                if remainder.strip("}").strip():
-                    raise second_error
-            except json.JSONDecodeError:
-                raise RuntimeError(
-                    f"Could not parse BeamNG config {label}: {second_error}. "
-                    f"Initial strict JSON error was: {first_error}"
-                ) from second_error
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"BeamNG config {label} did not parse to an object")
-    return parsed
-
-
-def load_pc(source_zip: Path, pc_path: str) -> dict[str, object]:
-    with zipfile.ZipFile(source_zip) as zf:
-        return parse_beamng_json(
-            zf.read(pc_path).decode("utf-8", errors="replace"),
-            label=pc_path,
-        )
-
-
-def load_info(source_zip: Path, info_path: str) -> dict[str, object]:
-    with zipfile.ZipFile(source_zip) as zf:
-        return parse_beamng_json(
-            zf.read(info_path).decode("utf-8", errors="replace"),
-            label=info_path,
-        )
-
-
-def info_path_for_config(source_zip: Path, vehicle_id: str, config_name: str) -> str | None:
-    candidates = [
-        f"{vehicle_prefix(vehicle_id)}/info_{config_name}.json",
-        f"{vehicle_prefix(vehicle_id)}/{config_name}.json",
-    ]
-    with zipfile.ZipFile(source_zip) as zf:
-        names = {name.replace("\\", "/") for name in zf.namelist()}
-    return next((candidate for candidate in candidates if candidate in names), None)
-
-
-def display_name_for(source_zip: Path, info_path: str | None, config_name: str) -> str:
-    if info_path is None:
-        return config_name
-    try:
-        info = load_info(source_zip, info_path)
-    except Exception:
-        return config_name
-    for key in ("Configuration", "Name", "name", "configuration"):
-        value = info.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return config_name
-
-
-def _zip_json_by_name(source_zip: Path, wanted_name: str) -> dict[str, object]:
-    wanted = wanted_name.replace("\\", "/").lower()
-    with zipfile.ZipFile(source_zip) as zf:
-        actual = next(
-            (
-                name
-                for name in zf.namelist()
-                if name.replace("\\", "/").lower() == wanted
-            ),
-            None,
-        )
-        if not actual:
-            return {}
-        try:
-            parsed = parse_beamng_json(
-                zf.read(actual).decode("utf-8", errors="replace"),
-                label=actual,
-            )
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
 
 
 def original_source_name(context: VehicleContext) -> str:
@@ -5187,20 +4493,6 @@ def generated_variant_part_name(source_part: str, target_hand: str, config_name:
     return f"{generated_part_name(source_part, target_hand)}__{safe_id(config_name)}"
 
 
-def clean_dir(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(fs_path(path))
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def safe_id(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
-
-
-def zip_member_path(value: str) -> Path:
-    return Path(*[part for part in value.replace("\\", "/").split("/") if part])
-
-
 def generated_dae_output_path(
     output_root: Path,
     output_vehicle_dir: Path,
@@ -6301,10 +5593,6 @@ def prop_row_world_matrix(
     return multiply_matrix(matrix, translation_matrix((-t[0], -t[1], -t[2])))
 
 
-def matrix4_flat(matrix: list[list[float]]) -> list[float]:
-    return [matrix[row][col] for row in range(4) for col in range(4)]
-
-
 def preview_node_names(obj: DaeObject) -> list[str]:
     node_names = [obj.id]
     for alias in (obj.name, obj.id.strip("_ ")):
@@ -6718,18 +6006,6 @@ def full_vehicle_preview_payload(
         "skipped_meshes": skipped,
         "rotation_calibration": rotation_counts,
     }
-
-
-def make_zip(src: Path, target: Path) -> None:
-    if os.path.exists(fs_path(target)):
-        os.remove(fs_path(target))
-    src_path = fs_path(src)
-    with zipfile.ZipFile(fs_path(target), "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _dirs, files in os.walk(src_path):
-            for filename in files:
-                file_path = os.path.join(root, filename)
-                archive_name = os.path.relpath(file_path, src_path).replace(os.sep, "/")
-                zf.write(file_path, archive_name)
 
 
 def package_name_for_context(context: VehicleContext) -> str:
@@ -7158,13 +6434,16 @@ def camera_positions_for_config(
     the camera must get the same move or the eye lands in the unmoved frame. The
     us_semi cabover cab is nodeMove'd +1.94 m (conventional +2.05 m), so its raw
     camera at y=-1.2 would otherwise sit ~2 m behind the moved seats and dash."""
+    camera_parts = _camera_bearing_parts(context)
+    if not camera_parts:
+        return []
     selected = selected_parts_for_config(context, config_name)
     selected_ids = {str(item) for item in selected.get("parts", set())}
     slot_options = selected.get("part_slot_options", {})
     if not isinstance(slot_options, dict):
         slot_options = {}
     rows: list[tuple[float, float, float]] = []
-    for part_id, cameras in _camera_bearing_parts(context).items():
+    for part_id, cameras in camera_parts.items():
         if part_id not in selected_ids:
             continue
         options = slot_options.get(part_id, ())
