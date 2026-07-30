@@ -357,11 +357,28 @@ def _write_json(
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def uv_island_mask(
+    root: ET.Element,
+    material: str,
+    size: tuple[int, int],
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Rasterise a material's UV triangles into a boolean island mask.
+
+    ``size`` is (width, height).  True marks pixels covered by UV geometry,
+    the same sense as the black islands in the written ``.uv_filled_mask.png``.
+    Callers that only need the mask can avoid writing any files.
+    """
+    width, height = size
+    triangles, stats = _triangles_for_material(root, material)
+    occupied, filled_polygons = _rasterise_triangles(triangles, width, height)
+    return occupied > 0, {**stats, "filled_clipped_polygons": filled_polygons}
+
+
 def extract(config: ExtractionConfig, root: ET.Element) -> dict[str, object]:
     texture = Image.open(config.texture).convert("RGBA")
     width, height = texture.size
-    triangles, stats = _triangles_for_material(root, config.material)
-    occupied, filled_polygons = _rasterise_triangles(triangles, width, height)
+    island_mask, stats = uv_island_mask(root, config.material, (width, height))
+    occupied = np.where(island_mask, np.uint8(255), np.uint8(0))
     paths = _extract_paths(occupied, config)
 
     mask_path = config.output_prefix.with_name(config.output_prefix.name + ".uv_filled_mask.png")
@@ -375,7 +392,6 @@ def extract(config: ExtractionConfig, root: ET.Element) -> dict[str, object]:
 
     stats = {
         **stats,
-        "filled_clipped_polygons": filled_polygons,
         "island_paths": len(paths),
         "largest_path_areas": [round(area, 1) for area, _points in paths[:10]],
     }

@@ -6,6 +6,7 @@ import math
 import os
 import queue
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +26,23 @@ APP_NAME = "BeamXP Vehicle ZIP Mesh Transform POC"
 PRIMITIVE_TAGS = {"triangles", "polylist", "polygons", "trifans", "tristrips"}
 TRANSFORM_TAGS = {"matrix", "translate", "rotate", "scale", "lookat", "skew"}
 DIALOG_DIRECTORY_KEYS = frozenset({"source", "export"})
+
+# ---------------------------------------------------------------------------
+# Texture region annotation step
+# ---------------------------------------------------------------------------
+#
+# Exporting a preview writes one PNG per wired material next to the DAE. This
+# optional post-export step reuses those PNGs: it rasterises each material's UV
+# islands from the whole source DAE, then runs the MSER region annotator over
+# the texture inside that UV domain.  It is intentionally a separate step driven by
+# explicit output paths, not part of the mesh transform itself.  Artifacts go to
+# a folder named after the vehicle beside the exported DAE, and re-exporting the
+# same vehicle overwrites them.
+
+ANNOTATE_EXPORTED_TEXTURES = True
+WRITE_ANNOTATION_SUMMARY_JSON = True
+ANNOTATED_IMAGE_SUFFIX = ".annotated.png"
+ANNOTATION_SUMMARY_JSON_SUFFIX = ".annotation.json"
 
 
 def application_settings_path() -> Path:
@@ -4216,6 +4234,189 @@ def export_transformed_part_dae(
 
 
 # ---------------------------------------------------------------------------
+# Texture region annotation
+# ---------------------------------------------------------------------------
+
+
+def _ensure_repo_root_on_sys_path() -> None:
+    """Allow sibling package imports when this file runs as a plain script."""
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+
+def _annotation_output_directory(output_dae: Path, vehicle_name: str) -> Path:
+    """Collect a vehicle's annotation artifacts beside its exported preview.
+
+    Re-exporting a vehicle deliberately overwrites its previous annotation run
+    so the folder always describes the latest export.
+    """
+    directory = output_dae.parent / (safe_name(vehicle_name) or output_dae.stem)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _annotation_output_path(directory: Path, texture_path: Path, suffix: str) -> Path:
+    """Name an annotation artifact after the exported texture it describes."""
+    return directory / f"{texture_path.with_suffix('').name}{suffix}"
+
+
+def _annotate_exported_texture(
+    source_root: ET.Element,
+    material_symbol: str,
+    texture_path: Path,
+    directory: Path,
+) -> dict[str, object]:
+    """Rasterise one material's UV islands, then annotate its exported texture."""
+    from mesh_segmentation_transform.annotate_texture_regions import (
+        TextureRegionAnnotationOutputs,
+        annotate_texture_regions,
+    )
+    from mesh_segmentation_transform.extract_uv_island_paths import (
+        ExtractionConfig,
+        extract as extract_uv_islands,
+    )
+
+    # Islands come from the whole source DAE, not the exported subset: a texture
+    # atlas is shared vehicle-wide, and every triangle using the material owns
+    # part of it.  Rasterising the exported part alone masks off most of the
+    # atlas and hides regions the annotator should see.
+    uv_result = extract_uv_islands(
+        ExtractionConfig(
+            texture=texture_path,
+            material=material_symbol,
+            output_prefix=directory / texture_path.with_suffix("").name,
+        ),
+        source_root,
+    )
+    uv_island_mask = Path(str(uv_result["mask"]))
+
+    annotated_image = _annotation_output_path(
+        directory, texture_path, ANNOTATED_IMAGE_SUFFIX
+    )
+    summary_json = (
+        _annotation_output_path(directory, texture_path, ANNOTATION_SUMMARY_JSON_SUFFIX)
+        if WRITE_ANNOTATION_SUMMARY_JSON
+        else None
+    )
+    summary = annotate_texture_regions(
+        texture_path=texture_path,
+        outputs=TextureRegionAnnotationOutputs(
+            annotated_image=annotated_image,
+            summary_json=summary_json,
+        ),
+        uv_island_mask_path=uv_island_mask,
+    )
+
+    uv_stats = uv_result["stats"]
+    return {
+        "material_symbol": material_symbol,
+        "texture": str(texture_path),
+        "uv_island_mask": str(uv_island_mask),
+        "uv_island_path_svg": str(uv_result["svg"]),
+        "uv_island_paths": uv_stats["island_paths"],
+        "uv_triangles": uv_stats["triangles"],
+        "annotated_image": str(annotated_image),
+        "summary_json": str(summary_json) if summary_json is not None else None,
+        "annotated_region_count": summary["grouped_regions"],
+    }
+
+
+def annotate_exported_preview_textures(
+    loaded: LoadedDae,
+    export_info: dict[str, object],
+    output_dae: Path,
+    vehicle_name: str,
+) -> dict[str, object]:
+    """Annotate every texture the preview export wired, reusing its own files.
+
+    UV islands are rasterised from the whole loaded vehicle so each texture is
+    annotated over its full UV domain; artifacts are written to a per-vehicle
+    folder beside the exported DAE.  Annotation is diagnostic and needs OpenCV,
+    which the mesh transform never does.  Every failure is therefore reported in
+    the transform report instead of failing an export that has already succeeded.
+    """
+    texture_info = export_info.get("blender_texture")
+    wired_materials = (
+        texture_info.get("wired_materials")
+        if isinstance(texture_info, dict) and texture_info.get("enabled")
+        else None
+    )
+    if not wired_materials:
+        return {"enabled": False, "reason": "the preview export wired no textures"}
+
+    try:
+        _ensure_repo_root_on_sys_path()
+        import mesh_segmentation_transform.annotate_texture_regions  # noqa: F401
+        import mesh_segmentation_transform.extract_uv_island_paths  # noqa: F401
+    except ImportError as exc:
+        return {
+            "enabled": False,
+            "reason": (
+                "Annotating exported textures requires OpenCV. "
+                f"Install it with: python -m pip install opencv-python ({exc})"
+            ),
+        }
+
+    # The export deep-copies the loaded tree before pruning it, so the parsed
+    # source DAE still carries every geometry that shares the atlas.
+    source_root = loaded.tree.getroot()
+
+    try:
+        directory = _annotation_output_directory(output_dae, vehicle_name)
+    except OSError as exc:
+        return {"enabled": False, "reason": f"the annotation folder is unwritable: {exc}"}
+
+    materials: list[dict[str, object]] = []
+    for wired in wired_materials:
+        material_symbol = str(wired.get("material_symbol") or "")
+        texture_path = Path(str(wired.get("output_texture") or ""))
+        try:
+            materials.append(
+                _annotate_exported_texture(
+                    source_root,
+                    material_symbol,
+                    texture_path,
+                    directory,
+                )
+            )
+        except Exception as exc:  # one unusable material must not lose the others
+            materials.append(
+                {
+                    "material_symbol": material_symbol,
+                    "texture": str(texture_path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {
+        "enabled": True,
+        "uv_source_dae": str(loaded.path),
+        "uv_scope": "every geometry in the source DAE that uses the material",
+        "output_directory": str(directory),
+        "materials": materials,
+    }
+
+
+def _annotation_status_suffix(annotation_info: dict[str, object] | None) -> str:
+    """Summarise the annotation step for the single-line export status."""
+    if annotation_info is None:
+        return ""
+    if not annotation_info.get("enabled"):
+        return f"   (no texture annotation: {annotation_info.get('reason', 'unavailable')})"
+    materials = annotation_info.get("materials") or []
+    regions = sum(
+        int(material.get("annotated_region_count", 0))
+        for material in materials
+        if "error" not in material
+    )
+    failed = sum(1 for material in materials if "error" in material)
+    suffix = f"   annotated {regions:,} regions across {len(materials) - failed:,} textures"
+    if failed:
+        suffix += f" ({failed:,} failed; see the transform report)"
+    return suffix
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic exports
 # ---------------------------------------------------------------------------
 
@@ -5114,6 +5315,15 @@ class SymmetrySweepProbeApp(tk.Tk):
                     }
                     for binding in automatic_bindings
                 ]
+            annotation_info: dict[str, object] | None = None
+            if ANNOTATE_EXPORTED_TEXTURES:
+                annotation_info = annotate_exported_preview_textures(
+                    self.loaded,
+                    export_info,
+                    output,
+                    source_stem,
+                )
+                export_info["texture_annotation"] = annotation_info
             report_path = output.with_suffix(".transform.json")
             obj_path = output.with_suffix(".transform.obj")
             write_report(report_path, self.loaded, self.result, export_info)
@@ -5121,7 +5331,10 @@ class SymmetrySweepProbeApp(tk.Tk):
         except Exception:
             messagebox.showerror(APP_NAME, traceback.format_exc())
             return
-        self.status_var.set(f"Exported transformed selected-part DAE to {output}")
+        self.status_var.set(
+            f"Exported transformed selected-part DAE to {output}"
+            f"{_annotation_status_suffix(annotation_info)}"
+        )
 
     def destroy(self) -> None:
         archive = self.archive

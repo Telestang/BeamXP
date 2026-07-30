@@ -35,6 +35,7 @@ release/*
 !release/*.zip
 *.spec.bak
 mesh_segmentation_transform/segmentation_outputs/
+mesh_segmentation_transform/annotated_texture/
 beamng_file_tree.py
 spatial_classifier/.git_adopted_backup/
 spatial_classifier/.git_adopted_backup_from_old/
