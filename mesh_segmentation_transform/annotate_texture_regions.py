@@ -79,10 +79,10 @@ class MserConfig:
     max_aspect:                       float = 40.0  # default: 40.0
 
     # Grouping
-    merge_distance_px:              int  = 15  # default: 10
-    group_dilate_px:                int  = 3  # default: 3
+    merge_distance_px:              int  = 10  # default: 10
+    group_dilate_px:                int  = 8  # default: 3
     require_union_region_group:     bool = True  # default: False
-    min_group_union_region_px:      int  = 100  # default: 64
+    min_group_union_region_px:      int  = 169  # default: 64
     enable_group_area_filter:       bool = True  # default: True
     enable_group_degenerate_filter: bool = True  # default: True
 
@@ -120,6 +120,29 @@ class MserConfig:
     enable_background_edge_filter:     bool  = False  # default: True
     background_edge_threshold:         int   = 24  # default: 24
     max_background_edge_fraction:      float = 0.12  # default: 0.12
+
+    # UV/magic-wand post cleanup
+    enable_uv_magic_wand_refine:       bool  = True  # default: False
+    require_uv_magic_wand_refine:      bool  = True  # default: False
+    uv_island_mask_path:               str   = "mesh_segmentation_transform/segmentation_outputs/scintilla_interior_b.color.full_uv_filled_mask.png"  # black UV islands on white background
+    magic_wand_colour_thresh:          int   = 150  # default: 28
+    magic_wand_seed_attempts:          int   = 32  # default: 64
+    magic_wand_output_padding_px:      int   = 0  # default: 2
+    magic_wand_min_island_area_px:     int   = 12  # default: 4
+    magic_wand_noise_bg_std_weight:    float = 1.00  # default: 1.00
+    magic_wand_noise_bg_std_scale:     float = 24.0  # default: 24.0
+    magic_wand_noise_min_signal:       float = 8.0  # default: 8.0
+    magic_wand_noise_residual_weight:  float = 0.00  # default: 0.00
+    magic_wand_noise_denoise_h:        float = 10.0  # default: 10.0
+    magic_wand_noise_denoise_h_colour: float = 10.0  # default: 10.0
+    magic_wand_noise_denoise_template: int   = 7  # default: 7
+    magic_wand_noise_denoise_search:   int   = 21  # default: 21
+    enable_magic_wand_noise_filter:    bool  = True  # default: False
+    max_magic_wand_noise_score:        float = 1.0  # default: 0.50
+    enable_final_size_filter:          bool  = True  # default: False
+    final_min_width_px:                int   = 4  # default: 4
+    final_min_height_px:               int   = 4  # default: 4
+    final_min_area_px:                 int   = 36  # default: 36
 
     # Annotation drawing
     green_colour:    tuple[int, int, int] = (0, 255, 0)  # default: (0, 255, 0)
@@ -175,6 +198,41 @@ def load_image(path: Path) -> np.ndarray:
             f"supported by your OpenCV build."
         )
     return image
+
+
+def load_uv_island_mask(path: Path, image_shape: tuple[int, int]) -> np.ndarray:
+    """Load black-island-on-white UV mask as a boolean island mask."""
+    mask_image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if mask_image is None:
+        raise FileNotFoundError(f"UV island mask not found or unreadable: {path}")
+
+    height, width = image_shape[:2]
+    if mask_image.shape[:2] != (height, width):
+        mask_image = cv2.resize(
+            mask_image,
+            (width, height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return mask_image < 128
+
+
+def resolve_config_path(path_text: str) -> Path:
+    """Resolve config paths relative to cwd first, then repo root."""
+    path = Path(path_text)
+    if path.is_absolute() or path.is_file():
+        return path
+
+    script_root = Path(__file__).resolve().parent
+    repo_root = script_root.parent
+    repo_relative = repo_root / path
+    if repo_relative.is_file():
+        return repo_relative
+
+    script_relative = script_root / path
+    if script_relative.is_file():
+        return script_relative
+
+    return repo_relative
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +578,111 @@ def dominant_quantized_colour(pixels: np.ndarray, quant_step: int) -> np.ndarray
     g = remainder // levels
     r = remainder % levels
     return np.asarray((b, g, r), dtype=np.int32)
+
+
+def estimate_background_colour(
+    crop: np.ndarray,
+    domain_mask: np.ndarray,
+    colour_thresh: int,
+) -> np.ndarray | None:
+    """Estimate the dominant background BGR colour inside the current domain."""
+    domain_pixels = crop[domain_mask]
+    if len(domain_pixels) == 0:
+        return None
+
+    dominant_matches = dominant_colour_matches(
+        domain_pixels,
+        max(colour_thresh, 1),
+    )
+    if not bool(dominant_matches.any()):
+        return None
+
+    return np.median(domain_pixels[dominant_matches], axis=0).astype(np.int16)
+
+
+def background_colour_mask(
+    crop: np.ndarray,
+    domain_mask: np.ndarray,
+    background_colour: np.ndarray,
+    colour_thresh: int,
+) -> np.ndarray:
+    """Return domain pixels close enough to the estimated background colour."""
+    colour_delta = np.linalg.norm(crop.astype(np.int16) - background_colour, axis=2)
+    return (colour_delta <= max(colour_thresh, 0)) & domain_mask
+
+
+def magic_wand_noise_metrics(
+    crop: np.ndarray,
+    background_mask: np.ndarray,
+    signal_mask: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    config: MserConfig,
+) -> dict[str, float]:
+    """Return OpenCV-backed background-noise/glyph-contrast diagnostics."""
+    if not bool(background_mask.any()) or not bool(signal_mask.any()):
+        return {
+            "score": float("inf"),
+            "signal": 0.0,
+            "background_std": 0.0,
+            "denoise_residual": 0.0,
+        }
+
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    background_u8 = background_mask.astype(np.uint8)
+    bg_mean, bg_stddev = cv2.meanStdDev(lab, mask=background_u8)
+    bg_mean_vec = bg_mean.reshape(3).astype(np.float32)
+    bg_std = float(np.linalg.norm(bg_stddev.reshape(3)))
+
+    signal_pixels = lab[signal_mask].astype(np.float32)
+    signal_delta = np.linalg.norm(signal_pixels - bg_mean_vec, axis=1)
+    signal = float(np.median(signal_delta)) if len(signal_delta) > 0 else 0.0
+
+    denoise_residual = 0.0
+    if (
+        config.magic_wand_noise_residual_weight > 0.0
+        and crop.shape[0] >= 3
+        and crop.shape[1] >= 3
+    ):
+        template_window = max(int(config.magic_wand_noise_denoise_template), 1)
+        search_window = max(int(config.magic_wand_noise_denoise_search), 1)
+        if template_window % 2 == 0:
+            template_window += 1
+        if search_window % 2 == 0:
+            search_window += 1
+        try:
+            denoised = cv2.fastNlMeansDenoisingColored(
+                crop,
+                None,
+                float(config.magic_wand_noise_denoise_h),
+                float(config.magic_wand_noise_denoise_h_colour),
+                template_window,
+                search_window,
+            )
+            residual = cv2.absdiff(lab, cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB))
+            residual_pixels = residual[background_mask].astype(np.float32)
+            if len(residual_pixels) > 0:
+                denoise_residual = float(
+                    np.median(np.linalg.norm(residual_pixels, axis=1))
+                )
+        except cv2.error:
+            denoise_residual = 0.0
+
+    weighted_noise = (
+        bg_std * config.magic_wand_noise_bg_std_weight
+        + denoise_residual * config.magic_wand_noise_residual_weight
+    )
+    if signal < config.magic_wand_noise_min_signal:
+        score = float("inf")
+    else:
+        ratio_score = weighted_noise / max(signal, 0.001)
+        background_penalty = bg_std / max(config.magic_wand_noise_bg_std_scale, 0.001)
+        score = ratio_score + background_penalty
+    return {
+        "score": float(score),
+        "signal": signal,
+        "background_std": bg_std,
+        "denoise_residual": denoise_residual,
+    }
 
 
 def quantized_colour_matches(
@@ -1322,6 +1485,271 @@ def cleanup_groups(
     return cleanup_groups_by_background(image, groups, config)
 
 
+def group_domain_mask(
+    group: tuple[int, int, int, int],
+    uv_island_mask: np.ndarray,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Return UV-island domain within a group crop."""
+    clamped = clamp_group(group, uv_island_mask.shape)
+    if clamped is None:
+        return None
+    x, y, w, h = clamped
+    domain = uv_island_mask[y : y + h, x : x + w].copy()
+    if not bool(domain.any()):
+        return None
+    return domain, clamped
+
+
+def flood_background_component(
+    crop: np.ndarray,
+    domain_mask: np.ndarray,
+    seed: tuple[int, int],
+    background_colour: np.ndarray,
+    colour_thresh: int,
+) -> np.ndarray:
+    """Flood fill estimated-background-colour pixels from a valid seed."""
+    seed_x, seed_y = seed
+    if not domain_mask[seed_y, seed_x]:
+        return np.zeros(domain_mask.shape, dtype=bool)
+
+    allowed = background_colour_mask(
+        crop,
+        domain_mask,
+        background_colour,
+        colour_thresh,
+    )
+    if not allowed[seed_y, seed_x]:
+        return np.zeros(domain_mask.shape, dtype=bool)
+
+    flood_input = allowed.astype(np.uint8) * 255
+    mask = np.zeros((flood_input.shape[0] + 2, flood_input.shape[1] + 2), dtype=np.uint8)
+    cv2.floodFill(flood_input, mask, seed, 128)
+    return flood_input == 128
+
+
+def feature_bbox_from_background(
+    crop: np.ndarray,
+    background_component: np.ndarray,
+    domain_mask: np.ndarray,
+    config: MserConfig,
+) -> tuple[tuple[int, int, int, int], dict[str, float]] | None:
+    """Return padded bbox around all non-background islands in the domain."""
+    feature_mask = domain_mask & ~background_component
+    if not bool(feature_mask.any()):
+        return None
+
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        feature_mask.astype(np.uint8),
+        connectivity=8,
+    )
+    if num_labels <= 1:
+        return None
+
+    x0: int | None = None
+    y0: int | None = None
+    x1: int | None = None
+    y1: int | None = None
+    height, width = domain_mask.shape[:2]
+    min_area = max(config.magic_wand_min_island_area_px, 0)
+    signal_mask = np.zeros(feature_mask.shape, dtype=bool)
+    for label_id in range(1, num_labels):
+        x = int(stats[label_id, cv2.CC_STAT_LEFT])
+        y = int(stats[label_id, cv2.CC_STAT_TOP])
+        w = int(stats[label_id, cv2.CC_STAT_WIDTH])
+        h = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label_id, cv2.CC_STAT_AREA])
+        if x <= 0 or y <= 0 or x + w >= width or y + h >= height:
+            continue
+        if area < min_area:
+            continue
+        signal_mask[labels == label_id] = True
+        x0 = x if x0 is None else min(x0, x)
+        y0 = y if y0 is None else min(y0, y)
+        x1 = x + w if x1 is None else max(x1, x + w)
+        y1 = y + h if y1 is None else max(y1, y + h)
+
+    if x0 is None or y0 is None or x1 is None or y1 is None:
+        return None
+
+    feature_bbox = (x0, y0, x1 - x0, y1 - y0)
+    noise_metrics = magic_wand_noise_metrics(
+        crop,
+        background_component,
+        signal_mask,
+        feature_bbox,
+        config,
+    )
+
+    pad = max(config.magic_wand_output_padding_px, 0)
+    out_x0 = max(x0 - pad, 0)
+    out_y0 = max(y0 - pad, 0)
+    out_x1 = min(x1 + pad, width)
+    out_y1 = min(y1 + pad, height)
+    if out_x1 <= out_x0 or out_y1 <= out_y0:
+        return None
+    return (out_x0, out_y0, out_x1 - out_x0, out_y1 - out_y0), noise_metrics
+
+
+def refine_group_with_uv_magic_wand(
+    image: np.ndarray,
+    group: tuple[int, int, int, int],
+    uv_island_mask: np.ndarray,
+    config: MserConfig,
+    rng: np.random.Generator,
+) -> tuple[tuple[int, int, int, int], dict[str, float]] | None:
+    """Refine a group using UV-domain constrained random-seed magic wand."""
+    domain_result = group_domain_mask(group, uv_island_mask)
+    if domain_result is None:
+        return None
+
+    domain_mask, clamped = domain_result
+    x, y, w, h = clamped
+    crop = image[y : y + h, x : x + w]
+    background_colour = estimate_background_colour(
+        crop,
+        domain_mask,
+        config.magic_wand_colour_thresh,
+    )
+    if background_colour is None:
+        return None
+
+    seed_mask = background_colour_mask(
+        crop,
+        domain_mask,
+        background_colour,
+        config.magic_wand_colour_thresh,
+    )
+    seed_points = np.argwhere(seed_mask)
+    if len(seed_points) == 0:
+        return None
+
+    attempts = min(max(config.magic_wand_seed_attempts, 1), len(seed_points))
+    seed_indices = rng.choice(len(seed_points), size=attempts, replace=False)
+    best: tuple[
+        tuple[int, int, int],
+        tuple[int, int, int, int],
+        dict[str, float],
+    ] | None = None
+    for seed_index in seed_indices:
+        seed_y, seed_x = (int(value) for value in seed_points[int(seed_index)])
+        background = flood_background_component(
+            crop,
+            domain_mask,
+            (seed_x, seed_y),
+            background_colour,
+            config.magic_wand_colour_thresh,
+        )
+        if not bool(background.any()):
+            continue
+        bg_ys, bg_xs = np.where(background)
+        bg_w = int(bg_xs.max() - bg_xs.min() + 1)
+        bg_h = int(bg_ys.max() - bg_ys.min() + 1)
+        bg_area = int(background.sum())
+        bbox_result = feature_bbox_from_background(
+            crop,
+            background,
+            domain_mask,
+            config,
+        )
+        if bbox_result is None:
+            continue
+        bbox, noise_metrics = bbox_result
+        bx, by, bw, bh = bbox
+        score = (max(bg_w, bg_h), min(bg_w, bg_h), bg_area)
+        if best is None or score > best[0]:
+            best = (score, (x + bx, y + by, bw, bh), noise_metrics)
+
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def refine_groups_with_uv_magic_wand(
+    image: np.ndarray,
+    groups: list[tuple[int, int, int, int]],
+    config: MserConfig,
+) -> tuple[list[tuple[int, int, int, int]], int, int, list[dict[str, float] | None]]:
+    """Apply UV-domain magic-wand refinement to groups when configured."""
+    if not config.enable_uv_magic_wand_refine or not config.uv_island_mask_path:
+        return groups, 0, 0, [None] * len(groups)
+
+    uv_mask = load_uv_island_mask(resolve_config_path(config.uv_island_mask_path), image.shape)
+    rng = np.random.default_rng(0)
+    refined: list[tuple[tuple[int, int, int, int], dict[str, float] | None]] = []
+    changed = 0
+    discarded = 0
+    for group in groups:
+        candidate = refine_group_with_uv_magic_wand(
+            image,
+            group,
+            uv_mask,
+            config,
+            rng,
+        )
+        if candidate is None:
+            if config.require_uv_magic_wand_refine:
+                discarded += 1
+                continue
+            refined.append((group, None))
+            continue
+        candidate_group, noise_metrics = candidate
+        refined.append((candidate_group, noise_metrics))
+        if candidate_group != group:
+            changed += 1
+
+    refined.sort(key=lambda item: (item[0][1], item[0][0]))
+    return [item[0] for item in refined], changed, discarded, [item[1] for item in refined]
+
+
+def filter_groups_by_magic_wand_noise(
+    groups: list[tuple[int, int, int, int]],
+    noise_metrics: list[dict[str, float] | None],
+    config: MserConfig,
+) -> tuple[list[tuple[int, int, int, int]], list[dict[str, float] | None], int]:
+    """Drop refined groups whose diagnostic noise score is above threshold."""
+    if not config.enable_magic_wand_noise_filter:
+        return groups, noise_metrics, 0
+
+    filtered_groups: list[tuple[int, int, int, int]] = []
+    filtered_metrics: list[dict[str, float] | None] = []
+    rejected = 0
+    for group, metrics in zip(groups, noise_metrics):
+        if metrics is not None and metrics["score"] > config.max_magic_wand_noise_score:
+            rejected += 1
+            continue
+        filtered_groups.append(group)
+        filtered_metrics.append(metrics)
+
+    return filtered_groups, filtered_metrics, rejected
+
+
+def filter_groups_by_final_size(
+    groups: list[tuple[int, int, int, int]],
+    noise_metrics: list[dict[str, float] | None],
+    config: MserConfig,
+) -> tuple[list[tuple[int, int, int, int]], list[dict[str, float] | None], int]:
+    """Drop remaining groups that are too small to be useful detections."""
+    if not config.enable_final_size_filter:
+        return groups, noise_metrics, 0
+
+    filtered_groups: list[tuple[int, int, int, int]] = []
+    filtered_metrics: list[dict[str, float] | None] = []
+    rejected = 0
+    for group, metrics in zip(groups, noise_metrics):
+        _x, _y, w, h = group
+        if (
+            w < config.final_min_width_px
+            or h < config.final_min_height_px
+            or w * h < config.final_min_area_px
+        ):
+            rejected += 1
+            continue
+        filtered_groups.append(group)
+        filtered_metrics.append(metrics)
+
+    return filtered_groups, filtered_metrics, rejected
+
+
 # ---------------------------------------------------------------------------
 # Annotation drawing
 # ---------------------------------------------------------------------------
@@ -1395,6 +1823,27 @@ def annotate_texture(
     boxes = detect_mser_boxes(grey, config)
     candidate_groups = group_boxes(boxes, grey.shape, config)
     groups, adjusted_groups = cleanup_groups(bgr, candidate_groups, config)
+    cleaned_group_count = len(groups)
+    (
+        groups,
+        uv_magic_wand_adjusted,
+        uv_magic_wand_discarded,
+        noise_metrics,
+    ) = refine_groups_with_uv_magic_wand(
+        bgr,
+        groups,
+        config,
+    )
+    groups, noise_metrics, magic_wand_noise_rejected = filter_groups_by_magic_wand_noise(
+        groups,
+        noise_metrics,
+        config,
+    )
+    groups, noise_metrics, final_size_rejected = filter_groups_by_final_size(
+        groups,
+        noise_metrics,
+        config,
+    )
     annotated = draw_annotations(bgr, groups, config)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1412,11 +1861,22 @@ def annotate_texture(
         "mser_boxes": len(boxes),
         "candidate_groups": len(candidate_groups),
         "background_filter_enabled": config.require_distinct_background,
-        "background_rejected": len(candidate_groups) - len(groups),
+        "background_rejected": len(candidate_groups) - cleaned_group_count,
         "cleanup_adjusted": adjusted_groups,
+        "uv_magic_wand_adjusted": uv_magic_wand_adjusted,
+        "uv_magic_wand_discarded": uv_magic_wand_discarded,
+        "magic_wand_noise_rejected": magic_wand_noise_rejected,
+        "final_size_rejected": final_size_rejected,
         "grouped_regions": len(groups),
         "groups": [
-            {"x": x, "y": y, "w": w, "h": h} for x, y, w, h in groups
+            {
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "noise_metrics": group_noise_metrics,
+            }
+            for (x, y, w, h), group_noise_metrics in zip(groups, noise_metrics)
         ],
     }
 
@@ -1493,7 +1953,11 @@ def main() -> None:
         print(
             f"{summary['candidate_groups']} candidate groups, "
             f"{summary['background_rejected']} rejected by background filter, "
-            f"{summary['cleanup_adjusted']} adjusted"
+            f"{summary['cleanup_adjusted']} adjusted, "
+            f"{summary['uv_magic_wand_adjusted']} UV/magic-wand refined, "
+            f"{summary['uv_magic_wand_discarded']} discarded without UV/magic-wand, "
+            f"{summary['magic_wand_noise_rejected']} rejected by magic-wand noise, "
+            f"{summary['final_size_rejected']} rejected by final size"
         )
     else:
         print(f"{summary['candidate_groups']} candidate groups, background filter off")
@@ -1501,9 +1965,19 @@ def main() -> None:
     print(f"elapsed: {elapsed_ms:.1f} ms")
 
     for index, group in enumerate(summary["groups"], start=1):
+        noise_metrics = group["noise_metrics"]
+        if noise_metrics is None:
+            noise_text = "n/a"
+        else:
+            noise_text = (
+                f"{noise_metrics['score']:.3f} "
+                f"signal={noise_metrics['signal']:.1f} "
+                f"bgstd={noise_metrics['background_std']:.1f} "
+                f"resid={noise_metrics['denoise_residual']:.1f}"
+            )
         print(
             f"  [{index:3d}]  x={group['x']:5d}  y={group['y']:5d}  "
-            f"w={group['w']:4d}  h={group['h']:4d}"
+            f"w={group['w']:4d}  h={group['h']:4d}  noise={noise_text}"
         )
 
 
