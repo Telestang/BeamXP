@@ -81,7 +81,6 @@ class MserConfig:
     # Grouping
     merge_distance_px:              int  = 10  # default: 10
     group_dilate_px:                int  = 8  # default: 3
-    require_union_region_group:     bool = True  # default: False
     min_group_union_region_px:      int  = 169  # default: 64
     enable_group_area_filter:       bool = True  # default: True
     enable_group_degenerate_filter: bool = True  # default: True
@@ -89,60 +88,30 @@ class MserConfig:
     # Final bounding-box padding around each group
     bbox_padding_px: int = 0  # default: 0
 
-    # Final cleanup
-    require_distinct_background:       bool  = True  # default: True
-
-    require_continuous_border:         bool  = False  # default: True
-    enable_border_repair:              bool  = False  # default: True
-    enable_circular_border_repair:     bool  = False  # default: True
-    border_var_thesh:                  int   = 28  # default: 8
-    border_width_px:                   int   = 3  # default: 3
-    min_border_colour_fraction:        float = 0.70  # default: 0.70
-    max_border_gap_px:                 int   = 3  # default: 3
-    border_adjust_inward_fraction:     float = 0.25  # default: 0.25
-    border_adjust_outward_fraction:    float = 0.5  # default: 0.25
-    border_adjust_coarse_step_px:      int   = 3  # default: 3
-    border_adjust_refine_candidates:   int   = 12  # default: 12
-
-    enable_background_ring_filter:     bool  = False  # default: True
-    background_quant_step:             int   = 16  # default: 16
-    background_ring_fraction:          float = 0.18  # default: 0.18
-    min_background_ring_fraction:      float = 0.45  # default: 0.45
-
-    enable_background_region_filter:   bool  = False  # default: True
-    min_background_region_fraction:    float = 0.30  # default: 0.30
-
-    enable_foreground_fraction_filter: bool  = False  # default: True
-    foreground_distance_px:            int   = 38  # default: 38
-    min_foreground_fraction:           float = 0.01  # default: 0.01
-    max_foreground_fraction:           float = 0.70  # default: 0.70
-    
-    enable_background_edge_filter:     bool  = False  # default: True
-    background_edge_threshold:         int   = 24  # default: 24
-    max_background_edge_fraction:      float = 0.12  # default: 0.12
-
     # UV/magic-wand post cleanup
     enable_uv_magic_wand_refine:       bool  = True  # default: False
     require_uv_magic_wand_refine:      bool  = True  # default: False
     uv_island_mask_path:               str   = "mesh_segmentation_transform/segmentation_outputs/scintilla_interior_b.color.full_uv_filled_mask.png"  # black UV islands on white background
-    magic_wand_colour_thresh:          int   = 150  # default: 28
+    magic_wand_colour_thresh:          int   = 100  # default: 28
     magic_wand_seed_attempts:          int   = 32  # default: 64
     magic_wand_output_padding_px:      int   = 0  # default: 2
     magic_wand_min_island_area_px:     int   = 12  # default: 4
     magic_wand_noise_bg_std_weight:    float = 1.00  # default: 1.00
     magic_wand_noise_bg_std_scale:     float = 24.0  # default: 24.0
     magic_wand_noise_min_signal:       float = 8.0  # default: 8.0
-    magic_wand_noise_residual_weight:  float = 0.00  # default: 0.00
-    magic_wand_noise_denoise_h:        float = 10.0  # default: 10.0
-    magic_wand_noise_denoise_h_colour: float = 10.0  # default: 10.0
-    magic_wand_noise_denoise_template: int   = 7  # default: 7
-    magic_wand_noise_denoise_search:   int   = 21  # default: 21
     enable_magic_wand_noise_filter:    bool  = True  # default: False
     max_magic_wand_noise_score:        float = 1.0  # default: 0.50
     enable_final_size_filter:          bool  = True  # default: False
     final_min_width_px:                int   = 4  # default: 4
     final_min_height_px:               int   = 4  # default: 4
     final_min_area_px:                 int   = 36  # default: 36
+    enable_final_single_colour_filter: bool  = True  # default: False
+    final_single_colour_quant_step:    int   = 12  # default: 12
+    final_single_colour_fraction:      float = 0.98  # default: 0.98
+    enable_final_offset_background_filter: bool = True  # default: False
+    final_offset_background_width_px:      int  = 2  # default: 2
+    final_offset_background_colour_tol:    int  = 32  # default: 32
+    final_offset_background_min_fraction:  float = 0.70  # default: 0.70
 
     # Annotation drawing
     green_colour:    tuple[int, int, int] = (0, 255, 0)  # default: (0, 255, 0)
@@ -285,69 +254,6 @@ def detect_mser_boxes(
     return np.asarray(boxes, dtype=np.int32)
 
 
-# ---------------------------------------------------------------------------
-# Spatial grouping via mask flood
-# ---------------------------------------------------------------------------
-
-
-def legacy_mask_group_boxes(
-    boxes: np.ndarray,
-    image_shape: tuple[int, int],
-    config: MserConfig,
-) -> list[tuple[int, int, int, int]]:
-    """Merge nearby boxes with the previous expanded-mask connected components."""
-    if len(boxes) == 0:
-        return []
-
-    height, width = image_shape[:2]
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    margin = config.merge_distance_px
-    for x, y, w, h in boxes:
-        x0 = max(x - margin, 0)
-        y0 = max(y - margin, 0)
-        x1 = min(x + w + margin, width)
-        y1 = min(y + h + margin, height)
-        mask[y0:y1, x0:x1] = 255
-
-    if config.group_dilate_px > 0:
-        kernel_size = config.group_dilate_px * 2 + 1
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (kernel_size, kernel_size)
-        )
-        mask = cv2.dilate(mask, kernel, iterations=1)
-
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
-    )
-
-    pad = config.bbox_padding_px
-    groups: list[tuple[int, int, int, int]] = []
-    for label_id in range(1, num_labels):  # skip background (0)
-        x = int(stats[label_id, cv2.CC_STAT_LEFT])
-        y = int(stats[label_id, cv2.CC_STAT_TOP])
-        w = int(stats[label_id, cv2.CC_STAT_WIDTH])
-        h = int(stats[label_id, cv2.CC_STAT_HEIGHT])
-
-        # Reject groups that are essentially the whole image (background leak)
-        if config.enable_group_area_filter and (
-            w * h > image_shape[0] * image_shape[1] * config.max_area_fraction
-        ):
-            continue
-        # Reject degenerate single-pixel noise groups
-        if config.enable_group_degenerate_filter and (w < 4 or h < 4):
-            continue
-
-        x0 = max(x - pad, 0)
-        y0 = max(y - pad, 0)
-        x1 = min(x + w + pad, width)
-        y1 = min(y + h + pad, height)
-        groups.append((x0, y0, x1 - x0, y1 - y0))
-
-    groups.sort(key=lambda g: (g[1], g[0]))
-    return groups
-
-
 def expanded_box(
     box: tuple[int, int, int, int],
     distance: int,
@@ -446,13 +352,11 @@ def group_boxes(
     config: MserConfig,
 ) -> list[tuple[int, int, int, int]]:
     """Merge bounding boxes into coherent text/symbol groups."""
-    if config.require_union_region_group:
-        return union_region_group_boxes(boxes, image_shape, config)
-    return legacy_mask_group_boxes(boxes, image_shape, config)
+    return union_region_group_boxes(boxes, image_shape, config)
 
 
 # ---------------------------------------------------------------------------
-# Final cleanup
+# Geometry and colour helpers
 # ---------------------------------------------------------------------------
 
 
@@ -472,96 +376,6 @@ def clamp_group(
     return (x0, y0, x1 - x0, y1 - y0)
 
 
-def ordered_border_pixels(crop: np.ndarray, border_width: int) -> np.ndarray:
-    """Return border pixels in perimeter order, outer ring first."""
-    height, width = crop.shape[:2]
-    rings: list[np.ndarray] = []
-
-    for inset in range(border_width):
-        top = inset
-        left = inset
-        bottom = height - 1 - inset
-        right = width - 1 - inset
-        if top > bottom or left > right:
-            break
-
-        if top == bottom:
-            rings.append(crop[top, left : right + 1])
-            continue
-        if left == right:
-            rings.append(crop[top : bottom + 1, left])
-            continue
-
-        rings.extend(
-            (
-                crop[top, left : right + 1],
-                crop[top + 1 : bottom + 1, right],
-                crop[bottom, left:right][::-1],
-                crop[top + 1 : bottom, left][::-1],
-            )
-        )
-
-    if not rings:
-        return np.empty((0, 3), dtype=crop.dtype)
-    return np.concatenate(rings, axis=0)
-
-
-def fill_short_false_runs(matches: np.ndarray, max_gap: int) -> np.ndarray:
-    """Bridge short mismatching gaps in a circular boolean sequence."""
-    if len(matches) == 0 or max_gap <= 0:
-        return matches
-
-    filled = matches.copy()
-    doubled = np.concatenate([matches, matches])
-    length = len(matches)
-    index = 0
-    while index < len(doubled):
-        if doubled[index]:
-            index += 1
-            continue
-
-        start = index
-        while index < len(doubled) and not doubled[index]:
-            index += 1
-        end = index
-
-        if end - start <= max_gap:
-            before = start > 0 and doubled[start - 1]
-            after = end < len(doubled) and doubled[end]
-            if before and after:
-                for doubled_index in range(start, end):
-                    filled[doubled_index % length] = True
-
-    return filled
-
-
-def longest_circular_true_run_fraction(matches: np.ndarray) -> float:
-    """Return longest contiguous true run as a fraction of sequence length."""
-    if len(matches) == 0:
-        return 0.0
-    if bool(matches.all()):
-        return 1.0
-
-    doubled = np.concatenate([matches, matches])
-    best = 0
-    current = 0
-    for value in doubled:
-        if value:
-            current += 1
-            best = min(max(best, current), len(matches))
-        else:
-            current = 0
-    return best / len(matches)
-
-
-def dominant_colour_matches(pixels: np.ndarray, quant_step: int) -> np.ndarray:
-    """Return mask for pixels matching the dominant quantized BGR colour."""
-    quant_step = max(quant_step, 1)
-    quantized = (pixels // quant_step).astype(np.int32)
-    dominant_bin = dominant_quantized_colour(pixels, quant_step)
-    return np.all(quantized == dominant_bin, axis=1)
-
-
 def dominant_quantized_colour(pixels: np.ndarray, quant_step: int) -> np.ndarray:
     """Return the dominant quantized BGR colour bin for a pixel collection."""
     quant_step = max(quant_step, 1)
@@ -578,6 +392,14 @@ def dominant_quantized_colour(pixels: np.ndarray, quant_step: int) -> np.ndarray
     g = remainder // levels
     r = remainder % levels
     return np.asarray((b, g, r), dtype=np.int32)
+
+
+def dominant_colour_matches(pixels: np.ndarray, quant_step: int) -> np.ndarray:
+    """Return mask for pixels matching the dominant quantized BGR colour."""
+    quant_step = max(quant_step, 1)
+    quantized = (pixels // quant_step).astype(np.int32)
+    dominant_bin = dominant_quantized_colour(pixels, quant_step)
+    return np.all(quantized == dominant_bin, axis=1)
 
 
 def estimate_background_colour(
@@ -615,7 +437,6 @@ def magic_wand_noise_metrics(
     crop: np.ndarray,
     background_mask: np.ndarray,
     signal_mask: np.ndarray,
-    bbox: tuple[int, int, int, int],
     config: MserConfig,
 ) -> dict[str, float]:
     """Return OpenCV-backed background-noise/glyph-contrast diagnostics."""
@@ -624,7 +445,6 @@ def magic_wand_noise_metrics(
             "score": float("inf"),
             "signal": 0.0,
             "background_std": 0.0,
-            "denoise_residual": 0.0,
         }
 
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
@@ -637,852 +457,19 @@ def magic_wand_noise_metrics(
     signal_delta = np.linalg.norm(signal_pixels - bg_mean_vec, axis=1)
     signal = float(np.median(signal_delta)) if len(signal_delta) > 0 else 0.0
 
-    denoise_residual = 0.0
-    if (
-        config.magic_wand_noise_residual_weight > 0.0
-        and crop.shape[0] >= 3
-        and crop.shape[1] >= 3
-    ):
-        template_window = max(int(config.magic_wand_noise_denoise_template), 1)
-        search_window = max(int(config.magic_wand_noise_denoise_search), 1)
-        if template_window % 2 == 0:
-            template_window += 1
-        if search_window % 2 == 0:
-            search_window += 1
-        try:
-            denoised = cv2.fastNlMeansDenoisingColored(
-                crop,
-                None,
-                float(config.magic_wand_noise_denoise_h),
-                float(config.magic_wand_noise_denoise_h_colour),
-                template_window,
-                search_window,
-            )
-            residual = cv2.absdiff(lab, cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB))
-            residual_pixels = residual[background_mask].astype(np.float32)
-            if len(residual_pixels) > 0:
-                denoise_residual = float(
-                    np.median(np.linalg.norm(residual_pixels, axis=1))
-                )
-        except cv2.error:
-            denoise_residual = 0.0
-
-    weighted_noise = (
-        bg_std * config.magic_wand_noise_bg_std_weight
-        + denoise_residual * config.magic_wand_noise_residual_weight
-    )
     if signal < config.magic_wand_noise_min_signal:
         score = float("inf")
     else:
+        weighted_noise = bg_std * config.magic_wand_noise_bg_std_weight
         ratio_score = weighted_noise / max(signal, 0.001)
         background_penalty = bg_std / max(config.magic_wand_noise_bg_std_scale, 0.001)
         score = ratio_score + background_penalty
+
     return {
         "score": float(score),
         "signal": signal,
         "background_std": bg_std,
-        "denoise_residual": denoise_residual,
     }
-
-
-def quantized_colour_matches(
-    pixels: np.ndarray,
-    quantized_colour: np.ndarray,
-    quant_step: int,
-) -> np.ndarray:
-    """Return mask for pixels matching one shared quantized BGR colour bin."""
-    quant_step = max(quant_step, 1)
-    quantized = (pixels // quant_step).astype(np.int32)
-    return np.all(quantized == quantized_colour, axis=1)
-
-
-def continuous_border_colour_fraction(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> float:
-    """Return the longest continuous dominant-colour run around the border."""
-    clamped = clamp_group(group, image.shape)
-    if clamped is None:
-        return 0.0
-
-    x, y, w, h = clamped
-    crop = image[y : y + h, x : x + w]
-    if crop.size == 0:
-        return 0.0
-
-    border_width = min(
-        max(config.border_width_px, 1),
-        max(1, min(w, h) // 2),
-    )
-    border_pixels = ordered_border_pixels(crop, border_width)
-    if len(border_pixels) == 0:
-        return 0.0
-
-    matches = dominant_colour_matches(border_pixels, config.border_var_thesh)
-    matches = fill_short_false_runs(matches, config.max_border_gap_px)
-    return longest_circular_true_run_fraction(matches)
-
-
-def has_continuous_border(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> bool:
-    """Return whether a rectangle border has one continuous dominant-colour run."""
-    if not config.require_continuous_border:
-        return True
-    return (
-        continuous_border_colour_fraction(image, group, config)
-        >= config.min_border_colour_fraction
-    )
-
-
-def border_side_colour_fraction(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    side: str,
-    config: MserConfig,
-    shared_colour: np.ndarray | None = None,
-) -> float:
-    """Return continuous shared-colour fraction for one rectangle side."""
-    clamped = clamp_group(group, image.shape)
-    if clamped is None:
-        return 0.0
-
-    x, y, w, h = clamped
-    crop = image[y : y + h, x : x + w]
-    if crop.size == 0:
-        return 0.0
-
-    border_width = min(
-        max(config.border_width_px, 1),
-        max(1, min(w, h) // 2),
-    )
-    if side == "left":
-        pixels = crop[:, :border_width].reshape(-1, 3)
-    elif side == "right":
-        pixels = crop[:, -border_width:].reshape(-1, 3)
-    elif side == "top":
-        pixels = crop[:border_width, :].reshape(-1, 3)
-    elif side == "bottom":
-        pixels = crop[-border_width:, :].reshape(-1, 3)
-    else:
-        raise ValueError(f"Unknown border side: {side}")
-
-    if len(pixels) == 0:
-        return 0.0
-
-    colour = (
-        shared_colour
-        if shared_colour is not None
-        else dominant_quantized_colour(pixels, config.border_var_thesh)
-    )
-    matches = quantized_colour_matches(pixels, colour, config.border_var_thesh)
-    matches = fill_short_false_runs(matches, config.max_border_gap_px)
-    return longest_circular_true_run_fraction(matches)
-
-
-def border_side_pixels(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    side: str,
-    config: MserConfig,
-) -> np.ndarray:
-    """Return pixels sampled from one candidate rectangle border side."""
-    clamped = clamp_group(group, image.shape)
-    if clamped is None:
-        return np.empty((0, 3), dtype=image.dtype)
-
-    x, y, w, h = clamped
-    crop = image[y : y + h, x : x + w]
-    if crop.size == 0:
-        return np.empty((0, 3), dtype=image.dtype)
-
-    border_width = min(
-        max(config.border_width_px, 1),
-        max(1, min(w, h) // 2),
-    )
-    if side == "left":
-        return crop[:, :border_width].reshape(-1, 3)
-    if side == "right":
-        return crop[:, -border_width:].reshape(-1, 3)
-    if side == "top":
-        return crop[:border_width, :].reshape(-1, 3)
-    if side == "bottom":
-        return crop[-border_width:, :].reshape(-1, 3)
-    raise ValueError(f"Unknown border side: {side}")
-
-
-def border_sides_pass(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    sides: tuple[str, ...],
-    config: MserConfig,
-) -> bool:
-    """Return whether all requested sides share one continuous border colour."""
-    side_pixels = [
-        border_side_pixels(image, group, side, config)
-        for side in sides
-    ]
-    if not side_pixels or any(len(pixels) == 0 for pixels in side_pixels):
-        return False
-
-    shared_colour = dominant_quantized_colour(
-        np.concatenate(side_pixels, axis=0),
-        config.border_var_thesh,
-    )
-    return all(
-        border_side_colour_fraction(image, group, side, config, shared_colour)
-        >= config.min_border_colour_fraction
-        for side in sides
-    )
-
-
-def circular_border_pixels(
-    image: np.ndarray,
-    centre_x: float,
-    centre_y: float,
-    radius: int,
-    border_width: int,
-) -> np.ndarray:
-    """Return ordered pixels sampled from a circular border annulus."""
-    if radius < 1:
-        return np.empty((0, 3), dtype=image.dtype)
-
-    height, width = image.shape[:2]
-    border_width = max(border_width, 1)
-    sample_count = max(24, int(round(2 * np.pi * radius)))
-    angles = np.linspace(0.0, 2 * np.pi, sample_count, endpoint=False)
-    pixels: list[np.ndarray] = []
-
-    for angle in angles:
-        cos_a = float(np.cos(angle))
-        sin_a = float(np.sin(angle))
-        for radial_offset in range(border_width):
-            sample_radius = max(0, radius - radial_offset)
-            x = int(round(centre_x + cos_a * sample_radius))
-            y = int(round(centre_y + sin_a * sample_radius))
-            if 0 <= x < width and 0 <= y < height:
-                pixels.append(image[y, x])
-
-    if not pixels:
-        return np.empty((0, 3), dtype=image.dtype)
-    return np.asarray(pixels, dtype=image.dtype)
-
-
-def circular_border_colour_fraction(
-    image: np.ndarray,
-    centre_x: float,
-    centre_y: float,
-    radius: int,
-    config: MserConfig,
-) -> float:
-    """Return longest shared-colour run around a circular border."""
-    pixels = circular_border_pixels(
-        image,
-        centre_x,
-        centre_y,
-        radius,
-        config.border_width_px,
-    )
-    if len(pixels) == 0:
-        return 0.0
-
-    matches = dominant_colour_matches(pixels, config.border_var_thesh)
-    matches = fill_short_false_runs(matches, config.max_border_gap_px)
-    return longest_circular_true_run_fraction(matches)
-
-
-def circle_group(
-    centre_x: float,
-    centre_y: float,
-    radius: int,
-    image_shape: tuple[int, int],
-) -> tuple[int, int, int, int] | None:
-    """Return a clamped square group enclosing a circle."""
-    x0 = int(round(centre_x - radius))
-    y0 = int(round(centre_y - radius))
-    diameter = int(round(radius * 2))
-    return clamp_group((x0, y0, diameter, diameter), image_shape)
-
-
-def circle_radius_values(
-    base_radius: int,
-    config: MserConfig,
-) -> list[int]:
-    """Return candidate radii spanning inward and outward circular search."""
-    inward = max(0, int(round(base_radius * config.border_adjust_inward_fraction)))
-    outward = max(0, int(round(base_radius * config.border_adjust_outward_fraction)))
-    min_radius = max(2, base_radius - inward)
-    max_radius = max(min_radius, base_radius + outward)
-    return adjustment_values(min_radius, max_radius, config.border_adjust_coarse_step_px)
-
-
-def circular_border_candidates(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> list[tuple[int, int, int, int]]:
-    """Return circular border candidates as bounding-square groups."""
-    x, y, w, h = group
-    centre_x = x + w / 2.0
-    centre_y = y + h / 2.0
-    base_radius = max(2, int(round(max(w, h) / 2.0)))
-
-    coarse_radii = [
-        radius
-        for radius in circle_radius_values(base_radius, config)
-        if circular_border_colour_fraction(image, centre_x, centre_y, radius, config)
-        >= config.min_border_colour_fraction
-    ]
-    if not coarse_radii:
-        return []
-
-    refined_radii: set[int] = set()
-    min_radius = min(circle_radius_values(base_radius, config))
-    max_radius = max(circle_radius_values(base_radius, config))
-    for radius in coarse_radii:
-        refined_radii.update(
-            refined_adjustment_values(
-                radius,
-                min_radius,
-                max_radius,
-                config.border_adjust_coarse_step_px,
-            )
-        )
-
-    candidates: list[tuple[int, int, tuple[int, int, int, int]]] = []
-    for radius in sorted(refined_radii):
-        if (
-            circular_border_colour_fraction(image, centre_x, centre_y, radius, config)
-            < config.min_border_colour_fraction
-        ):
-            continue
-        candidate = circle_group(centre_x, centre_y, radius, image.shape)
-        if candidate is None or candidate[2] < 4 or candidate[3] < 4:
-            continue
-        candidates.append((abs(radius - base_radius), candidate[2] * candidate[3], candidate))
-
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    return [candidate for _distance, _area, candidate in candidates]
-
-
-def adjustment_values(min_offset: int, max_offset: int, coarse_step: int) -> list[int]:
-    """Return coarse offsets spanning the allowed adjustment range."""
-    coarse_step = max(coarse_step, 1)
-    if min_offset > max_offset:
-        min_offset, max_offset = max_offset, min_offset
-    values = set(range(min_offset, max_offset + 1, coarse_step))
-    values.update({min_offset, 0, max_offset})
-    return sorted(values)
-
-
-def refined_adjustment_values(
-    center: int,
-    min_offset: int,
-    max_offset: int,
-    coarse_step: int,
-) -> list[int]:
-    """Return 1 px offsets around one coarse adjustment."""
-    radius = max(coarse_step, 1) - 1
-    if min_offset > max_offset:
-        min_offset, max_offset = max_offset, min_offset
-    start = max(min_offset, center - radius)
-    end = min(max_offset, center + radius)
-    values = set(range(start, end + 1))
-    values.add(center)
-    return sorted(values)
-
-
-def edge_adjustment_bounds(
-    side: str,
-    base_size: int,
-    config: MserConfig,
-) -> tuple[int, int]:
-    """Return signed offset bounds for one edge.
-
-    Positive offsets move left/top inward but right/bottom outward.
-    """
-    inward = max(0, int(round(base_size * config.border_adjust_inward_fraction)))
-    outward = max(0, int(round(base_size * config.border_adjust_outward_fraction)))
-    if side in {"left", "top"}:
-        return -outward, inward
-    if side in {"right", "bottom"}:
-        return -inward, outward
-    raise ValueError(f"Unknown border side: {side}")
-
-
-def adjust_edge(
-    group: tuple[int, int, int, int],
-    side: str,
-    offset: int,
-    image_shape: tuple[int, int],
-) -> tuple[int, int, int, int] | None:
-    """Return a group with one edge moved by offset pixels."""
-    x, y, w, h = group
-    x0 = x
-    y0 = y
-    x1 = x + w
-    y1 = y + h
-
-    if side == "left":
-        x0 = x + offset
-    elif side == "right":
-        x1 = x + w + offset
-    elif side == "top":
-        y0 = y + offset
-    elif side == "bottom":
-        y1 = y + h + offset
-    else:
-        raise ValueError(f"Unknown border side: {side}")
-
-    return clamp_group((x0, y0, x1 - x0, y1 - y0), image_shape)
-
-
-def passing_edge_offsets(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    side: str,
-    offsets: list[int],
-    config: MserConfig,
-) -> list[int]:
-    """Return offsets where one adjusted edge has a continuous colour."""
-    passing: list[int] = []
-    for offset in offsets:
-        candidate = adjust_edge(group, side, offset, image.shape)
-        if candidate is None or candidate[2] < 4 or candidate[3] < 4:
-            continue
-        if border_sides_pass(image, candidate, (side,), config):
-            passing.append(offset)
-    return passing
-
-
-def ranked_offset_pairs(
-    start_offsets: list[int],
-    end_offsets: list[int],
-    base_size: int,
-    max_pairs: int,
-) -> list[tuple[int, int]]:
-    """Return edge-offset pairs ranked by smallest resulting size."""
-    pairs: list[tuple[int, int, int]] = []
-    for start_offset in start_offsets:
-        for end_offset in end_offsets:
-            size = base_size - start_offset + end_offset
-            if size >= 4:
-                pairs.append((size, start_offset, end_offset))
-
-    pairs.sort(key=lambda item: item[0])
-    return [(start, end) for _, start, end in pairs[: max(max_pairs, 1)]]
-
-
-def combine_horizontal_offsets(
-    group: tuple[int, int, int, int],
-    left_offset: int,
-    right_offset: int,
-    image_shape: tuple[int, int],
-) -> tuple[int, int, int, int] | None:
-    """Return a group with left and right edges adjusted together."""
-    x, y, w, h = group
-    return clamp_group(
-        (x + left_offset, y, w - left_offset + right_offset, h),
-        image_shape,
-    )
-
-
-def combine_vertical_offsets(
-    group: tuple[int, int, int, int],
-    top_offset: int,
-    bottom_offset: int,
-    image_shape: tuple[int, int],
-) -> tuple[int, int, int, int] | None:
-    """Return a group with top and bottom edges adjusted together."""
-    x, y, w, h = group
-    return clamp_group(
-        (x, y + top_offset, w, h - top_offset + bottom_offset),
-        image_shape,
-    )
-
-
-def width_candidates_to_vertical_border(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> list[tuple[int, int, int, int]]:
-    """Return width-adjusted candidates whose vertical borders are continuous."""
-    _, _, w, _ = group
-    left_min, left_max = edge_adjustment_bounds("left", w, config)
-    right_min, right_max = edge_adjustment_bounds("right", w, config)
-
-    left_coarse = passing_edge_offsets(
-        image,
-        group,
-        "left",
-        adjustment_values(left_min, left_max, config.border_adjust_coarse_step_px),
-        config,
-    )
-    right_coarse = passing_edge_offsets(
-        image,
-        group,
-        "right",
-        adjustment_values(right_min, right_max, config.border_adjust_coarse_step_px),
-        config,
-    )
-    coarse_pairs = ranked_offset_pairs(
-        left_coarse,
-        right_coarse,
-        w,
-        config.border_adjust_refine_candidates,
-    )
-    if not coarse_pairs:
-        return []
-
-    left_offsets: set[int] = set()
-    right_offsets: set[int] = set()
-    for left_center, right_center in coarse_pairs:
-        left_offsets.update(
-            refined_adjustment_values(
-                left_center,
-                left_min,
-                left_max,
-                config.border_adjust_coarse_step_px,
-            )
-        )
-        right_offsets.update(
-            refined_adjustment_values(
-                right_center,
-                right_min,
-                right_max,
-                config.border_adjust_coarse_step_px,
-            )
-        )
-
-    left_refined = passing_edge_offsets(
-        image,
-        group,
-        "left",
-        sorted(left_offsets),
-        config,
-    )
-    right_refined = passing_edge_offsets(
-        image,
-        group,
-        "right",
-        sorted(right_offsets),
-        config,
-    )
-
-    refined_candidates: list[tuple[int, tuple[int, int, int, int]]] = []
-    for left_offset, right_offset in ranked_offset_pairs(
-        left_refined,
-        right_refined,
-        w,
-        config.border_adjust_refine_candidates,
-    ):
-        candidate = combine_horizontal_offsets(
-            group,
-            left_offset,
-            right_offset,
-            image.shape,
-        )
-        if candidate is None or candidate[2] < 4:
-            continue
-        if border_sides_pass(image, candidate, ("left", "right"), config):
-            refined_candidates.append((candidate[2] * candidate[3], candidate))
-
-    refined_candidates.sort(key=lambda item: item[0])
-    return [candidate for _, candidate in refined_candidates]
-
-
-def adjust_width_to_vertical_border(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> tuple[int, int, int, int] | None:
-    """Adjust left/right edges until both vertical borders are continuous."""
-    candidates = width_candidates_to_vertical_border(image, group, config)
-    if not candidates:
-        return None
-    return candidates[0]
-
-
-def height_candidates_to_horizontal_border(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> list[tuple[int, int, int, int]]:
-    """Return height-adjusted candidates whose horizontal borders are continuous."""
-    _, _, _, h = group
-    top_min, top_max = edge_adjustment_bounds("top", h, config)
-    bottom_min, bottom_max = edge_adjustment_bounds("bottom", h, config)
-
-    top_coarse = passing_edge_offsets(
-        image,
-        group,
-        "top",
-        adjustment_values(top_min, top_max, config.border_adjust_coarse_step_px),
-        config,
-    )
-    bottom_coarse = passing_edge_offsets(
-        image,
-        group,
-        "bottom",
-        adjustment_values(bottom_min, bottom_max, config.border_adjust_coarse_step_px),
-        config,
-    )
-    coarse_pairs = ranked_offset_pairs(
-        top_coarse,
-        bottom_coarse,
-        h,
-        config.border_adjust_refine_candidates,
-    )
-    if not coarse_pairs:
-        return []
-
-    top_offsets: set[int] = set()
-    bottom_offsets: set[int] = set()
-    for top_center, bottom_center in coarse_pairs:
-        top_offsets.update(
-            refined_adjustment_values(
-                top_center,
-                top_min,
-                top_max,
-                config.border_adjust_coarse_step_px,
-            )
-        )
-        bottom_offsets.update(
-            refined_adjustment_values(
-                bottom_center,
-                bottom_min,
-                bottom_max,
-                config.border_adjust_coarse_step_px,
-            )
-        )
-
-    top_refined = passing_edge_offsets(
-        image,
-        group,
-        "top",
-        sorted(top_offsets),
-        config,
-    )
-    bottom_refined = passing_edge_offsets(
-        image,
-        group,
-        "bottom",
-        sorted(bottom_offsets),
-        config,
-    )
-
-    refined_candidates: list[tuple[int, tuple[int, int, int, int]]] = []
-    for top_offset, bottom_offset in ranked_offset_pairs(
-        top_refined,
-        bottom_refined,
-        h,
-        config.border_adjust_refine_candidates,
-    ):
-        candidate = combine_vertical_offsets(
-            group,
-            top_offset,
-            bottom_offset,
-            image.shape,
-        )
-        if candidate is None or candidate[3] < 4:
-            continue
-        if border_sides_pass(image, candidate, ("top", "bottom"), config):
-            refined_candidates.append((candidate[2] * candidate[3], candidate))
-
-    refined_candidates.sort(key=lambda item: item[0])
-    return [candidate for _, candidate in refined_candidates]
-
-
-def adjust_height_to_horizontal_border(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> tuple[int, int, int, int] | None:
-    """Adjust top/bottom edges until both horizontal borders are continuous."""
-    candidates = height_candidates_to_horizontal_border(image, group, config)
-    if not candidates:
-        return None
-    return candidates[0]
-
-
-def adjust_group_to_continuous_border(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-    require_distinct_background: bool = False,
-) -> tuple[int, int, int, int] | None:
-    """Repair width then height to find a continuous-border candidate."""
-    if has_continuous_border(image, group, config) and (
-        not require_distinct_background
-        or has_distinct_background(image, group, config)
-    ):
-        return group
-
-    if not config.enable_border_repair:
-        return None
-
-    for width_adjusted in width_candidates_to_vertical_border(image, group, config):
-        for height_adjusted in height_candidates_to_horizontal_border(
-            image,
-            width_adjusted,
-            config,
-        ):
-            if not has_continuous_border(image, height_adjusted, config):
-                continue
-            if require_distinct_background and not has_distinct_background(
-                image,
-                height_adjusted,
-                config,
-            ):
-                continue
-            return height_adjusted
-
-    if config.enable_circular_border_repair:
-        for circle_adjusted in circular_border_candidates(image, group, config):
-            if require_distinct_background and not has_distinct_background(
-                image,
-                circle_adjusted,
-                config,
-            ):
-                continue
-            return circle_adjusted
-
-    return None
-
-
-def has_distinct_background(
-    image: np.ndarray,
-    group: tuple[int, int, int, int],
-    config: MserConfig,
-) -> bool:
-    """Return whether a group looks like markings on a stable background."""
-    if not config.require_distinct_background:
-        return True
-
-    x, y, w, h = group
-    if w <= 0 or h <= 0:
-        return False
-
-    crop = image[y : y + h, x : x + w]
-    if crop.size == 0:
-        return False
-
-    ring_width = max(2, int(round(min(w, h) * config.background_ring_fraction)))
-    ring_width = min(ring_width, max(1, min(w, h) // 2))
-
-    ring_mask = np.zeros((h, w), dtype=bool)
-    ring_mask[:ring_width, :] = True
-    ring_mask[-ring_width:, :] = True
-    ring_mask[:, :ring_width] = True
-    ring_mask[:, -ring_width:] = True
-
-    ring_pixels = crop[ring_mask]
-    if len(ring_pixels) == 0:
-        return False
-
-    quant_step = max(config.background_quant_step, 1)
-    quantized_ring = (ring_pixels // quant_step).astype(np.int16)
-    bins, counts = np.unique(
-        quantized_ring.reshape(-1, 3), axis=0, return_counts=True
-    )
-    dominant_index = int(np.argmax(counts))
-    dominant_bin = bins[dominant_index]
-    ring_fraction = float(counts[dominant_index]) / len(ring_pixels)
-    if (
-        config.enable_background_ring_filter
-        and ring_fraction < config.min_background_ring_fraction
-    ):
-        return False
-
-    quantized_crop = (crop // quant_step).astype(np.int16)
-    background_mask = np.all(quantized_crop == dominant_bin, axis=2)
-    background_fraction = float(background_mask.mean())
-    if (
-        config.enable_background_region_filter
-        and background_fraction < config.min_background_region_fraction
-    ):
-        return False
-
-    crop_int = crop.astype(np.int16)
-    horizontal_delta = np.linalg.norm(
-        crop_int[:, 1:, :] - crop_int[:, :-1, :], axis=2
-    )
-    vertical_delta = np.linalg.norm(
-        crop_int[1:, :, :] - crop_int[:-1, :, :], axis=2
-    )
-    horizontal_ring = ring_mask[:, 1:] & ring_mask[:, :-1]
-    vertical_ring = ring_mask[1:, :] & ring_mask[:-1, :]
-    edge_threshold = max(config.background_edge_threshold, 1)
-    edge_count = int((horizontal_delta[horizontal_ring] >= edge_threshold).sum())
-    edge_count += int((vertical_delta[vertical_ring] >= edge_threshold).sum())
-    edge_total = int(horizontal_ring.sum() + vertical_ring.sum())
-    if edge_total > 0:
-        edge_fraction = edge_count / edge_total
-        if (
-            config.enable_background_edge_filter
-            and edge_fraction > config.max_background_edge_fraction
-        ):
-            return False
-
-    if not config.enable_foreground_fraction_filter:
-        return True
-
-    background_pixels = crop[background_mask]
-    if len(background_pixels) == 0:
-        return False
-
-    background_colour = np.median(background_pixels, axis=0).astype(np.float32)
-    colour_distance = np.linalg.norm(
-        crop.astype(np.float32) - background_colour, axis=2
-    )
-    foreground_fraction = float(
-        (colour_distance >= config.foreground_distance_px).mean()
-    )
-
-    return (
-        config.min_foreground_fraction
-        <= foreground_fraction
-        <= config.max_foreground_fraction
-    )
-
-
-def cleanup_groups_by_background(
-    image: np.ndarray,
-    groups: list[tuple[int, int, int, int]],
-    config: MserConfig,
-) -> tuple[list[tuple[int, int, int, int]], int]:
-    """Apply border repair and background validation to completed groups."""
-    if not config.require_distinct_background:
-        return groups, 0
-
-    cleaned_groups: list[tuple[int, int, int, int]] = []
-    adjusted_count = 0
-    for group in groups:
-        candidate = adjust_group_to_continuous_border(
-            image,
-            group,
-            config,
-            require_distinct_background=True,
-        )
-        if candidate is None:
-            continue
-        cleaned_groups.append(candidate)
-        if candidate != group:
-            adjusted_count += 1
-
-    return cleaned_groups, adjusted_count
-
-
-def cleanup_groups(
-    image: np.ndarray,
-    groups: list[tuple[int, int, int, int]],
-    config: MserConfig,
-) -> tuple[list[tuple[int, int, int, int]], int]:
-    """Apply final post-group cleanup."""
-    return cleanup_groups_by_background(image, groups, config)
 
 
 def group_domain_mask(
@@ -1571,12 +558,10 @@ def feature_bbox_from_background(
     if x0 is None or y0 is None or x1 is None or y1 is None:
         return None
 
-    feature_bbox = (x0, y0, x1 - x0, y1 - y0)
     noise_metrics = magic_wand_noise_metrics(
         crop,
         background_component,
         signal_mask,
-        feature_bbox,
         config,
     )
 
@@ -1654,6 +639,9 @@ def refine_group_with_uv_magic_wand(
         if bbox_result is None:
             continue
         bbox, noise_metrics = bbox_result
+        noise_metrics["background_b"] = float(background_colour[0])
+        noise_metrics["background_g"] = float(background_colour[1])
+        noise_metrics["background_r"] = float(background_colour[2])
         bx, by, bw, bh = bbox
         score = (max(bg_w, bg_h), min(bg_w, bg_h), bg_area)
         if best is None or score > best[0]:
@@ -1750,6 +738,143 @@ def filter_groups_by_final_size(
     return filtered_groups, filtered_metrics, rejected
 
 
+def dominant_colour_fraction(crop: np.ndarray, quant_step: int) -> float:
+    """Return fraction of pixels in the dominant quantized colour bin."""
+    pixels = crop.reshape(-1, 3)
+    if len(pixels) == 0:
+        return 1.0
+
+    quant_step = max(quant_step, 1)
+    quantized = (pixels // quant_step).astype(np.int32)
+    levels = (255 // quant_step) + 1
+    if levels**3 > 1_000_000:
+        _bins, counts = np.unique(quantized.reshape(-1, 3), axis=0, return_counts=True)
+        return float(counts.max()) / len(pixels)
+
+    codes = (quantized[:, 0] * levels + quantized[:, 1]) * levels + quantized[:, 2]
+    counts = np.bincount(codes)
+    return float(counts.max()) / len(pixels)
+
+
+def filter_groups_by_single_colour(
+    image: np.ndarray,
+    groups: list[tuple[int, int, int, int]],
+    noise_metrics: list[dict[str, float] | None],
+    config: MserConfig,
+) -> tuple[list[tuple[int, int, int, int]], list[dict[str, float] | None], int]:
+    """Drop final groups that are effectively one flat colour."""
+    if not config.enable_final_single_colour_filter:
+        return groups, noise_metrics, 0
+
+    filtered_groups: list[tuple[int, int, int, int]] = []
+    filtered_metrics: list[dict[str, float] | None] = []
+    rejected = 0
+    for group, metrics in zip(groups, noise_metrics):
+        clamped = clamp_group(group, image.shape)
+        if clamped is None:
+            rejected += 1
+            continue
+        x, y, w, h = clamped
+        crop = image[y : y + h, x : x + w]
+        flat_fraction = dominant_colour_fraction(
+            crop,
+            config.final_single_colour_quant_step,
+        )
+        if flat_fraction >= config.final_single_colour_fraction:
+            rejected += 1
+            continue
+        filtered_groups.append(group)
+        filtered_metrics.append(metrics)
+
+    return filtered_groups, filtered_metrics, rejected
+
+
+def offset_background_fraction(
+    image: np.ndarray,
+    group: tuple[int, int, int, int],
+    background_colour: np.ndarray,
+    offset_width: int,
+    colour_tolerance: int,
+) -> float:
+    """Return fraction of outward offset-ring pixels matching background colour."""
+    ring_width = max(offset_width, 1)
+    x, y, w, h = group
+    expanded = clamp_group(
+        (x - ring_width, y - ring_width, w + ring_width * 2, h + ring_width * 2),
+        image.shape,
+    )
+    inner = clamp_group(group, image.shape)
+    if expanded is None or inner is None:
+        return 0.0
+
+    ex, ey, ew, eh = expanded
+    ix, iy, iw, ih = inner
+    crop = image[ey : ey + eh, ex : ex + ew]
+    ring_mask = np.ones((eh, ew), dtype=bool)
+
+    inner_x0 = max(ix - ex, 0)
+    inner_y0 = max(iy - ey, 0)
+    inner_x1 = min(inner_x0 + iw, ew)
+    inner_y1 = min(inner_y0 + ih, eh)
+    ring_mask[inner_y0:inner_y1, inner_x0:inner_x1] = False
+
+    ring_pixels = crop[ring_mask]
+    if len(ring_pixels) == 0:
+        return 0.0
+
+    colour_delta = np.linalg.norm(
+        ring_pixels.astype(np.float32) - background_colour.astype(np.float32),
+        axis=1,
+    )
+    return float((colour_delta <= max(colour_tolerance, 0)).mean())
+
+
+def filter_groups_by_offset_background(
+    image: np.ndarray,
+    groups: list[tuple[int, int, int, int]],
+    noise_metrics: list[dict[str, float] | None],
+    config: MserConfig,
+) -> tuple[list[tuple[int, int, int, int]], list[dict[str, float] | None], int]:
+    """Drop groups whose outward ring does not match detected background colour."""
+    if not config.enable_final_offset_background_filter:
+        return groups, noise_metrics, 0
+
+    filtered_groups: list[tuple[int, int, int, int]] = []
+    filtered_metrics: list[dict[str, float] | None] = []
+    rejected = 0
+    for group, metrics in zip(groups, noise_metrics):
+        if metrics is None or not all(
+            key in metrics for key in ("background_b", "background_g", "background_r")
+        ):
+            rejected += 1
+            continue
+
+        background_colour = np.asarray(
+            (
+                metrics["background_b"],
+                metrics["background_g"],
+                metrics["background_r"],
+            ),
+            dtype=np.float32,
+        )
+        coverage = offset_background_fraction(
+            image,
+            group,
+            background_colour,
+            config.final_offset_background_width_px,
+            config.final_offset_background_colour_tol,
+        )
+        metrics["offset_background_fraction"] = coverage
+        if coverage < config.final_offset_background_min_fraction:
+            rejected += 1
+            continue
+
+        filtered_groups.append(group)
+        filtered_metrics.append(metrics)
+
+    return filtered_groups, filtered_metrics, rejected
+
+
 # ---------------------------------------------------------------------------
 # Annotation drawing
 # ---------------------------------------------------------------------------
@@ -1821,9 +946,8 @@ def annotate_texture(
     grey = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
     boxes = detect_mser_boxes(grey, config)
-    candidate_groups = group_boxes(boxes, grey.shape, config)
-    groups, adjusted_groups = cleanup_groups(bgr, candidate_groups, config)
-    cleaned_group_count = len(groups)
+    groups = group_boxes(boxes, grey.shape, config)
+    candidate_group_count = len(groups)
     (
         groups,
         uv_magic_wand_adjusted,
@@ -1844,6 +968,20 @@ def annotate_texture(
         noise_metrics,
         config,
     )
+    groups, noise_metrics, final_single_colour_rejected = filter_groups_by_single_colour(
+        bgr,
+        groups,
+        noise_metrics,
+        config,
+    )
+    groups, noise_metrics, final_offset_background_rejected = (
+        filter_groups_by_offset_background(
+            bgr,
+            groups,
+            noise_metrics,
+            config,
+        )
+    )
     annotated = draw_annotations(bgr, groups, config)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1859,14 +997,13 @@ def annotate_texture(
         "output": str(output_path),
         "image_size": f"{bgr.shape[1]}x{bgr.shape[0]}",
         "mser_boxes": len(boxes),
-        "candidate_groups": len(candidate_groups),
-        "background_filter_enabled": config.require_distinct_background,
-        "background_rejected": len(candidate_groups) - cleaned_group_count,
-        "cleanup_adjusted": adjusted_groups,
+        "candidate_groups": candidate_group_count,
         "uv_magic_wand_adjusted": uv_magic_wand_adjusted,
         "uv_magic_wand_discarded": uv_magic_wand_discarded,
         "magic_wand_noise_rejected": magic_wand_noise_rejected,
         "final_size_rejected": final_size_rejected,
+        "final_single_colour_rejected": final_single_colour_rejected,
+        "final_offset_background_rejected": final_offset_background_rejected,
         "grouped_regions": len(groups),
         "groups": [
             {
@@ -1949,18 +1086,15 @@ def main() -> None:
         f"{summary['mser_boxes']} MSER boxes → "
         f"{summary['grouped_regions']} annotated groups"
     )
-    if summary["background_filter_enabled"]:
-        print(
-            f"{summary['candidate_groups']} candidate groups, "
-            f"{summary['background_rejected']} rejected by background filter, "
-            f"{summary['cleanup_adjusted']} adjusted, "
-            f"{summary['uv_magic_wand_adjusted']} UV/magic-wand refined, "
-            f"{summary['uv_magic_wand_discarded']} discarded without UV/magic-wand, "
-            f"{summary['magic_wand_noise_rejected']} rejected by magic-wand noise, "
-            f"{summary['final_size_rejected']} rejected by final size"
-        )
-    else:
-        print(f"{summary['candidate_groups']} candidate groups, background filter off")
+    print(
+        f"{summary['candidate_groups']} candidate groups, "
+        f"{summary['uv_magic_wand_adjusted']} UV/magic-wand refined, "
+        f"{summary['uv_magic_wand_discarded']} discarded without UV/magic-wand, "
+        f"{summary['magic_wand_noise_rejected']} rejected by magic-wand noise, "
+        f"{summary['final_size_rejected']} rejected by final size, "
+        f"{summary['final_single_colour_rejected']} rejected as single colour, "
+        f"{summary['final_offset_background_rejected']} rejected by offset background"
+    )
     print(f"Wrote {summary['output']}")
     print(f"elapsed: {elapsed_ms:.1f} ms")
 
@@ -1973,7 +1107,7 @@ def main() -> None:
                 f"{noise_metrics['score']:.3f} "
                 f"signal={noise_metrics['signal']:.1f} "
                 f"bgstd={noise_metrics['background_std']:.1f} "
-                f"resid={noise_metrics['denoise_residual']:.1f}"
+                f"offsetbg={noise_metrics.get('offset_background_fraction', 0.0):.3f}"
             )
         print(
             f"  [{index:3d}]  x={group['x']:5d}  y={group['y']:5d}  "
