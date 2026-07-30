@@ -17,7 +17,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 from xml.etree import ElementTree as ET
 
 import numpy as np

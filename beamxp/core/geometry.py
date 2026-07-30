@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Iterable
+from collections.abc import Iterable
 
 from beamxp.core.constants import NUMBER_RE
 

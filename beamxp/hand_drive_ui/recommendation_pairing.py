@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from .shared import core
 from .recommendation_common import (
     SPATIAL_CONTACT_LIMIT,
     SPATIAL_PAIR_DISTANCE,
     SPATIAL_PAIR_MIN_OFFSET,
     _unscoped_contact_is_cabin_furniture,
 )
+from .shared import core
 
 
 def _passenger_footwell_forced(
@@ -24,6 +24,7 @@ def _passenger_footwell_forced(
     it does not itself grant admission or a verdict.
     """
     import math
+
     import numpy as np
 
     if frame.wheel_center is None:

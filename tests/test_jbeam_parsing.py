@@ -5,7 +5,6 @@ import unittest
 from beamxp import hand_drive_core as core
 from beamxp import transform_helpers as th
 
-
 # Stock content ships part keys with a stray comma between the colon and the
 # brace ("bluebuck_bumper_F":, {...}); the game's lenient parser accepts it.
 STRAY_COMMA_PART = """
@@ -178,7 +177,8 @@ class SlotFitmentAndNoneTests(unittest.TestCase):
     WHEEL = '"acme_wheel": {\n"slotType": "acme_wheel",\n}'
 
     def _index(self):
-        body = "{" + ",\n".join([self.ROOT, self.MIRROR, self.I4, self.V8, self.WHEEL]) + "}"
+        parts = (self.ROOT, self.MIRROR, self.I4, self.V8, self.WHEEL)
+        body = "{" + ",".join(parts) + "}"
         return core.build_part_body_index({"vehicles/acme/a.jbeam": body})
 
     def _resolve(self, parts):
@@ -223,22 +223,28 @@ class SlotFitmentAndNoneTests(unittest.TestCase):
 class SlotPathKeyTests(unittest.TestCase):
     # The same slot id (plate) appears under two different parents; a .pc keys
     # its pick by full path so the two are distinguishable (miramar's ute plate).
-    PARTS = [
-        '"veh": {\n"slotType": "main",\n"slots": [\n'
-        '    ["type", "default", "description"],\n'
-        '    ["body", "body", "Body"],\n'
-        "]\n}",
-        '"body": {\n"slotType": "body",\n"slots": [\n'
-        '    ["type", "default", "description"],\n'
-        '    ["plate", "", "Body Plate"],\n'
-        '    ["tailgate", "tailgate", "Tailgate"],\n'
-        "]\n}",
-        '"tailgate": {\n"slotType": "tailgate",\n"slots": [\n'
-        '    ["type", "default", "description"],\n'
-        '    ["plate", "", "Tailgate Plate"],\n'
-        "]\n}",
+    PARTS = (
+        (
+            '"veh": {\n"slotType": "main",\n"slots": [\n'
+            '    ["type", "default", "description"],\n'
+            '    ["body", "body", "Body"],\n'
+            "]\n}"
+        ),
+        (
+            '"body": {\n"slotType": "body",\n"slots": [\n'
+            '    ["type", "default", "description"],\n'
+            '    ["plate", "", "Body Plate"],\n'
+            '    ["tailgate", "tailgate", "Tailgate"],\n'
+            "]\n}"
+        ),
+        (
+            '"tailgate": {\n"slotType": "tailgate",\n"slots": [\n'
+            '    ["type", "default", "description"],\n'
+            '    ["plate", "", "Tailgate Plate"],\n'
+            "]\n}"
+        ),
         '"plate": {\n"slotType": "plate",\n}',
-    ]
+    )
 
     def _index(self):
         return core.build_part_body_index(

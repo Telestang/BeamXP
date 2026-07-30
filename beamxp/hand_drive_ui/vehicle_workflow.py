@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .shared import *
-from .recommendation_engine import build_mode_recommendations
 
 
 class VehicleWorkflowMixin:
@@ -48,7 +47,7 @@ class VehicleWorkflowMixin:
             and not (str(item.get("zip")) == zip_str and str(item.get("vehicleId")) == vehicle_id)
         ]
         deduped.insert(0, {"zip": zip_str, "vehicleId": vehicle_id})
-        self.settings["recentVehicles"] = deduped[:MODEL_HISTORY_LIMIT]
+        self.settings["recentVehicles"] = deduped
 
     def _prune_recent_vehicle(self, source_zip: Path, vehicle_id: str) -> None:
         zip_str = str(source_zip)

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from .shared import *
-from .windowing import WindowingMixin
+from .build_and_preview import BuildAndPreviewMixin
 from .layout import LayoutMixin
-from .vehicle_workflow import VehicleWorkflowMixin
-from .variant_workflow import VariantWorkflowMixin
+from .part_editing import PartEditingMixin
 from .parts_workflow import PartsWorkflowMixin
 from .plates_workflow import PlatesWorkflowMixin
 from .recommendations_ui import RecommendationsUIMixin
-from .part_editing import PartEditingMixin
-from .build_and_preview import BuildAndPreviewMixin
+from .shared import *
+from .variant_workflow import VariantWorkflowMixin
+from .vehicle_workflow import VehicleWorkflowMixin
+from .windowing import WindowingMixin
 from .worker_handlers import WorkerHandlersMixin
 
 
@@ -135,7 +135,7 @@ class HandDriveToolApp(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generic BeamNG hand-drive visual conversion tool")
     parser.add_argument("--source", help="Vehicle source zip to open")
-    parser.add_argument("--vehicle", help="Vehicle model folder under vehicles/")
+    parser.add_argument("--vehicle", help="Vehicle catalog id to load from the source zip")
     parser.add_argument("--validate", action="store_true", help="Print detected inventory and exit")
     return parser.parse_args()
 

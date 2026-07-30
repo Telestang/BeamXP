@@ -7,7 +7,7 @@ Original source lines 3521-4068. Import the public orchestration module
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from collections.abc import Iterable
 from beamxp import transform_helpers
 from beamxp.core import mesh_resolution
 from beamxp.core.beam_json import (
@@ -149,14 +149,14 @@ def resolve_selected_parts(
     parts_order: list[str] = []
     selected_by_slot: dict[str, str] = {"main": main_part}
     selected_by_path: dict[str, str] = {"/": main_part}
-    part_slot_options: dict[str, tuple[str, ...]] = {main_part: tuple()}
+    part_slot_options: dict[str, tuple[str, ...]] = {main_part: ()}
     part_instances: list[dict[str, object]] = []
     cycles: list[dict[str, object]] = []
     instance_id_counts: dict[str, int] = {}
 
     queue: list[
         tuple[str, tuple[str, ...], str, str | None, str, tuple[str, ...]]
-    ] = [(main_part, tuple(), "/", None, "main", tuple())]
+    ] = [(main_part, (), "/", None, "main", ())]
 
     for slot_type, part_id in explicit_parts.items():
         if part_id and "/" not in slot_type:
@@ -276,7 +276,7 @@ def selected_parts_for_config(context: VehicleContext, config_name: str) -> dict
     selected = resolve_selected_parts(
         pc,
         context.jbeam_texts,
-        vehicle_id=context.vehicle_id,
+        vehicle_id=context.source_vehicle_id,
         part_body_index=context.part_body_index,
     )
     context.selected_parts_cache[config_name] = selected

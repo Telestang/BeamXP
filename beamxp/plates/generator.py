@@ -735,7 +735,7 @@ def build_font_atlas(font_path: Path, glyphs: set[str], spacing: int = 0, emboss
             "height": str(line_height),
             "xoffset": str(int(entry["l"])),
             "yoffset": "0",
-            "xadvance": str(int(round(entry["advance"])) + int(spacing)),
+            "xadvance": str(round(entry["advance"]) + int(spacing)),
             "page": "0",
             "chnl": "15",
         })
@@ -1325,7 +1325,7 @@ def render_plate_preview(
 
 def _design_key(cfg: dict[str, object], font_key: str) -> str:
     hashable = json.dumps({k: v for k, v in cfg.items() if k != "enabled"}, sort_keys=True, ensure_ascii=False)
-    digest = hashlib.sha1(f"{_ASSET_VERSION}|{font_key}|{hashable}".encode("utf-8"))
+    digest = hashlib.sha1(f"{_ASSET_VERSION}|{font_key}|{hashable}".encode())
     return digest.hexdigest()[:10]
 
 
@@ -1647,13 +1647,20 @@ def _emit_design(
             border_n_rel = f"{design_rel}/{border_n_name}"
             border_s_rel = f"{design_rel}/{border_s_name}"
 
-        def format_block(bg_stem: str, *, rear: bool) -> dict[str, object]:
+        def format_block(
+            bg_stem: str,
+            *,
+            rear: bool,
+            block_fmt: str = fmt,
+            block_border_n_rel: str | None = border_n_rel,
+            block_border_s_rel: str | None = border_s_rel,
+        ) -> dict[str, object]:
             """One format entry: background texture on disk + design JSON block."""
             bg_name = f"bg_{bg_stem.replace('-', '_')}_d.png"
-            _save_png(_render_background_for(cfg, fmt, font_path, rear=rear), design_dir / bg_name)
+            _save_png(_render_background_for(cfg, block_fmt, font_path, rear=rear), design_dir / bg_name)
             block: dict[str, object] = {
-                "size": {"x": _CANVAS[fmt][0], "y": _CANVAS[fmt][1]},
-                "text": _family_text_params(cfg, fmt, atlas.metrics),
+                "size": {"x": _CANVAS[block_fmt][0], "y": _CANVAS[block_fmt][1]},
+                "text": _family_text_params(cfg, block_fmt, atlas.metrics),
                 "characterLayout": f"{font_rel}/platefont.json",
                 "generator": generator_rel,
             }
@@ -1661,8 +1668,8 @@ def _emit_design(
                 f"{design_rel}/{bg_name}",
                 font_rel,
                 fill_style=_diffuse_fill_style(cfg, rear=rear),
-                bump_bg_rel=border_n_rel,
-                specular_bg_rel=border_s_rel,
+                bump_bg_rel=block_border_n_rel,
+                specular_bg_rel=block_border_s_rel,
             ))
             return block
 
@@ -1951,7 +1958,7 @@ def _model_plate_part_catalog(context) -> list[_ModelPlatePart]:
                 )
             )
     catalog.sort(key=lambda part: (part.rear, part.name.lower(), part.part_id.lower()))
-    setattr(context, "_bhdc_model_plate_parts", catalog)
+    context._bhdc_model_plate_parts = catalog
     return catalog
 
 
@@ -2019,7 +2026,7 @@ def _vanilla_plate_mesh_catalog(context) -> list[_VanillaPlateMesh]:
         for mesh, fmt in formats_by_mesh.items()
     ]
     catalog.sort(key=_vanilla_plate_mesh_sort_key)
-    setattr(context, "_bhdc_vanilla_plate_meshes", catalog)
+    context._bhdc_vanilla_plate_meshes = catalog
     return catalog
 
 
@@ -2034,7 +2041,7 @@ def _plate_slots_by_side_for_config(context, config_name: str) -> dict[str, list
     cache = getattr(context, "_bhdc_plate_slots_by_config", None)
     if not isinstance(cache, dict):
         cache = {}
-        setattr(context, "_bhdc_plate_slots_by_config", cache)
+        context._bhdc_plate_slots_by_config = cache
     cached = cache.get(config_name)
     if isinstance(cached, dict):
         return cached

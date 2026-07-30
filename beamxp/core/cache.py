@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import fields as dataclass_fields, replace as dataclass_replace
 import hashlib
 import json
 import os
 import pickle
+from collections.abc import Iterable
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
-from typing import Iterable
 
 from beamxp.core.constants import HAND_LHD, HAND_RHD, HAND_UNKNOWN
 from beamxp.core.dae import DaeObject
 from beamxp.core.files import common_zip_candidates, project_dir_for, write_text_file
 from beamxp.core.models import VehicleContext
 
-
 # Bump whenever context-building logic changes in a way that affects cached
 # VehicleContext content. Structural dataclass changes are also caught by the
 # field-name fingerprint.
-CONTEXT_CACHE_VERSION = 10
+CONTEXT_CACHE_VERSION = 11
 HAND_DETECTION_CACHE_VERSION = 1
 
 

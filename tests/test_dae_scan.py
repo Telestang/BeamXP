@@ -84,12 +84,14 @@ class ReachableCommonOrderTests(unittest.TestCase):
         # insertion order (and therefore preview sampling) vary per process.
         vehicle = {
             "acme": (
-                '"acme": {"slotType":"main","slots":[\n'
-                '["type","default","description"],\n'
-                '["zeta_slot","zeta_part",""],\n'
-                '["alpha_slot","alpha_part",""],\n'
-                '["mid_slot","mid_part",""],\n'
-                "]}",
+                (
+                    '"acme": {"slotType":"main","slots":[\n'
+                    '["type","default","description"],\n'
+                    '["zeta_slot","zeta_part",""],\n'
+                    '["alpha_slot","alpha_part",""],\n'
+                    '["mid_slot","mid_part",""],\n'
+                    "]}"
+                ),
                 "acme.jbeam",
             )
         }

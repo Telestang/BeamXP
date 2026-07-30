@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from .shared import core
+from .recommendation_classifier import _classify_meshes_for_trim
 from .recommendation_common import (
     _spatial_entries_for_trim,
     _spatial_surfaces_for_trim,
 )
-from .recommendation_classifier import _classify_meshes_for_trim
 from .recommendation_pairing import (
     _inherit_mounted_parts,
     _passenger_footwell_forced,
     _resolve_trim_pairs,
 )
+from .shared import core
 
 
 def build_mode_recommendations(
@@ -131,7 +131,7 @@ def build_mode_recommendations(
     emitted_pairs: set[frozenset] = set()
     requested = set(object_ids)
     for object_id in sorted(requested & set(memo)):
-        mode, reason, confidence, extra = memo[object_id]
+        mode, reason, confidence, _extra = memo[object_id]
         if mode in {"none", "functional_skip"}:
             continue
         if confidence == "low":
@@ -148,9 +148,12 @@ def build_mode_recommendations(
                 obj_a = context.objects.get(object_id)
                 obj_b = context.objects.get(twin)
                 first, second = object_id, twin
-                if obj_a is not None and obj_b is not None:
-                    if frame.side * obj_b.x > frame.side * obj_a.x:
-                        first, second = twin, object_id
+                if (
+                    obj_a is not None
+                    and obj_b is not None
+                    and frame.side * obj_b.x > frame.side * obj_a.x
+                ):
+                    first, second = twin, object_id
                 recommendations.append({
                     "kind": "pair",
                     "object_id": first,

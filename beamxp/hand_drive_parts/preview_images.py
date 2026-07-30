@@ -89,7 +89,7 @@ def converted_description(base_description: object, target_hand: str) -> str:
     if not description:
         return suffix[0].upper() + suffix[1:]
     lowered = description.lower()
-    if lowered.endswith(f" - {suffix.lower()}") or lowered.endswith(suffix.lower()):
+    if lowered.endswith((f" - {suffix.lower()}", suffix.lower())):
         return description
     return f"{description} - {suffix}"
 
@@ -100,9 +100,12 @@ def source_preview_path(source_zip: Path, vehicle_path: str, config_name: str) -
     with zipfile.ZipFile(source_zip) as zf:
         for name in zf.namelist():
             clean = name.replace("\\", "/")
-            if clean.lower().startswith(prefix) and Path(clean).suffix.lower() in preview_exts:
-                if clean.lower() == f"{prefix}{Path(clean).suffix.lower()}":
-                    return clean
+            if (
+                clean.lower().startswith(prefix)
+                and Path(clean).suffix.lower() in preview_exts
+                and clean.lower() == f"{prefix}{Path(clean).suffix.lower()}"
+            ):
+                return clean
     return None
 
 

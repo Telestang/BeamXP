@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 class PlateLibraryDialog(tk.Toplevel):
-    def __init__(self, app: "HandDriveToolApp") -> None:
+    def __init__(self, app: HandDriveToolApp) -> None:
         super().__init__(app)
         self.app = app
         self.title("Licence Plate Library")

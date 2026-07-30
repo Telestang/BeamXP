@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -9,7 +9,6 @@ import numpy as np
 from beamxp import hand_drive_core as core
 from beamxp import hand_drive_tool as tool
 from beamxp import spatial_visibility_backend
-
 
 # ---------------------------------------------------------------------------
 # Geometry fixtures
@@ -322,7 +321,7 @@ class ScopeTests(unittest.TestCase):
         )
         context = make_context(meshes)
         frame = core.driver_frame_for_context(context)
-        present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
+        _present, arrays = tool._spatial_entries_for_trim(context, None, set(meshes))
         stats = core.visibility_scan(arrays, frame.eye, set(), frame.forward)
 
         # This fuel-tank-like fixture is exposed in the spherical shell but

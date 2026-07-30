@@ -6,28 +6,171 @@ import re
 import shutil
 import sys
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from beamxp.core.constants import APP_SETTINGS_PATH, PROJECTS_DIR
 
 
-def vehicle_ids_in_zip(source_zip: Path) -> list[str]:
+@dataclass(frozen=True)
+class VehicleCatalogEntry:
+    vehicle_id: str
+    source_vehicle_id: str
+    config_names: tuple[str, ...] = ()
+
+
+def _direct_zip_files(names: list[str], vehicle_id: str, suffix: str) -> list[str]:
+    prefix = f"vehicles/{vehicle_id}/"
+    wanted = suffix.lower()
+    out: list[str] = []
+    for name in names:
+        clean = name.replace("\\", "/")
+        if not clean.startswith(prefix) or Path(clean).suffix.lower() != wanted:
+            continue
+        if "/" in clean[len(prefix) :]:
+            continue
+        out.append(clean)
+    return sorted(out)
+
+
+def _beamng_catalog_group_key(info: dict[str, object]) -> str:
+    for key in ("vehicleSelectorSubGroup", "vehicleSelectorSubCluster"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _selector_model_key(selector_key: str, source_vehicle_id: str) -> str:
+    pattern = rf"^vehiclesData\.{re.escape(source_vehicle_id)}(?:\.([^.]+))?\.vehicleSelectorSub(?:Group|Cluster)$"
+    match = re.match(pattern, selector_key)
+    if not match:
+        return ""
+    return str(match.group(1) or source_vehicle_id)
+
+
+def _shared_config_prefix(config_names: list[str]) -> str:
+    if not config_names:
+        return ""
+    split_names = [name.split("_") for name in config_names]
+    prefix: list[str] = []
+    for parts in zip(*split_names):
+        first = parts[0]
+        if all(part == first for part in parts):
+            prefix.append(first)
+        else:
+            break
+    return "_".join(prefix)
+
+
+def _catalog_vehicle_id(
+    source_vehicle_id: str,
+    selector_key: str,
+    config_names: list[str],
+) -> str:
+    model_key = _selector_model_key(selector_key, source_vehicle_id)
+    if not model_key:
+        return source_vehicle_id
+    if model_key == source_vehicle_id:
+        return source_vehicle_id
+    shared_prefix = _shared_config_prefix(config_names)
+    if shared_prefix and model_key.startswith(f"{shared_prefix}_"):
+        return shared_prefix
+    return model_key
+
+
+def vehicle_catalog_entries_in_zip(source_zip: Path) -> list[VehicleCatalogEntry]:
     vehicles: dict[str, set[str]] = {}
     with zipfile.ZipFile(source_zip) as zf:
-        for name in zf.namelist():
-            match = re.match(r"vehicles/([^/]+)/(.+)", name.replace("\\", "/"), re.IGNORECASE)
+        names = [name.replace("\\", "/") for name in zf.namelist()]
+        names_set = set(names)
+        for name in names:
+            match = re.match(r"vehicles/([^/]+)/(.+)", name, re.IGNORECASE)
             if not match:
                 continue
             vehicle_id, rest = match.groups()
             suffix = Path(rest).suffix.lower()
             if suffix in {".dae", ".pc", ".jbeam"}:
                 vehicles.setdefault(vehicle_id, set()).add(suffix)
-    return sorted(
-        vehicle_id
-        for vehicle_id, suffixes in vehicles.items()
-        if ".dae" in suffixes and (".pc" in suffixes or ".jbeam" in suffixes)
+
+        entries: list[VehicleCatalogEntry] = []
+        for source_vehicle_id in sorted(vehicles):
+            suffixes = vehicles[source_vehicle_id]
+            if ".dae" not in suffixes or (".pc" not in suffixes and ".jbeam" not in suffixes):
+                continue
+
+            pc_paths = _direct_zip_files(names, source_vehicle_id, ".pc")
+            grouped: dict[str, list[str]] = {}
+            ungrouped: list[str] = []
+            if pc_paths:
+                from beamxp.core.beam_json import load_info
+
+                for pc_path in pc_paths:
+                    config_name = Path(pc_path).stem
+                    info_candidates = (
+                        f"vehicles/{source_vehicle_id}/info_{config_name}.json",
+                        f"vehicles/{source_vehicle_id}/{config_name}.json",
+                    )
+                    info_path = next((candidate for candidate in info_candidates if candidate in names_set), None)
+                    group_key = ""
+                    if info_path is not None:
+                        try:
+                            group_key = _beamng_catalog_group_key(load_info(source_zip, info_path))
+                        except Exception:
+                            group_key = ""
+                    if group_key:
+                        grouped.setdefault(group_key, []).append(config_name)
+                    else:
+                        ungrouped.append(config_name)
+
+            if not grouped:
+                entries.append(VehicleCatalogEntry(source_vehicle_id, source_vehicle_id))
+                continue
+
+            used_ids: set[str] = set()
+            for group_key, config_names in sorted(grouped.items()):
+                vehicle_id = safe_project_segment(
+                    _catalog_vehicle_id(source_vehicle_id, group_key, sorted(config_names))
+                )
+                if vehicle_id in used_ids:
+                    vehicle_id = safe_project_segment(f"{source_vehicle_id}_{vehicle_id}")
+                used_ids.add(vehicle_id)
+                entries.append(
+                    VehicleCatalogEntry(
+                        vehicle_id=vehicle_id,
+                        source_vehicle_id=source_vehicle_id,
+                        config_names=tuple(sorted(config_names)),
+                    )
+                )
+            if ungrouped:
+                vehicle_id = source_vehicle_id
+                if vehicle_id in used_ids:
+                    vehicle_id = safe_project_segment(f"{source_vehicle_id}_other")
+                entries.append(
+                    VehicleCatalogEntry(
+                        vehicle_id=vehicle_id,
+                        source_vehicle_id=source_vehicle_id,
+                        config_names=tuple(sorted(ungrouped)),
+                    )
+                )
+        return sorted(entries, key=lambda entry: (entry.vehicle_id.lower(), entry.source_vehicle_id.lower()))
+
+
+def vehicle_catalog_entry_for_id(source_zip: Path, vehicle_id: str) -> VehicleCatalogEntry | None:
+    wanted = str(vehicle_id).lower()
+    return next(
+        (
+            entry
+            for entry in vehicle_catalog_entries_in_zip(source_zip)
+            if entry.vehicle_id.lower() == wanted
+        ),
+        None,
     )
+
+
+def vehicle_ids_in_zip(source_zip: Path) -> list[str]:
+    return [entry.vehicle_id for entry in vehicle_catalog_entries_in_zip(source_zip)]
 
 
 def safe_project_segment(value: object) -> str:

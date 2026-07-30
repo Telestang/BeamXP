@@ -7,7 +7,6 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-
 NS = {"c": "http://www.collada.org/2005/11/COLLADASchema"}
 
 PROP_FUNC_MESH_RE = re.compile(

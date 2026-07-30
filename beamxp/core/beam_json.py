@@ -62,7 +62,7 @@ def json_line_needs_comma(current: str, next_line: str) -> bool:
     next_line = next_line.strip()
     if not current or not next_line:
         return False
-    if current.endswith(",") or current.endswith("{") or current.endswith("["):
+    if current.endswith((",", "{", "[")):
         return False
     if next_line[0] in "]}":
         return False
@@ -107,14 +107,14 @@ def parse_beamng_json(text: str, *, label: str) -> dict[str, object]:
                 parsed, end = json.JSONDecoder().raw_decode(cleaned)
                 remainder = cleaned[end:].strip()
                 if remainder.strip("}").strip():
-                    raise second_error
+                    raise
             except json.JSONDecodeError:
                 raise RuntimeError(
                     f"Could not parse BeamNG config {label}: {second_error}. "
                     f"Initial strict JSON error was: {first_error}"
                 ) from second_error
     if not isinstance(parsed, dict):
-        raise RuntimeError(f"BeamNG config {label} did not parse to an object")
+        raise TypeError(f"BeamNG config {label} did not parse to an object")
     return parsed
 
 
@@ -144,6 +144,33 @@ def info_path_for_config(source_zip: Path, vehicle_id: str, config_name: str) ->
     return next((candidate for candidate in candidates if candidate in names), None)
 
 
+def humanize_config_key(value: str) -> str:
+    tokens = [token for token in re.split(r"[_\s-]+", value.strip()) if token]
+    out: list[str] = []
+    for token in tokens:
+        if token.isupper() or re.search(r"\d", token):
+            out.append(token)
+        elif len(token) == 1:
+            out.append(token.upper())
+        else:
+            out.append(token[:1].upper() + token[1:].lower())
+    return " ".join(out)
+
+
+def display_name_from_localization_key(value: str) -> str | None:
+    text = value.strip()
+    if not text.startswith("vehiclesData."):
+        return None
+    parts = [part for part in text.split(".") if part]
+    if len(parts) < 3:
+        return None
+    candidate = parts[-2] if parts[-1] in {"Configuration", "Name", "Description"} else parts[-1]
+    if candidate in {"Configuration", "Name", "Description"}:
+        return None
+    display = humanize_config_key(candidate)
+    return display or None
+
+
 def display_name_for(source_zip: Path, info_path: str | None, config_name: str) -> str:
     if info_path is None:
         return config_name
@@ -154,8 +181,9 @@ def display_name_for(source_zip: Path, info_path: str | None, config_name: str) 
     for key in ("Configuration", "Name", "name", "configuration"):
         value = info.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
-    return config_name
+            localized_fallback = display_name_from_localization_key(value)
+            return localized_fallback or value.strip()
+    return humanize_config_key(config_name) or config_name
 
 
 def zip_json_by_name(source_zip: Path, wanted_name: str) -> dict[str, object]:

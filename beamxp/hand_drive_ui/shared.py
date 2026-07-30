@@ -7,15 +7,14 @@ import re
 import subprocess
 import sys
 import threading
+import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
-import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
-from beamxp.model_preview import ModelPreview
 from beamxp import hand_drive_core as core
+from beamxp.model_preview import ModelPreview
 from beamxp.plates import generator as plate_generator
 from beamxp.plates.editor import PlateEditorDialog
 from beamxp.plates.library import PlateLibraryDialog
@@ -45,9 +44,6 @@ BLENDER_CANDIDATES = (
     Path(r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"),
     Path(r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"),
 )
-
-MODEL_HISTORY_LIMIT = 12
-
 
 def fmt_float(value: float | None) -> str:
     if value is None:
@@ -159,15 +155,45 @@ def app_icon_path() -> Path | None:
     return None
 
 __all__ = [
-    "argparse", "json", "queue", "re", "subprocess", "sys", "threading",
-    "ThreadPoolExecutor", "datetime", "Path", "filedialog", "messagebox",
-    "tk", "ttk", "ModelPreview", "core", "plate_generator",
-    "PlateEditorDialog", "PlateLibraryDialog", "mesh_preview",
-    "APP_ROOT", "THIS_DIR", "RESOURCE_DIR", "SOURCE_ROOT_DIR",
-    "BLENDER_PREVIEW_SCRIPT", "APP_ICON_NAME", "BLENDER_CANDIDATES",
-    "MODEL_HISTORY_LIMIT", "fmt_float", "position_labels", "yn_label",
-    "mode_label", "part_type_label", "MODE_CYCLE_VALUES",
-    "MODE_VALUES_BY_LABEL", "MODE_HOTKEYS", "BUILD_LABELS",
-    "STRUCTURAL_PROMPT_DELAY_MS", "offset_label", "offset_display",
-    "existing_initial_dir", "app_icon_path",
+    "APP_ICON_NAME",
+    "APP_ROOT",
+    "BLENDER_CANDIDATES",
+    "BLENDER_PREVIEW_SCRIPT",
+    "BUILD_LABELS",
+    "MODE_CYCLE_VALUES",
+    "MODE_HOTKEYS",
+    "MODE_VALUES_BY_LABEL",
+    "RESOURCE_DIR",
+    "SOURCE_ROOT_DIR",
+    "STRUCTURAL_PROMPT_DELAY_MS",
+    "THIS_DIR",
+    "ModelPreview",
+    "Path",
+    "PlateEditorDialog",
+    "PlateLibraryDialog",
+    "ThreadPoolExecutor",
+    "app_icon_path",
+    "argparse",
+    "core",
+    "datetime",
+    "existing_initial_dir",
+    "filedialog",
+    "fmt_float",
+    "json",
+    "mesh_preview",
+    "messagebox",
+    "mode_label",
+    "offset_display",
+    "offset_label",
+    "part_type_label",
+    "plate_generator",
+    "position_labels",
+    "queue",
+    "re",
+    "subprocess",
+    "sys",
+    "threading",
+    "tk",
+    "ttk",
+    "yn_label",
 ]

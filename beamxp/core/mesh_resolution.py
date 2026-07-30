@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 from beamxp import transform_helpers
 

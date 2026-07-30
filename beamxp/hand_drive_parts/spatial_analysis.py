@@ -12,7 +12,7 @@ import math
 import re
 import zipfile
 from dataclasses import dataclass
-from typing import Iterable
+from collections.abc import Iterable
 from xml.etree import ElementTree as ET
 import numpy as np
 from beamxp import spatial_visibility_backend
@@ -289,7 +289,7 @@ def camera_positions_for_config(
 def _driver_frame_core(
     context: VehicleContext,
     object_ids: Iterable[str] | None,
-) -> tuple[str | None, float, "np.ndarray | None"]:
+) -> tuple[str | None, float, np.ndarray | None]:
     """Config-independent parts of the driver frame: the steering-ref wheel id,
     the lateral centre, and the wheel's raw sample points.
 
@@ -324,7 +324,7 @@ def _assemble_driver_frame(
     eye: tuple[float, float, float] | None,
     wheel_id: str | None,
     center_x: float,
-    wheel_points: "np.ndarray | None",
+    wheel_points: np.ndarray | None,
 ) -> DriverFrame | None:
     """Build the DriverFrame from the eye plus the config-independent core.
 
@@ -801,7 +801,7 @@ def directional_verdict_backing(
     if not transformed or not foreground:
         return result
 
-    class_names = sorted(set(verdict_by_id[object_id] for object_id in transformed))
+    class_names = sorted({verdict_by_id[object_id] for object_id in transformed})
     class_index = {name: index for index, name in enumerate(class_names)}
     chunks = [points_by_id[object_id] for object_id in transformed]
     classes = np.concatenate([

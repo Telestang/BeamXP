@@ -10,7 +10,7 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 import numpy as np
 from beamxp import transform_helpers
 from beamxp.core import dae

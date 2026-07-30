@@ -12,7 +12,7 @@ import math
 import re
 import zipfile
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 from beamxp import transform_helpers
 from beamxp.core.beam_json import (
     add_missing_json_commas,
@@ -492,9 +492,7 @@ def part_fits_slot(part_slot_types: Iterable[str], slot: SlotDef) -> bool:
     allow = set(slot.allow_types) or {slot.slot_type}
     if types.isdisjoint(allow):
         return False
-    if slot.deny_types and not types.isdisjoint(slot.deny_types):
-        return False
-    return True
+    return not (slot.deny_types and not types.isdisjoint(slot.deny_types))
 
 
 def vector_from_row(
@@ -651,8 +649,7 @@ NODE_TRANSFORM_KEY_RE = re.compile(r'"(?P<key>node(?:Rotate|Offset|Move)(?P<inde
 
 def approximate_expression_number(value: str) -> float | None:
     text = value.strip()
-    if text.startswith("$="):
-        text = text[2:]
+    text = text.removeprefix("$=")
     try:
         return float(text)
     except ValueError:
@@ -807,7 +804,7 @@ def _safe_jbeam_ast_eval(node: ast.AST, values: dict[str, object]) -> object:
             elif isinstance(operator, ast.GtE):
                 ok = left >= right
             else:
-                raise ValueError("unsupported comparison")
+                raise TypeError("unsupported comparison")
             if not ok:
                 return False
             left = right
@@ -820,9 +817,9 @@ def _safe_jbeam_ast_eval(node: ast.AST, values: dict[str, object]) -> object:
             return args[1] if _lua_truthy(args[0]) else args[2]
         function = _EXPR_NAMESPACE.get(node.func.id)
         if not callable(function):
-            raise ValueError(f"unsupported function {node.func.id}")
+            raise TypeError(f"unsupported function {node.func.id}")
         return function(*args)
-    raise ValueError(f"unsupported expression node {type(node).__name__}")
+    raise TypeError(f"unsupported expression node {type(node).__name__}")
 
 
 def _evaluate_lua_expression(expression: str, variables: dict[str, object]) -> object:

@@ -18,8 +18,8 @@ import math
 import re
 import sys
 import traceback
-from xml.etree import ElementTree as ET
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 COLLADA_NS = "http://www.collada.org/2005/11/COLLADASchema"
 ET.register_namespace("", COLLADA_NS)
@@ -99,7 +99,7 @@ def prepare_dae_for_import(path: Path, aliases: dict[str, str], index: int, targ
 
 def node_aliases_for_payload(payload: dict) -> list[dict[str, str]]:
     dae_files = payload.get("dae_files", [])
-    aliases_by_dae: list[dict[str, str]] = [dict() for _entry in dae_files]
+    aliases_by_dae: list[dict[str, str]] = [{} for _entry in dae_files]
     for instance in payload.get("instances", []):
         try:
             dae_index = int(instance["dae"])
@@ -287,8 +287,10 @@ def write_notes(bpy, payload: dict, placed: int, missing: list) -> None:
         "BeamXP Full Vehicle Preview",
         "",
         f"Vehicle: {payload.get('vehicle_id')}",
-        f"Config: {payload.get('config_name')} -> {payload.get('output_name')} "
-        f"(target hand: {payload.get('target_hand')})",
+        (
+            f"Config: {payload.get('config_name')} -> {payload.get('output_name')} "
+            f"(target hand: {payload.get('target_hand')})"
+        ),
         f"Instances placed: {placed}",
         "",
         "Collections (this preview shows ONE config/variant):",

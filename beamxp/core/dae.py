@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import re
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 from xml.etree import ElementTree as ET
 
 import numpy as np
@@ -59,9 +59,8 @@ class DaeObject:
 
 
 def parse_dae(source_zip: Path, dae_path: str) -> ET.ElementTree:
-    with zipfile.ZipFile(source_zip) as zf:
-        with zf.open(dae_path) as fh:
-            return ET.parse(fh)
+    with zipfile.ZipFile(source_zip) as zf, zf.open(dae_path) as fh:
+        return ET.parse(fh)
 
 
 def dae_unit_scale(root: ET.Element) -> float:

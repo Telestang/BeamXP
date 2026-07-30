@@ -888,7 +888,7 @@ class GLRenderer:
         height = max(16, int(height))
         self._ensure_fbo(width, height)
 
-        view, proj, mvp = self._compute_view_proj(width, height, target, yaw, pitch, distance)
+        view, _proj, mvp = self._compute_view_proj(width, height, target, yaw, pitch, distance)
 
         fbo = self._fbo_ms or self._fbo
         fbo.use()
@@ -968,8 +968,6 @@ class GLRenderer:
         parts are never selectable. x, y use tk canvas coords (origin top-left)."""
         width = max(16, int(width))
         height = max(16, int(height))
-        x = int(round(x))
-        y = int(round(y))
         if not (0 <= x < width and 0 <= y < height):
             return None
         vao = self._vao_pick_stock if show_stock else self._vao_pick_conv

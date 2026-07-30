@@ -124,7 +124,7 @@ class PlateEditorDialog(tk.Toplevel):
 
     def __init__(
         self,
-        app: "HandDriveToolApp",
+        app: HandDriveToolApp,
         variant_name: str | None = None,
         *,
         set_id: str | None = None,

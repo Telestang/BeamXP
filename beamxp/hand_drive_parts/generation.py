@@ -13,7 +13,7 @@ import re
 import textwrap
 import zipfile
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 from xml.etree import ElementTree as ET
 from beamxp import transform_helpers
 from beamxp.core.beam_json import (
@@ -207,9 +207,7 @@ def generate_daes(
                     if mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
                         matrix_elem.text = transform_helpers.format_matrix(transform_helpers.mirror_matrix_x(parsed_matrix))
                     elif mode == MODE_TRANSLATE:
-                        if object_id in translated_prop_meshes:
-                            pass
-                        elif (
+                        if object_id in translated_prop_meshes or (
                             object_id in translated_flexbody_meshes
                             and object_id in jbeam_positioned_flexbodies
                         ):
@@ -735,7 +733,7 @@ def output_vehicle_preview_payload(
     selected = resolve_selected_parts(
         load_beamng_json_file(pc_path),
         combined_jbeam_texts,
-        vehicle_id=context.vehicle_id,
+        vehicle_id=context.source_vehicle_id,
         part_body_index=combined_part_index,
     )
     selected_nodes = selected_node_positions_for_parts(
@@ -866,7 +864,7 @@ def full_vehicle_preview_payload(
     selected = resolve_selected_parts(
         preview_pc,
         context.jbeam_texts,
-        vehicle_id=context.vehicle_id,
+        vehicle_id=context.source_vehicle_id,
         part_body_index=preview_part_index,
     )
     selected_nodes = selected_node_positions_for_parts(

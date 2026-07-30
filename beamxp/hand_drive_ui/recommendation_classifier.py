@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from .shared import core
 from .recommendation_common import (
     SPATIAL_PAIR_MIN_OFFSET,
     SPATIAL_PASSENGER_VISIBLE_FRACTION,
@@ -10,6 +9,7 @@ from .recommendation_common import (
     _is_enclosed_candidate,
     _mesh_symmetry,
 )
+from .shared import core
 
 
 def _classify_meshes_for_trim(
@@ -408,6 +408,14 @@ def _classify_meshes_for_trim(
             candidate_stats_ng: dict[str, float],
             candidate_passenger_stats: dict[str, float],
             candidate_passenger_stats_ng: dict[str, float],
+            *,
+            candidate_out80: float = out80,
+            candidate_half_width: float = half_width,
+            candidate_diagonal: float = diagonal,
+            candidate_ahead: float = ahead,
+            candidate_centroid: np.ndarray = centroid,
+            candidate_passenger_ahead: float = passenger_ahead,
+            candidate_in_cone: bool = in_cone,
         ) -> tuple[bool, bool, bool, bool, bool, bool]:
             visible = (
                 candidate_stats["front_vf"] >= SPATIAL_VISIBLE_FRACTION
@@ -418,32 +426,32 @@ def _classify_meshes_for_trim(
             )
             enclosed = _is_enclosed_candidate(
                 candidate_stats,
-                out80,
-                half_width,
+                candidate_out80,
+                candidate_half_width,
             )
             fitment = (
                 candidate_stats_ng["vf"] >= 0.12
-                and diagonal <= 0.60
-                and 0.15 <= ahead <= 1.5
-                and abs(float(centroid[2]) - frame.eye[2]) <= 0.7
-                and abs(float(centroid[0]) - cx0) >= half_width - 0.06
+                and candidate_diagonal <= 0.60
+                and 0.15 <= candidate_ahead <= 1.5
+                and abs(float(candidate_centroid[2]) - frame.eye[2]) <= 0.7
+                and abs(float(candidate_centroid[0]) - cx0) >= candidate_half_width - 0.06
             )
             passenger_fitment = (
                 candidate_passenger_stats_ng["vf"] >= 0.12
-                and diagonal <= 0.60
-                and 0.15 <= passenger_ahead <= 1.5
-                and abs(float(centroid[2]) - passenger_eye[2]) <= 0.7
-                and abs(float(centroid[0]) - cx0) >= half_width - 0.06
+                and candidate_diagonal <= 0.60
+                and 0.15 <= candidate_passenger_ahead <= 1.5
+                and abs(float(candidate_centroid[2]) - passenger_eye[2]) <= 0.7
+                and abs(float(candidate_centroid[0]) - cx0) >= candidate_half_width - 0.06
             )
             buried = (
                 candidate_stats["backed"] >= 0.75
                 and candidate_stats["depth"] <= 0.35
             )
             cone = (
-                in_cone
+                candidate_in_cone
                 and candidate_stats["depth"] <= 0.75
                 and candidate_stats["min_r"] <= SPATIAL_REACH_LIMIT
-                and (float(centroid[2]) >= floor_z - 0.10 or buried)
+                and (float(candidate_centroid[2]) >= floor_z - 0.10 or buried)
                 and (
                     candidate_stats["vf"] >= 0.45
                     or candidate_stats["min_r"] <= wheel_dist + 0.45

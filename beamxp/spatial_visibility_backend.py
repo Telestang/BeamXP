@@ -20,7 +20,6 @@ import threading
 
 import numpy as np
 
-
 SPATIAL_BACKEND_ENV = "BEAMXP_SPATIAL_BACKEND"
 
 

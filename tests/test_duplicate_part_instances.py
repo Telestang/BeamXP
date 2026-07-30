@@ -4,7 +4,6 @@ import unittest
 
 from beamxp import hand_drive_core as core
 
-
 ROOT = r"""
 "veh": {
     "slotType": "main",

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import unittest
-from tempfile import TemporaryDirectory
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from xml.etree import ElementTree as ET
 
 import numpy as np
 
 from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
-    ArchiveMaterialRecord,
     ArchiveMaterialPreviewLayer,
+    ArchiveMaterialRecord,
     ArchiveTextureBinding,
     DaePart,
     GeometryInstance,

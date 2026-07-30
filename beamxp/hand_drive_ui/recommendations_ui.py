@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .shared import *
 from .recommendation_engine import build_mode_recommendations
+from .shared import *
 
 
 class RecommendationsUIMixin:

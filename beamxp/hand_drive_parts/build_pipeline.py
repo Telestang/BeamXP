@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import shutil
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from beamxp.core.constants import (
     ACTION_OPPOSITE,
@@ -307,7 +307,7 @@ def build_batch(
     if isinstance(delta, dict):
         delta["steeringRefs"] = selected_steering_refs(conversion)
     embedded = copy.deepcopy(conversion)
-    embedded["builtAt"] = datetime.now().isoformat(timespec="seconds")
+    embedded["builtAt"] = datetime.now(UTC).isoformat(timespec="seconds")
     embedded["build"] = {
         "generatedConfigs": generated_configs,
         "outputs": output_plans,

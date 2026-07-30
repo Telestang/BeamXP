@@ -69,6 +69,7 @@ from beamxp.core.files import (
     read_json_file,
     safe_id,
     safe_project_segment,
+    vehicle_catalog_entry_for_id,
     vehicle_ids_in_zip,
     vehicle_prefix,
     write_bytes_file,
@@ -171,8 +172,10 @@ def load_vehicle_context(
     if not vehicle_ids:
         raise RuntimeError(f"No BeamNG vehicles with DAE/PC/JBeam files found in {source_zip}")
     selected_vehicle_id = vehicle_id or vehicle_ids[0]
-    if selected_vehicle_id not in vehicle_ids:
+    entry = vehicle_catalog_entry_for_id(source_zip, selected_vehicle_id)
+    if entry is None:
         raise RuntimeError(f"Vehicle {selected_vehicle_id!r} not found in {source_zip}")
+    source_vehicle_id = entry.source_vehicle_id
 
     if use_cache:
         cached = load_cached_vehicle_context(source_zip, selected_vehicle_id)
@@ -185,12 +188,12 @@ def load_vehicle_context(
     # Upfit bodies live under e.g. vehicles/us_semi/tanker/tanker.dae; without
     # the subdir DAEs those meshes (tanker, cargobox, dump, flatbed, ...) have no
     # geometry and vanish from the preview.
-    dae_paths = direct_vehicle_files(source_zip, selected_vehicle_id, ".dae")
-    for path in list_vehicle_files(source_zip, selected_vehicle_id, ".dae"):
+    dae_paths = direct_vehicle_files(source_zip, source_vehicle_id, ".dae")
+    for path in list_vehicle_files(source_zip, source_vehicle_id, ".dae"):
         if path not in dae_paths:
             dae_paths.append(path)
     if not dae_paths:
-        raise RuntimeError(f"No DAE files found for vehicles/{selected_vehicle_id}")
+        raise RuntimeError(f"No DAE files found for vehicles/{source_vehicle_id}")
 
     objects: dict[str, DaeObject] = {}
     preview_by_id: dict[str, dict[str, object]] = {}
@@ -205,9 +208,12 @@ def load_vehicle_context(
             preview_by_id.setdefault(object_id, preview)
 
     variants: dict[str, VariantInfo] = {}
-    for pc_path in direct_vehicle_files(source_zip, selected_vehicle_id, ".pc"):
+    allowed_configs = set(entry.config_names)
+    for pc_path in direct_vehicle_files(source_zip, source_vehicle_id, ".pc"):
         config_name = Path(pc_path).stem
-        info_path = info_path_for_config(source_zip, selected_vehicle_id, config_name)
+        if allowed_configs and config_name not in allowed_configs:
+            continue
+        info_path = info_path_for_config(source_zip, source_vehicle_id, config_name)
         display_name = display_name_for(source_zip, info_path, config_name)
         variants[config_name] = VariantInfo(
             name=config_name,
@@ -217,7 +223,7 @@ def load_vehicle_context(
         )
 
     jbeam_texts, part_body_index, node_positions = load_resolver_inputs(
-        source_zip, selected_vehicle_id
+        source_zip, source_vehicle_id
     )
     common_objects, common_previews, common_daes = load_common_dae_objects(
         source_zip,
@@ -258,7 +264,7 @@ def load_vehicle_context(
     context = VehicleContext(
         source_zip=source_zip,
         vehicle_id=selected_vehicle_id,
-        vehicle_path=vehicle_prefix(selected_vehicle_id),
+        vehicle_path=vehicle_prefix(source_vehicle_id),
         dae_paths=dae_paths + [path for path in common_daes if path not in dae_paths],
         variants=variants,
         objects=objects,

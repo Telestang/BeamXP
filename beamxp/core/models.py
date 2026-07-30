@@ -50,7 +50,7 @@ class BakedMeshSpec:
 
 @dataclass
 class SharedBakeContext:
-    context: "VehicleContext"
+    context: VehicleContext
     config_name: str
     target_hand: str
     source_part_id: str
@@ -91,6 +91,13 @@ class VehicleContext:
     selected_node_positions_cache: dict[str, dict[str, tuple[float, float, float]]] = field(default_factory=dict)
     part_array_cache: dict[tuple[str, str], str | None] = field(default_factory=dict)
     variant_hands_cache: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    @property
+    def source_vehicle_id(self) -> str:
+        parts = [part for part in self.vehicle_path.replace("\\", "/").split("/") if part]
+        if len(parts) >= 2 and parts[0].lower() == "vehicles":
+            return parts[1]
+        return self.vehicle_id
 
 
 @dataclass
