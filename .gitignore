@@ -56,3 +56,6 @@ examples/converted_mods/*.zip
 
 # Working docs / handover notes — kept local only.
 docs/
+
+# Generated RHD texture outputs (large binaries)
+rhd_textures/
