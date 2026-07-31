@@ -957,8 +957,7 @@ def union_region_group_candidates(
     if len(boxes) == 0:
         return []
 
-    image_shape = image.shape
-    height, width = image_shape[:2]
+    height, width = image.shape[:2]
     distance = max(0, config.merge_distance_px)
     min_union_area = max(1, config.min_group_union_region_px)
     box_tuples = [tuple(int(value) for value in box) for box in boxes]
@@ -988,36 +987,44 @@ def union_region_group_candidates(
             index = parent[index]
         return index
 
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root == right_root:
-            return
-        if island[left_root] != island[right_root]:
-            return
-        first = bounds[left_root]
-        second = bounds[right_root]
-        parent[right_root] = left_root
-        bounds[left_root] = (
+    def merge(root: int, other_root: int) -> None:
+        """Attach one resolved root to another, growing the surviving bounds."""
+        first = bounds[root]
+        second = bounds[other_root]
+        parent[other_root] = root
+        bounds[root] = (
             min(first[0], second[0]),
             min(first[1], second[1]),
             max(first[2], second[2]),
             max(first[3], second[3]),
         )
 
+    # Neighbour search over a uniform grid whose cell is the merge distance, so
+    # two expanded boxes that overlap always share at least one cell.  Each box
+    # is inserted only after it has been compared with the boxes already there,
+    # which is what keeps every pair from being considered twice.
     grid: dict[tuple[int, int], list[int]] = {}
-    for i, expanded in enumerate(expanded_boxes):
+    for index, expanded in enumerate(expanded_boxes):
         checked: set[int] = set()
-        cells = list(grid_cells_for_box(expanded, cell_size))
+        cells = grid_cells_for_box(expanded, cell_size)
         for cell in cells:
-            for j in grid.get(cell, []):
-                if j in checked:
+            for other in grid.get(cell, ()):
+                if other in checked:
                     continue
-                checked.add(j)
-                if intersection_area(expanded, expanded_boxes[j]) >= min_union_area:
-                    union(i, j)
+                checked.add(other)
+                # Resolve membership before measuring any overlap.  Dense glyph
+                # clusters put a box in a cell with hundreds of others, nearly
+                # all of which it has already been merged with transitively --
+                # 98% of pairs on the busiest atlas -- and a pair that cannot
+                # merge does not need its overlap computed at all.
+                root = find(index)
+                other_root = find(other)
+                if root == other_root or island[root] != island[other_root]:
+                    continue
+                if intersection_area(expanded, expanded_boxes[other]) >= min_union_area:
+                    merge(root, other_root)
         for cell in cells:
-            grid.setdefault(cell, []).append(i)
+            grid.setdefault(cell, []).append(index)
 
     members: dict[int, list[int]] = {}
     for index in range(len(box_tuples)):
@@ -1041,32 +1048,6 @@ def union_region_group_candidates(
 
     candidates.sort(key=lambda candidate: (candidate.bounds[1], candidate.bounds[0]))
     return candidates
-
-
-def union_region_group_boxes(
-    boxes: np.ndarray,
-    image: np.ndarray,
-    config: MserConfig,
-    uv_mask: np.ndarray | None = None,
-    domain: UvDomainIndex | None = None,
-) -> list[tuple[int, int, int, int]]:
-    """Compatibility wrapper returning only group bounds."""
-    return [
-        candidate.bounds
-        for candidate in union_region_group_candidates(
-            boxes, image, config, uv_mask, domain
-        )
-    ]
-
-
-def group_boxes(
-    boxes: np.ndarray,
-    image: np.ndarray,
-    config: MserConfig,
-    uv_mask: np.ndarray | None = None,
-) -> list[tuple[int, int, int, int]]:
-    """Merge bounding boxes into coherent text/symbol groups."""
-    return union_region_group_boxes(boxes, image, config, uv_mask)
 
 
 # ---------------------------------------------------------------------------
