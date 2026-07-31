@@ -15,7 +15,9 @@ The correction happens in three passes, each narrower than the last:
     flipping it would fix one part and break another.
 2.  Flip whole UV islands that carry glyphs and are reflection-symmetric, so
     the flipped content lands back inside the same silhouette.
-3.  Flip anything still backwards in place, within its own detected bounds.
+3.  Flip anything still backwards in place, within its own detected bounds.  A
+    region overrunning its UV island cannot come out perfect, and is flipped
+    anyway and reported rather than left reliably backwards.
 
 Which way to flip is read off the surface, not guessed from the texture.  The
 exporter reflects about world X, so the correct flip is along whichever image
@@ -115,9 +117,10 @@ class RhdTextureConfig:
     # surface folds under the glyph.
     min_region_axis_agreement: float = 0.8
     # A flip only exchanges a texel when its opposite number is also inside
-    # the mirrored domain.  Below this share the region is left alone rather
-    # than half turned over: backwards but intact is a state you can still
-    # see and fix, whereas half exchanged is a broken glyph.
+    # the mirrored domain, so a region overrunning its UV island cannot come
+    # out perfect.  This is a reporting threshold, not a veto: the region is
+    # still flipped on the axis the surface chose, because a mostly-correct
+    # glyph beats a reliably backwards one in a tool that runs unattended.
     min_region_exchangeable: float = 0.98
 
     # BC7 encode quality.  alpha_ultrafast ~5s, alpha_fast ~30s,
@@ -997,7 +1000,8 @@ def build_rhd_texture(
 
     in_place: list[tuple[int, int, int, int]] = []
     in_place_axes: list[str] = []
-    skipped: list[tuple[int, int, int, int, str, float]] = []
+    in_place_shares: list[float] = []
+    imperfect: list[tuple[int, int, int, int, str, float]] = []
     marginal = 0
     for x, y, w, h in mirrored_regions:
         x0, y0 = max(x, 0), max(y, 0)
@@ -1015,24 +1019,26 @@ def build_rhd_texture(
             marginal += 1
             log(f"    ~ ({x},{y}) {w}x{h}: axis only {share:.0%} {axis}; "
                 "the surface turns a corner under this glyph")
-        # Refuse to half-turn a region.  Where the region overruns its UV
-        # island, some texels have no partner to swap with and would keep their
-        # original content among neighbours that moved, which breaks the glyph
-        # instead of leaving it merely backwards.
+        # Where the region overruns its UV island some texels have no partner
+        # and keep their original content.  Measured on both axes so the
+        # report says whether the other one would have fared better; the
+        # surface still decides which is applied.
         exchangeable = exchangeable_share(mirror_mask, (x, y, w, h), axis)
         if exchangeable < config.min_region_exchangeable:
-            skipped.append((x, y, w, h, axis, exchangeable))
-            log(f"    x ({x},{y}) {w}x{h}: only {exchangeable:.0%} of it can "
-                f"exchange on the {axis} axis; left unflipped rather than broken")
-            continue
+            other = "vertical" if axis == "horizontal" else "horizontal"
+            alternative = exchangeable_share(mirror_mask, (x, y, w, h), other)
+            imperfect.append((x, y, w, h, axis, exchangeable))
+            log(f"    ~ ({x},{y}) {w}x{h}: {exchangeable:.0%} exchangeable on "
+                f"{axis} ({alternative:.0%} on {other}); flipped anyway")
         apply_masked_flip(rgba, mirror_mask, (x, y, w, h), axis)
         in_place.append((x, y, w, h))
         in_place_axes.append(axis)
+        in_place_shares.append(exchangeable)
     log(f"  pass 3: flipped {len(in_place)} remaining glyph region(s) in place "
         f"({in_place_axes.count('horizontal')} horizontal, "
         f"{in_place_axes.count('vertical')} vertical"
         + (f", {marginal} marginal" if marginal else "")
-        + (f"; {len(skipped)} left unflipped" if skipped else "") + ")")
+        + (f"; {len(imperfect)} imperfect" if imperfect else "") + ")")
 
     stem = PurePosixPath(texture_member).name
     for suffix in (".dds", ".DDS", ".png", ".PNG"):
@@ -1083,13 +1089,16 @@ def build_rhd_texture(
                     for flip in flips
                 ],
                 "in_place_flips": [
-                    {"x": x, "y": y, "w": w, "h": h, "axis": axis}
-                    for (x, y, w, h), axis in zip(in_place, in_place_axes)
-                ],
-                "skipped_regions": [
                     {"x": x, "y": y, "w": w, "h": h, "axis": axis,
                      "exchangeable": round(share, 4)}
-                    for x, y, w, h, axis, share in skipped
+                    for (x, y, w, h), axis, share in zip(
+                        in_place, in_place_axes, in_place_shares
+                    )
+                ],
+                "imperfect_regions": [
+                    {"x": x, "y": y, "w": w, "h": h, "axis": axis,
+                     "exchangeable": round(share, 4)}
+                    for x, y, w, h, axis, share in imperfect
                 ],
             },
             indent=2,
