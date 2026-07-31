@@ -15,9 +15,7 @@ the source texture.
 Dependencies (cross-platform, Windows + Linux):
     numpy
     opencv-python   (cv2)
-
-Optional, for DDS input only:
-    Pillow          (PIL)
+    Pillow          (PIL)      DDS decoding
 
 Usage:
     python annotate_texture_regions.py scintilla_gauges.png
@@ -38,18 +36,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# Optional DDS support via Pillow
-# ---------------------------------------------------------------------------
-
-try:
-    from PIL import Image as _PILImage
-
-    _HAS_PILLOW = True
-except ImportError:
-    _HAS_PILLOW = False
-
+from PIL import Image as _PILImage
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -65,9 +52,9 @@ class MserConfig:
     """
 
     # MSER detector
-    delta:         int   = 8  # default: 5
+    delta:         int   = 10  # default: 5
     min_area:      int   = 30  # default: 30
-    max_area:      int   = 1_024  # default: 1_024
+    max_area:      int   = 10000  # default: 1_024
     max_variation: float = 0.25  # default: 0.25
     min_diversity: float = 0.2  # default: 0.2
 
@@ -119,7 +106,7 @@ class MserConfig:
     # justify itself by being round.  Absolute coverage is the wrong test: a
     # dial's box always has dead corners, and boxes already low stay low when
     # merged with their own duplicates.
-    max_group_uv_coverage_drop:     float = 0.02  # default: 0.02
+    max_group_uv_coverage_drop:     float = 0.00  # default: 0.02
 
     # Round regions: inscribe a circle in a squarish group and keep it when the
     # corners it drops hold nothing -- background colour or no UV domain at all.
@@ -137,15 +124,23 @@ class MserConfig:
     magic_wand_colour_thresh:              int   = 100  # default: 100
     magic_wand_output_padding_px:          int   = 2  # default: 2
     magic_wand_min_island_area_px:         int   = 12  # default: 12
-    magic_wand_noise_bg_std_weight:        float = 1.00  # default: 1.00
-    magic_wand_noise_bg_std_scale:         float = 24.0  # default: 24.0
-    magic_wand_noise_min_signal:           float = 8.0  # default: 8.0
-    enable_magic_wand_noise_filter:        bool  = True  # default: True
-    max_magic_wand_noise_score:            float = 1.0  # default: 0.50
+    # Contrast, measured with two standard quantities in CIELAB rather than a
+    # bespoke score: Delta-E is the perceptual distance between the mark and its
+    # background, and contrast-to-noise is that distance in units of the
+    # background's own standard deviation.
+    enable_contrast_filter:                bool  = False  # default: True
+    contrast_background_tolerance:         int   = 100  # default: 100 (background colour band)
+    contrast_surround_px:                  int   = 12  # default: 12
+    contrast_surround_scale:               float = 0.5  # default: 0.5 of the longest side
+    contrast_surround_gap_px:              int   = 3  # default: 3 (guard band)
+    min_contrast_background_px:            int   = 64  # default: 64
+    max_contrast_region_area_px:           int   = 6000  # default: 6000 (larger regions skip the test)
+    min_contrast_delta_e:                  float = 2.0  # default: 2.0 (CIE76)
+    min_contrast_to_noise:                 float = 3.5  # default: 3.5 (background sigmas)
     enable_final_size_filter:              bool  = True  # default: True
     final_min_width_px:                    int   = 4  # default: 4
     final_min_height_px:                   int   = 4  # default: 4
-    final_min_area_px:                     int   = 100  # default: 100
+    final_min_area_px:                     int   = 50  # default: 100
     enable_final_aspect_filter:            bool  = True  # default: True
     final_max_aspect:                      float = 12.0  # default: 12.0 (long side / short)
 
@@ -213,33 +208,23 @@ class DetectionStage:
 def load_image(path: Path) -> np.ndarray:
     """Load a texture as a BGR uint8 ndarray.
 
-    PNG, JPG, BMP, TIFF and other formats supported by the local OpenCV
-    build are read directly.  DDS requires Pillow; a clear error is raised when Pillow
-    is unavailable.
+    PNG, JPG, BMP, TIFF and other formats supported by the local OpenCV build
+    are read directly; DDS goes through Pillow.
     """
     if not path.is_file():
         raise FileNotFoundError(f"Texture not found: {path}")
 
-    suffix = path.suffix.lower()
-
-    if suffix == ".dds":
-        if not _HAS_PILLOW:
-            raise RuntimeError(
-                f"Reading DDS textures requires Pillow.  "
-                f"Install it with:  python -m pip install Pillow\n"
-                f"Alternatively, convert {path.name} to PNG first."
-            )
+    if path.suffix.lower() == ".dds":
         with _PILImage.open(path) as pil_image:
             rgba = pil_image.convert("RGBA")
-        bgr = cv2.cvtColor(np.asarray(rgba, dtype=np.uint8), cv2.COLOR_RGBA2BGR)
-        return bgr
+        return cv2.cvtColor(np.asarray(rgba, dtype=np.uint8), cv2.COLOR_RGBA2BGR)
 
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(
             f"OpenCV could not decode {path.name}.  "
-            f"Use PNG, JPG, BMP, TIFF, DDS with Pillow, or another format "
-            f"supported by your OpenCV build."
+            f"Use PNG, JPG, BMP, TIFF, DDS, or another format supported by "
+            f"your OpenCV build."
         )
     return image
 
@@ -1115,36 +1100,148 @@ def magic_wand_noise_metrics(
     signal_mask: np.ndarray,
     config: MserConfig,
 ) -> dict[str, float]:
-    """Return OpenCV-backed background-noise/glyph-contrast diagnostics."""
+    """Return contrast diagnostics for a mark against its own background.
+
+    Two standard quantities, both in CIELAB:
+
+    ``delta_e``
+        CIE76 colour difference between the mark and the background -- how far
+        apart they are perceptually, in the units perceptual thresholds are
+        quoted in.
+    ``contrast_to_noise``
+        That difference divided by the background's standard deviation, the
+        usual contrast-to-noise ratio.  It answers the question a flat-colour or
+        variance test cannot: a mark on clean trim stands many sigmas clear,
+        while a shadow on woven or ribbed material does not, however dark it is.
+    """
     if not bool(background_mask.any()) or not bool(signal_mask.any()):
-        return {
-            "score": float("inf"),
-            "signal": 0.0,
-            "background_std": 0.0,
-        }
+        return {"delta_e": 0.0, "contrast_to_noise": 0.0, "background_std": 0.0}
 
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-    background_u8 = background_mask.astype(np.uint8)
-    bg_mean, bg_stddev = cv2.meanStdDev(lab, mask=background_u8)
-    bg_mean_vec = bg_mean.reshape(3).astype(np.float32)
-    bg_std = float(np.linalg.norm(bg_stddev.reshape(3)))
-
-    signal_pixels = lab[signal_mask].astype(np.float32)
-    signal_delta = np.linalg.norm(signal_pixels - bg_mean_vec, axis=1)
-    signal = float(np.median(signal_delta)) if len(signal_delta) > 0 else 0.0
-
-    if signal < config.magic_wand_noise_min_signal:
-        score = float("inf")
-    else:
-        weighted_noise = bg_std * config.magic_wand_noise_bg_std_weight
-        ratio_score = weighted_noise / max(signal, 0.001)
-        background_penalty = bg_std / max(config.magic_wand_noise_bg_std_scale, 0.001)
-        score = ratio_score + background_penalty
+    background_mean, background_stddev = cv2.meanStdDev(
+        lab, mask=background_mask.astype(np.uint8)
+    )
+    background_std = float(np.linalg.norm(background_stddev.reshape(3)))
+    signal_mean = lab[signal_mask].astype(np.float32).mean(axis=0)
+    delta_e = float(np.linalg.norm(signal_mean - background_mean.reshape(3)))
 
     return {
-        "score": float(score),
-        "signal": signal,
-        "background_std": bg_std,
+        "delta_e": delta_e,
+        "contrast_to_noise": delta_e / max(background_std, 1e-6),
+        "background_std": background_std,
+    }
+
+
+def occupied_region_mask(
+    shape: tuple[int, ...],
+    groups: list[tuple[int, int, int, int]],
+    gap: int,
+) -> np.ndarray:
+    """Return every region's footprint, grown by a guard band.
+
+    Used to keep the contrast surround off other detections and off the
+    antialiased halo around its own mark; both would land in the background
+    sample and inflate the noise term for exactly the crisp marks worth keeping.
+    """
+    height, width = shape[:2]
+    occupied = np.zeros((height, width), dtype=np.uint8)
+    for x, y, w, h in groups:
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + w, width), min(y + h, height)
+        if x1 > x0 and y1 > y0:
+            occupied[y0:y1, x0:x1] = 1
+    if gap > 0:
+        occupied = cv2.dilate(
+            occupied, cv2.getStructuringElement(cv2.MORPH_RECT, (gap * 2 + 1,) * 2)
+        )
+    return occupied > 0
+
+
+def region_contrast_metrics(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+    blocked: np.ndarray | None = None,
+) -> dict[str, float] | None:
+    """Measure the mark against the material surrounding it.
+
+    Signal and noise are measured over different areas, which is the whole
+    point: a 9x11 px region has no meaningful noise estimate inside itself, so
+    the surround supplies one.  The region is dilated, intersected with the UV
+    domain and with the island the region sits on -- pixels off the island or
+    off the atlas are not this material and must not colour the estimate -- and
+    the ring outside the region becomes the background sample.
+
+    ``delta_e``
+        CIE76 distance between the mark's mean colour and the surround's.
+    ``contrast_to_noise``
+        That distance over the surround's standard deviation.  Because the noise
+        term comes from the material rather than from the mark, a faint but
+        well-formed mark on clean trim still scores well: it is measuring how
+        far the mark sits from the surface's own variation, not how loud it is.
+    """
+    clamped = clamp_group(group, image.shape)
+    if clamped is None:
+        return None
+    x, y, w, h = clamped
+
+    margin = max(
+        config.contrast_surround_px,
+        int(round(max(w, h) * max(config.contrast_surround_scale, 0.0))),
+    )
+    outer = clamp_group((x - margin, y - margin, w + margin * 2, h + margin * 2), image.shape)
+    if outer is None:
+        return None
+    ox, oy, ow, oh = outer
+    crop = image[oy : oy + oh, ox : ox + ow]
+    domain = (
+        uv_mask[oy : oy + oh, ox : ox + ow]
+        if uv_mask is not None
+        else np.ones((oh, ow), dtype=bool)
+    )
+
+    inner = np.zeros((oh, ow), dtype=bool)
+    inner[y - oy : y - oy + h, x - ox : x - ox + w] = True
+    if uv_mask is not None:
+        domain = dominant_island_component(domain, (x - ox, y - oy, w, h))
+
+    # Keep the surround off every detection and off its own guard band.
+    if blocked is not None:
+        excluded = blocked[oy : oy + oh, ox : ox + ow]
+    else:
+        excluded = occupied_region_mask(
+            (oh, ow),
+            [(x - ox, y - oy, w, h)],
+            max(config.contrast_surround_gap_px, 0),
+        )
+    surround = domain & ~inner & ~excluded
+    if int(surround.sum()) < max(config.min_contrast_background_px, 1):
+        return None
+    mark = domain & inner
+    if not bool(mark.any()):
+        return None
+
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+    background = lab[surround]
+    tolerance = max(config.contrast_background_tolerance, 1)
+    background_colour = estimate_background_colour(crop, surround, tolerance)
+    if background_colour is not None:
+        # Judge the mark by the pixels that differ from the surrounding material,
+        # not by the region's average, which a large flat margin would dominate.
+        matching = channel_colour_mask(crop, mark, background_colour, tolerance)
+        distinct = mark & ~matching
+        if bool(distinct.any()):
+            mark = distinct
+
+    delta_e = float(np.linalg.norm(lab[mark].mean(axis=0) - background.mean(axis=0)))
+    # Floor the spread at one code value: below that the ratio measures
+    # quantisation, and an unbounded number is no use as a threshold.
+    background_std = max(float(np.linalg.norm(background.std(axis=0))), 1.0)
+    return {
+        "delta_e": delta_e,
+        "contrast_to_noise": delta_e / background_std,
+        "background_std": background_std,
     }
 
 
@@ -1339,15 +1436,18 @@ def filter_groups_by_magic_wand_noise(
     list[dict[str, float] | None],
     list[tuple[int, int, int, int]],
 ]:
-    """Drop refined groups whose diagnostic noise score is above threshold."""
-    if not config.enable_magic_wand_noise_filter:
+    """Drop groups whose mark does not stand clear of its own background."""
+    if not config.enable_contrast_filter:
         return groups, noise_metrics, []
 
     filtered_groups: list[tuple[int, int, int, int]] = []
     filtered_metrics: list[dict[str, float] | None] = []
     rejected: list[tuple[int, int, int, int]] = []
     for group, metrics in zip(groups, noise_metrics):
-        if metrics is not None and metrics["score"] > config.max_magic_wand_noise_score:
+        if metrics is not None and (
+            metrics["delta_e"] < config.min_contrast_delta_e
+            or metrics["contrast_to_noise"] < config.min_contrast_to_noise
+        ):
             rejected.append(group)
             continue
         filtered_groups.append(group)
@@ -1737,15 +1837,36 @@ def _step_noise(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
+    # Measure here rather than relying on the magic wand having run, so the
+    # stage works the same with refinement switched off.
+    blocked = occupied_region_mask(
+        image.shape, list(state.groups), max(config.contrast_surround_gap_px, 0)
+    )
+    measured: list[dict[str, float] | None] = []
+    for group, existing in zip(state.groups, state.noise_metrics):
+        # Large regions skip the test: a noisy detection is an MSER failure at
+        # small scale, and there is no such thing as a large noise blob here.
+        if group[2] * group[3] > config.max_contrast_region_area_px:
+            measured.append(existing)
+            continue
+        contrast = region_contrast_metrics(image, uv_mask, group, config, blocked)
+        if contrast is None:
+            measured.append(existing)
+            continue
+        measured.append({**(existing or {}), **contrast})
+
     groups, metrics, rejected = filter_groups_by_magic_wand_noise(
-        state.groups, state.noise_metrics, config
+        state.groups, measured, config
     )
     return DetectionState(state.boxes, groups, metrics), DetectionStage(
         key="noise",
-        title="Noise score",
+        title="Contrast",
         kept=tuple(groups),
         rejected=tuple(rejected),
-        detail=f"score <= {config.max_magic_wand_noise_score}",
+        detail=(
+            f"Delta-E >= {config.min_contrast_delta_e}, "
+            f"contrast-to-noise >= {config.min_contrast_to_noise}"
+        ),
     )
 
 
@@ -1934,11 +2055,15 @@ PARAMETER_STEP = {
     "magic_wand_colour_thresh": 5,
     "magic_wand_output_padding_px": 5,
     "magic_wand_min_island_area_px": 5,
-    "magic_wand_noise_bg_std_weight": 5,
-    "magic_wand_noise_bg_std_scale": 5,
-    "magic_wand_noise_min_signal": 5,
-    "enable_magic_wand_noise_filter": 6,
-    "max_magic_wand_noise_score": 6,
+    "enable_contrast_filter": 6,
+    "contrast_background_tolerance": 6,
+    "contrast_surround_px": 6,
+    "contrast_surround_scale": 6,
+    "contrast_surround_gap_px": 6,
+    "max_contrast_region_area_px": 6,
+    "min_contrast_background_px": 6,
+    "min_contrast_delta_e": 6,
+    "min_contrast_to_noise": 6,
     "enable_final_size_filter": 7,
     "final_min_width_px": 7,
     "final_min_height_px": 7,
@@ -2284,17 +2409,17 @@ def main() -> None:
     for index, group in enumerate(summary["groups"], start=1):
         noise_metrics = group["noise_metrics"]
         if noise_metrics is None:
-            noise_text = "n/a"
+            contrast_text = "n/a"
         else:
-            noise_text = (
-                f"{noise_metrics['score']:.3f} "
-                f"signal={noise_metrics['signal']:.1f} "
+            contrast_text = (
+                f"dE={noise_metrics['delta_e']:.1f} "
+                f"cnr={noise_metrics['contrast_to_noise']:.1f} "
                 f"bgstd={noise_metrics['background_std']:.1f} "
                 f"offsetbg={noise_metrics.get('offset_background_fraction', 0.0):.3f}"
             )
         print(
             f"  [{index:3d}]  x={group['x']:5d}  y={group['y']:5d}  "
-            f"w={group['w']:4d}  h={group['h']:4d}  noise={noise_text}"
+            f"w={group['w']:4d}  h={group['h']:4d}  {contrast_text}"
         )
 
 
