@@ -39,9 +39,13 @@ if __package__ in (None, ""):
 
 from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     DEFAULT_CONFIG,
+    DEFAULT_UV_ISLAND_SYMMETRY_CONFIG,
     DetectionRun,
     DetectionStage,
     MserConfig,
+    UvIslandSymmetryConfig,
+    UvIslandSymmetryMatch,
+    analyse_uv_island_symmetry,
     load_image,
     run_detection,
 )
@@ -112,6 +116,8 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "enable_min_component_area_filter",
             "min_component_area_px",
+            "min_box_width_px",
+            "min_box_height_px",
             "enable_mser_area_fraction_filter",
             "max_area_fraction",
             "enable_aspect_ratio_filter",
@@ -128,28 +134,24 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "flat_box_min_coverage",
             "flat_box_context_px",
             "flat_box_min_domain_px",
+            "flat_box_min_feature_px",
         ),
     ),
     (
         "Repeating pattern",
         (
-            "enable_pattern_box_filter",
-            "max_pattern_autocorrelation",
-            "pattern_box_window_scale",
-            "pattern_box_min_window_px",
-            "pattern_box_min_period_px",
-            "pattern_box_max_period_px",
             "enable_pattern_group_filter",
-            "max_pattern_group_autocorrelation",
-            "pattern_group_window_scale",
-            "pattern_group_max_period_px",
+            "max_pattern_autocorrelation",
+            "pattern_window_scale",
+            "pattern_min_window_px",
+            "pattern_min_period_px",
+            "pattern_max_period_px",
         ),
     ),
     (
         "Grouping",
         (
             "merge_distance_px",
-            "group_dilate_px",
             "min_group_union_region_px",
             "enable_group_area_filter",
             "enable_group_degenerate_filter",
@@ -160,31 +162,8 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "circular_group_padding_px",
             "circular_group_colour_tolerance",
             "circular_group_max_corner_content",
-        ),
-    ),
-    (
-        "UV magic wand",
-        (
-            "enable_uv_mask_before_mser",
-            "enable_uv_magic_wand_refine",
-            "require_uv_magic_wand_refine",
-            "magic_wand_colour_thresh",
-            "magic_wand_output_padding_px",
-            "magic_wand_min_island_area_px",
-        ),
-    ),
-    (
-        "Contrast",
-        (
-            "enable_contrast_filter",
-            "contrast_background_tolerance",
-            "contrast_surround_px",
-            "contrast_surround_scale",
-            "contrast_surround_gap_px",
-            "max_contrast_region_area_px",
-            "min_contrast_background_px",
-            "min_contrast_delta_e",
-            "min_contrast_to_noise",
+            "enable_region_domain_filter",
+            "min_region_uv_coverage",
         ),
     ),
     (
@@ -199,12 +178,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "enable_final_single_colour_filter",
             "final_single_colour_quant_step",
             "final_single_colour_fraction",
-            "enable_final_offset_background_filter",
-            "final_offset_background_width_px",
-            "final_offset_background_colour_tol",
-            "final_offset_background_min_fraction",
-            "enable_region_domain_filter",
-            "min_region_uv_coverage",
+            "final_region_padding_px",
         ),
     ),
 )
@@ -219,6 +193,9 @@ HIDDEN_PARAMETERS = frozenset(
         "red_thickness",
     }
 )
+
+UV_SYMMETRY_HIDDEN_PARAMETERS = frozenset({"blue_colour", "blue_thickness"})
+UV_SYMMETRY_OUTLINE_WIDTH = 2
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +263,8 @@ def material_symbols_for_binding(
 class RunResult:
     source: TextureSource
     run: DetectionRun
+    symmetry_config: UvIslandSymmetryConfig
+    symmetric_uv_islands: tuple[UvIslandSymmetryMatch, ...]
     seconds: float
 
     @property
@@ -520,6 +499,13 @@ class StageCanvas:
                     height,
                     stage.circles,
                 )
+            if self.app.show_uv_symmetry.get():
+                self._draw_uv_symmetry(
+                    draw,
+                    result.symmetric_uv_islands,
+                    result.symmetry_config,
+                    view,
+                )
 
         self.last_render = visible
         self.photo = ImageTk.PhotoImage(visible)
@@ -560,6 +546,35 @@ class StageCanvas:
                 continue
             draw.rectangle((x0, y0, x1, y1), outline=colour, width=BOX_OUTLINE_WIDTH)
 
+    def _draw_uv_symmetry(
+        self,
+        draw: ImageDraw.ImageDraw,
+        matches: tuple[UvIslandSymmetryMatch, ...],
+        config: UvIslandSymmetryConfig,
+        view: ViewState,
+    ) -> None:
+        """Draw the independent blue UV-island contour overlay."""
+        if not config.enable_uv_island_symmetry:
+            return
+        colour = tuple(reversed(config.blue_colour))
+        for match in matches:
+            for contour in match.contours:
+                if len(contour) < 2:
+                    continue
+                points = [
+                    (
+                        (x - view.origin_x) * view.scale,
+                        (y - view.origin_y) * view.scale,
+                    )
+                    for x, y in contour
+                ]
+                draw.line(
+                    points + [points[0]],
+                    fill=colour,
+                    width=UV_SYMMETRY_OUTLINE_WIDTH,
+                    joint="curve",
+                )
+
 
 # ---------------------------------------------------------------------------
 # Application
@@ -591,6 +606,7 @@ class TuningApp(tk.Tk):
         self._syncing = False  # guards the summary <-> tab selection round trip
         self._pyramid: list[tuple[Image.Image, Image.Image, float]] = []  # plain, masked, ratio
         self.parameter_vars: dict[str, tk.Variable] = {}
+        self.symmetry_parameter_vars: dict[str, tk.Variable] = {}
         self.stage_canvases: dict[str, StageCanvas] = {}
 
         self.source_var = tk.StringVar()
@@ -605,6 +621,7 @@ class TuningApp(tk.Tk):
         self.show_kept = tk.BooleanVar(value=True)
         self.show_rejected = tk.BooleanVar(value=True)
         self.show_uv_domain = tk.BooleanVar(value=SHOW_UV_DOMAIN_BY_DEFAULT)
+        self.show_uv_symmetry = tk.BooleanVar(value=True)
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -688,6 +705,12 @@ class TuningApp(tk.Tk):
             overlay_bar,
             text=f"Mask non-UV area ({UV_BLOCKED_REGION})",
             variable=self.show_uv_domain,
+            command=self._redraw,
+        ).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(
+            overlay_bar,
+            text="Symmetric UV islands (blue)",
+            variable=self.show_uv_symmetry,
             command=self._redraw,
         ).pack(side="left", padx=(10, 0))
         ttk.Button(overlay_bar, text="Fit", command=self._fit_view).pack(side="left", padx=(16, 0))
@@ -801,21 +824,42 @@ class TuningApp(tk.Tk):
                 self.parameter_vars[name] = variable
                 row += 1
 
+        ttk.Label(parent, text="UV island symmetry", font=("", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(10, 2), padx=4
+        )
+        row += 1
+        for field in fields(UvIslandSymmetryConfig):
+            name = field.name
+            if name in UV_SYMMETRY_HIDDEN_PARAMETERS:
+                continue
+            value = getattr(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, name)
+            if isinstance(value, bool):
+                variable = tk.BooleanVar(value=value)
+                ttk.Checkbutton(parent, text=name, variable=variable).grid(
+                    row=row, column=0, columnspan=2, sticky="w", padx=4
+                )
+            else:
+                variable = tk.StringVar(value=str(value))
+                ttk.Label(parent, text=name).grid(row=row, column=0, sticky="w", padx=4)
+                entry = ttk.Entry(parent, textvariable=variable, width=11)
+                entry.grid(row=row, column=1, sticky="e", padx=4)
+                entry.bind("<Return>", lambda _e: self._run())
+            self.symmetry_parameter_vars[name] = variable
+            row += 1
+
     def _placeholder_stages(self) -> list[DetectionStage]:
         return [
             DetectionStage(key=key, title=title, kept=())
             for key, title in (
                 ("mser", "MSER boxes"),
-                ("flat_box", "Flat-colour boxes"),
-                ("pattern_box", "Repeating pattern (boxes)"),
-                ("grouped", "Grouped"),
-                ("pattern_group", "Repeating pattern (groups)"),
-                ("uv_refine", "UV magic wand"),
-                ("noise", "Contrast"),
+                ("flat_box", "Box filtering"),
+                ("grouped", "Initial grouping"),
+                ("region_domain", "Domain recovery"),
+                ("overlap_group", "Post-circle forced merge"),
+                ("pattern_group", "Repeating pattern"),
                 ("size", "Final size"),
                 ("flat", "Single colour"),
-                ("offset_background", "Offset background"),
-                ("region_domain", "Fits the domain"),
+                ("final_padding", "Final padding"),
             )
         ]
 
@@ -861,9 +905,35 @@ class TuningApp(tk.Tk):
                 raise ValueError(f"{field.name}: {text!r} is not a valid number") from exc
         return replace(DEFAULT_CONFIG, **overrides)
 
+    def current_uv_symmetry_config(self) -> UvIslandSymmetryConfig:
+        """Build the independent UV symmetry configuration from its widgets."""
+        overrides: dict[str, object] = {}
+        for field in fields(UvIslandSymmetryConfig):
+            variable = self.symmetry_parameter_vars.get(field.name)
+            if variable is None:
+                continue
+            default = getattr(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, field.name)
+            raw = variable.get()
+            if isinstance(default, bool):
+                overrides[field.name] = bool(raw)
+                continue
+            text = str(raw).strip()
+            try:
+                overrides[field.name] = (
+                    int(text) if isinstance(default, int) else float(text)
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"{field.name}: {text!r} is not a valid number"
+                ) from exc
+        return replace(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, **overrides)
+
     def _reset_parameters(self) -> None:
         for name, variable in self.parameter_vars.items():
             default = getattr(DEFAULT_CONFIG, name)
+            variable.set(default if isinstance(default, bool) else str(default))
+        for name, variable in self.symmetry_parameter_vars.items():
+            default = getattr(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, name)
             variable.set(default if isinstance(default, bool) else str(default))
         self.status_var.set("Parameters reset to the module defaults.")
 
@@ -871,6 +941,7 @@ class TuningApp(tk.Tk):
         """Copy changed values as MserConfig assignments, ready to paste."""
         try:
             config = self.current_config()
+            symmetry_config = self.current_uv_symmetry_config()
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -881,6 +952,19 @@ class TuningApp(tk.Tk):
             if field.name not in HIDDEN_PARAMETERS
             and getattr(config, field.name) != getattr(DEFAULT_CONFIG, field.name)
         ]
+        symmetry_lines = [
+            f"    {field.name}: {'bool' if isinstance(getattr(symmetry_config, field.name), bool) else type(getattr(symmetry_config, field.name)).__name__} = "
+            f"{getattr(symmetry_config, field.name)!r}"
+            for field in fields(UvIslandSymmetryConfig)
+            if field.name not in UV_SYMMETRY_HIDDEN_PARAMETERS
+            and getattr(symmetry_config, field.name)
+            != getattr(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, field.name)
+        ]
+        if symmetry_lines:
+            if lines:
+                lines.append("")
+            lines.append("# UvIslandSymmetryConfig")
+            lines.extend(symmetry_lines)
         if not lines:
             self.status_var.set("No parameters differ from the module defaults.")
             return
@@ -1074,6 +1158,7 @@ class TuningApp(tk.Tk):
             return
         try:
             config = self.current_config()
+            symmetry_config = self.current_uv_symmetry_config()
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -1096,9 +1181,14 @@ class TuningApp(tk.Tk):
             )
             started = time.perf_counter()
             run = run_detection(source.image, source.uv_mask, config, previous)
+            symmetric_uv_islands = analyse_uv_island_symmetry(
+                source.uv_mask, symmetry_config
+            )
             return "run", RunResult(
                 source=source,
                 run=run,
+                symmetry_config=symmetry_config,
+                symmetric_uv_islands=symmetric_uv_islands,
                 seconds=time.perf_counter() - started,
             )
 
@@ -1134,6 +1224,7 @@ class TuningApp(tk.Tk):
             False,
             f"{result.source.texture_path.name}  {width}x{height}  "
             f"UV domain {islands / (width * height):.1%}  "
+            f"{len(result.symmetric_uv_islands):,} symmetric UV islands  "
             f"{result.source.uv_stats.get('triangles', 0):,} UV triangles from "
             f"{', '.join(result.source.material_symbols)}  "
             f"{reused} in {result.seconds:.2f} s",
@@ -1184,7 +1275,14 @@ class TuningApp(tk.Tk):
         if stage.rejected:
             parts.append(f"{len(stage.rejected):,} removed here")
         if stage.adjusted:
-            parts.append(f"{stage.adjusted:,} tightened")
+            action = (
+                "absorbed"
+                if stage.key == "overlap_group"
+                else "padded"
+                if stage.key == "final_padding"
+                else "adjusted"
+            )
+            parts.append(f"{stage.adjusted:,} {action}")
         detail = f"{stage.title}: " + ", ".join(parts)
         if stage.detail:
             detail += f"\n{stage.detail}"
