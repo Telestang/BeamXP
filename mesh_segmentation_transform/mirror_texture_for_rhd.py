@@ -14,10 +14,16 @@ The correction happens in three passes, each narrower than the last:
     parts sharing the material.  A texel any part rigid-transforms is excluded:
     flipping it would fix one part and break another.
 2.  Flip whole UV islands that carry glyphs and are reflection-symmetric, so
-    the flipped content lands back inside the same silhouette.  Horizontal is
-    preferred; vertical is used only when the island has no horizontal
-    symmetry.  Never both.
+    the flipped content lands back inside the same silhouette.
 3.  Flip anything still backwards in place, within its own detected bounds.
+
+Which way to flip is read off the surface, not guessed from the texture.  The
+exporter reflects about world X, so the correct flip is along whichever image
+axis world X runs in, and that is the x row of the UV-to-surface Jacobian of
+the triangles under the glyph.  The island's own outline only decides whether
+the whole island may be turned over on that axis, or whether its glyphs have to
+be done individually.  Off-axis mirrors, where world X runs diagonally across
+the UV, are resolved to the nearer axis and not otherwise corrected.
 
 Outputs a PNG for inspection in Blender and a BC7 DDS with a ``_rhd`` suffix
 for BeamNG.
@@ -104,6 +110,10 @@ class RhdTextureConfig:
     # Share of a region that must sit inside flipped islands before it counts
     # as already handled by pass 2.
     min_region_island_cover: float = 0.5
+    # Below this share of texels agreeing on the flip axis, the region is
+    # still flipped on the majority axis but reported: it usually means the
+    # surface folds under the glyph.
+    min_region_axis_agreement: float = 0.8
 
     # BC7 encode quality.  alpha_ultrafast ~5s, alpha_fast ~30s,
     # alpha_basic ~60s for a 4096 square.
@@ -399,21 +409,28 @@ def split_mirrored_and_rigid(
     symbols: set[str],
     config: RhdTextureConfig,
     sweep_cache: dict[str, object] | None = None,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """Split this part's UV triangles by the fate the exporter gives them.
 
-    Returns (mirrored, rigid).  Mirrored triangles are the residual husk, whose
-    positions the exporter reflects; rigid triangles belong to an accepted
-    perimeter-symmetric candidate and are already handled by its rotation.
+    Returns (mirrored_uv, rigid_uv, mirrored_xyz).  Mirrored triangles are the
+    residual husk, whose positions the exporter reflects; rigid triangles belong
+    to an accepted perimeter-symmetric candidate and are already handled by its
+    rotation.  ``mirrored_xyz`` carries the same triangles' world-metre corners,
+    in the order welding produced, so a UV corner and a surface corner at the
+    same index are the same corner -- that pairing is what lets the flip axis be
+    derived from the surface rather than guessed from the island's outline.
     """
     uv_by_source = uv_triangles_by_source(loaded, part, symbols)
     if not uv_by_source:
-        return [], []
+        return [], [], []
 
     result = sweep_part(loaded, part, config, sweep_cache)
     labels = _candidate_ids_by_face(result)
+    vertices = result.topology.vertices
+    triangles = result.topology.triangles
 
     mirrored: list[np.ndarray] = []
+    mirrored_xyz: list[np.ndarray] = []
     rigid: list[np.ndarray] = []
     for face_index, candidate_id in enumerate(labels):
         reference = result.topology.source_faces[face_index]
@@ -426,8 +443,124 @@ def split_mirrored_and_rigid(
         )
         if triangle is None:
             continue
-        (mirrored if candidate_id < 0 else rigid).append(triangle)
-    return mirrored, rigid
+        if candidate_id < 0:
+            mirrored.append(triangle)
+            mirrored_xyz.append(vertices[triangles[face_index]])
+        else:
+            rigid.append(triangle)
+    return mirrored, rigid, mirrored_xyz
+
+
+AXIS_UNKNOWN, AXIS_HORIZONTAL, AXIS_VERTICAL = 0, 1, 2
+
+
+def surface_flip_axes(
+    uv: np.ndarray,
+    xyz: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Per triangle, which image axis the mirrored world axis runs along.
+
+    The exporter reflects the husk about world X, so a glyph is undone by
+    flipping the texture along whichever image direction world X travels in.
+    Over one triangle the surface is affine in UV, so that direction is read
+    straight off the Jacobian: solve J [W1-W0, W2-W0] = [P1-P0, P2-P0] for the
+    x row alone, giving dx/du and dx/dv.
+
+    The two are compared per texel rather than per unit UV -- a unit of u spans
+    ``width`` texels and a unit of v spans ``height`` -- so the test stays
+    correct on a non-square atlas.  Only which axis wins matters, so the v flip
+    the rasteriser applies is irrelevant: it negates the derivative without
+    moving it to the other axis.
+
+    Off-axis cases, where world X runs diagonally across the UV, are decided by
+    the larger component and not otherwise corrected.
+    """
+    if len(uv) == 0:
+        return np.empty(0, dtype=np.uint8)
+
+    d1 = uv[:, 1] - uv[:, 0]
+    d2 = uv[:, 2] - uv[:, 0]
+    determinant = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+
+    first_x = xyz[:, 1, 0] - xyz[:, 0, 0]
+    second_x = xyz[:, 2, 0] - xyz[:, 0, 0]
+
+    usable = np.abs(determinant) > 1e-12
+    safe = np.where(usable, determinant, 1.0)
+    dx_du = (first_x * d2[:, 1] - second_x * d1[:, 1]) / safe
+    dx_dv = (-first_x * d2[:, 0] + second_x * d1[:, 0]) / safe
+
+    horizontal = np.abs(dx_du) / max(width, 1) >= np.abs(dx_dv) / max(height, 1)
+    axes = np.where(horizontal, AXIS_HORIZONTAL, AXIS_VERTICAL).astype(np.uint8)
+    axes[~usable] = AXIS_UNKNOWN  # a triangle with no UV area says nothing
+    return axes
+
+
+def rasterise_axis_map(
+    triangles: list[np.ndarray],
+    axes: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Paint each mirrored triangle's chosen axis into a per-texel map.
+
+    Rasterising rather than indexing means a region's axis can be settled by
+    counting texels it actually covers, which needs no spatial index and stays
+    exact where several triangles overlap one glyph.
+    """
+    axis_map = np.zeros((height, width), dtype=np.uint8)
+    for triangle, axis in zip(triangles, axes):
+        if axis == AXIS_UNKNOWN:
+            continue
+        min_u, min_v = triangle.min(axis=0)
+        max_u, max_v = triangle.max(axis=0)
+        for shift_u in range(math.floor(min_u), math.floor(max_u) + 1):
+            for shift_v in range(math.floor(min_v), math.floor(max_v) + 1):
+                clipped = clip_to_unit_tile(triangle - (shift_u, shift_v))
+                if len(clipped) < 3:
+                    continue
+                points = np.empty((len(clipped), 2), dtype=np.int32)
+                points[:, 0] = np.clip(
+                    np.round(clipped[:, 0] * (width - 1)), 0, width - 1
+                )
+                points[:, 1] = np.clip(
+                    np.round((1.0 - clipped[:, 1]) * (height - 1)), 0, height - 1
+                )
+                if cv2.contourArea(points) <= 0.01:
+                    continue
+                cv2.fillPoly(axis_map, [points], int(axis), lineType=cv2.LINE_8)
+    return axis_map
+
+
+def region_flip_axis(
+    axis_map: np.ndarray,
+    stencil: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    fallback: str = "horizontal",
+) -> tuple[str, float]:
+    """Decide one region's flip axis by majority over the texels it covers.
+
+    Returns the axis and the winning share, so a marginal call -- a glyph
+    straddling a fold where the surface turns a corner -- can be reported
+    rather than silently taken.
+    """
+    x, y, w, h = bounds
+    height, width = axis_map.shape
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return fallback, 0.0
+    window = axis_map[y0:y1, x0:x1][stencil[y0:y1, x0:x1]]
+    horizontal = int((window == AXIS_HORIZONTAL).sum())
+    vertical = int((window == AXIS_VERTICAL).sum())
+    total = horizontal + vertical
+    if total == 0:
+        return fallback, 0.0
+    if horizontal >= vertical:
+        return "horizontal", horizontal / total
+    return "vertical", vertical / total
 
 
 @dataclass(slots=True)
@@ -440,6 +573,7 @@ class DomainMasks:
     mirrored_triangles: int
     rigid_triangles: int
     parts_analysed: int
+    axis_map: np.ndarray | None = None
 
 
 def build_domain_masks(
@@ -458,11 +592,12 @@ def build_domain_masks(
     """
     width, height = size
     mirrored_triangles: list[np.ndarray] = []
+    mirrored_surfaces: list[np.ndarray] = []
     rigid_triangles: list[np.ndarray] = []
     analysed = 0
     for part in parts:
         try:
-            mirrored, rigid = split_mirrored_and_rigid(
+            mirrored, rigid, surfaces = split_mirrored_and_rigid(
                 loaded, part, symbols, config, sweep_cache
             )
         except Exception as exc:  # a part the sweep cannot handle is not fatal
@@ -472,6 +607,7 @@ def build_domain_masks(
             continue
         analysed += 1
         mirrored_triangles.extend(mirrored)
+        mirrored_surfaces.extend(surfaces)
         rigid_triangles.extend(rigid)
         log(f"    {part.label}: {len(mirrored):5d} mirrored, {len(rigid):5d} rigid")
 
@@ -483,6 +619,24 @@ def build_domain_masks(
     mirror &= ~conflict
     log(f"  coverage: mirrored {mirror.mean():.2%}  rigid {rigid_mask.mean():.2%}  "
         f"conflict excluded {conflict.mean():.2%}")
+
+    axis_map = None
+    if mirrored_surfaces:
+        axes = surface_flip_axes(
+            np.asarray(mirrored_triangles, dtype=float),
+            np.asarray(mirrored_surfaces, dtype=float),
+            width,
+            height,
+        )
+        axis_map = rasterise_axis_map(mirrored_triangles, axes, width, height)
+        painted = axis_map[mirror]
+        horizontal = int((painted == AXIS_HORIZONTAL).sum())
+        vertical = int((painted == AXIS_VERTICAL).sum())
+        total = max(horizontal + vertical, 1)
+        log(f"  mirrored world X runs along the image's horizontal axis over "
+            f"{horizontal / total:.1%} of the domain, vertical over "
+            f"{vertical / total:.1%}")
+
     return DomainMasks(
         mirror=mirror,
         rigid=rigid_mask,
@@ -490,6 +644,7 @@ def build_domain_masks(
         mirrored_triangles=len(mirrored_triangles),
         rigid_triangles=len(rigid_triangles),
         parts_analysed=analysed,
+        axis_map=axis_map,
     )
 
 
@@ -510,16 +665,21 @@ def plan_island_flips(
     mirror_mask: np.ndarray,
     regions: list[tuple[int, int, int, int]],
     config: RhdTextureConfig,
+    axis_map: np.ndarray | None = None,
 ) -> tuple[list[IslandFlip], np.ndarray]:
     """Choose which whole islands to turn over, and on which axis.
 
-    A horizontal flip is what actually undoes a left-right mirror, so it is
-    always preferred.  It is only safe when the island matches its own
-    left-right reflection, otherwise the flipped content would land outside the
-    island's silhouette and bleed onto neighbouring geometry.  An island that
-    fails that test but matches its top-bottom reflection is flipped vertically
-    instead.  Never both: the two together are a 180 degree rotation, which
-    leaves the glyphs mirrored again.
+    Direction and permission are two separate questions.  The surface decides
+    the direction: whichever image axis the mirrored world axis runs along is
+    the one that undoes the mirror, and ``axis_map`` carries that per texel.
+    The island's own outline decides permission: flipping along that axis is
+    only safe if the island matches its reflection in it, or the content lands
+    outside the silhouette and bleeds onto neighbouring geometry.
+
+    An island whose required axis is not a symmetry of it is left alone here
+    and its glyphs fall to the in-place pass, which can flip them on the right
+    axis within their own bounds.  Never both axes: together they are a 180
+    degree rotation, which leaves the glyphs mirrored again.
     """
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
         mirror_mask.astype(np.uint8), connectivity=8
@@ -552,11 +712,19 @@ def plan_island_flips(
 
         horizontal = _reflection_similarity(component, np.fliplr(component))
         vertical = _reflection_similarity(component, np.flipud(component))
-        if horizontal >= threshold:
-            axis = "horizontal"
-        elif vertical >= threshold:
-            axis = "vertical"
+        if axis_map is not None:
+            island_stencil = np.zeros_like(mirror_mask)
+            island_stencil[y : y + h, x : x + w] = component
+            axis, _share = region_flip_axis(
+                axis_map, island_stencil, (x, y, w, h)
+            )
         else:
+            axis = "horizontal" if horizontal >= threshold else "vertical"
+        # The surface has named the axis; the outline only says whether the
+        # whole island may be turned over on it.  If not, the glyphs inside it
+        # are handled individually rather than flipped on the wrong axis.
+        similarity = horizontal if axis == "horizontal" else vertical
+        if similarity < threshold:
             continue
 
         flips.append(
@@ -780,7 +948,7 @@ def build_rhd_texture(
     log(f"  {len(mirrored_regions)} of them sit on mirrored geometry")
 
     flips, flipped_islands = plan_island_flips(
-        mirror_mask, mirrored_regions, config
+        mirror_mask, mirrored_regions, config, masks.axis_map
     )
     label_image = None
     if flips:
@@ -799,6 +967,8 @@ def build_rhd_texture(
         f"{sum(1 for f in flips if f.axis == 'vertical')} vertical)")
 
     in_place: list[tuple[int, int, int, int]] = []
+    in_place_axes: list[str] = []
+    marginal = 0
     for x, y, w, h in mirrored_regions:
         x0, y0 = max(x, 0), max(y, 0)
         x1, y1 = min(x + w, width), min(y + h, height)
@@ -806,9 +976,22 @@ def build_rhd_texture(
             continue
         if flipped_islands[y0:y1, x0:x1].mean() >= config.min_region_island_cover:
             continue
-        apply_masked_flip(rgba, mirror_mask, (x, y, w, h), "horizontal")
+        axis, share = (
+            region_flip_axis(masks.axis_map, mirror_mask, (x, y, w, h))
+            if masks.axis_map is not None
+            else ("horizontal", 1.0)
+        )
+        if share < config.min_region_axis_agreement:
+            marginal += 1
+            log(f"    ~ ({x},{y}) {w}x{h}: axis only {share:.0%} {axis}; "
+                "the surface turns a corner under this glyph")
+        apply_masked_flip(rgba, mirror_mask, (x, y, w, h), axis)
         in_place.append((x, y, w, h))
-    log(f"  pass 3: flipped {len(in_place)} remaining glyph region(s) in place")
+        in_place_axes.append(axis)
+    log(f"  pass 3: flipped {len(in_place)} remaining glyph region(s) in place "
+        f"({in_place_axes.count('horizontal')} horizontal, "
+        f"{in_place_axes.count('vertical')} vertical"
+        + (f", {marginal} marginal" if marginal else "") + ")")
 
     stem = PurePosixPath(texture_member).name
     for suffix in (".dds", ".DDS", ".png", ".PNG"):
@@ -859,7 +1042,8 @@ def build_rhd_texture(
                     for flip in flips
                 ],
                 "in_place_flips": [
-                    {"x": x, "y": y, "w": w, "h": h} for x, y, w, h in in_place
+                    {"x": x, "y": y, "w": w, "h": h, "axis": axis}
+                    for (x, y, w, h), axis in zip(in_place, in_place_axes)
                 ],
             },
             indent=2,
