@@ -114,6 +114,11 @@ class RhdTextureConfig:
     # still flipped on the majority axis but reported: it usually means the
     # surface folds under the glyph.
     min_region_axis_agreement: float = 0.8
+    # A flip only exchanges a texel when its opposite number is also inside
+    # the mirrored domain.  Below this share the region is left alone rather
+    # than half turned over: backwards but intact is a state you can still
+    # see and fix, whereas half exchanged is a broken glyph.
+    min_region_exchangeable: float = 0.98
 
     # BC7 encode quality.  alpha_ultrafast ~5s, alpha_fast ~30s,
     # alpha_basic ~60s for a 4096 square.
@@ -743,6 +748,29 @@ def plan_island_flips(
     return flips, flipped_mask
 
 
+def exchangeable_share(
+    stencil: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    axis: str,
+) -> float:
+    """Share of a rectangle whose texels can legally swap with their partner.
+
+    A texel may only move if the position it swaps with is also inside the
+    mirrored domain.  Where that fails the texel keeps its original content
+    while its neighbours move, which does not leave the glyph backwards -- it
+    breaks it.  Measuring the share first lets the caller decline.
+    """
+    x, y, w, h = bounds
+    height, width = stencil.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    mask = stencil[y0:y1, x0:x1]
+    flip = np.fliplr if axis == "horizontal" else np.flipud
+    return float((mask & flip(mask)).mean())
+
+
 def apply_masked_flip(
     image: np.ndarray,
     stencil: np.ndarray,
@@ -753,6 +781,7 @@ def apply_masked_flip(
 
     Only texels whose flipped partner is also inside the stencil are exchanged,
     so content is never dragged in from outside the region being turned over.
+    Callers wanting all-or-nothing should check ``exchangeable_share`` first.
     Returns the number of texels written.
     """
     x, y, w, h = bounds
@@ -968,6 +997,7 @@ def build_rhd_texture(
 
     in_place: list[tuple[int, int, int, int]] = []
     in_place_axes: list[str] = []
+    skipped: list[tuple[int, int, int, int, str, float]] = []
     marginal = 0
     for x, y, w, h in mirrored_regions:
         x0, y0 = max(x, 0), max(y, 0)
@@ -985,13 +1015,24 @@ def build_rhd_texture(
             marginal += 1
             log(f"    ~ ({x},{y}) {w}x{h}: axis only {share:.0%} {axis}; "
                 "the surface turns a corner under this glyph")
+        # Refuse to half-turn a region.  Where the region overruns its UV
+        # island, some texels have no partner to swap with and would keep their
+        # original content among neighbours that moved, which breaks the glyph
+        # instead of leaving it merely backwards.
+        exchangeable = exchangeable_share(mirror_mask, (x, y, w, h), axis)
+        if exchangeable < config.min_region_exchangeable:
+            skipped.append((x, y, w, h, axis, exchangeable))
+            log(f"    x ({x},{y}) {w}x{h}: only {exchangeable:.0%} of it can "
+                f"exchange on the {axis} axis; left unflipped rather than broken")
+            continue
         apply_masked_flip(rgba, mirror_mask, (x, y, w, h), axis)
         in_place.append((x, y, w, h))
         in_place_axes.append(axis)
     log(f"  pass 3: flipped {len(in_place)} remaining glyph region(s) in place "
         f"({in_place_axes.count('horizontal')} horizontal, "
         f"{in_place_axes.count('vertical')} vertical"
-        + (f", {marginal} marginal" if marginal else "") + ")")
+        + (f", {marginal} marginal" if marginal else "")
+        + (f"; {len(skipped)} left unflipped" if skipped else "") + ")")
 
     stem = PurePosixPath(texture_member).name
     for suffix in (".dds", ".DDS", ".png", ".PNG"):
@@ -1044,6 +1085,11 @@ def build_rhd_texture(
                 "in_place_flips": [
                     {"x": x, "y": y, "w": w, "h": h, "axis": axis}
                     for (x, y, w, h), axis in zip(in_place, in_place_axes)
+                ],
+                "skipped_regions": [
+                    {"x": x, "y": y, "w": w, "h": h, "axis": axis,
+                     "exchangeable": round(share, 4)}
+                    for x, y, w, h, axis, share in skipped
                 ],
             },
             indent=2,
