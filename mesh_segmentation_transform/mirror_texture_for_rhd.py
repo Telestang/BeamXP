@@ -123,6 +123,19 @@ class RhdTextureConfig:
     # glyph beats a reliably backwards one in a tool that runs unattended.
     min_region_exchangeable: float = 0.98
 
+    # Containment.  A region whose feature runs on past its own bounds is not
+    # a self contained mark: flipping the slice inside the region reverses it
+    # while its neighbours keep their lean, and the join shows.  Stitching is
+    # the usual offender.  A region with no usable ring is never rejected --
+    # nothing was measured, so nothing is concluded.
+    enable_containment_filter: bool = True
+    max_feature_escape: float = 0.10
+    background_ring_px: int = 4
+    background_spread_k: float = 4.0  # widens tolerance on woven backing
+    background_tolerance_floor: float = 14.0
+    escape_margin_fraction: float = 0.6  # how far past the region to follow
+    escape_min_margin_px: int = 24
+
     # BC7 encode quality.  alpha_ultrafast ~5s, alpha_fast ~30s,
     # alpha_basic ~60s for a 4096 square.
     bc7_profile: str = "alpha_basic"
@@ -661,6 +674,96 @@ def build_domain_masks(
 # ---------------------------------------------------------------------------
 
 
+def ring_background(
+    rgb: np.ndarray,
+    domain: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    ring: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Mean and per-channel spread of the band just outside a region.
+
+    Taken inside the UV domain only, so a region at an island edge measures the
+    material around it rather than the void beyond the island.  ``None`` means
+    there was too little band to characterise.
+    """
+    x, y, w, h = bounds
+    height, width = domain.shape
+    ox0, oy0 = max(x - ring, 0), max(y - ring, 0)
+    ox1, oy1 = min(x + w + ring, width), min(y + h + ring, height)
+    if ox1 <= ox0 or oy1 <= oy0:
+        return None
+    band = np.ones((oy1 - oy0, ox1 - ox0), dtype=bool)
+    band[max(y, 0) - oy0 : min(y + h, height) - oy0,
+         max(x, 0) - ox0 : min(x + w, width) - ox0] = False
+    band &= domain[oy0:oy1, ox0:ox1]
+    if int(band.sum()) < 24:
+        return None
+    pixels = rgb[oy0:oy1, ox0:ox1][band].astype(np.float32)
+    return pixels.mean(axis=0), pixels.std(axis=0)
+
+
+def feature_escape(
+    rgb: np.ndarray,
+    domain: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: RhdTextureConfig,
+) -> float | None:
+    """Share of the feature touching a region that continues past its bounds.
+
+    The background is read from a ring around the region -- its mean and its
+    spread, so a woven or noisy backing widens the tolerance instead of reading
+    as feature -- then everything unlike it is magic-wanded and followed out of
+    the region.
+
+    This measures the property that actually matters.  A glyph is a self
+    contained mark and scores near zero.  A row of stitching is one continuous
+    run: flipping the slice inside the region reverses its lean while its
+    neighbours keep theirs, and the join becomes a visible break.  Anything
+    scoring zero can be turned over without disturbing what surrounds it,
+    whatever it happens to depict.
+
+    ``None`` means the region has no usable ring, so nothing can be concluded.
+    """
+    x, y, w, h = bounds
+    height, width = domain.shape
+    background = ring_background(rgb, domain, bounds, config.background_ring_px)
+    if background is None:
+        return None
+    mean, spread = background
+    tolerance = np.maximum(
+        spread * config.background_spread_k, float(config.background_tolerance_floor)
+    )
+
+    margin = max(int(round(max(w, h) * config.escape_margin_fraction)),
+                 config.escape_min_margin_px)
+    wx0, wy0 = max(x - margin, 0), max(y - margin, 0)
+    wx1, wy1 = min(x + w + margin, width), min(y + h + margin, height)
+    window = rgb[wy0:wy1, wx0:wx1].astype(np.float32)
+
+    feature = (np.abs(window - mean) > tolerance).any(axis=2) & domain[wy0:wy1, wx0:wx1]
+    if not bool(feature.any()):
+        return 0.0
+
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        feature.astype(np.uint8), connectivity=8
+    )
+    region = np.zeros_like(feature)
+    region[max(y, 0) - wy0 : min(y + h, height) - wy0,
+           max(x, 0) - wx0 : min(x + w, width) - wx0] = True
+
+    touching = np.unique(labels[feature & region])
+    inside_area = outside_area = 0
+    for label in touching[touching > 0]:
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < 8:  # compression speckle, not a feature
+            continue
+        within = int(((labels == label) & region).sum())
+        inside_area += within
+        outside_area += area - within
+    total = inside_area + outside_area
+    return (outside_area / total) if total else 0.0
+
+
 def _reflection_similarity(component: np.ndarray, reflected: np.ndarray) -> float:
     """Intersection-over-union agreement between a mask and its reflection."""
     union = int((component | reflected).sum())
@@ -979,6 +1082,21 @@ def build_rhd_texture(
             mirrored_regions.append((x, y, w, h))
     log(f"  {len(mirrored_regions)} of them sit on mirrored geometry")
 
+    uncontained: list[tuple[int, int, int, int, float]] = []
+    if config.enable_containment_filter:
+        contained: list[tuple[int, int, int, int]] = []
+        for bounds in mirrored_regions:
+            escape = feature_escape(rgb, mirror_mask, bounds, config)
+            if escape is not None and escape > config.max_feature_escape:
+                uncontained.append((*bounds, escape))
+                continue
+            contained.append(bounds)
+        for x, y, w, h, escape in uncontained:
+            log(f"    - ({x},{y}) {w}x{h}: {escape:.0%} of its feature runs "
+                "past the region; not a self-contained mark, left alone")
+        mirrored_regions = contained
+        log(f"  {len(mirrored_regions)} are self-contained enough to flip")
+
     flips, flipped_islands = plan_island_flips(
         mirror_mask, mirrored_regions, config, masks.axis_map
     )
@@ -1094,6 +1212,10 @@ def build_rhd_texture(
                     for (x, y, w, h), axis, share in zip(
                         in_place, in_place_axes, in_place_shares
                     )
+                ],
+                "uncontained_regions": [
+                    {"x": x, "y": y, "w": w, "h": h, "escape": round(e, 4)}
+                    for x, y, w, h, e in uncontained
                 ],
                 "imperfect_regions": [
                     {"x": x, "y": y, "w": w, "h": h, "axis": axis,
