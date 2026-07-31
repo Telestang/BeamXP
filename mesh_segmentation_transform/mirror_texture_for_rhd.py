@@ -361,22 +361,21 @@ def parts_using_material(
     return matches
 
 
-def split_mirrored_and_rigid(
+def sweep_part(
     loaded: LoadedDae,
     part: DaePart,
-    symbols: set[str],
     config: RhdTextureConfig,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Run the symmetry sweep and split this part's UV triangles by fate.
+    cache: dict[str, object] | None = None,
+) -> object:
+    """Symmetry sweep for one part, memoised by part key.
 
-    Returns (mirrored, rigid).  Mirrored triangles are the residual husk, whose
-    positions the exporter reflects; rigid triangles belong to an accepted
-    perimeter-symmetric candidate and are already handled by its rotation.
+    A part usually paints several textures -- scintilla's dashboard binds four,
+    three of which are skins over one UV layout -- and the sweep depends only on
+    geometry, so it must not be repeated per texture.  At 2.5s a part that is
+    the difference between a fast run and a pointless one.
     """
-    uv_by_source = uv_triangles_by_source(loaded, part, symbols)
-    if not uv_by_source:
-        return [], []
-
+    if cache is not None and part.key in cache:
+        return cache[part.key]
     result = analyse_symmetry_sweep(
         loaded,
         part,
@@ -389,6 +388,29 @@ def split_mirrored_and_rigid(
         config.direct_symmetry_tolerance_metres,
         config.sample_spacing_metres,
     )
+    if cache is not None:
+        cache[part.key] = result
+    return result
+
+
+def split_mirrored_and_rigid(
+    loaded: LoadedDae,
+    part: DaePart,
+    symbols: set[str],
+    config: RhdTextureConfig,
+    sweep_cache: dict[str, object] | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Split this part's UV triangles by the fate the exporter gives them.
+
+    Returns (mirrored, rigid).  Mirrored triangles are the residual husk, whose
+    positions the exporter reflects; rigid triangles belong to an accepted
+    perimeter-symmetric candidate and are already handled by its rotation.
+    """
+    uv_by_source = uv_triangles_by_source(loaded, part, symbols)
+    if not uv_by_source:
+        return [], []
+
+    result = sweep_part(loaded, part, config, sweep_cache)
     labels = _candidate_ids_by_face(result)
 
     mirrored: list[np.ndarray] = []
@@ -406,6 +428,69 @@ def split_mirrored_and_rigid(
             continue
         (mirrored if candidate_id < 0 else rigid).append(triangle)
     return mirrored, rigid
+
+
+@dataclass(slots=True)
+class DomainMasks:
+    """Which texels the exporter mirrors, and which it leaves to a rotation."""
+
+    mirror: np.ndarray
+    rigid: np.ndarray
+    conflict_coverage: float
+    mirrored_triangles: int
+    rigid_triangles: int
+    parts_analysed: int
+
+
+def build_domain_masks(
+    loaded: LoadedDae,
+    parts: list[DaePart],
+    symbols: set[str],
+    size: tuple[int, int],
+    config: RhdTextureConfig,
+    sweep_cache: dict[str, object] | None = None,
+    log=print,
+) -> DomainMasks:
+    """Rasterise the mirrored and rigid domains over every part sharing a layout.
+
+    A texel any part rigid-transforms is subtracted from the mirror mask:
+    flipping a shared texel would fix one part and break another.
+    """
+    width, height = size
+    mirrored_triangles: list[np.ndarray] = []
+    rigid_triangles: list[np.ndarray] = []
+    analysed = 0
+    for part in parts:
+        try:
+            mirrored, rigid = split_mirrored_and_rigid(
+                loaded, part, symbols, config, sweep_cache
+            )
+        except Exception as exc:  # a part the sweep cannot handle is not fatal
+            log(f"    ! {part.label}: {type(exc).__name__}: {exc}")
+            continue
+        if not mirrored and not rigid:
+            continue
+        analysed += 1
+        mirrored_triangles.extend(mirrored)
+        rigid_triangles.extend(rigid)
+        log(f"    {part.label}: {len(mirrored):5d} mirrored, {len(rigid):5d} rigid")
+
+    log(f"  rasterising {len(mirrored_triangles):,} mirrored and "
+        f"{len(rigid_triangles):,} rigid UV triangles")
+    mirror = rasterise_uv_triangles(mirrored_triangles, width, height)
+    rigid_mask = rasterise_uv_triangles(rigid_triangles, width, height)
+    conflict = mirror & rigid_mask
+    mirror &= ~conflict
+    log(f"  coverage: mirrored {mirror.mean():.2%}  rigid {rigid_mask.mean():.2%}  "
+        f"conflict excluded {conflict.mean():.2%}")
+    return DomainMasks(
+        mirror=mirror,
+        rigid=rigid_mask,
+        conflict_coverage=float(conflict.mean()),
+        mirrored_triangles=len(mirrored_triangles),
+        rigid_triangles=len(rigid_triangles),
+        parts_analysed=analysed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -635,9 +720,17 @@ def build_rhd_texture(
     config: RhdTextureConfig = DEFAULT_RHD_CONFIG,
     mser_config: MserConfig = DEFAULT_CONFIG,
     part_filter: tuple[str, ...] = (),
+    masks: DomainMasks | None = None,
+    sweep_cache: dict[str, object] | None = None,
     log=print,
 ) -> RhdTextureResult:
-    """Run the whole correction and write the PNG and DDS outputs."""
+    """Run the whole correction and write the PNG and DDS outputs.
+
+    ``masks`` lets a caller supply a domain already rasterised for this UV
+    layout.  Skins of one layout -- scintilla ships three interior variants --
+    share their masks exactly, so recomputing them per skin would repeat every
+    sweep and every rasterisation for nothing.
+    """
     started = time.perf_counter()
     texture_path = extract_archive_member(archive, texture_member)
     with Image.open(texture_path) as image:
@@ -657,34 +750,18 @@ def build_rhd_texture(
     symbols = set(material_symbols_for_binding(loaded, candidates[0][1]))
     if not symbols:
         raise ValueError(f"No COLLADA symbol resolved for {texture_member}")
-    log(f"  {len(candidates)} part(s) use this texture; symbols {sorted(symbols)}")
 
-    mirrored_triangles: list[np.ndarray] = []
-    rigid_triangles: list[np.ndarray] = []
-    analysed = 0
-    for part, _binding in candidates:
-        try:
-            mirrored, rigid = split_mirrored_and_rigid(loaded, part, symbols, config)
-        except Exception as exc:  # a part the sweep cannot handle is not fatal
-            log(f"    ! {part.label}: {type(exc).__name__}: {exc}")
-            continue
-        if not mirrored and not rigid:
-            continue
-        analysed += 1
-        mirrored_triangles.extend(mirrored)
-        rigid_triangles.extend(rigid)
-        log(f"    {part.label}: {len(mirrored):5d} mirrored, {len(rigid):5d} rigid")
-
-    log(f"  rasterising {len(mirrored_triangles):,} mirrored and "
-        f"{len(rigid_triangles):,} rigid UV triangles")
-    mirror_mask = rasterise_uv_triangles(mirrored_triangles, width, height)
-    rigid_mask = rasterise_uv_triangles(rigid_triangles, width, height)
-    # A texel some part rigid-transforms must not be flipped: that part's glyphs
-    # are already correct, and flipping shared texels would break them.
-    conflict = mirror_mask & rigid_mask
-    mirror_mask &= ~conflict
-    log(f"  coverage: mirrored {mirror_mask.mean():.2%}  rigid {rigid_mask.mean():.2%}  "
-        f"conflict excluded {conflict.mean():.2%}")
+    if masks is None:
+        log(f"  {len(candidates)} part(s) use this texture; symbols {sorted(symbols)}")
+        masks = build_domain_masks(
+            loaded, [part for part, _b in candidates], symbols,
+            (width, height), config, sweep_cache, log,
+        )
+    else:
+        log(f"  {len(candidates)} part(s); reusing the masks for this UV layout "
+            f"(mirrored {masks.mirror.mean():.2%})")
+    mirror_mask, rigid_mask = masks.mirror, masks.rigid
+    analysed = masks.parts_analysed
 
     detection = run_detection(rgb[:, :, ::-1].copy(), mirror_mask | rigid_mask,
                               mser_config)
@@ -767,7 +844,7 @@ def build_rhd_texture(
                 "parts_analysed": analysed,
                 "mirror_coverage": round(float(mirror_mask.mean()), 6),
                 "rigid_coverage": round(float(rigid_mask.mean()), 6),
-                "conflict_coverage": round(float(conflict.mean()), 6),
+                "conflict_coverage": round(masks.conflict_coverage, 6),
                 "island_flips": [
                     {
                         "label": flip.label,
@@ -796,11 +873,11 @@ def build_rhd_texture(
         texture_member=texture_member,
         size=(width, height),
         parts_analysed=analysed,
-        mirrored_triangles=len(mirrored_triangles),
-        rigid_triangles=len(rigid_triangles),
+        mirrored_triangles=masks.mirrored_triangles,
+        rigid_triangles=masks.rigid_triangles,
         mirror_coverage=float(mirror_mask.mean()),
         rigid_coverage=float(rigid_mask.mean()),
-        conflict_coverage=float(conflict.mean()),
+        conflict_coverage=masks.conflict_coverage,
         glyph_regions=len(regions),
         mirrored_glyph_regions=len(mirrored_regions),
         island_flips=flips,
@@ -809,6 +886,97 @@ def build_rhd_texture(
         dds_path=dds_path,
         seconds=time.perf_counter() - started,
     )
+
+
+def textures_for_parts(
+    archive: VehicleArchive,
+    loaded: LoadedDae,
+    part_filter: tuple[str, ...] = (),
+) -> dict[str, list[DaePart]]:
+    """Map every texture the in-scope parts paint to the parts that paint it.
+
+    Scope selects which textures get rebuilt, not which parts define a
+    texture's domain: once a texture is in, every part using it is swept, or
+    its rigid claim on shared texels would be invisible.
+    """
+    wanted: set[str] = set()
+    for part in loaded.parts:
+        if part_filter and not any(
+            token.lower() in part.label.lower() for token in part_filter
+        ):
+            continue
+        try:
+            choices = archive_texture_choices_for_part(archive, loaded, part)
+        except Exception:
+            continue
+        wanted.update(binding.texture_member for binding in choices)
+
+    by_texture: dict[str, list[DaePart]] = {member: [] for member in sorted(wanted)}
+    for part in loaded.parts:
+        try:
+            choices = archive_texture_choices_for_part(archive, loaded, part)
+        except Exception:
+            continue
+        for binding in choices:
+            if binding.texture_member in by_texture:
+                by_texture[binding.texture_member].append(part)
+    return by_texture
+
+
+def build_all_rhd_textures(
+    archive: VehicleArchive,
+    loaded: LoadedDae,
+    output_directory: Path,
+    config: RhdTextureConfig = DEFAULT_RHD_CONFIG,
+    mser_config: MserConfig = DEFAULT_CONFIG,
+    part_filter: tuple[str, ...] = (),
+    log=print,
+) -> list[RhdTextureResult]:
+    """Rebuild every texture the in-scope parts paint.
+
+    Sweeps are memoised per part and domain masks per (UV layout, size), so a
+    part painting four textures is still swept once and a set of skins over one
+    layout is rasterised once.
+    """
+    by_texture = textures_for_parts(archive, loaded, part_filter)
+    if not by_texture:
+        raise ValueError("No texture resolved for the selected parts.")
+    log(f"{len(by_texture)} texture(s) to rebuild")
+
+    sweep_cache: dict[str, object] = {}
+    mask_cache: dict[tuple, DomainMasks] = {}
+    results: list[RhdTextureResult] = []
+
+    for member, parts in by_texture.items():
+        log(f"\n{PurePosixPath(member).name}")
+        try:
+            binding = next(
+                b
+                for b in archive_texture_choices_for_part(archive, loaded, parts[0])
+                if b.texture_member == member
+            )
+            symbols = frozenset(material_symbols_for_binding(loaded, binding))
+            with Image.open(extract_archive_member(archive, member)) as image:
+                size = image.size
+            key = (symbols, size, tuple(sorted(part.key for part in parts)))
+            masks = mask_cache.get(key)
+            if masks is None:
+                masks = build_domain_masks(
+                    loaded, parts, set(symbols), size, config, sweep_cache, log
+                )
+                mask_cache[key] = masks
+            if not bool(masks.mirror.any()):
+                log("  nothing mirrored on this texture; skipped")
+                continue
+            results.append(
+                build_rhd_texture(
+                    archive, loaded, member, output_directory, config, mser_config,
+                    masks=masks, sweep_cache=sweep_cache, log=log,
+                )
+            )
+        except Exception as exc:
+            log(f"  ! failed: {type(exc).__name__}: {exc}")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -826,8 +994,13 @@ def main() -> int:
     parser.add_argument("vehicle", type=Path, help="Vehicle ZIP archive.")
     parser.add_argument(
         "--texture",
-        required=True,
-        help="Texture file name or member path, e.g. scintilla_interior_b.color.DDS",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Texture file name or member path, e.g. scintilla_interior_b.color.DDS. "
+            "Repeatable. Omit to rebuild every texture the selected parts paint."
+        ),
     )
     parser.add_argument("--dae", help="DAE member path. Defaults to the largest.")
     parser.add_argument(
@@ -870,18 +1043,23 @@ def main() -> int:
     workspace = Path(tempfile.mkdtemp(prefix="beamxp_rhd_"))
     archive = scan_vehicle_archive(args.vehicle, workspace)
 
-    member = args.texture.replace("\\", "/")
-    if member not in archive.members:
-        wanted = PurePosixPath(member).name.lower()
-        found = [m for m in archive.members if PurePosixPath(m).name.lower() == wanted]
-        if not found:
-            parser.error(f"Texture not found in archive: {args.texture}")
-        member = found[0]
+    members: list[str] = []
+    for requested in args.texture:
+        member = requested.replace("\\", "/")
+        if member not in archive.members:
+            wanted = PurePosixPath(member).name.lower()
+            found = [
+                m for m in archive.members if PurePosixPath(m).name.lower() == wanted
+            ]
+            if not found:
+                parser.error(f"Texture not found in archive: {requested}")
+            member = found[0]
+        members.append(member)
 
     dae_member = args.dae or max(
         archive.dae_members, key=lambda m: archive.member_sizes.get(m, 0)
     )
-    print(f"{args.vehicle.name}\n  DAE {dae_member}\n  texture {member}")
+    print(f"{args.vehicle.name}\n  DAE {dae_member}")
     loaded = load_dae(extract_archive_member(archive, dae_member))
 
     output = args.output or Path("rhd_textures") / args.vehicle.stem
@@ -890,28 +1068,41 @@ def main() -> int:
         min_island_symmetry=args.island_symmetry,
         write_debug_overlays=not args.no_overlay,
     )
-    result = build_rhd_texture(
-        archive,
-        loaded,
-        member,
-        output,
-        config,
-        part_filter=tuple(args.part),
-    )
 
-    print(
-        f"\n{result.size[0]}x{result.size[1]}  {result.parts_analysed} part(s)  "
-        f"{len(result.island_flips)} island flip(s)  "
-        f"{len(result.in_place_flips)} in-place flip(s)  "
-        f"{result.seconds:.1f}s"
-    )
-    for flip in result.island_flips:
-        x, y, w, h = flip.bounds
-        print(
-            f"  island {flip.label:4d}  {w:5d}x{h:<5d} at ({x},{y})  "
-            f"{flip.axis:10s}  lr {flip.horizontal_similarity:.3f}  "
-            f"ud {flip.vertical_similarity:.3f}  {flip.glyph_count} glyph(s)"
+    started = time.perf_counter()
+    if members:
+        sweep_cache: dict[str, object] = {}
+        results = []
+        for member in members:
+            print(f"\n{PurePosixPath(member).name}")
+            results.append(
+                build_rhd_texture(
+                    archive, loaded, member, output, config,
+                    part_filter=tuple(args.part), sweep_cache=sweep_cache,
+                )
+            )
+    else:
+        results = build_all_rhd_textures(
+            archive, loaded, output, config, part_filter=tuple(args.part)
         )
+
+    print(f"\n{'=' * 70}\n{len(results)} texture(s) rebuilt in "
+          f"{time.perf_counter() - started:.1f}s")
+    for result in results:
+        print(
+            f"  {PurePosixPath(result.texture_member).name:44s} "
+            f"{result.size[0]}x{result.size[1]}  "
+            f"{result.mirror_coverage:6.2%} mirrored  "
+            f"{len(result.island_flips)} island + "
+            f"{len(result.in_place_flips)} in-place flip(s)"
+        )
+        for flip in result.island_flips:
+            x, y, w, h = flip.bounds
+            print(
+                f"      island {flip.label:4d}  {w:5d}x{h:<5d} at ({x},{y})  "
+                f"{flip.axis:10s}  lr {flip.horizontal_similarity:.3f}  "
+                f"ud {flip.vertical_similarity:.3f}  {flip.glyph_count} glyph(s)"
+            )
     return 0
 
 
