@@ -58,25 +58,26 @@ class MserConfig:
     max_variation: float = 1.0  # default: 0.25
     min_diversity: float = 0.1  # default: 0.2
 
-    # Post-detection filtering
-    enable_min_component_area_filter: bool  = True  # default: True
-    min_component_area_px:            int   = 16  # default: 16
-    enable_mser_area_fraction_filter: bool  = True  # default: True
-    max_area_fraction:                float = 0.25  # default: 0.25
+    # Post-detection filtering.  MSER's own max_area already caps a region far
+    # below any sane fraction of the atlas, so no image-fraction test is applied
+    # to boxes; measured over eight 4k dashboards it rejected nothing.
     enable_aspect_ratio_filter:       bool  = True  # default: True
     min_aspect:                       float = 0.1  # default: 0.1
     max_aspect:                       float = 10.0  # default: 10.0
 
-    # Early box filters, applied to raw MSER boxes before grouping
-    enable_flat_box_filter:      bool  = True  # default: True
+    # Early box filters, applied to raw MSER boxes before grouping.  The test
+    # that survives is the feature-blob size: an MSER box is homogeneous by
+    # definition, so it is judged together with a ring of context, and what
+    # separates a glyph stroke from blank trim is whether the non-background
+    # pixels form one whole run or break into speckle.
+    enable_box_feature_filter:   bool  = True  # default: True
     min_box_width_px:            int   = 3  # default: 3
     min_box_height_px:           int   = 3  # default: 3
-    flat_box_colour_tolerance:   int   = 16  # default: 16 (magic-wand sensitivity)
-    flat_box_min_coverage:       float = 0.97  # default: 0.97 (reject at or above)
-    flat_box_min_domain_px:      int   = 8  # default: 8
-    flat_box_context_px:         int   = 3  # default: 3 (an MSER box alone is always flat)
+    box_feature_colour_tolerance: int  = 16  # default: 16 (magic-wand sensitivity)
+    box_feature_min_domain_px:   int   = 8  # default: 8
+    box_feature_context_px:      int   = 3  # default: 3 (an MSER box alone is always flat)
     min_box_uv_coverage:         float = 0.75  # default: 0.75 (share of the box inside the UV domain)
-    flat_box_min_feature_px:     int   = 24  # default: 24 (largest non-background blob)
+    box_min_feature_px:          int   = 24  # default: 24 (largest non-background blob)
     # Repeating-pattern rejection, applied to assembled groups.  A group covers
     # a whole panel, so the statistic sees several periods; the same test on a
     # single MSER box separated nothing.  Measured on the dash, perforated
@@ -93,16 +94,15 @@ class MserConfig:
     # Boxes are expanded by this many pixels on every side before the
     # minimum union-area test.  This replaces the old additive
     # merge_distance_px + group_dilate_px pair.
+    #
+    # No size or area cap is applied while candidates are assembled.  A group
+    # that comes out too broad still owns its exact member boxes, and domain
+    # recovery below can split it back down; dropping it here would throw those
+    # members away, which is the one case recovery exists to handle.
     merge_distance_px:              int  = 18  # default: 18
-    min_group_union_region_px:      int  = 1  # default: 169 - 1px for any overlap allowed
-    enable_group_area_filter:       bool = True  # default: True
-    enable_group_degenerate_filter: bool = True  # default: True
+    min_group_union_region_px:      int  = 1  # default: 1 (any overlap merges)
     enable_island_bounded_grouping: bool = True  # default: True
-    # How much UV-domain coverage a merge may cost before the merged box has to
-    # justify itself by being round.  Absolute coverage is the wrong test: a
-    # dial's box always has dead corners, and boxes already low stay low when
-    # merged with their own duplicates.
-    max_group_uv_coverage_drop:     float = 0.00  # default: 0.02
+    enable_overlap_group_merge:     bool = True  # default: True
 
     # Round regions: inscribe a circle in a squarish group and keep it when the
     # corners it drops are one solid colour or contain no UV domain at all.
@@ -118,7 +118,7 @@ class MserConfig:
     enable_final_size_filter:              bool  = True  # default: True
     final_min_width_px:                    int   = 4  # default: 4
     final_min_height_px:                   int   = 4  # default: 4
-    final_min_area_px:                     int   = 50  # default: 100
+    final_min_area_px:                     int   = 50  # default: 50
     enable_final_aspect_filter:            bool  = True  # default: True
     final_max_aspect:                      float = 12.0  # default: 12.0 (long side / short)
 
@@ -128,9 +128,6 @@ class MserConfig:
     # group that still fails is retried once at half the merge distance.
     enable_region_domain_filter:           bool  = True  # default: True
     min_region_uv_coverage:                float = 0.98  # default: 0.98
-    enable_final_single_colour_filter:     bool  = True  # default: True
-    final_single_colour_quant_step:        int   = 12  # default: 12
-    final_single_colour_fraction:          float = 0.98  # default: 0.98
 
     # Terminal output shaping.  Applied only after every detection/filter stage,
     # so padding cannot cause a region to fail an earlier size, colour, or domain
@@ -408,8 +405,10 @@ def detect_mser_boxes(
 ) -> np.ndarray:
     """Return filtered axis-aligned bounding boxes from MSER detection.
 
-    Each row is ``[x, y, w, h]`` in pixel coordinates.  Boxes that fail
-    the area, aspect-ratio, or image-fraction filters are discarded.
+    Each row is ``[x, y, w, h]`` in pixel coordinates.  Only the aspect-ratio
+    test is applied here.  Size is left to ``config.min_area``/``max_area``,
+    which MSER enforces on the region itself rather than on its bounding box,
+    and to the minimum box dimensions in the next stage.
     """
     mser = cv2.MSER_create(
         config.delta,
@@ -423,17 +422,9 @@ def detect_mser_boxes(
     if len(regions) == 0:
         return np.empty((0, 4), dtype=np.int32)
 
-    image_area = grey.shape[0] * grey.shape[1]
-    max_component_area = int(image_area * config.max_area_fraction)
-
     boxes: list[tuple[int, int, int, int]] = []
     for region in regions:
         x, y, w, h = cv2.boundingRect(region)
-        area = w * h
-        if config.enable_min_component_area_filter and area < config.min_component_area_px:
-            continue
-        if config.enable_mser_area_fraction_filter and area > max_component_area:
-            continue
         aspect = max(w, h) / max(min(w, h), 1)
         if config.enable_aspect_ratio_filter and (
             aspect < config.min_aspect or aspect > config.max_aspect
@@ -524,31 +515,32 @@ def box_uv_coverage(
     return float(uv_mask[y : y + h, x : x + w].sum()) / float(area)
 
 
-def box_flat_colour_coverage(
+def box_feature_blob_px(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
     box: tuple[int, int, int, int],
     config: MserConfig,
-) -> tuple[float, int] | None:
-    """Return a box's single-colour coverage and its largest non-background blob.
+) -> int | None:
+    """Return the area of a box's largest connected non-background run.
 
-    Coverage alone cannot tell blank trim from a thin glyph stroke on a wide
-    plate -- both are ~85% one colour.  The second value is the area of the
-    largest connected run of non-dominant pixels: speckle noise on blank trim
-    breaks into tiny fragments, while a stroke stays whole.
+    Speckle noise on blank trim breaks into tiny fragments, while a glyph
+    stroke stays whole, so this one number separates the two.  The share of the
+    box that is a single colour was measured alongside it for a long time and
+    dropped: across eight 4k dashboards it rejected between zero and six boxes,
+    none of which survived to affect a final region.
 
     Uses the magic wand's colour model: the dominant colour is estimated inside
-    the UV domain, then coverage is the share of domain pixels within
-    ``flat_box_colour_tolerance`` of it.  ``None`` means the box has too little
-    UV domain to judge.
+    the UV domain, and anything further than ``box_feature_colour_tolerance``
+    from it on any channel counts as feature.  ``None`` means the box has too
+    little UV domain to judge.
 
-    The test covers the box plus ``flat_box_context_px``, because an MSER region
-    is homogeneous by definition -- measured on the bare box, a glyph stroke
-    looks as single-coloured as blank trim does.  With a ring of context, a
-    stroke brings its background in and stops looking flat.
+    The test covers the box plus ``box_feature_context_px``, because an MSER
+    region is homogeneous by definition -- measured on the bare box, a glyph
+    stroke has no background to stand out against.  With a ring of context, the
+    stroke's surroundings come in and the stroke becomes the feature.
     """
     inner = box
-    box = context_box(box, config.flat_box_context_px)
+    box = context_box(box, config.box_feature_context_px)
     clamped = clamp_group(box, image.shape)
     if clamped is None:
         return None
@@ -569,36 +561,33 @@ def box_flat_colour_coverage(
                 max(min(inner[3], h), 1),
             ),
         )
-    if int(domain.sum()) < max(config.flat_box_min_domain_px, 1):
+    if int(domain.sum()) < max(config.box_feature_min_domain_px, 1):
         return None
 
-    tolerance = max(config.flat_box_colour_tolerance, 0)
+    tolerance = max(config.box_feature_colour_tolerance, 0)
     dominant = estimate_background_colour(crop, domain, max(tolerance, 1))
     if dominant is None:
         return None
-    matching = channel_colour_mask(crop, domain, dominant, tolerance)
-    coverage = float(matching.sum()) / float(domain.sum())
 
-    feature = domain & ~matching
+    feature = domain & ~channel_colour_mask(crop, domain, dominant, tolerance)
     if not bool(feature.any()):
-        return coverage, 0
+        return 0
     count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
         feature.astype(np.uint8), connectivity=8
     )
-    largest = max(
+    return max(
         (int(stats[label, cv2.CC_STAT_AREA]) for label in range(1, count)),
         default=0,
     )
-    return coverage, largest
 
 
-def filter_boxes_by_flat_colour(
+def filter_boxes_by_feature(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
     boxes: np.ndarray,
     config: MserConfig,
 ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
-    """Drop undersized, single-coloured, or out-of-domain MSER boxes.
+    """Drop undersized, featureless, or out-of-domain MSER boxes.
 
     The pre-MSER fill makes every island silhouette a hard edge, so MSER finds a
     few regions straddling the boundary.  Those carry no geometry over most of
@@ -617,21 +606,14 @@ def filter_boxes_by_flat_colour(
         ):
             rejected.append(box)
             continue
-        if not config.enable_flat_box_filter:
+        if not config.enable_box_feature_filter:
             kept.append(box)
             continue
         if box_uv_coverage(uv_mask, box, image.shape) < config.min_box_uv_coverage:
             rejected.append(box)
             continue
-        metrics = box_flat_colour_coverage(image, uv_mask, box, config)
-        if metrics is None:
-            rejected.append(box)
-            continue
-        coverage, feature_px = metrics
-        if (
-            coverage >= config.flat_box_min_coverage
-            or feature_px < config.flat_box_min_feature_px
-        ):
+        feature_px = box_feature_blob_px(image, uv_mask, box, config)
+        if feature_px is None or feature_px < config.box_min_feature_px:
             rejected.append(box)
             continue
         kept.append(box)
@@ -651,9 +633,9 @@ def repeating_pattern_score(window: np.ndarray, config: MserConfig) -> float:
     raw peak is useless here because it mostly measures smoothness -- blank trim
     scores higher than a woven panel.
 
-    Note the score did not separate weave from glyphs on the atlases tested; it
-    is reported so the tuning harness can show it, and its filter is off by
-    default.
+    The measure only separates anything once it sees several periods, so it is
+    applied to assembled groups and not to single MSER boxes.  Even then it is
+    narrow: across eight 4k dashboards it changed the outcome on one.
     """
     patch = window.astype(np.float32)
     patch -= float(patch.mean())
@@ -710,7 +692,13 @@ def pattern_window_for_box(
     box: tuple[int, int, int, int],
     config: MserConfig,
 ) -> np.ndarray | None:
-    """Return a grey neighbourhood around a box, wide enough to show repeats."""
+    """Return a square grey neighbourhood centred on a box.
+
+    The side is the box's longer edge, so a wide, short group is scored over a
+    tall square that reaches well past it.  That is deliberate for a weave,
+    which continues beyond whatever slice of it MSER happened to group, but it
+    does dilute the statistic for a long strip of text.
+    """
     x, y, w, h = box
     target = max(
         int(round(max(w, h) * max(config.pattern_window_scale, 1.0))),
@@ -857,8 +845,8 @@ def filter_groups_by_pattern(
 
     A group spans a whole panel rather than one glyph stroke, so the statistic
     finally has several periods to work with -- the same test on a single MSER
-    box could not separate anything.  The window is the group itself: padding it
-    out dilutes the pattern with surrounding trim.
+    box could not separate anything.  See ``pattern_window_for_box`` for the
+    window the score is actually measured over.
     """
     if not config.enable_pattern_group_filter or not groups:
         return groups, []
@@ -925,20 +913,46 @@ class GroupCandidate:
     members: tuple[tuple[int, int, int, int], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class UvDomainIndex:
+    """Whole-mask derivatives shared by every grouping call in one run.
+
+    Domain recovery regroups the members of each failed candidate separately,
+    so without this the connected-component pass over the entire atlas ran once
+    per failure -- work that does not depend on the boxes being regrouped.  The
+    labels are read-only and safe to share between calls and between resumed
+    runs of the same texture.
+    """
+
+    island_labels: np.ndarray
+
+
+def build_uv_domain_index(uv_mask: np.ndarray | None) -> UvDomainIndex | None:
+    """Label the UV islands once, for reuse by every grouping call."""
+    if uv_mask is None:
+        return None
+    _count, labels = cv2.connectedComponents(
+        uv_mask.astype(np.uint8), connectivity=8
+    )
+    return UvDomainIndex(island_labels=labels)
+
+
 def union_region_group_candidates(
     boxes: np.ndarray,
     image: np.ndarray,
     config: MserConfig,
     uv_mask: np.ndarray | None = None,
-    strict_merges: bool = False,
+    domain: UvDomainIndex | None = None,
 ) -> list[GroupCandidate]:
-    """Group boxes and retain exact membership for later recovery.
+    """Group boxes by proximity and retain exact membership for later recovery.
 
-    The first pass is deliberately permissive.  Shaped UV-domain validation is
-    performed later, after a complete group has had the opportunity to qualify
-    as circular.  ``strict_merges`` is used only when rebuilding a failed group:
-    a candidate merge may not lose more UV coverage than
-    ``max_group_uv_coverage_drop`` relative to either input component.
+    Deliberately permissive, and deliberately without any cap on the result: a
+    group that comes out too broad is handed to domain recovery, which can
+    split it back into the boxes it was built from.  Discarding it here would
+    discard those boxes with it.
+
+    ``domain`` is the shared island labelling; it is built on demand when the
+    caller has none.
     """
     if len(boxes) == 0:
         return []
@@ -953,17 +967,11 @@ def union_region_group_candidates(
     parent = list(range(len(box_tuples)))
     bounds = [(x, y, x + w, y + h) for x, y, w, h in box_tuples]
 
-    integral = (
-        cv2.integral(uv_mask.astype(np.uint8))
-        if uv_mask is not None
-        else None
-    )
-
     island = [0] * len(box_tuples)
     if uv_mask is not None and config.enable_island_bounded_grouping:
-        _count, labels = cv2.connectedComponents(
-            uv_mask.astype(np.uint8), connectivity=8
-        )
+        if domain is None:
+            domain = build_uv_domain_index(uv_mask)
+        labels = domain.island_labels  # type: ignore[union-attr]
         for index, (bx, by, bw, bh) in enumerate(box_tuples):
             clamped = clamp_group((bx, by, bw, bh), uv_mask.shape)
             if clamped is None:
@@ -973,26 +981,6 @@ def union_region_group_candidates(
             within = within[within > 0]
             if within.size:
                 island[index] = int(np.bincount(within).argmax())
-
-    def covered(rect: tuple[int, int, int, int]) -> float:
-        if integral is None:
-            return 1.0
-        x0 = min(max(rect[0], 0), width)
-        y0 = min(max(rect[1], 0), height)
-        x1 = min(max(rect[2], 0), width)
-        y1 = min(max(rect[3], 0), height)
-        if x1 <= x0 or y1 <= y0:
-            return 0.0
-        inside = (
-            int(integral[y1, x1])
-            - int(integral[y0, x1])
-            - int(integral[y1, x0])
-            + int(integral[y0, x0])
-        )
-        area = max((rect[2] - rect[0]) * (rect[3] - rect[1]), 1)
-        return inside / float(area)
-
-    coverage = [covered(rect) for rect in bounds]
 
     def find(index: int) -> int:
         while parent[index] != index:
@@ -1009,21 +997,13 @@ def union_region_group_candidates(
             return
         first = bounds[left_root]
         second = bounds[right_root]
-        merged = (
+        parent[right_root] = left_root
+        bounds[left_root] = (
             min(first[0], second[0]),
             min(first[1], second[1]),
             max(first[2], second[2]),
             max(first[3], second[3]),
         )
-        merged_coverage = covered(merged)
-        if strict_merges and merged_coverage < (
-            min(coverage[left_root], coverage[right_root])
-            - max(config.max_group_uv_coverage_drop, 0.0)
-        ):
-            return
-        parent[right_root] = left_root
-        bounds[left_root] = merged
-        coverage[left_root] = merged_coverage
 
     grid: dict[tuple[int, int], list[int]] = {}
     for i, expanded in enumerate(expanded_boxes):
@@ -1050,17 +1030,11 @@ def union_region_group_candidates(
         y0 = max(rect[1], 0)
         x1 = min(rect[2], width)
         y1 = min(rect[3], height)
-        w = x1 - x0
-        h = y1 - y0
-        if config.enable_group_area_filter and (
-            w * h > image_shape[0] * image_shape[1] * config.max_area_fraction
-        ):
-            continue
-        if config.enable_group_degenerate_filter and (w < 4 or h < 4):
+        if x1 <= x0 or y1 <= y0:
             continue
         candidates.append(
             GroupCandidate(
-                bounds=(x0, y0, w, h),
+                bounds=(x0, y0, x1 - x0, y1 - y0),
                 members=tuple(box_tuples[index] for index in indices),
             )
         )
@@ -1074,13 +1048,13 @@ def union_region_group_boxes(
     image: np.ndarray,
     config: MserConfig,
     uv_mask: np.ndarray | None = None,
-    strict_merges: bool = False,
+    domain: UvDomainIndex | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Compatibility wrapper returning only group bounds."""
     return [
         candidate.bounds
         for candidate in union_region_group_candidates(
-            boxes, image, config, uv_mask, strict_merges=strict_merges
+            boxes, image, config, uv_mask, domain
         )
     ]
 
@@ -1116,11 +1090,8 @@ def clamp_group(
     return (x0, y0, x1 - x0, y1 - y0)
 
 
-def dominant_quantized_colour(pixels: np.ndarray, quant_step: int) -> np.ndarray:
-    """Return the dominant quantized BGR colour bin for a pixel collection."""
-    quant_step = max(quant_step, 1)
-    quantized = (pixels // quant_step).astype(np.int32)
-    levels = (255 // quant_step) + 1
+def dominant_quantized_bin(quantized: np.ndarray, levels: int) -> np.ndarray:
+    """Return the most populated quantized BGR bin, given quantized pixels."""
     if levels**3 > 1_000_000:
         bins, counts = np.unique(quantized.reshape(-1, 3), axis=0, return_counts=True)
         return bins[int(np.argmax(counts))]
@@ -1129,17 +1100,7 @@ def dominant_quantized_colour(pixels: np.ndarray, quant_step: int) -> np.ndarray
     dominant_code = int(np.bincount(codes).argmax())
     b = dominant_code // (levels * levels)
     remainder = dominant_code % (levels * levels)
-    g = remainder // levels
-    r = remainder % levels
-    return np.asarray((b, g, r), dtype=np.int32)
-
-
-def dominant_colour_matches(pixels: np.ndarray, quant_step: int) -> np.ndarray:
-    """Return mask for pixels matching the dominant quantized BGR colour."""
-    quant_step = max(quant_step, 1)
-    quantized = (pixels // quant_step).astype(np.int32)
-    dominant_bin = dominant_quantized_colour(pixels, quant_step)
-    return np.all(quantized == dominant_bin, axis=1)
+    return np.asarray((b, remainder // levels, remainder % levels), dtype=np.int32)
 
 
 def estimate_background_colour(
@@ -1147,30 +1108,26 @@ def estimate_background_colour(
     domain_mask: np.ndarray,
     colour_thresh: int,
 ) -> np.ndarray | None:
-    """Estimate the dominant background BGR colour inside the current domain."""
+    """Estimate the dominant background BGR colour inside the current domain.
+
+    Quantises once and reuses that array for both the bin histogram and the
+    membership test; this runs per MSER box, so it is the pipeline's hottest
+    piece of arithmetic.
+    """
     domain_pixels = crop[domain_mask]
     if len(domain_pixels) == 0:
         return None
 
-    dominant_matches = dominant_colour_matches(
-        domain_pixels,
-        max(colour_thresh, 1),
+    quant_step = max(colour_thresh, 1)
+    quantized = (domain_pixels // quant_step).astype(np.int32)
+    levels = (255 // quant_step) + 1
+    dominant_matches = np.all(
+        quantized == dominant_quantized_bin(quantized, levels), axis=1
     )
     if not bool(dominant_matches.any()):
         return None
 
     return np.median(domain_pixels[dominant_matches], axis=0).astype(np.int16)
-
-
-def background_colour_mask(
-    crop: np.ndarray,
-    domain_mask: np.ndarray,
-    background_colour: np.ndarray,
-    colour_thresh: int,
-) -> np.ndarray:
-    """Return domain pixels close enough to the estimated background colour."""
-    colour_delta = np.linalg.norm(crop.astype(np.int16) - background_colour, axis=2)
-    return (colour_delta <= max(colour_thresh, 0)) & domain_mask
 
 
 def filter_groups_by_final_size(
@@ -1196,53 +1153,6 @@ def filter_groups_by_final_size(
             config.enable_final_aspect_filter
             and max(w, h) / max(min(w, h), 1) > config.final_max_aspect
         ):
-            rejected.append(group)
-            continue
-        kept.append(group)
-
-    return kept, rejected
-
-
-def dominant_colour_fraction(crop: np.ndarray, quant_step: int) -> float:
-    """Return fraction of pixels in the dominant quantized colour bin."""
-    pixels = crop.reshape(-1, 3)
-    if len(pixels) == 0:
-        return 1.0
-
-    quant_step = max(quant_step, 1)
-    quantized = (pixels // quant_step).astype(np.int32)
-    levels = (255 // quant_step) + 1
-    if levels**3 > 1_000_000:
-        _bins, counts = np.unique(quantized.reshape(-1, 3), axis=0, return_counts=True)
-        return float(counts.max()) / len(pixels)
-
-    codes = (quantized[:, 0] * levels + quantized[:, 1]) * levels + quantized[:, 2]
-    counts = np.bincount(codes)
-    return float(counts.max()) / len(pixels)
-
-
-def filter_groups_by_single_colour(
-    image: np.ndarray,
-    groups: list[tuple[int, int, int, int]],
-    config: MserConfig,
-) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
-    """Drop final groups that are effectively one flat colour."""
-    if not config.enable_final_single_colour_filter:
-        return groups, []
-
-    kept: list[tuple[int, int, int, int]] = []
-    rejected: list[tuple[int, int, int, int]] = []
-    for group in groups:
-        clamped = clamp_group(group, image.shape)
-        if clamped is None:
-            rejected.append(group)
-            continue
-        x, y, w, h = clamped
-        flat_fraction = dominant_colour_fraction(
-            image[y : y + h, x : x + w],
-            config.final_single_colour_quant_step,
-        )
-        if flat_fraction >= config.final_single_colour_fraction:
             rejected.append(group)
             continue
         kept.append(group)
@@ -1313,12 +1223,17 @@ class DetectionState:
     boxes: np.ndarray
     groups: list[tuple[int, int, int, int]]
     candidates: list[GroupCandidate] = field(default_factory=list)
+    # Built once by the grouping step and read by domain recovery.  Shared by
+    # reference: the labelling is read-only and depends only on the UV mask,
+    # which never changes within a run or across a resumed one.
+    domain: UvDomainIndex | None = None
 
     def copy(self) -> "DetectionState":
         return DetectionState(
             boxes=self.boxes.copy(),
             groups=list(self.groups),
             candidates=list(self.candidates),
+            domain=self.domain,
         )
 
 
@@ -1338,15 +1253,15 @@ def _step_mser(
     )
 
 
-def _step_flat_box(
+def _step_box_filter(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
-    boxes, rejected = filter_boxes_by_flat_colour(image, uv_mask, state.boxes, config)
+    boxes, rejected = filter_boxes_by_feature(image, uv_mask, state.boxes, config)
     return DetectionState(boxes, []), DetectionStage(
-        key="flat_box",
+        key="box_filter",
         title="Box filtering",
         kept=tuple(tuple(int(v) for v in box) for box in boxes),  # type: ignore[misc]
         rejected=tuple(rejected),
@@ -1354,11 +1269,11 @@ def _step_flat_box(
             f"minimum {max(config.min_box_width_px, 1)}x"
             f"{max(config.min_box_height_px, 1)} px; "
             + (
-                f"need >= {config.min_box_uv_coverage:.0%} of the box inside the UV domain; "
-                f"reject at >= {config.flat_box_min_coverage:.0%} of the domain area "
-                f"within {config.flat_box_colour_tolerance} of one colour"
-                if config.enable_flat_box_filter
-                else "flat-colour and UV-domain checks disabled"
+                f"need >= {config.min_box_uv_coverage:.0%} of the box inside the UV "
+                f"domain and a non-background blob of >= {config.box_min_feature_px} px "
+                f"within {config.box_feature_colour_tolerance} of one colour"
+                if config.enable_box_feature_filter
+                else "feature and UV-domain checks disabled"
             )
         ),
     )
@@ -1371,17 +1286,19 @@ def _step_grouped(
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
     """Create permissive initial groups and retain their exact members."""
+    domain = build_uv_domain_index(uv_mask)
     candidates = union_region_group_candidates(
-        state.boxes, image, config, uv_mask, strict_merges=False
+        state.boxes, image, config, uv_mask, domain
     )
     groups = [candidate.bounds for candidate in candidates]
-    return DetectionState(state.boxes, groups, candidates), DetectionStage(
+    return DetectionState(state.boxes, groups, candidates, domain), DetectionStage(
         key="grouped",
         title="Initial grouping",
         kept=tuple(groups),
         detail=(
             f"boxes expanded by {config.merge_distance_px} px per side; "
-            "membership retained for two-pass domain recovery"
+            "no size cap here -- membership is retained so an over-broad group "
+            "can be split by domain recovery"
         ),
     )
 
@@ -1425,22 +1342,6 @@ def _step_size(
     )
 
 
-def _step_flat(
-    image: np.ndarray,
-    uv_mask: np.ndarray | None,
-    config: MserConfig,
-    state: DetectionState,
-) -> tuple[DetectionState, DetectionStage]:
-    groups, rejected = filter_groups_by_single_colour(image, state.groups, config)
-    return DetectionState(state.boxes, groups), DetectionStage(
-        key="flat",
-        title="Single colour",
-        kept=tuple(groups),
-        rejected=tuple(rejected),
-        detail=f"dominant colour fraction < {config.final_single_colour_fraction}",
-    )
-
-
 def _region_shape_and_coverage(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
@@ -1477,6 +1378,7 @@ def _step_region_domain(
     candidates = state.candidates or [
         GroupCandidate(bounds=group, members=(group,)) for group in state.groups
     ]
+    domain = state.domain or build_uv_domain_index(uv_mask)
     if not config.enable_region_domain_filter or uv_mask is None:
         return state, DetectionStage(
             key="region_domain",
@@ -1528,7 +1430,7 @@ def _step_region_domain(
             image,
             config,
             uv_mask,
-            strict_merges=False,
+            domain,
         )
         for rebuilt_candidate in rebuilt:
             _rebuilt_radius, rebuilt_coverage = _region_shape_and_coverage(
@@ -1548,7 +1450,7 @@ def _step_region_domain(
                 image,
                 half_distance_config,
                 uv_mask,
-                strict_merges=False,
+                domain,
             )
             rescued_here = 0
             for retry_candidate in retry_candidates:
@@ -1565,7 +1467,7 @@ def _step_region_domain(
 
     kept_candidates.sort(key=lambda candidate: (candidate.bounds[1], candidate.bounds[0]))
     kept = [candidate.bounds for candidate in kept_candidates]
-    return DetectionState(state.boxes, kept, kept_candidates), DetectionStage(
+    return DetectionState(state.boxes, kept, kept_candidates, domain), DetectionStage(
         key="region_domain",
         title="Domain recovery",
         kept=tuple(kept),
@@ -1676,20 +1578,25 @@ def _step_overlap_group(
 ) -> tuple[DetectionState, DetectionStage]:
     """Force positive-area shaped overlaps, then validate each merged result."""
     groups = list(state.groups)
+
+    if not config.enable_overlap_group_merge or len(groups) < 2:
+        return DetectionState(state.boxes, groups), DetectionStage(
+            key="overlap_group",
+            title="Post-circle forced merge",
+            kept=tuple(groups),
+            detail=(
+                "disabled"
+                if not config.enable_overlap_group_merge
+                else "fewer than two recovered groups; nothing to merge"
+            ),
+        )
+
     radii = [
         inscribed_circle_radius(image, uv_mask, group, config)
         if config.enable_circular_groups
         else None
         for group in groups
     ]
-
-    if len(groups) < 2:
-        return DetectionState(state.boxes, groups), DetectionStage(
-            key="overlap_group",
-            title="Post-circle forced merge",
-            kept=tuple(groups),
-            detail="fewer than two recovered groups; nothing to merge",
-        )
 
     parent = list(range(len(groups)))
 
@@ -1834,18 +1741,17 @@ def _step_final_padding(
 # Stages holding assembled regions rather than raw MSER boxes; only these are
 # worth shaping, and only these are few enough for it to be cheap.
 GROUP_STAGE_KEYS = frozenset(
-    {"grouped", "region_domain", "overlap_group", "pattern_group", "size", "flat"}
+    {"grouped", "region_domain", "overlap_group", "pattern_group", "size"}
 )
 
 PIPELINE_STEPS = (
     _step_mser,
-    _step_flat_box,
+    _step_box_filter,
     _step_grouped,
     _step_region_domain,
     _step_overlap_group,
     _step_pattern_group,
     _step_size,
-    _step_flat,
     _step_final_padding,
 )
 
@@ -1858,28 +1764,20 @@ PARAMETER_STEP = {
     "max_area": 0,
     "max_variation": 0,
     "min_diversity": 0,
-    "enable_min_component_area_filter": 0,
-    "min_component_area_px": 0,
-    "enable_mser_area_fraction_filter": 0,
-    "max_area_fraction": 0,
     "enable_aspect_ratio_filter": 0,
     "min_aspect": 0,
     "max_aspect": 0,
-    "enable_flat_box_filter": 1,
+    "enable_box_feature_filter": 1,
     "min_box_width_px": 1,
     "min_box_height_px": 1,
-    "flat_box_colour_tolerance": 1,
-    "flat_box_min_coverage": 1,
-    "flat_box_min_domain_px": 1,
-    "flat_box_context_px": 1,
+    "box_feature_colour_tolerance": 1,
+    "box_feature_min_domain_px": 1,
+    "box_feature_context_px": 1,
     "min_box_uv_coverage": 1,
-    "flat_box_min_feature_px": 1,
+    "box_min_feature_px": 1,
     "merge_distance_px": 2,
     "min_group_union_region_px": 2,
-    "enable_group_area_filter": 2,
-    "enable_group_degenerate_filter": 2,
     "enable_island_bounded_grouping": 2,
-    "max_group_uv_coverage_drop": 2,
     "enable_circular_groups": 2,
     "circular_group_min_squareness": 2,
     "circular_group_padding_px": 2,
@@ -1887,6 +1785,7 @@ PARAMETER_STEP = {
     "circular_group_max_corner_content": 2,
     "enable_region_domain_filter": 3,
     "min_region_uv_coverage": 3,
+    "enable_overlap_group_merge": 4,
     "enable_pattern_group_filter": 5,
     "max_pattern_autocorrelation": 5,
     "pattern_window_scale": 5,
@@ -1899,10 +1798,7 @@ PARAMETER_STEP = {
     "final_min_area_px": 6,
     "enable_final_aspect_filter": 6,
     "final_max_aspect": 6,
-    "enable_final_single_colour_filter": 7,
-    "final_single_colour_quant_step": 7,
-    "final_single_colour_fraction": 7,
-    "final_region_padding_px": 8,
+    "final_region_padding_px": 7,
     "uv_island_mask_path": len(PIPELINE_STEPS),
     "green_colour": len(PIPELINE_STEPS),
     "red_colour": len(PIPELINE_STEPS),
@@ -2009,11 +1905,10 @@ def detect_texture_regions(
     return {
         "image_size": f"{image.shape[1]}x{image.shape[0]}",
         "mser_boxes": len(by_key["mser"].kept),
-        "flat_boxes_rejected": len(by_key["flat_box"].rejected),
+        "boxes_rejected": len(by_key["box_filter"].rejected),
         "candidate_groups": len(by_key["grouped"].kept),
         "pattern_groups_rejected": len(by_key["pattern_group"].rejected),
         "final_size_rejected": len(by_key["size"].rejected),
-        "final_single_colour_rejected": len(by_key["flat"].rejected),
         "domain_recovery_rejected": len(by_key["region_domain"].rejected),
         "region_domain_rejected": len(by_key["region_domain"].rejected),
         "overlap_regions_absorbed": by_key["overlap_group"].adjusted,
@@ -2295,11 +2190,10 @@ def main() -> None:
         f"{summary['symmetric_uv_islands']} symmetric UV islands"
     )
     print(
-        f"{summary['flat_boxes_rejected']} flat boxes rejected, "
+        f"{summary['boxes_rejected']} boxes rejected, "
         f"{summary['candidate_groups']} candidate groups, "
         f"{summary['pattern_groups_rejected']} rejected as repeating pattern, "
         f"{summary['final_size_rejected']} rejected by final size, "
-        f"{summary['final_single_colour_rejected']} rejected as single colour, "
         f"{summary['region_domain_rejected']} rejected as outside the UV domain, "
         f"{summary['overlap_regions_absorbed']} overlapping regions absorbed"
     )

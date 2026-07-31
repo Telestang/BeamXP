@@ -114,27 +114,22 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Box filtering",
         (
-            "enable_min_component_area_filter",
-            "min_component_area_px",
             "min_box_width_px",
             "min_box_height_px",
-            "enable_mser_area_fraction_filter",
-            "max_area_fraction",
             "enable_aspect_ratio_filter",
             "min_aspect",
             "max_aspect",
         ),
     ),
     (
-        "Flat-colour boxes",
+        "Box features",
         (
-            "enable_flat_box_filter",
+            "enable_box_feature_filter",
             "min_box_uv_coverage",
-            "flat_box_colour_tolerance",
-            "flat_box_min_coverage",
-            "flat_box_context_px",
-            "flat_box_min_domain_px",
-            "flat_box_min_feature_px",
+            "box_feature_colour_tolerance",
+            "box_feature_context_px",
+            "box_feature_min_domain_px",
+            "box_min_feature_px",
         ),
     ),
     (
@@ -153,10 +148,8 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "merge_distance_px",
             "min_group_union_region_px",
-            "enable_group_area_filter",
-            "enable_group_degenerate_filter",
             "enable_island_bounded_grouping",
-            "max_group_uv_coverage_drop",
+            "enable_overlap_group_merge",
             "enable_circular_groups",
             "circular_group_min_squareness",
             "circular_group_padding_px",
@@ -175,9 +168,6 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "final_min_area_px",
             "enable_final_aspect_filter",
             "final_max_aspect",
-            "enable_final_single_colour_filter",
-            "final_single_colour_quant_step",
-            "final_single_colour_fraction",
             "final_region_padding_px",
         ),
     ),
@@ -852,13 +842,12 @@ class TuningApp(tk.Tk):
             DetectionStage(key=key, title=title, kept=())
             for key, title in (
                 ("mser", "MSER boxes"),
-                ("flat_box", "Box filtering"),
+                ("box_filter", "Box filtering"),
                 ("grouped", "Initial grouping"),
                 ("region_domain", "Domain recovery"),
                 ("overlap_group", "Post-circle forced merge"),
                 ("pattern_group", "Repeating pattern"),
                 ("size", "Final size"),
-                ("flat", "Single colour"),
                 ("final_padding", "Final padding"),
             )
         ]
