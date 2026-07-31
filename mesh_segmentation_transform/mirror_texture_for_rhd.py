@@ -136,6 +136,24 @@ class RhdTextureConfig:
     escape_margin_fraction: float = 0.6  # how far past the region to follow
     escape_min_margin_px: int = 24
 
+    # Blob rejection, off by default.  A vent slot nearly fills its own hull
+    # where lettering does not, and gating on area removes the small solid
+    # glyphs -- a bar, an arrowhead -- that otherwise confound it: measured,
+    # large glyphs reach 0.53 against 1.01 for slots, and every glyph above
+    # 0.9 is under 1300 px.
+    #
+    # It is disabled because it rejected a real one.  The Ardente's window
+    # switch is a white pictogram on a solid dark pad, and the ring sees the
+    # surround, so the feature it measures is the pad -- 0.99 solid -- not
+    # the icon.  Separating that from a bare slot needs a second pass inside
+    # the blob (0.054 of it differs, against 0.000-0.024 for slots), which is
+    # a third threshold fitted to four samples.  The harm it prevents is also
+    # unproven: every blob it catches scores zero escape, so flipping one
+    # disturbs nothing around it.  Left in, and off, pending more vehicles.
+    enable_blob_filter: bool = False
+    min_blob_filter_area_px: int = 2000
+    max_blob_solidity: float = 0.95
+
     # BC7 encode quality.  alpha_ultrafast ~5s, alpha_fast ~30s,
     # alpha_basic ~60s for a 4096 square.
     bc7_profile: str = "alpha_basic"
@@ -764,6 +782,44 @@ def feature_escape(
     return (outside_area / total) if total else 0.0
 
 
+def hull_solidity(
+    rgb: np.ndarray,
+    domain: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: RhdTextureConfig,
+) -> float | None:
+    """Feature area over the area of its convex hull, within the region.
+
+    Lettering leaves large bites out of its own hull; a rounded slot or a pad
+    fills nearly all of it.  Values slightly over 1 are normal -- the hull is a
+    polygon through pixel centres while the feature is counted in whole pixels.
+    ``None`` means the background could not be characterised.
+    """
+    x, y, w, h = bounds
+    height, width = domain.shape
+    background = ring_background(rgb, domain, bounds, config.background_ring_px)
+    if background is None:
+        return None
+    mean, spread = background
+    tolerance = np.maximum(
+        spread * config.background_spread_k, float(config.background_tolerance_floor)
+    )
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = rgb[y0:y1, x0:x1].astype(np.float32)
+    feature = (np.abs(crop - mean) > tolerance).any(axis=2) & domain[y0:y1, x0:x1]
+    area = int(feature.sum())
+    if area < 12:
+        return None
+    hull = cv2.convexHull(cv2.findNonZero(feature.astype(np.uint8)))
+    hull_area = float(cv2.contourArea(hull))
+    if hull_area <= 0:
+        return None
+    return area / hull_area
+
+
 def _reflection_similarity(component: np.ndarray, reflected: np.ndarray) -> float:
     """Intersection-over-union agreement between a mask and its reflection."""
     union = int((component | reflected).sum())
@@ -1097,6 +1153,23 @@ def build_rhd_texture(
         mirrored_regions = contained
         log(f"  {len(mirrored_regions)} are self-contained enough to flip")
 
+    blobs: list[tuple[int, int, int, int, float]] = []
+    if config.enable_blob_filter:
+        keep: list[tuple[int, int, int, int]] = []
+        for bounds in mirrored_regions:
+            if bounds[2] * bounds[3] < config.min_blob_filter_area_px:
+                keep.append(bounds)
+                continue
+            solidity = hull_solidity(rgb, mirror_mask, bounds, config)
+            if solidity is not None and solidity >= config.max_blob_solidity:
+                blobs.append((*bounds, solidity))
+                continue
+            keep.append(bounds)
+        for x, y, w, h, solidity in blobs:
+            log(f"    - ({x},{y}) {w}x{h}: fills {solidity:.2f} of its hull; "
+                "a blob rather than a mark, left alone")
+        mirrored_regions = keep
+
     flips, flipped_islands = plan_island_flips(
         mirror_mask, mirrored_regions, config, masks.axis_map
     )
@@ -1212,6 +1285,10 @@ def build_rhd_texture(
                     for (x, y, w, h), axis, share in zip(
                         in_place, in_place_axes, in_place_shares
                     )
+                ],
+                "blob_regions": [
+                    {"x": x, "y": y, "w": w, "h": h, "solidity": round(v, 3)}
+                    for x, y, w, h, v in blobs
                 ],
                 "uncontained_regions": [
                     {"x": x, "y": y, "w": w, "h": h, "escape": round(e, 4)}
