@@ -136,23 +136,24 @@ class RhdTextureConfig:
     escape_margin_fraction: float = 0.6  # how far past the region to follow
     escape_min_margin_px: int = 24
 
-    # Blob rejection, off by default.  A vent slot nearly fills its own hull
-    # where lettering does not, and gating on area removes the small solid
-    # glyphs -- a bar, an arrowhead -- that otherwise confound it: measured,
-    # large glyphs reach 0.53 against 1.01 for slots, and every glyph above
-    # 0.9 is under 1300 px.
+    # Blob rejection.  A bare vent slot nearly fills its own convex hull and
+    # is uniform inside; lettering is full of concavity.  Two guards keep it
+    # from eating real marks.
     #
-    # It is disabled because it rejected a real one.  The Ardente's window
-    # switch is a white pictogram on a solid dark pad, and the ring sees the
-    # surround, so the feature it measures is the pad -- 0.99 solid -- not
-    # the icon.  Separating that from a bare slot needs a second pass inside
-    # the blob (0.054 of it differs, against 0.000-0.024 for slots), which is
-    # a third threshold fitted to four samples.  The harm it prevents is also
-    # unproven: every blob it catches scores zero escape, so flipping one
-    # disturbs nothing around it.  Left in, and off, pending more vehicles.
-    enable_blob_filter: bool = False
+    # Area, because the small solid glyphs that confound solidity -- a bar at
+    # 1.15, an arrowhead at 1.06 -- are all under 1300 px, while above 2000 px
+    # the largest measured glyph reaches 0.53 against 1.01 for slots.
+    #
+    # Interior contrast, because a switch pad is a solid blob with a glyph
+    # printed on it.  The ring reads the surround, so the feature measured is
+    # the pad rather than the icon, and the Ardente's window switch was
+    # rejected at 0.99 solid.  What separates it is not how much of the blob
+    # differs from itself but how strongly: a bare slot varies by 6-18 levels
+    # inside, a pad carrying a mark by 173-228.
+    enable_blob_filter: bool = True
     min_blob_filter_area_px: int = 2000
     max_blob_solidity: float = 0.95
+    min_blob_interior_contrast: float = 60.0
 
     # BC7 encode quality.  alpha_ultrafast ~5s, alpha_fast ~30s,
     # alpha_basic ~60s for a 4096 square.
@@ -820,6 +821,51 @@ def hull_solidity(
     return area / hull_area
 
 
+def blob_interior_contrast(
+    rgb: np.ndarray,
+    domain: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: RhdTextureConfig,
+) -> float | None:
+    """How strongly anything is drawn inside a region's dominant feature blob.
+
+    Measured against the blob's own colour rather than the surround, because a
+    switch pad reads as one solid feature from outside: the ring sees near
+    black, so the pad and the white icon on it fall in together.  Judged from
+    the pad's own median instead, the icon stands out by around 200 levels
+    while a bare slot varies by under 20.
+
+    Returned as the 99th percentile deviation, so a single hot texel cannot
+    rescue a blob.  ``None`` when there is no usable background or blob.
+    """
+    x, y, w, h = bounds
+    height, width = domain.shape
+    background = ring_background(rgb, domain, bounds, config.background_ring_px)
+    if background is None:
+        return None
+    mean, spread = background
+    tolerance = np.maximum(
+        spread * config.background_spread_k, float(config.background_tolerance_floor)
+    )
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = rgb[y0:y1, x0:x1].astype(np.float32)
+    feature = (np.abs(crop - mean) > tolerance).any(axis=2) & domain[y0:y1, x0:x1]
+    if int(feature.sum()) < 32:
+        return None
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        feature.astype(np.uint8), connectivity=8
+    )
+    largest = 1 + int(
+        np.argmax([stats[i, cv2.CC_STAT_AREA] for i in range(1, count)])
+    )
+    blob = labels == largest
+    base = np.median(crop[blob], axis=0)
+    return float(np.percentile(np.abs(crop - base).max(axis=2)[blob], 99))
+
+
 def _reflection_similarity(component: np.ndarray, reflected: np.ndarray) -> float:
     """Intersection-over-union agreement between a mask and its reflection."""
     union = int((component | reflected).sum())
@@ -1161,10 +1207,16 @@ def build_rhd_texture(
                 keep.append(bounds)
                 continue
             solidity = hull_solidity(rgb, mirror_mask, bounds, config)
-            if solidity is not None and solidity >= config.max_blob_solidity:
-                blobs.append((*bounds, solidity))
+            if solidity is None or solidity < config.max_blob_solidity:
+                keep.append(bounds)
                 continue
-            keep.append(bounds)
+            # Solid, but a switch pad is solid too.  Only a blob with nothing
+            # printed on it is safe to dismiss.
+            contrast = blob_interior_contrast(rgb, mirror_mask, bounds, config)
+            if contrast is None or contrast >= config.min_blob_interior_contrast:
+                keep.append(bounds)
+                continue
+            blobs.append((*bounds, solidity))
         for x, y, w, h, solidity in blobs:
             log(f"    - ({x},{y}) {w}x{h}: fills {solidity:.2f} of its hull; "
                 "a blob rather than a mark, left alone")
