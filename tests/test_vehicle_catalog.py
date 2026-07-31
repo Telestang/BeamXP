@@ -5,6 +5,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from beamxp import hand_drive_core as core
 from beamxp.core.beam_json import display_name_for, info_path_for_config
 from beamxp.core.files import vehicle_catalog_entry_for_id, vehicle_ids_in_zip
 
@@ -93,6 +94,21 @@ class VehicleCatalogTests(unittest.TestCase):
             display_name_for(zip_path, info_path, "ardente_190d_DCT"),
             "Ardente 190d A",
         )
+
+    def test_generated_output_info_does_not_keep_localization_keys(self) -> None:
+        variant = core.VariantInfo(
+            "ardente_carabinieri",
+            "vehicles/vivace/ardente_carabinieri.pc",
+            "vehicles/vivace/info_ardente_carabinieri.json",
+            "Ardente Carabinieri",
+        )
+        info = {
+            "Configuration": "vehiclesData.vivace.ardente_carabinieri.Configuration",
+            "Description": "vehiclesData.vivace.ardente_carabinieri.Description",
+        }
+
+        self.assertEqual(core.generated_info_display_name(info, variant), "Ardente Carabinieri")
+        self.assertEqual(core.generated_info_description(info), "")
 
 
 if __name__ == "__main__":

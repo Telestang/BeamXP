@@ -18,6 +18,7 @@ from xml.etree import ElementTree as ET
 from beamxp import transform_helpers
 from beamxp.core.beam_json import (
     add_missing_json_commas,
+    display_name_from_localization_key,
     display_name_for,
     info_path_for_config,
     json_line_needs_comma,
@@ -344,6 +345,26 @@ def append_hand_label(name: object, target_hand: str) -> str:
     return f"{text} {target_hand}"
 
 
+def generated_info_display_name(info: dict[str, object], variant: VariantInfo) -> str:
+    for key in ("Configuration", "Name", "name", "configuration"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return display_name_from_localization_key(value) or value.strip()
+    return variant.display_name
+
+
+def generated_info_description(info: dict[str, object]) -> str:
+    for key in ("Description", "description"):
+        value = info.get(key)
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text or display_name_from_localization_key(text):
+            return ""
+        return text
+    return ""
+
+
 def write_generated_jbeam_and_configs(
     context: VehicleContext,
     output_vehicle_dir: Path,
@@ -515,8 +536,8 @@ def write_generated_jbeam_and_configs(
                 info = load_info(context.source_zip, variant.info_path)
             except Exception:
                 info = {}
-        existing_name = str(info.get("Configuration") or info.get("Name") or variant.display_name)
-        existing_description = info.get("Description") or info.get("description") or ""
+        existing_name = generated_info_display_name(info, variant)
+        existing_description = generated_info_description(info)
         converted_name = append_hand_label(existing_name, target_hand)
         info["Configuration"] = converted_name
         info["Name"] = converted_name
@@ -568,11 +589,11 @@ def write_original_plate_configs(
                 info = load_info(context.source_zip, variant.info_path)
             except Exception:
                 info = {}
-        existing_name = str(info.get("Configuration") or info.get("Name") or variant.display_name)
+        existing_name = generated_info_display_name(info, variant)
         plates_name = existing_name if existing_name.lower().endswith(" plates") else f"{existing_name} Plates"
         info["Configuration"] = plates_name
         info["Name"] = plates_name
-        description = str(info.get("Description") or info.get("description") or "").strip()
+        description = generated_info_description(info)
         info["Description"] = f"{description} - BeamXP plate configuration" if description else "BeamXP plate configuration"
         info["Config Type"] = "Custom"
         info["Source"] = conversion_source_name(context)
@@ -1045,4 +1066,4 @@ def full_vehicle_preview_payload(
         "rotation_calibration": rotation_counts,
     }
 
-__all__ = ['generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', 'full_vehicle_preview_payload']
+__all__ = ['generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', 'full_vehicle_preview_payload']
