@@ -66,6 +66,7 @@ from beamxp.core.models import (
     VariantInfo,
     VehicleContext,
 )
+from beamxp.hand_drive_parts.spatial_analysis import display_texture_flip_scope
 
 def find_part_body(
     part_id: str,
@@ -515,22 +516,20 @@ def texture_flip_mesh_ids(
     context: VehicleContext,
     object_modes: dict[str, str],
 ) -> set[str]:
-    """Aesthetic-mirror meshes carrying a beamNavigator screen island, whose
-    texture must keep its left/right reading after the geometric mirror.
+    """Mirrored meshes carrying display-screen UV islands, whose textures must
+    keep their left/right reading after the geometric mirror.
 
-    Derived entirely from the vehicle's own data (nav_screen_mesh_scope reads
-    the navigator controller and its glowMap) — there is no manual flag. A nav
-    screen only reads backwards once its mesh is actually reflected, so this is
-    gated on MODE_MIRROR: MODE_TRANSLATE keeps the texture as authored, and
-    MODE_MIRROR_STRUCTURAL swaps in the opposite-side mesh, which already
-    carries the correct mapping."""
-    nav_scope = nav_screen_mesh_scope(context)
-    if not nav_scope:
+    Derived entirely from the vehicle's own data: navigator controllers,
+    glowMaps and emissive screen-like materials. A screen only reads backwards
+    once its mesh is actually reflected, so translate mode keeps the texture as
+    authored."""
+    display_scope = display_texture_flip_scope(context)
+    if not display_scope:
         return set()
     return {
         object_id
         for object_id, mode in object_modes.items()
-        if mode == MODE_MIRROR and object_id in nav_scope
+        if mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL} and object_id in display_scope
     }
 
 

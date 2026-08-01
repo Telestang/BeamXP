@@ -2,7 +2,7 @@
 
 Convert any BeamNG.drive vehicle — vanilla or mod — between left-hand drive and right-hand drive, and generate custom licence plates.
 
-**[Download BeamXP 0.2.5-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.2.5-alpha-windows.zip)** — extract it anywhere and run the exe.
+**[Download BeamXP 0.2.6-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.2.6-alpha-windows.zip)** — extract it anywhere and run the exe.
 
 *BeamXP was previously named BeamHDC (BeamNG Hand Drive Converter).*
 
@@ -59,7 +59,7 @@ If Defender (or anything else) flags a release for you, please [open an issue](#
 
 ## Quick Start
 
-1. [Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.2.5-alpha-windows.zip), extract it, and run the exe (or run from source — see Requirements).
+1. [Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.2.6-alpha-windows.zip), extract it, and run the exe (or run from source — see Requirements).
 2. Select a source BeamNG vehicle `.zip`.
 3. If prompted, choose the vehicle model ID.
 4. Select the variants/trims you want to convert.
@@ -185,7 +185,7 @@ Swaps an opposite-side mirrored mesh onto the existing source-side JBeam structu
 
 ### Flip Tex
 
-Mirroring a mesh also mirror-images its texture. That is correct for most trim, but wrong for parts that display readable content — a satnav/infotainment screen, badges, decals with text. Toggle `Flip Tex` on a `Mirror Aesthetic` part to reflect its texture coordinates horizontally along with the geometry, so the image keeps its normal left/right reading. The reflection happens within the part's own UV footprint, so it keeps sampling the same region of a shared texture atlas. `Mirror Structural` deliberately does not offer it: that mode swaps in the opposite-side mesh, which already carries its own correct texture mapping. `Recommend Modes` proposes it automatically for display screens.
+Mirroring a mesh also mirror-images its texture. That is correct for most trim, but wrong for parts that display readable content — a satnav/infotainment screen, badges, decals with text. Toggle `Flip Tex` on a `Mirror Aesthetic` part to reflect its texture coordinates horizontally along with the geometry, so the image keeps its normal left/right reading. The reflection happens within the part's own UV footprint, so it keeps sampling the same region of a shared texture atlas. `Mirror Structural` deliberately does not offer it: that mode swaps in the opposite-side mesh, which already carries its own correct texture mapping. `Recommend Modes` proposes it automatically for display screens, found from the vehicle's own navigator controllers, glowMaps and emissive screen-like materials, so a cluster that groups its satnav and instrument displays into one mesh is covered as well.
 
 ## Licence Plates
 

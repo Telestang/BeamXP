@@ -1105,6 +1105,9 @@ _NAV_SCREEN_MATERIAL_RE = re.compile(
 _GLOW_STATE_VALUE_RE = re.compile(r':\s*"@?([^"]+)"')
 # A glowMap base-material key ("etk800_gauges_screen":{...}).
 _GLOW_BASE_KEY_RE = re.compile(r'"([A-Za-z0-9_]+)"\s*:[\s,]*\{')
+_DISPLAY_MATERIAL_TOKEN_RE = re.compile(
+    r"(^|[_.-])(display|gauges?|gps|nav|navi|screen)([_.-]|$)"
+)
 
 
 def nav_screen_materials_for_context(context: VehicleContext) -> frozenset[str]:
@@ -1184,6 +1187,58 @@ def nav_screen_mesh_scope(context: VehicleContext) -> dict[str, frozenset[str]]:
             if matched:
                 scope[object_id] = matched
     context._nav_screen_mesh_scope = scope
+    return scope
+
+
+def display_screen_materials_for_context(context: VehicleContext) -> frozenset[str]:
+    """DAE material symbols for live interior display textures.
+
+    ``nav_screen_materials_for_context`` catches the BeamNG navigator material
+    exactly. Newer vehicles can group that nav screen with separate instrument
+    cluster display materials in one mesh, so include emissive, screen-named
+    material symbols as well.
+    """
+    cached = getattr(context, "_display_screen_materials", None)
+    if cached is not None:
+        return cached
+
+    materials = set(nav_screen_materials_for_context(context))
+    for material, flags in material_flags_for_context(context).items():
+        if (
+            flags.get("emissive")
+            and not flags.get("glass")
+            and _DISPLAY_MATERIAL_TOKEN_RE.search(material)
+        ):
+            materials.add(material)
+
+    result = frozenset(materials)
+    context._display_screen_materials = result
+    return result
+
+
+def display_texture_flip_scope(context: VehicleContext) -> dict[str, frozenset[str]]:
+    """Mesh id -> display material symbols whose UV islands need mirror repair.
+
+    This broadens the old nav-only scope for grouped display meshes such as
+    Ardente's combined GPS and gauge cluster screen, while remaining
+    material-scoped so bezels and unrelated geometry in the same mesh are left
+    alone.
+    """
+    cached = getattr(context, "_display_texture_flip_scope", None)
+    if cached is not None:
+        return cached
+
+    display_materials = display_screen_materials_for_context(context)
+    scope: dict[str, frozenset[str]] = {}
+    if display_materials:
+        for object_id, symbols in mesh_material_symbols(context).items():
+            matched = frozenset(
+                symbol for sym in symbols if (symbol := sym.lower()) in display_materials
+            )
+            if matched:
+                scope[object_id] = matched
+
+    context._display_texture_flip_scope = scope
     return scope
 
 
@@ -1295,4 +1350,4 @@ def inert_material_alias_symbols(context: VehicleContext) -> frozenset[str]:
     context._inert_material_alias_symbols = result
     return result
 
-__all__ = ['SPATIAL_BIN_DEG', 'DriverFrame', 'iter_named_array_texts', 'parse_internal_camera_positions', '_camera_bearing_parts', 'camera_positions_for_config', '_driver_frame_core', '_assemble_driver_frame', 'driver_frame_for_context', 'spatial_spherical_bins', 'visibility_scan', 'surface_visibility_stats', 'surface_visibility_stats_batch', 'directional_verdict_backing', 'floor_height_from_shell', 'glass_beyond_fractions', 'cloud_symmetry_residual', 'reflected_orphan_stats', 'mirror_pair_distance', 'mirror_pair_residual', 'principal_extent_sds', 'material_uses_glass_blending', 'material_flags_for_context', '_NAV_SCREEN_MATERIAL_RE', '_GLOW_STATE_VALUE_RE', '_GLOW_BASE_KEY_RE', 'nav_screen_materials_for_context', 'nav_screen_mesh_scope', 'mesh_material_symbols', 'inert_material_alias_symbols']
+__all__ = ['SPATIAL_BIN_DEG', 'DriverFrame', 'iter_named_array_texts', 'parse_internal_camera_positions', '_camera_bearing_parts', 'camera_positions_for_config', '_driver_frame_core', '_assemble_driver_frame', 'driver_frame_for_context', 'spatial_spherical_bins', 'visibility_scan', 'surface_visibility_stats', 'surface_visibility_stats_batch', 'directional_verdict_backing', 'floor_height_from_shell', 'glass_beyond_fractions', 'cloud_symmetry_residual', 'reflected_orphan_stats', 'mirror_pair_distance', 'mirror_pair_residual', 'principal_extent_sds', 'material_uses_glass_blending', 'material_flags_for_context', '_NAV_SCREEN_MATERIAL_RE', '_GLOW_STATE_VALUE_RE', '_GLOW_BASE_KEY_RE', '_DISPLAY_MATERIAL_TOKEN_RE', 'nav_screen_materials_for_context', 'nav_screen_mesh_scope', 'display_screen_materials_for_context', 'display_texture_flip_scope', 'mesh_material_symbols', 'inert_material_alias_symbols']

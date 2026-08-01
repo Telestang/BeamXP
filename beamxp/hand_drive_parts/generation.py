@@ -122,6 +122,7 @@ from beamxp.core.models import (
     VariantInfo,
     VehicleContext,
 )
+from beamxp.hand_drive_parts.spatial_analysis import display_texture_flip_scope
 from beamxp.plates import generator as plate_generator
 
 def generate_daes(
@@ -139,10 +140,10 @@ def generate_daes(
     texture_flip_ids: set[str] | None = None,
 ) -> list[Path]:
     texture_flip_ids = texture_flip_ids or set()
-    # Per-mesh nav-screen material scope: which UV island(s) to reflect. A
+    # Per-mesh display material scope: which UV island(s) to reflect. A
     # dedicated screen mesh maps to all its symbols (whole-mesh flip); a shared
-    # mesh (nav screen + cluster) maps to only the screen island.
-    nav_flip_scope = nav_screen_mesh_scope(context)
+    # mesh (nav screen + cluster) maps to only the display islands.
+    display_flip_scope = display_texture_flip_scope(context)
     generated: list[Path] = []
     objects_by_dae: dict[tuple[Path, str], list[tuple[str, str]]] = {}
     for object_id in object_modes:
@@ -241,7 +242,7 @@ def generate_daes(
                                 old_geom,
                                 new_geom_id,
                                 flip_texture=object_id in texture_flip_ids,
-                                flip_materials=nav_flip_scope.get(object_id),
+                                flip_materials=display_flip_scope.get(object_id),
                             )
                         elif (
                             mode == MODE_TRANSLATE
@@ -296,7 +297,7 @@ def generate_daes(
                             old_geom,
                             new_geom_id,
                             flip_texture=spec.configured_mesh in texture_flip_ids,
-                            flip_materials=nav_flip_scope.get(spec.configured_mesh),
+                            flip_materials=display_flip_scope.get(spec.configured_mesh),
                         )
                     else:
                         generated_geometry[new_geom_id] = transform_helpers.copied_geometry(old_geom, new_geom_id)

@@ -97,12 +97,11 @@ class TextureFlipTests(unittest.TestCase):
         values = [float(v) for v in positions.find("c:float_array", th.NS).text.split()]
         self.assertEqual(values[0::3], [0.5, -0.5, -0.5, 0.5])
 
-    def test_texture_flip_mesh_ids_is_nav_screens_in_mirror_aesthetic(self) -> None:
-        # Derived from nav detection (no manual flag) and gated to Mirror
-        # Aesthetic: Mirror Structural swaps in the opposite-side mesh, which
-        # already reads correctly, and Translate never reflects the geometry.
+    def test_texture_flip_mesh_ids_is_display_screens_in_mirror_modes(self) -> None:
+        # Derived from display detection (no manual flag) and gated to modes
+        # that reflect geometry. Translate never reflects the geometry.
         context = types.SimpleNamespace(
-            _nav_screen_mesh_scope={
+            _display_texture_flip_scope={
                 "screen": frozenset({"screen"}),
                 "gauge": frozenset({"gauge_screen"}),
                 "panel": frozenset({"panel_screen"}),
@@ -112,12 +111,12 @@ class TextureFlipTests(unittest.TestCase):
             "screen": core.MODE_MIRROR,           # nav + mirror -> flipped
             "dash": core.MODE_MIRROR,             # mirror but not a nav screen
             "gauge": core.MODE_TRANSLATE,         # nav but translated, not reflected
-            "panel": core.MODE_MIRROR_STRUCTURAL, # nav but swaps in the twin
+            "panel": core.MODE_MIRROR_STRUCTURAL, # display + mirrored geometry
         }
-        self.assertEqual(core.texture_flip_mesh_ids(context, modes), {"screen"})
+        self.assertEqual(core.texture_flip_mesh_ids(context, modes), {"screen", "panel"})
 
 
-class NavScreenDetectionTests(unittest.TestCase):
+class DisplayScreenDetectionTests(unittest.TestCase):
     """The beamNavigator screen material resolves to what the DAE binds, both
     directly (etk800) and through the same part's glowMap (sunburst2)."""
 
@@ -171,11 +170,41 @@ class NavScreenDetectionTests(unittest.TestCase):
             {"sunburst2_nav": frozenset({"sunburst2_display_nav"})},
         )
 
+    def test_grouped_nav_and_gauge_screen_materials_share_flip_scope(self) -> None:
+        body = """
+        "ardente_dash": { "slotType": "ardente_dash",
+          "controller": [ ["fileName"],
+            ["beamNavigator", {"screenMaterialName": "@ardente_gps_screen", "name": "ardente_navi"}] ],
+          "glowMap": {
+            "ardente_gauges_screen": {"simpleFunction": {"ignitionLevel": 0.5},
+              "off": "screen_off", "on": "ardente_gauges_screen_accessory",
+              "on_intense": "ardente_gauges_screen_accessory"},
+            "ardente_gps_screen": {"simpleFunction": {"ignitionLevel": 0.5},
+              "off": "screen_off", "on": "ardente_naviscreen_accessory",
+              "on_intense": "ardente_naviscreen_accessory"}
+          }
+        }
+        """
+        context = self._context(
+            {"ardente_dash": body},
+            {"ardente_screens": ("ardente_gauges_screen", "ardente_gps_screen")},
+        )
+        context._material_flags = {
+            "ardente_gauges_screen": {"emissive": True, "glass": False},
+            "ardente_gps_screen": {"emissive": True, "glass": False},
+        }
+        self.assertEqual(
+            core.display_texture_flip_scope(context),
+            {"ardente_screens": frozenset({"ardente_gauges_screen", "ardente_gps_screen"})},
+        )
+
     def test_no_navigator_yields_empty(self) -> None:
         body = '"plain_dash": { "slotType": "plain_dash", "flexbodies": [["mesh"]] }'
         context = self._context({"plain_dash": body}, {"plain_dash": ("dash_mat",)})
+        context._material_flags = {}
         self.assertEqual(core.nav_screen_materials_for_context(context), frozenset())
         self.assertEqual(core.nav_screen_mesh_scope(context), {})
+        self.assertEqual(core.display_texture_flip_scope(context), {})
 
 
 class ScopedTextureFlipTests(unittest.TestCase):
