@@ -15,9 +15,13 @@ Split in three layers so the heavy parts are testable without tk:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
+import os
 import pickle
 import re
+import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +29,19 @@ from pathlib import Path
 import numpy as np
 
 GEOMETRY_CACHE_VERSION = 3  # 3: apply COLLADA <unit> scale (cm-authored DAEs)
+
+UI_STALL_LOG_MS = float(os.environ.get("BEAMXP_UI_STALL_LOG_MS", "100"))
+
+
+@contextmanager
+def _timed_ui(label: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if elapsed_ms >= UI_STALL_LOG_MS:
+            print(f"[BeamXP ui] {label} took {elapsed_ms:.1f} ms", file=sys.stderr)
 
 MODE_COLORS = {
     "skip": (0.62, 0.64, 0.67),
@@ -748,85 +765,86 @@ class GLRenderer:
         self._grid_count = len(data)
 
     def upload_scene(self, scene: SceneData) -> None:
-        for attr in (
-            "_vbo_conv",
-            "_vbo_stock",
-            "_vbo_color",
-            "_vbo_selected",
-            "_vbo_dimmed",
-            "_vbo_pickid",
-            "_ibo",
-            "_ibo_outline",
-            "_vao_conv",
-            "_vao_stock",
-            "_vao_outline_conv",
-            "_vao_outline_stock",
-            "_vao_pick_conv",
-            "_vao_pick_stock",
-        ):
-            buf = getattr(self, attr)
-            if buf is not None:
-                buf.release()
-                setattr(self, attr, None)
-        self.scene = scene
-        self._pick_names = []
-        if scene.triangle_count == 0:
-            self._vao_conv = self._vao_stock = None
-            self._index_count = 0
-            return
-        self._vbo_conv = self.ctx.buffer(scene.verts_converted.tobytes())
-        self._vbo_stock = self.ctx.buffer(scene.verts_stock.tobytes())
-        self._vbo_color = self.ctx.buffer(scene.color_ids.tobytes())
-        self._vbo_selected = self.ctx.buffer(np.zeros(len(scene.color_ids), dtype=np.float32).tobytes())
-        self._vbo_dimmed = self.ctx.buffer(np.zeros(len(scene.color_ids), dtype=np.float32).tobytes())
-        self._ibo = self.ctx.buffer(scene.triangles.tobytes())
-        self._ibo_outline = self.ctx.buffer(reserve=4)
-        layout = [
-            (self._vbo_conv, "3f", "in_pos"),
-            (self._vbo_color, "1f", "in_color"),
-            (self._vbo_selected, "1f", "in_selected"),
-            (self._vbo_dimmed, "1f", "in_dimmed"),
-        ]
-        self._vao_conv = self.ctx.vertex_array(self.prog, layout, index_buffer=self._ibo)
-        layout_stock = [
-            (self._vbo_stock, "3f", "in_pos"),
-            (self._vbo_color, "1f", "in_color"),
-            (self._vbo_selected, "1f", "in_selected"),
-            (self._vbo_dimmed, "1f", "in_dimmed"),
-        ]
-        self._vao_stock = self.ctx.vertex_array(self.prog, layout_stock, index_buffer=self._ibo)
-        self._vao_outline_conv = self.ctx.vertex_array(
-            self.outline_prog,
-            [(self._vbo_conv, "3f", "in_pos")],
-            index_buffer=self._ibo_outline,
-        )
-        self._vao_outline_stock = self.ctx.vertex_array(
-            self.outline_prog,
-            [(self._vbo_stock, "3f", "in_pos")],
-            index_buffer=self._ibo_outline,
-        )
-        # Per-vertex pick id: one rendered placement -> id k+1, so duplicate
-        # mesh placements can be picked as mesh@@1 / mesh@@2 table rows.
-        self._pick_names = list(scene.pick_names or scene.base_groups or scene.groups.keys())
-        pick_ids = np.zeros(len(scene.color_ids), dtype=np.float32)
-        for index, name in enumerate(self._pick_names):
-            for _t0, _t1, v0, v1 in scene.groups.get(name, ()):
-                pick_ids[v0:v1] = float(index + 1)
-        self._vbo_pickid = self.ctx.buffer(pick_ids.tobytes())
-        self._vao_pick_conv = self.ctx.vertex_array(
-            self.pick_prog,
-            [(self._vbo_conv, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
-            index_buffer=self._ibo,
-        )
-        self._vao_pick_stock = self.ctx.vertex_array(
-            self.pick_prog,
-            [(self._vbo_stock, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
-            index_buffer=self._ibo,
-        )
-        self._index_count = scene.triangle_count * 3
-        self._outline_index_count = 0
-        self._selected_names = set()
-        self._visible_names = None
+        with _timed_ui("GLRenderer.upload_scene"):
+            for attr in (
+                "_vbo_conv",
+                "_vbo_stock",
+                "_vbo_color",
+                "_vbo_selected",
+                "_vbo_dimmed",
+                "_vbo_pickid",
+                "_ibo",
+                "_ibo_outline",
+                "_vao_conv",
+                "_vao_stock",
+                "_vao_outline_conv",
+                "_vao_outline_stock",
+                "_vao_pick_conv",
+                "_vao_pick_stock",
+            ):
+                buf = getattr(self, attr)
+                if buf is not None:
+                    buf.release()
+                    setattr(self, attr, None)
+            self.scene = scene
+            self._pick_names = []
+            if scene.triangle_count == 0:
+                self._vao_conv = self._vao_stock = None
+                self._index_count = 0
+                return
+            self._vbo_conv = self.ctx.buffer(scene.verts_converted.tobytes())
+            self._vbo_stock = self.ctx.buffer(scene.verts_stock.tobytes())
+            self._vbo_color = self.ctx.buffer(scene.color_ids.tobytes())
+            self._vbo_selected = self.ctx.buffer(np.zeros(len(scene.color_ids), dtype=np.float32).tobytes())
+            self._vbo_dimmed = self.ctx.buffer(np.zeros(len(scene.color_ids), dtype=np.float32).tobytes())
+            self._ibo = self.ctx.buffer(scene.triangles.tobytes())
+            self._ibo_outline = self.ctx.buffer(reserve=4)
+            layout = [
+                (self._vbo_conv, "3f", "in_pos"),
+                (self._vbo_color, "1f", "in_color"),
+                (self._vbo_selected, "1f", "in_selected"),
+                (self._vbo_dimmed, "1f", "in_dimmed"),
+            ]
+            self._vao_conv = self.ctx.vertex_array(self.prog, layout, index_buffer=self._ibo)
+            layout_stock = [
+                (self._vbo_stock, "3f", "in_pos"),
+                (self._vbo_color, "1f", "in_color"),
+                (self._vbo_selected, "1f", "in_selected"),
+                (self._vbo_dimmed, "1f", "in_dimmed"),
+            ]
+            self._vao_stock = self.ctx.vertex_array(self.prog, layout_stock, index_buffer=self._ibo)
+            self._vao_outline_conv = self.ctx.vertex_array(
+                self.outline_prog,
+                [(self._vbo_conv, "3f", "in_pos")],
+                index_buffer=self._ibo_outline,
+            )
+            self._vao_outline_stock = self.ctx.vertex_array(
+                self.outline_prog,
+                [(self._vbo_stock, "3f", "in_pos")],
+                index_buffer=self._ibo_outline,
+            )
+            # Per-vertex pick id: one rendered placement -> id k+1, so duplicate
+            # mesh placements can be picked as mesh@@1 / mesh@@2 table rows.
+            self._pick_names = list(scene.pick_names or scene.base_groups or scene.groups.keys())
+            pick_ids = np.zeros(len(scene.color_ids), dtype=np.float32)
+            for index, name in enumerate(self._pick_names):
+                for _t0, _t1, v0, v1 in scene.groups.get(name, ()):
+                    pick_ids[v0:v1] = float(index + 1)
+            self._vbo_pickid = self.ctx.buffer(pick_ids.tobytes())
+            self._vao_pick_conv = self.ctx.vertex_array(
+                self.pick_prog,
+                [(self._vbo_conv, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
+                index_buffer=self._ibo,
+            )
+            self._vao_pick_stock = self.ctx.vertex_array(
+                self.pick_prog,
+                [(self._vbo_stock, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
+                index_buffer=self._ibo,
+            )
+            self._index_count = scene.triangle_count * 3
+            self._outline_index_count = 0
+            self._selected_names = set()
+            self._visible_names = None
 
     def set_selection(self, mesh_names: set[str]) -> None:
         if self.scene is None or self._vbo_selected is None:
@@ -857,23 +875,24 @@ class GLRenderer:
 
     def set_visible(self, mesh_names: set[str] | None) -> None:
         """None -> everything visible; otherwise rebuild the index buffer."""
-        if self.scene is None or self._ibo is None:
-            return
-        self._visible_names = set(mesh_names) if mesh_names is not None else None
-        if mesh_names is None:
-            triangles = self.scene.triangles
-        else:
-            spans = [
-                self.scene.triangles[t0:t1]
-                for name in mesh_names
-                for (t0, t1, _v0, _v1) in self.scene.groups.get(name, ())
-            ]
-            triangles = np.vstack(spans) if spans else np.zeros((0, 3), dtype=np.int32)
-        self._ibo.orphan(max(triangles.nbytes, 4))
-        if triangles.nbytes:
-            self._ibo.write(triangles.tobytes())
-        self._index_count = triangles.size
-        self._rebuild_outline_indices()
+        with _timed_ui("GLRenderer.set_visible"):
+            if self.scene is None or self._ibo is None:
+                return
+            self._visible_names = set(mesh_names) if mesh_names is not None else None
+            if mesh_names is None:
+                triangles = self.scene.triangles
+            else:
+                spans = [
+                    self.scene.triangles[t0:t1]
+                    for name in mesh_names
+                    for (t0, t1, _v0, _v1) in self.scene.groups.get(name, ())
+                ]
+                triangles = np.vstack(spans) if spans else np.zeros((0, 3), dtype=np.int32)
+            self._ibo.orphan(max(triangles.nbytes, 4))
+            if triangles.nbytes:
+                self._ibo.write(triangles.tobytes())
+            self._index_count = triangles.size
+            self._rebuild_outline_indices()
 
     def set_global_opacity(self, opacity: float) -> None:
         opacity = max(0.0, min(1.0, float(opacity)))
@@ -1181,21 +1200,22 @@ class MeshPreview:
 
     # --- scene management -------------------------------------------------
     def show_scene(self, scene: SceneData, *, reset_view: bool = False) -> None:
-        self.scene = scene
-        self.renderer.upload_scene(scene)
-        self.renderer.set_visible(self.visible_ids)
-        self.renderer.set_selection(self.selected_ids)
-        self.renderer.set_dimmed(self.dimmed_ids)
-        parts = len(scene.base_groups or scene.groups)
-        self.status_var.set(
-            f"{scene.label}: {parts} mesh(es), {scene.triangle_count:,} tris"
-            + (f", {len(scene.skipped)} without geometry" if scene.skipped else "")
-        )
-        self.canvas.itemconfigure(self._message_item, text="")
-        if reset_view or not self._scene_seen_before:
-            self.reset_view()
-        else:
-            self.request_render()
+        with _timed_ui("MeshPreview.show_scene"):
+            self.scene = scene
+            self.renderer.upload_scene(scene)
+            self.renderer.set_visible(self.visible_ids)
+            self.renderer.set_selection(self.selected_ids)
+            self.renderer.set_dimmed(self.dimmed_ids)
+            parts = len(scene.base_groups or scene.groups)
+            self.status_var.set(
+                f"{scene.label}: {parts} mesh(es), {scene.triangle_count:,} tris"
+                + (f", {len(scene.skipped)} without geometry" if scene.skipped else "")
+            )
+            self.canvas.itemconfigure(self._message_item, text="")
+            if reset_view or not self._scene_seen_before:
+                self.reset_view()
+            else:
+                self.request_render()
 
     def set_visible_ids(self, object_ids, *, reset: bool = False) -> None:
         self.visible_ids = set(object_ids) if object_ids is not None else None

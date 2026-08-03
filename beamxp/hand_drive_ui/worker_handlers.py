@@ -31,6 +31,9 @@ class WorkerHandlersMixin:
         if kind == "mesh_scene_done":
             self._handle_mesh_scene_done(payload)
             return
+        if kind == "part_table_success":
+            self._handle_part_table_success(payload)
+            return
         if kind == "variant_hands_done":
             self._handle_variant_hands_done(payload)
             return
@@ -86,6 +89,34 @@ class WorkerHandlersMixin:
         self._update_detail()
         self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed")
         self._schedule_pending_parts_refresh()
+
+    def _handle_part_table_success(self, payload: object) -> None:
+        seq, context, key, future = payload
+        self.part_table_running = False
+        self.part_table_requested_key = None
+        should_apply = (
+            seq == self.part_table_seq
+            and context is self.context
+            and key == self._part_table_snapshot_key()
+        )
+        try:
+            snapshot = future.result()
+        except Exception as exc:
+            if should_apply:
+                self.status_var.set(f"Part table refresh failed: {exc}")
+            self._schedule_pending_part_table_snapshot()
+            return
+        if not should_apply:
+            self._schedule_pending_part_table_snapshot()
+            return
+        self.part_table_snapshot_key = key
+        self.part_table_snapshot = snapshot
+        reset_view = self.part_table_pending_reset
+        self.part_table_pending_reset = False
+        self._refresh_parts(reset_view=reset_view)
+        self._update_detail()
+        self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed")
+        self._schedule_pending_part_table_snapshot()
 
     def _schedule_pending_parts_refresh(self) -> None:
         if not self.part_refresh_pending:

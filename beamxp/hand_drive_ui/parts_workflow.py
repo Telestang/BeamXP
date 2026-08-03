@@ -134,24 +134,35 @@ class PartsWorkflowMixin:
         ordinal, count = numbered
         return f"{display} #{ordinal}" if count > 1 else display
 
-    def _mesh_transform_instances_for_config(self, config_name: str) -> list[core.MeshTransformInstance]:
-        if self.context is None:
+    @staticmethod
+    def _mesh_transform_instances_for_config_data(
+        context: core.VehicleContext | None,
+        conversion: dict[str, object],
+        config_name: str,
+    ) -> list[core.MeshTransformInstance]:
+        if context is None:
             return []
-        conversion = getattr(self, "conversion", {})
         if not isinstance(conversion, dict):
             conversion = {}
-        plan = core.slot_pair_plans_for_variants(self.context, conversion, [config_name]).get(config_name)
+        plan = core.slot_pair_plans_for_variants(context, conversion, [config_name]).get(config_name)
         if plan is None:
-            return core.selected_mesh_transform_instances_for_config(self.context, config_name)
-        pc = core.load_pc(self.context.source_zip, self.context.variants[config_name].pc_path)
+            return core.selected_mesh_transform_instances_for_config(context, config_name)
+        pc = core.load_pc(context.source_zip, context.variants[config_name].pc_path)
         core.apply_hand_authored_group(pc, plan)
         selected = core.resolve_selected_parts(
             pc,
-            self.context.jbeam_texts,
-            vehicle_id=self.context.source_vehicle_id,
-            part_body_index=self.context.part_body_index,
+            context.jbeam_texts,
+            vehicle_id=context.source_vehicle_id,
+            part_body_index=context.part_body_index,
         )
-        return core.selected_mesh_transform_instances_for_selection(self.context, selected)
+        return core.selected_mesh_transform_instances_for_selection(context, selected)
+
+    def _mesh_transform_instances_for_config(self, config_name: str) -> list[core.MeshTransformInstance]:
+        return self._mesh_transform_instances_for_config_data(
+            self.context,
+            getattr(self, "conversion", {}),
+            config_name,
+        )
 
     def _mesh_numbering_cache_key(self) -> tuple[object, str]:
         conversion = getattr(self, "conversion", {})
@@ -178,20 +189,31 @@ class PartsWorkflowMixin:
             and isinstance(getattr(self, "mesh_instance_numbering_cache", None), dict)
         ):
             return self.mesh_instance_numbering_cache
+        numbering = self._vehicle_mesh_instance_numbering_data(self.context, getattr(self, "conversion", {}))
+        self.mesh_instance_numbering_key = cache_key
+        self.mesh_instance_numbering_cache = numbering
+        return numbering
+
+    @classmethod
+    def _vehicle_mesh_instance_numbering_data(
+        cls,
+        context: core.VehicleContext,
+        conversion: dict[str, object],
+    ) -> dict[str, dict[str, int]]:
         keys_by_mesh: dict[str, set[str]] = {}
-        for config_name in sorted(self.context.variants):
+        for config_name in sorted(context.variants):
             try:
-                instances = self._mesh_transform_instances_for_config(config_name)
+                instances = cls._mesh_transform_instances_for_config_data(context, conversion, config_name)
             except Exception:
                 continue
             for instance in instances:
                 if instance.count_for_mesh <= 1:
                     continue
                 mesh_id = str(instance.mesh_id)
-                key = self._mesh_instance_number_key(instance)
+                key = cls._mesh_instance_number_key(instance)
                 if mesh_id and key:
                     keys_by_mesh.setdefault(mesh_id, set()).add(key)
-        numbering = {
+        return {
             mesh_id: {
                 key: index + 1
                 for index, key in enumerate(sorted(keys, key=str.lower))
@@ -199,29 +221,32 @@ class PartsWorkflowMixin:
             for mesh_id, keys in keys_by_mesh.items()
             if len(keys) > 1
         }
-        self.mesh_instance_numbering_key = cache_key
-        self.mesh_instance_numbering_cache = numbering
-        return numbering
 
-    def _part_table_rows(self, ids: list[str]) -> list[dict[str, object]]:
-        if self.context is None:
+    @classmethod
+    def _part_table_rows_data(
+        cls,
+        context: core.VehicleContext | None,
+        conversion: dict[str, object],
+        config: str | None,
+        ids: list[str],
+        vehicle_numbering: dict[str, dict[str, int]],
+    ) -> list[dict[str, object]]:
+        if context is None:
             return []
-        config = self._mesh_scene_config()
-        vehicle_numbering = self._vehicle_mesh_instance_numbering()
         rows: list[dict[str, object]] = []
         used: set[str] = set()
         row_id_counts: dict[str, int] = {}
-        if config is not None and config in self.context.variants:
+        if config is not None and config in context.variants:
             try:
-                instances = self._mesh_transform_instances_for_config(config)
+                instances = cls._mesh_transform_instances_for_config_data(context, conversion, config)
             except Exception:
                 instances = []
             for instance in instances:
                 mesh_id = instance.mesh_id
-                if mesh_id not in ids or mesh_id not in self.context.objects:
+                if mesh_id not in ids or mesh_id not in context.objects:
                     continue
                 used.add(mesh_id)
-                number_key = self._mesh_instance_number_key(instance)
+                number_key = cls._mesh_instance_number_key(instance)
                 mesh_numbering = vehicle_numbering.get(mesh_id, {})
                 if number_key in mesh_numbering:
                     display_ordinal = mesh_numbering[number_key]
@@ -248,7 +273,7 @@ class PartsWorkflowMixin:
                     "instance_number_key": number_key,
                 })
         for mesh_id in ids:
-            if mesh_id in used or mesh_id not in self.context.objects:
+            if mesh_id in used or mesh_id not in context.objects:
                 continue
             rows.append({
                 "row_id": mesh_id,
@@ -263,6 +288,17 @@ class PartsWorkflowMixin:
             })
         rows.sort(key=lambda row: (str(row["mesh_id"]).lower(), str(row["row_id"])))
         return rows
+
+    def _part_table_rows(self, ids: list[str]) -> list[dict[str, object]]:
+        if self.context is None:
+            return []
+        return self._part_table_rows_data(
+            self.context,
+            getattr(self, "conversion", {}),
+            self._mesh_scene_config(),
+            ids,
+            self._vehicle_mesh_instance_numbering(),
+        )
 
     def _replace_source_child_overrides(
         self,
@@ -386,39 +422,139 @@ class PartsWorkflowMixin:
             return "N/A"
         return yn_label(settings.get("includeChildren"))
 
-    def _refresh_parts(self, *, reset_view: bool = False) -> None:
+    def _part_table_snapshot_key(self) -> tuple[object, ...] | None:
         if self.context is None:
-            if hasattr(self, "part_tree"):
-                for item in self.part_tree.get_children():
-                    self.part_tree.delete(item)
-            self.current_part_ids = []
-            self.part_row_mesh_ids = {}
-            self.part_row_side_refs = {}
-            self.part_row_positions = {}
-            self.part_instance_rows = {}
-            self.part_child_overrides = {}
-            self._refresh_slots()
-            self._refresh_derived_output_summary()
+            return None
+        return (
+            id(self.context),
+            self._mesh_scene_config(),
+            tuple(self.resolved_part_ids),
+            tuple(self._selected_variant_names()),
+            self._mesh_numbering_cache_key()[1],
+        )
+
+    @classmethod
+    def _build_part_table_snapshot_worker(
+        cls,
+        context: core.VehicleContext,
+        conversion: dict[str, object],
+        config: str | None,
+        ids: tuple[str, ...],
+        selected_variants: tuple[str, ...],
+    ) -> dict[str, object]:
+        with timed_worker("part table snapshot"):
+            vehicle_numbering = cls._vehicle_mesh_instance_numbering_data(context, conversion)
+            table_rows = cls._part_table_rows_data(
+                context,
+                conversion,
+                config,
+                list(ids),
+                vehicle_numbering,
+            )
+            flexbody_meshes, prop_meshes, _all_meshes = core.selected_mesh_roles(
+                context,
+                list(selected_variants),
+            )
+            return {
+                "rows": table_rows,
+                "label_universe": [object_id for object_id in ids if object_id in context.objects],
+                "flexbody_meshes": flexbody_meshes,
+                "prop_meshes": prop_meshes,
+                "vehicle_numbering": vehicle_numbering,
+            }
+
+    def _schedule_part_table_snapshot(self, *, reset_view: bool = False) -> None:
+        if self.context is None:
+            return
+        key = self._part_table_snapshot_key()
+        if key is None:
+            return
+        self.part_table_pending_reset = self.part_table_pending_reset or reset_view
+        if self.part_table_running:
+            self.part_table_pending = True
+            self.part_table_requested_key = key
+            return
+        if self.part_table_requested_key == key:
+            return
+        self.part_table_requested_key = key
+        self.part_table_seq += 1
+        seq = self.part_table_seq
+        context = self.context
+        conversion_copy = json.loads(json.dumps(self.conversion, default=str))
+        config = self._mesh_scene_config()
+        ids = tuple(self.resolved_part_ids)
+        selected = tuple(self._selected_variant_names())
+        self.part_table_running = True
+        self.status_var.set("Preparing part table...")
+        future = self.part_table_builder.submit(
+            self._build_part_table_snapshot_worker,
+            context,
+            conversion_copy,
+            config,
+            ids,
+            selected,
+        )
+        future.add_done_callback(
+            lambda completed, current_seq=seq, current_context=context, current_key=key: self.worker_queue.put(
+                ("part_table_success", (current_seq, current_context, current_key, completed))
+            )
+        )
+
+    def _schedule_pending_part_table_snapshot(self) -> None:
+        if not self.part_table_pending:
+            return
+        reset_view = self.part_table_pending_reset
+        self.part_table_pending = False
+        self.part_table_pending_reset = False
+        self.part_table_requested_key = None
+        self._schedule_part_table_snapshot(reset_view=reset_view)
+
+    def _refresh_parts(self, *, reset_view: bool = False) -> None:
+        with timed_ui("_refresh_parts"):
+            if self.context is None:
+                if hasattr(self, "part_tree"):
+                    for item in self.part_tree.get_children():
+                        self.part_tree.delete(item)
+                self.current_part_ids = []
+                self.part_row_mesh_ids = {}
+                self.part_row_side_refs = {}
+                self.part_row_positions = {}
+                self.part_instance_rows = {}
+                self.part_child_overrides = {}
+                self.part_table_snapshot_key = None
+                self.part_table_snapshot = None
+                self._refresh_slots()
+                self._refresh_derived_output_summary()
+                return
+            # The x/y/z columns read placed geometry, so make sure it matches the
+            # trim on screen before the rows are built.
+            self._refresh_box_preview()
+            key = self._part_table_snapshot_key()
+            snapshot = self.part_table_snapshot if self.part_table_snapshot_key == key else None
+            if not isinstance(snapshot, dict):
+                self._schedule_part_table_snapshot(reset_view=reset_view)
+                return
+            self._apply_part_table_snapshot(snapshot, reset_view=reset_view)
+
+    def _apply_part_table_snapshot(self, snapshot: dict[str, object], *, reset_view: bool = False) -> None:
+        if self.context is None:
             return
         query = self.filter_var.get().strip().lower()
-        # The x/y/z columns read placed geometry, so make sure it matches the
-        # trim on screen before the rows are built.
-        self._refresh_box_preview()
         keep = set(self.part_tree.selection())
         previous_order = list(self.part_tree.get_children(""))
         for item in self.part_tree.get_children():
             self.part_tree.delete(item)
 
         parts = self.conversion.setdefault("parts", {})
-        ids = self.resolved_part_ids
+        table_rows = list(snapshot.get("rows") or [])
+        label_universe = list(snapshot.get("label_universe") or [])
+        flexbody_meshes = set(snapshot.get("flexbody_meshes") or set())
+        prop_meshes = set(snapshot.get("prop_meshes") or set())
+        vehicle_numbering = snapshot.get("vehicle_numbering")
+        if isinstance(vehicle_numbering, dict):
+            self.mesh_instance_numbering_key = self._mesh_numbering_cache_key()
+            self.mesh_instance_numbering_cache = vehicle_numbering
         active_ids = self._preview_active_ids()
-        selected_variants = self._selected_variant_names()
-        flexbody_meshes, prop_meshes, _all_meshes = core.selected_mesh_roles(
-            self.context,
-            selected_variants,
-        )
-        label_universe = [object_id for object_id in ids if object_id in self.context.objects]
-        table_rows = self._part_table_rows(ids)
         self.part_child_overrides = self._replace_source_child_overrides(table_rows, label_universe)
         self.part_row_mesh_ids = {str(row["row_id"]): str(row["mesh_id"]) for row in table_rows}
         self.part_row_side_refs = {str(row["row_id"]): str(row["side_ref"]) for row in table_rows}
@@ -429,11 +565,13 @@ class PartsWorkflowMixin:
                 str(row["mesh_id"]) in self.context.variant_dependent_meshes,
             )
             for row in table_rows
-            if row.get("position") is not None
+            if isinstance(row, dict) and row.get("position") is not None
         }
         displayed: list[str] = []
         row_index = 0
         for row in table_rows:
+            if not isinstance(row, dict):
+                continue
             row_id = str(row["row_id"])
             object_id = str(row["mesh_id"])
             obj = self.context.objects.get(object_id)
@@ -621,30 +759,31 @@ class PartsWorkflowMixin:
         }
 
     def _refresh_viewer(self, *, reset: bool = False) -> None:
-        if self.viewer is None:
-            return
-        visible_ids = self._resolved_visible_ids()
-        # Selected inactive parts are temporarily injected into the GPU scene
-        # (scene.extra); show them while they stay selected. Intersecting with
-        # the live selection hides a stale extra instantly after deselection,
-        # before the scene rebuild that drops it has landed.
-        scene = getattr(self.viewer, "scene", None)
-        selected_meshes = self._selected_part_mesh_ids()
-        pick_to_row = getattr(scene, "pick_to_row", {}) if scene is not None else {}
-        if isinstance(pick_to_row, dict):
-            for preview_mesh, row_mesh in pick_to_row.items():
-                if str(row_mesh) in visible_ids:
-                    visible_ids.add(str(preview_mesh))
-        visible_ids |= set(getattr(scene, "extra", ()) or ()) & selected_meshes
-        current_mesh_ids = {self._part_row_mesh_id(row_id) for row_id in self.current_part_ids}
-        dimmed_ids = visible_ids - current_mesh_ids
-        self.viewer.set_visible_ids(list(visible_ids), reset=reset)
-        if hasattr(self.viewer, "set_dimmed_ids"):
-            self.viewer.set_dimmed_ids(dimmed_ids)
-        # Selection only drives the highlight outline (skipped for hidden parts
-        # in the renderer); it never adds a part to the visible set above.
-        selected_ids = self._selected_preview_ids() if self.viewer_supports_scene else selected_meshes
-        self.viewer.set_selected_ids(selected_ids)
+        with timed_ui("_refresh_viewer"):
+            if self.viewer is None:
+                return
+            visible_ids = self._resolved_visible_ids()
+            # Selected inactive parts are temporarily injected into the GPU scene
+            # (scene.extra); show them while they stay selected. Intersecting with
+            # the live selection hides a stale extra instantly after deselection,
+            # before the scene rebuild that drops it has landed.
+            scene = getattr(self.viewer, "scene", None)
+            selected_meshes = self._selected_part_mesh_ids()
+            pick_to_row = getattr(scene, "pick_to_row", {}) if scene is not None else {}
+            if isinstance(pick_to_row, dict):
+                for preview_mesh, row_mesh in pick_to_row.items():
+                    if str(row_mesh) in visible_ids:
+                        visible_ids.add(str(preview_mesh))
+            visible_ids |= set(getattr(scene, "extra", ()) or ()) & selected_meshes
+            current_mesh_ids = {self._part_row_mesh_id(row_id) for row_id in self.current_part_ids}
+            dimmed_ids = visible_ids - current_mesh_ids
+            self.viewer.set_visible_ids(list(visible_ids), reset=reset)
+            if hasattr(self.viewer, "set_dimmed_ids"):
+                self.viewer.set_dimmed_ids(dimmed_ids)
+            # Selection only drives the highlight outline (skipped for hidden parts
+            # in the renderer); it never adds a part to the visible set above.
+            selected_ids = self._selected_preview_ids() if self.viewer_supports_scene else selected_meshes
+            self.viewer.set_selected_ids(selected_ids)
 
     def _preview_active_ids(self) -> set[str]:
         """Object ids present on the trim currently shown in the moderngl
@@ -754,57 +893,58 @@ class PartsWorkflowMixin:
         self.auto_delta_var.set(f"{fmt_float(auto)} ({source})")
 
     def _update_detail(self) -> None:
-        if self.context is None:
-            self.detail_var.set("")
-            return
-        # Every conversion mutation (mode, translate offset, equivalent parts,
-        # steering ref, manual delta, variant hand override) funnels through here
-        # as its final UI step, so this is where we keep the GPU preview live.
-        # _schedule_mesh_scene is snapshot-guarded: pure selection/visibility
-        # changes leave the fingerprint unchanged and cost only a cheap compare.
-        self._schedule_mesh_scene()
-        self._refresh_derived_output_summary()
-        selected_parts = self.part_tree.selection()
-        if selected_parts:
-            row_id = selected_parts[0]
-            object_id = self._part_row_mesh_id(row_id)
-            obj = self.context.objects.get(object_id)
-            settings = self.conversion.get("parts", {}).get(object_id, {})
-            if obj:
-                display_name = self._part_row_label(row_id, object_id, self.resolved_part_ids)
-                mode = str(settings.get("mode", core.MODE_SKIP)) if isinstance(settings, dict) else core.MODE_SKIP
-                child_override = self._part_child_override(row_id)
-                mode_display = self._part_override_mode_label(child_override) if child_override else mode_label(mode)
-                part_offset = (
-                    offset_display(
-                        mode,
-                        settings.get("translateOffset") if isinstance(settings, dict) else None,
-                        manual_delta=self.manual_delta_enabled.get(),
-                    )
-                    if mode == core.MODE_TRANSLATE and not child_override
-                    else "N/A"
-                )
-                position, varies = self._table_position(row_id)
-                source = self._swap_source_label(object_id, settings) if isinstance(settings, dict) else ""
-                if child_override:
-                    source = self._part_child_source_label(child_override)
-                ref_note = ""
-                side_ref = self._part_row_side_ref(row_id)
-                if side_ref != object_id:
-                    row = getattr(self, "part_instance_rows", {}).get(row_id) or {}
-                    ref_note = f", instance #{row.get('ordinal_for_mesh', 1)}"
-                self.detail_var.set(
-                    f"{display_name}: {mode_display}, "
-                    f"full id {object_id}{ref_note}, source {source or 'N/A'}, x {fmt_float(position[0])}, offset {part_offset}, "
-                    f"dae {obj.dae_path}{self._variant_position_note(object_id) if varies else ''}"
-                )
+        with timed_ui("_update_detail"):
+            if self.context is None:
+                self.detail_var.set("")
                 return
-        active = len(core.active_part_modes(self.conversion))
-        selected_variants = len(self._selected_variant_names())
-        self.detail_var.set(
-            f"{len(self.current_part_ids)} displayed mesh(es), {active} transform setting(s), "
-            f"{selected_variants} selected variant(s)"
-        )
+            # Every conversion mutation (mode, translate offset, equivalent parts,
+            # steering ref, manual delta, variant hand override) funnels through here
+            # as its final UI step, so this is where we keep the GPU preview live.
+            # _schedule_mesh_scene is snapshot-guarded: pure selection/visibility
+            # changes leave the fingerprint unchanged and cost only a cheap compare.
+            self._schedule_mesh_scene()
+            self._refresh_derived_output_summary()
+            selected_parts = self.part_tree.selection()
+            if selected_parts:
+                row_id = selected_parts[0]
+                object_id = self._part_row_mesh_id(row_id)
+                obj = self.context.objects.get(object_id)
+                settings = self.conversion.get("parts", {}).get(object_id, {})
+                if obj:
+                    display_name = self._part_row_label(row_id, object_id, self.resolved_part_ids)
+                    mode = str(settings.get("mode", core.MODE_SKIP)) if isinstance(settings, dict) else core.MODE_SKIP
+                    child_override = self._part_child_override(row_id)
+                    mode_display = self._part_override_mode_label(child_override) if child_override else mode_label(mode)
+                    part_offset = (
+                        offset_display(
+                            mode,
+                            settings.get("translateOffset") if isinstance(settings, dict) else None,
+                            manual_delta=self.manual_delta_enabled.get(),
+                        )
+                        if mode == core.MODE_TRANSLATE and not child_override
+                        else "N/A"
+                    )
+                    position, varies = self._table_position(row_id)
+                    source = self._swap_source_label(object_id, settings) if isinstance(settings, dict) else ""
+                    if child_override:
+                        source = self._part_child_source_label(child_override)
+                    ref_note = ""
+                    side_ref = self._part_row_side_ref(row_id)
+                    if side_ref != object_id:
+                        row = getattr(self, "part_instance_rows", {}).get(row_id) or {}
+                        ref_note = f", instance #{row.get('ordinal_for_mesh', 1)}"
+                    self.detail_var.set(
+                        f"{display_name}: {mode_display}, "
+                        f"full id {object_id}{ref_note}, source {source or 'N/A'}, x {fmt_float(position[0])}, offset {part_offset}, "
+                        f"dae {obj.dae_path}{self._variant_position_note(object_id) if varies else ''}"
+                    )
+                    return
+            active = len(core.active_part_modes(self.conversion))
+            selected_variants = len(self._selected_variant_names())
+            self.detail_var.set(
+                f"{len(self.current_part_ids)} displayed mesh(es), {active} transform setting(s), "
+                f"{selected_variants} selected variant(s)"
+            )
 
     def _set_all_variants_selected(self, selected: bool) -> None:
         if self.context is None:

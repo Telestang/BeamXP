@@ -67,6 +67,7 @@ class HandDriveToolApp(
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_running = False
         self.part_resolver = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rhd-parts")
+        self.part_table_builder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rhd-part-table")
         self.variant_detector = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rhd-variants")
         self.variant_detection_seq = 0
         self.variant_detection_running = False
@@ -78,6 +79,13 @@ class HandDriveToolApp(
         self.part_refresh_pending = False
         self.part_refresh_pending_reset = False
         self.part_refresh_seq = 0
+        self.part_table_seq = 0
+        self.part_table_running = False
+        self.part_table_pending = False
+        self.part_table_pending_reset = False
+        self.part_table_requested_key: tuple[object, ...] | None = None
+        self.part_table_snapshot_key: tuple[object, ...] | None = None
+        self.part_table_snapshot: dict[str, object] | None = None
         self.resolved_part_ids: list[str] = []
         self.vehicle_load_seq = 0
         self.recommendation_seq = 0
@@ -145,7 +153,7 @@ class HandDriveToolApp(
         self.part_row_positions: dict[str, tuple[tuple[float, float, float], bool]] = {}
         self.part_instance_rows: dict[str, dict[str, object]] = {}
         self.part_child_overrides: dict[str, dict[str, str]] = {}
-        self.mesh_instance_numbering_key: int | None = None
+        self.mesh_instance_numbering_key: tuple[object, str] | None = None
         self.mesh_instance_numbering_cache: dict[str, dict[str, int]] = {}
         self.current_slot_ids: list[str] = []
         self.slot_usage_key: tuple[str, ...] | None = None

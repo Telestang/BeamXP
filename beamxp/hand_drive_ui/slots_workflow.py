@@ -297,57 +297,58 @@ class SlotsWorkflowMixin:
         return rows
 
     def _refresh_slots(self) -> None:
-        if hasattr(self, "slot_tree"):
-            keep = set(self.slot_tree.selection())
-            previous_order = list(self.slot_tree.get_children(""))
-            for item in self.slot_tree.get_children():
-                self.slot_tree.delete(item)
-        else:
-            keep = set()
-            previous_order = []
-        self.side_pair_rows_by_iid = {}
-        if self.context is None:
-            return
-        query = self.slot_filter_var.get().strip().lower()
-        context = self._side_pair_table_context()
-        rows = self._side_pair_table_rows(context)
-        displayed: list[str] = []
-        row_index = 0
-        for row in rows:
-            values = (
-                row["kind"],
-                row["left"],
-                row["right"],
-            )
-            if (
-                query
-                and all(query not in str(value).lower() for value in values)
-            ):
-                continue
-            row_id = str(row["id"])
-            displayed.append(row_id)
-            self.side_pair_rows_by_iid[row_id] = row["pair"]
-            self.slot_tree.insert(
-                "",
-                "end",
-                iid=row_id,
-                tags=self._row_tags(row_index),
-                values=values,
-            )
-            row_index += 1
-        self.current_slot_ids = displayed
-        self._restore_tree_order(self.slot_tree, previous_order)
-        target = getattr(self, "side_pair_pick_target", None)
-        if isinstance(target, dict):
-            item = str(target.get("item") or "")
-            field = str(target.get("field") or "")
-            if item and field in {"left", "right"} and self.slot_tree.exists(item):
-                self.slot_tree.set(item, field, "click a part...")
+        with timed_ui("_refresh_slots"):
+            if hasattr(self, "slot_tree"):
+                keep = set(self.slot_tree.selection())
+                previous_order = list(self.slot_tree.get_children(""))
+                for item in self.slot_tree.get_children():
+                    self.slot_tree.delete(item)
             else:
-                self._clear_side_pair_pick_target()
-        visible_keep = [item for item in keep if self.slot_tree.exists(item)]
-        if visible_keep:
-            self.slot_tree.selection_set(visible_keep)
+                keep = set()
+                previous_order = []
+            self.side_pair_rows_by_iid = {}
+            if self.context is None:
+                return
+            query = self.slot_filter_var.get().strip().lower()
+            context = self._side_pair_table_context()
+            rows = self._side_pair_table_rows(context)
+            displayed: list[str] = []
+            row_index = 0
+            for row in rows:
+                values = (
+                    row["kind"],
+                    row["left"],
+                    row["right"],
+                )
+                if (
+                    query
+                    and all(query not in str(value).lower() for value in values)
+                ):
+                    continue
+                row_id = str(row["id"])
+                displayed.append(row_id)
+                self.side_pair_rows_by_iid[row_id] = row["pair"]
+                self.slot_tree.insert(
+                    "",
+                    "end",
+                    iid=row_id,
+                    tags=self._row_tags(row_index),
+                    values=values,
+                )
+                row_index += 1
+            self.current_slot_ids = displayed
+            self._restore_tree_order(self.slot_tree, previous_order)
+            target = getattr(self, "side_pair_pick_target", None)
+            if isinstance(target, dict):
+                item = str(target.get("item") or "")
+                field = str(target.get("field") or "")
+                if item and field in {"left", "right"} and self.slot_tree.exists(item):
+                    self.slot_tree.set(item, field, "click a part...")
+                else:
+                    self._clear_side_pair_pick_target()
+            visible_keep = [item for item in keep if self.slot_tree.exists(item)]
+            if visible_keep:
+                self.slot_tree.selection_set(visible_keep)
 
     def _side_pair_pair_key(self, left: object, right: object) -> tuple[str, str]:
         return tuple(sorted((str(left or ""), str(right or ""))))

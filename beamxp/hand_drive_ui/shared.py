@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import queue
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +47,36 @@ BLENDER_CANDIDATES = (
     Path(r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"),
     Path(r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"),
 )
+
+UI_STALL_LOG_MS = float(os.environ.get("BEAMXP_UI_STALL_LOG_MS", "100"))
+
+
+def log_ui_timing(label: str, elapsed_ms: float) -> None:
+    if elapsed_ms >= UI_STALL_LOG_MS:
+        print(f"[BeamXP ui] {label} took {elapsed_ms:.1f} ms", file=sys.stderr)
+
+
+def log_worker_timing(label: str, elapsed_ms: float) -> None:
+    if elapsed_ms >= UI_STALL_LOG_MS:
+        print(f"[BeamXP worker] {label} took {elapsed_ms:.1f} ms", file=sys.stderr)
+
+
+@contextmanager
+def timed_ui(label: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        log_ui_timing(label, (time.perf_counter() - start) * 1000.0)
+
+
+@contextmanager
+def timed_worker(label: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        log_worker_timing(label, (time.perf_counter() - start) * 1000.0)
 
 def fmt_float(value: float | None) -> str:
     if value is None:
@@ -190,6 +222,8 @@ __all__ = [
     "filedialog",
     "fmt_float",
     "json",
+    "log_ui_timing",
+    "log_worker_timing",
     "mesh_preview",
     "messagebox",
     "mode_label",
@@ -204,6 +238,8 @@ __all__ = [
     "subprocess",
     "sys",
     "threading",
+    "timed_ui",
+    "timed_worker",
     "tk",
     "ttk",
     "yn_label",

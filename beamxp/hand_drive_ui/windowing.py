@@ -9,6 +9,7 @@ class WindowingMixin:
     def _on_close(self) -> None:
         self._close_tree_combo_editor()
         self.part_resolver.shutdown(wait=False, cancel_futures=True)
+        self.part_table_builder.shutdown(wait=False, cancel_futures=True)
         self.variant_detector.shutdown(wait=False, cancel_futures=True)
         self.destroy()
 

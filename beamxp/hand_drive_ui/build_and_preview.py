@@ -177,28 +177,29 @@ class BuildAndPreviewMixin:
         """Fingerprint of everything the 3D scene depends on. Viewer-only
         flags (visibility/solo) are excluded - those only filter the index
         buffer and never need a rebuild."""
-        config = self._mesh_scene_config()
-        if config is None:
-            return None
-        conversion = json.loads(json.dumps(self.conversion, default=str))
-        parts = conversion.get("parts")
-        if isinstance(parts, dict):
-            for settings in parts.values():
-                if isinstance(settings, dict):
-                    settings.pop("viewerVisible", None)
-                    settings.pop("viewerSolo", None)
-        return json.dumps(
-            {
-                "config": config,
-                "output": self._selected_preview_output_name(),
-                "conversion": conversion,
-                # Selected-but-inactive parts are injected into the scene, so
-                # the scene must rebuild when that set changes (and only then;
-                # selection moves between active parts leave it empty/equal).
-                "extra": self._selected_extra_preview_ids(),
-            },
-            sort_keys=True,
-        )
+        with timed_ui("_mesh_scene_snapshot"):
+            config = self._mesh_scene_config()
+            if config is None:
+                return None
+            conversion = json.loads(json.dumps(self.conversion, default=str))
+            parts = conversion.get("parts")
+            if isinstance(parts, dict):
+                for settings in parts.values():
+                    if isinstance(settings, dict):
+                        settings.pop("viewerVisible", None)
+                        settings.pop("viewerSolo", None)
+            return json.dumps(
+                {
+                    "config": config,
+                    "output": self._selected_preview_output_name(),
+                    "conversion": conversion,
+                    # Selected-but-inactive parts are injected into the scene, so
+                    # the scene must rebuild when that set changes (and only then;
+                    # selection moves between active parts leave it empty/equal).
+                    "extra": self._selected_extra_preview_ids(),
+                },
+                sort_keys=True,
+            )
 
     def _schedule_mesh_scene(self, *, immediate: bool = False) -> None:
         if self.context is None or not self.viewer_supports_scene:
@@ -270,34 +271,35 @@ class BuildAndPreviewMixin:
         return mesh_preview.build_scene(payload, cache_dir)
 
     def _handle_mesh_scene_done(self, payload: object) -> None:
-        seq, completed_snapshot, completed = payload
-        self.mesh_scene_running = False
-        should_apply = (
-            seq == self.mesh_scene_seq
-            and completed_snapshot == self._mesh_scene_snapshot()
-            and self.viewer is not None
-            and self.viewer_supports_scene
-        )
-        try:
-            scene = completed.result()
-        except Exception as exc:
-            if should_apply and self.viewer is not None:
-                self.viewer.set_message(f"preview failed: {exc}")
+        with timed_ui("_handle_mesh_scene_done"):
+            seq, completed_snapshot, completed = payload
+            self.mesh_scene_running = False
+            should_apply = (
+                seq == self.mesh_scene_seq
+                and completed_snapshot == self._mesh_scene_snapshot()
+                and self.viewer is not None
+                and self.viewer_supports_scene
+            )
+            try:
+                scene = completed.result()
+            except Exception as exc:
+                if should_apply and self.viewer is not None:
+                    self.viewer.set_message(f"preview failed: {exc}")
+                self._schedule_pending_mesh_scene()
+                return
+            if not should_apply:
+                self._schedule_pending_mesh_scene()
+                return
+            assert self.viewer is not None
+            self.viewer.show_scene(scene, reset_view=self.mesh_scene_reset_pending)
+            self.mesh_scene_reset_pending = False
+            # Replacement-source children can render as meshes that belong to the
+            # replacement part rather than the original child row. Once the GPU
+            # scene has its pick-to-row map, rebuild the table so green preview
+            # children and table rows agree about their inherited transform.
+            self._refresh_parts()
+            self._refresh_active_cells()
             self._schedule_pending_mesh_scene()
-            return
-        if not should_apply:
-            self._schedule_pending_mesh_scene()
-            return
-        assert self.viewer is not None
-        self.viewer.show_scene(scene, reset_view=self.mesh_scene_reset_pending)
-        self.mesh_scene_reset_pending = False
-        # Replacement-source children can render as meshes that belong to the
-        # replacement part rather than the original child row. Once the GPU
-        # scene has its pick-to-row map, rebuild the table so green preview
-        # children and table rows agree about their inherited transform.
-        self._refresh_parts()
-        self._refresh_active_cells()
-        self._schedule_pending_mesh_scene()
 
     def _schedule_pending_mesh_scene(self) -> None:
         if not self.mesh_scene_pending:
