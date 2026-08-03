@@ -43,6 +43,11 @@ from PIL import Image as _PILImage
 # ---------------------------------------------------------------------------
 
 
+SHAPE_HULL = "hull"
+SHAPE_ROTATED = "rotated"
+BOUNDS_SHAPES = (SHAPE_HULL, SHAPE_ROTATED)
+
+
 @dataclass(frozen=True, slots=True)
 class MserConfig:
     """Tuneable MSER and grouping parameters.
@@ -51,12 +56,181 @@ class MserConfig:
     near-flat colour backgrounds.
     """
 
+    # Which front-end produces the raw boxes.  Everything after it -- box
+    # filtering, grouping, domain recovery, size -- is shared.
+    #
+    # "mser" finds maximally stable extremal regions, which is right for print:
+    # a painted glyph is a patch of one colour against another.
+    #
+    # "edge" is for relief.  A moulded glyph is not a uniform region at all --
+    # the trim inside the stroke is the same material, at the same height, as
+    # the trim outside it.  What exists is the pair of edges where the surface
+    # steps up and back down, so MSER has nothing to be stable about and finds
+    # nothing.  A kernel gradient keys on exactly the thing that is there, and
+    # costs one convolution instead of a region search.
+    box_source:    str   = "mser"  # default: "mser"  ("mser" or "edge")
+
     # MSER detector
     delta:         int   = 12  # default: 5
     min_area:      int   = 10  # default: 30
     max_area:      int   = 10000  # default: 1_024
     max_variation: float = 1.0  # default: 0.25
     min_diversity: float = 0.1  # default: 0.2
+
+    # Edge detector.  Only read when box_source is "edge".
+    edge_operator:              str   = "scharr"  # default: "scharr" ("scharr", "sobel", "laplacian")
+    edge_kernel_px:             int   = 3  # default: 3 (sobel/laplacian aperture; scharr is always 3)
+    edge_blur_sigma:            float = 1.0  # default: 1.0 (pre-smooth, in texture pixels)
+    # Threshold against a local average of the gradient rather than a global
+    # level.  This is the parameter that decides whether shallow marks are
+    # found at all.  On the ardente the trim seam beside "ARDENTE" answers
+    # tens of times louder than the lettering, so any single threshold set
+    # high enough to exclude the seam also excludes the word -- measured, a
+    # 97th-percentile global cut found the word and 12,000 other things, and a
+    # 99th found neither.  Compared with its own neighbourhood the word is
+    # locally prominent and the flat trim around it is not.
+    # Zero falls back to the global percentile below.
+    edge_local_window_px:       int   = 64  # default: 64
+    edge_local_k:               float = 2.2  # default: 2.2 (multiple of the local mean)
+    # Used when edge_local_window_px is zero.
+    edge_threshold_percentile:  float = 99.0  # default: 99.0
+    edge_threshold_floor:       float = 2.0  # default: 2.0 (absolute gradient floor)
+    # A stroke arrives as two parallel edges with untouched material between
+    # them.  Closing by about the stroke width fuses them into one mark, which
+    # is what the grouping stage downstream expects to be handed.
+    edge_close_px:              int   = 5  # default: 5
+    edge_dilate_px:             int   = 1  # default: 1
+    edge_min_component_px:      int   = 12  # default: 12
+
+    # Stroke width (Epshtein et al.).  Off by default, so the colour pipeline
+    # is exactly what it was.  This is the test that separates lettering from
+    # everything else a relief map is full of: a letter is drawn with a pen of
+    # one thickness, while a panel seam, a bevel or a run of stitching is not,
+    # however strong an edge it makes.  Needs a height-like image -- see
+    # stroke_width_transform.
+    enable_stroke_width_filter: bool  = False  # default: False
+    swt_polarity:               str   = "raised"  # default: "raised" ("raised", "engraved", "both")
+    swt_gradient_tolerance_degrees: float = 45.0  # default: 45.0 (how opposed the facing edge must be)
+    swt_min_stroke_px:          int   = 2  # default: 2
+    swt_max_stroke_px:          int   = 40  # default: 40 (also caps the ray march)
+    swt_median_px:              int   = 3  # default: 3 (0 or 1 disables the smoothing pass)
+    # Reject above this standard-deviation-over-mean of the widths in a box.
+    swt_max_width_variation:    float = 0.5  # default: 0.5
+    # And reject a box too little of which carries any stroke at all.
+    swt_min_coverage:           float = 0.05  # default: 0.05
+
+    # Ring smoothness.  Judges the material around a region rather than the
+    # region itself: a moulded mark is put on plain trim, while the grilles,
+    # weaves and carpet that keep being mistaken for one continue past their
+    # own bounds in every direction.  Off by default, so the colour pipeline
+    # is exactly what it was.
+    # Rotated bounds.  Fits the smallest rotated rectangle to the feature in
+    # each region and judges the region by its true proportions rather than by
+    # an axis-aligned box that a tilted mark barely fills.  Runs before the
+    # flatness test, whose percentile is diluted by exactly that background.
+    # Off by default.
+    enable_rotated_bounds_filter: bool = False  # default: False
+    rotated_bounds_min_points:     int = 12  # default: 12 (else nothing is fitted)
+    # Rotated area over axis-aligned area.  A mark sitting square in its box
+    # approaches 1; a thin diagonal streak collapses towards 0.
+    min_rotated_fill:            float = 0.25  # default: 0.25
+    # True long-over-short, which for anything tilted the axis-aligned box
+    # gets wrong.
+    max_rotated_aspect:          float = 14.0  # default: 14.0
+    # Which boundary describes the feature.  The hull hugs about a fifth
+    # tighter than the rectangle, so it is the better answer to "where is this
+    # mark"; the rectangle is kept because it is the thing an angle and a true
+    # aspect ratio come from, and because a hull of thirty points is a busier
+    # outline to read at a glance.
+    bounds_shape:                  str = SHAPE_HULL  # default: "hull"
+    # Optional UV-edge agreement for adopting a rotated outline.  This answers
+    # a different question from the feature fit: a long mark can have a real
+    # direction while still not being a mark that should rotate with the trim.
+    # When enabled, the region has to sit near a UV island edge and the fitted
+    # feature direction has to agree with that edge.  The outline then uses the
+    # edge angle, so one side of the drawn rectangle is parallel to the island
+    # edge rather than wobbling with glyph noise.
+    enable_edge_aligned_rotation: bool = False  # default: False
+    rotation_edge_min_gap_px:     float = 2.0  # default: 2.0 (touching the edge is not proximity)
+    rotation_edge_search_px:      int = 24  # default: 24 (max distance to UV edge)
+    rotation_edge_band_px:        int = 6  # default: 6 (edge samples near closest approach)
+    rotation_edge_min_points:     int = 8  # default: 8 (else no edge angle is fitted)
+    max_rotation_edge_angle_degrees: float = 12.0  # default: 12.0
+    max_opposite_rotation_edge_fraction: float = 0.5  # default: 0.5 (reject UV-bounded strips)
+    # How much of the enclosing shape has to be feature before the outline is
+    # worth adopting.  An absolute bar, not a comparison against the
+    # axis-aligned box: comparing two shapes around one feature, the ratio of
+    # their tightness is only the ratio of their areas, so a relative test says
+    # nothing the areas did not already say.  Below this the boundary is
+    # wrapping mostly empty space -- scattered speckle rather than a mark --
+    # and drawing it would overstate the fit.  Measured on the ardente,
+    # ARDENTE's hull is 0.41 and AIRBAG's 0.66 against a median of 0.40.
+    # The region is kept either way; this decides only which shape describes it.
+    min_feature_tightness:       float = 0.20  # default: 0.20
+    # And how elongated the feature has to be before its orientation means
+    # anything.  A rotated boundary claims a direction, and for a near-square
+    # or round mark there is no direction to claim: the fit settles wherever
+    # the noise puts it.  Measured on the ardente, both horn icons come out at
+    # aspect 1.5 tilted 8 degrees -- a wobble, not an angle -- while ARDENTE
+    # reads 9.1 and AIRBAG 5.3 about axes that are unmistakably real.  Below
+    # this the region keeps its axis-aligned box, which claims nothing.
+    min_rotated_elongation:      float = 2.5  # default: 2.5
+
+    # Text lines.  The only filter here that asks what a mark *is* rather than
+    # whether it is one.  A horn or seat pictogram passes every other test --
+    # it is a genuine mark on plain trim -- and is still not the AIRBAG text on
+    # the fascia.  What makes text text is several similar marks in a row.
+    # Off by default.
+    enable_text_line_filter:      bool = False  # default: False
+    # Components smaller than this are speckle, not characters.
+    text_min_component_px:         int = 20  # default: 20
+    # Measured on the ardente, AIRBAG has 6 components and ARDENTE 14, while
+    # every horn and seat icon has one.  Four leaves room for a short word
+    # without admitting a two-part symbol.
+    text_min_characters:           int = 4  # default: 4
+    # How far the component centres may stray from one straight line.  AIRBAG
+    # scatters 0.019 and ARDENTE 0.072; the non-text regions with enough
+    # components to measure scatter 0.18 to 0.56.
+    max_baseline_scatter:        float = 0.15  # default: 0.15
+
+    # Region flatness.  The other half of the pair: the ring test rejects a
+    # region because of what surrounds it, this one because there is nothing
+    # in it.  A bolster roll or a fascia curve raises an edge without carrying
+    # a mark, and to the ring test that is indistinguishable from lettering on
+    # plain trim.  Off by default.
+    enable_region_flatness_filter: bool = False  # default: False
+    # A high percentile, not a mean: a small glyph in a generous box is mostly
+    # background, and what matters is whether anything stands up at all.
+    region_flatness_percentile:  float = 90.0  # default: 90.0
+    region_flatness_min_domain_px: int = 48  # default: 48 (else nothing is concluded)
+    # As a multiple of the atlas's typical gradient.  Reject below this.
+    #
+    # 10 rather than the 2 or 3 that sounds cautious, because anything the edge
+    # front-end returns has edges in it by construction: measured on the
+    # ardente, the flattest of 68 detections still read 3.78, so a floor of 3
+    # can never fire.  At 10 it takes 21 regions to 13 while ARDENTE reads 45
+    # and AIRBAG 64, so both keep four to six times the margin.  Lower it to 6
+    # for a gentler cut.
+    #
+    # It does nothing at all on the colour path -- painted glyphs are
+    # high-contrast too, and no threshold up to 10 removed a single one of 113
+    # colour detections.  This is a relief-side filter.
+    min_region_relief:           float = 10.0  # default: 10.0
+
+    enable_ring_smoothness_filter: bool = False  # default: False
+    ring_smoothness_width_px:      int = 12  # default: 12 (how thick a ring)
+    # Held off the region so the mark's own outer edge is not counted as
+    # surrounding busyness; without it every real mark measures rough.
+    ring_smoothness_margin_px:     int = 3  # default: 3
+    ring_smoothness_percentile:  float = 75.0  # default: 75.0 (ring's own level)
+    ring_smoothness_min_domain_px: int = 48  # default: 48 (else nothing is concluded)
+    # As a multiple of the atlas's typical gradient, so it travels between
+    # vehicles.  Measured on the ardente interior: AIRBAG's ring reads 1.01 and
+    # ARDENTE's 1.99, against a median of 10.2 over all detections and 63-102
+    # for the grilles.  3 sits on a plateau -- raising it from 2.5 costs four
+    # regions and raising it again costs none -- so it buys ARDENTE a margin
+    # for nothing.
+    max_ring_roughness:          float = 3.0  # default: 3.0
 
     # Post-detection filtering.  MSER's own max_area already caps a region far
     # below any sane fraction of the atlas, so no image-fraction test is applied
@@ -127,7 +301,7 @@ class MserConfig:
     # invalid boxes are removed and survivors are regrouped.  A broad rebuilt
     # group that still fails is retried once at half the merge distance.
     enable_region_domain_filter:           bool  = True  # default: True
-    min_region_uv_coverage:                float = 0.98  # default: 0.98
+    min_region_uv_coverage:                float = 1.0  # default: 0.98
 
     # Terminal output shaping.  Applied only after every detection/filter stage,
     # so padding cannot cause a region to fail an earlier size, colour, or domain
@@ -145,10 +319,34 @@ class MserConfig:
 # Active tuning preset
 # ---------------------------------------------------------------------------
 #
-# Edit the MserConfig field values above while tuning.  DEFAULT_CONFIG is kept
-# deliberately empty so those field values are the single source of truth.
+# Edit the MserConfig field values above while tuning the colour path.
+# Relief/normal-map detection uses a separate preset: moulded marks need an
+# edge-heavy pipeline and rotated boxes, while printed marks should keep the
+# colour-oriented defaults.
 
-DEFAULT_CONFIG = MserConfig()
+DEFAULT_COLOUR_CONFIG = MserConfig()
+DEFAULT_RELIEF_DETECTION_CONFIG = replace(
+    DEFAULT_COLOUR_CONFIG,
+    box_source="edge",
+    edge_operator="laplacian",
+    swt_polarity="both",
+    enable_rotated_bounds_filter=True,
+    min_rotated_fill=0.01,
+    bounds_shape=SHAPE_ROTATED,
+    enable_edge_aligned_rotation=True,
+    rotation_edge_search_px=100,
+    min_feature_tightness=0.01,
+    enable_region_flatness_filter=True,
+    min_region_relief=30.0,
+    enable_ring_smoothness_filter=True,
+    ring_smoothness_width_px=1,
+    ring_smoothness_percentile=60.0,
+    min_box_width_px=15,
+    min_box_height_px=15,
+    box_min_feature_px=15,
+    final_max_aspect=20.0,
+)
+DEFAULT_CONFIG = DEFAULT_COLOUR_CONFIG
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +403,12 @@ class DetectionStage:
     adjusted: int = 0  # regions this stage moved, expanded, or absorbed
     # Radius per kept region, or None where the region stays rectangular.
     circles: tuple[int | None, ...] = ()
+    # Corner points of the rotated rectangle fitted to each kept region, where
+    # one was fitted.  Carried so the viewer can outline what was actually
+    # measured rather than the axis-aligned box it happened to sit in -- on a
+    # tilted mark those are very different shapes, and a filter judged on one
+    # while the other is drawn cannot be tuned by eye.
+    rotations: tuple[tuple[tuple[float, float], ...] | None, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +640,787 @@ def detect_mser_boxes(
         return np.empty((0, 4), dtype=np.int32)
 
     return np.asarray(boxes, dtype=np.int32)
+
+
+def edge_response(grey: np.ndarray, config: MserConfig) -> np.ndarray:
+    """Gradient magnitude of a greyscale image, as a float32 map.
+
+    Scharr by default: at a 3x3 aperture it is markedly more rotation-accurate
+    than Sobel, which matters here because moulded lettering has strokes at
+    every angle and a detector that answers differently to a vertical and a
+    diagonal stroke will find some letters and lose others.
+    """
+    source = grey.astype(np.float32)
+    if config.edge_blur_sigma > 0:
+        source = cv2.GaussianBlur(source, (0, 0), config.edge_blur_sigma)
+
+    if config.edge_operator == "laplacian":
+        aperture = max(int(config.edge_kernel_px) | 1, 1)
+        return np.abs(cv2.Laplacian(source, cv2.CV_32F, ksize=aperture))
+    if config.edge_operator == "sobel":
+        aperture = max(int(config.edge_kernel_px) | 1, 1)
+        dx = cv2.Sobel(source, cv2.CV_32F, 1, 0, ksize=aperture)
+        dy = cv2.Sobel(source, cv2.CV_32F, 0, 1, ksize=aperture)
+    else:
+        dx = cv2.Scharr(source, cv2.CV_32F, 1, 0)
+        dy = cv2.Scharr(source, cv2.CV_32F, 0, 1)
+    return cv2.magnitude(dx, dy)
+
+
+def edge_mask(
+    grey: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Threshold the gradient into an edge mask, and return it with the response.
+
+    Shared by the edge box source and the stroke-width transform, so both agree
+    on what an edge is; two different answers to that would make the stroke
+    widths describe edges the boxes were never built from.
+    """
+    response = edge_response(grey, config)
+    domain = uv_mask if uv_mask is not None else np.ones(grey.shape[:2], bool)
+    inside = response[domain]
+    if inside.size == 0:
+        return np.zeros(grey.shape[:2], dtype=bool), response
+
+    if config.edge_local_window_px > 0:
+        window = max(int(config.edge_local_window_px), 3)
+        # Averaged over the domain only, so material beside a void is compared
+        # with material rather than with the empty half of its neighbourhood.
+        weight = domain.astype(np.float32)
+        total = cv2.blur(response * weight, (window, window))
+        share = cv2.blur(weight, (window, window))
+        local = total / np.maximum(share, 1e-6)
+        threshold = np.maximum(
+            local * float(config.edge_local_k), float(config.edge_threshold_floor)
+        )
+    else:
+        percentile = float(
+            np.percentile(inside, min(max(config.edge_threshold_percentile, 0.0), 100.0))
+        )
+        threshold = np.float32(max(percentile, float(config.edge_threshold_floor)))
+    return (response >= threshold) & domain, response
+
+
+def detect_edge_boxes(
+    grey: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> np.ndarray:
+    """Return bounding boxes of connected edge structure.
+
+    Closing runs before components are labelled so a stroke's two edges become
+    one blob; without it every letter arrives as a pair of thin rings and the
+    grouping stage has twice as much to join.
+    """
+    mask, _response = edge_mask(grey, uv_mask, config)
+    edges = mask.astype(np.uint8)
+    if not bool(edges.any()):
+        return np.empty((0, 4), dtype=np.int32)
+
+    if config.edge_close_px > 0:
+        size = max(int(config.edge_close_px), 1)
+        edges = cv2.morphologyEx(
+            edges, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+    if config.edge_dilate_px > 0:
+        size = max(int(config.edge_dilate_px) * 2 + 1, 1)
+        edges = cv2.dilate(
+            edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        )
+
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        edges, connectivity=8
+    )
+    boxes: list[tuple[int, int, int, int]] = []
+    for label in range(1, count):
+        if int(stats[label, cv2.CC_STAT_AREA]) < max(config.edge_min_component_px, 1):
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        aspect = max(w, h) / max(min(w, h), 1)
+        if config.enable_aspect_ratio_filter and (
+            aspect < config.min_aspect or aspect > config.max_aspect
+        ):
+            continue
+        boxes.append((x, y, w, h))
+    if not boxes:
+        return np.empty((0, 4), dtype=np.int32)
+    return np.asarray(boxes, dtype=np.int32)
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureShape:
+    """The feature inside a region, and the shapes that enclose it."""
+
+    area_px: float  # feature texels
+    hull: tuple[tuple[float, float], ...]
+    hull_area: float
+    rectangle: tuple[tuple[float, float], tuple[float, float], float]
+    rectangle_area: float
+
+    def tightness(self, shape: str) -> float:
+        """Share of the enclosing shape that is actually feature.
+
+        This is the measure that says how closely a boundary hugs what it
+        surrounds, and it is not the same question as how much smaller that
+        boundary is than the axis-aligned box.  Comparing two shapes around one
+        feature, the ratio of their tightness is just the ratio of their areas,
+        so "improved on the box" carries no information the areas did not.  As
+        an absolute bar it does: a boundary enclosing mostly nothing describes
+        scattered speckle, whatever shape it is.
+
+        Slightly over 1 is normal and not an error -- the hull is a polygon
+        through pixel centres while the feature is counted in whole pixels.
+        """
+        area = self.hull_area if shape == SHAPE_HULL else self.rectangle_area
+        return self.area_px / max(area, 1e-6)
+
+    def outline(self, shape: str) -> tuple[tuple[float, float], ...]:
+        if shape == SHAPE_HULL:
+            return self.hull
+        return tuple(
+            (float(px), float(py)) for px, py in cv2.boxPoints(self.rectangle)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeAlignment:
+    """A feature rectangle whose side is parallel to a nearby UV edge."""
+
+    outline: tuple[tuple[float, float], ...]
+    edge_angle_degrees: float
+    feature_angle_degrees: float
+    angle_delta_degrees: float
+    distance_px: float
+    edge_points: int
+
+
+def feature_shape(
+    mask: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+) -> FeatureShape | None:
+    """Fit a convex hull and its minimum-area rectangle to a region's feature.
+
+    The hull is computed first and the rectangle derived from it, which is both
+    exact and nearly free: rotating calipers over the hull's handful of points
+    gives a rectangle identical to the one fitted to every feature texel --
+    measured across 60 regions, the areas never differed at all -- and the hull
+    is where the work was anyway.
+
+    The hull is the tighter of the two boundaries by about a fifth, so it is
+    the better description of where a mark actually is.  It is not the cheaper
+    one, which is worth saying because it sounds as though it should be:
+    ``minAreaRect`` over the raw points is a single optimised call at 5.5 ms
+    across those regions, while taking the hull and measuring its area costs
+    5.9 ms in two.  Doing both comes to 6.5 ms, against 316 ms for the gradient
+    threshold the mask came from, so the choice is about which shape describes
+    the feature and not about cost.
+    """
+    x, y, w, h = bounds
+    height, width = mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    points = cv2.findNonZero(mask[y0:y1, x0:x1].astype(np.uint8))
+    if points is None or len(points) < max(config.rotated_bounds_min_points, 3):
+        return None
+
+    hull = cv2.convexHull(points)
+    rectangle = cv2.minAreaRect(hull)
+    (cx, cy), size, angle = rectangle
+    return FeatureShape(
+        area_px=float(len(points)),
+        hull=tuple(
+            (float(px) + x0, float(py) + y0) for px, py in hull.reshape(-1, 2)
+        ),
+        hull_area=float(cv2.contourArea(hull)),
+        rectangle=((cx + x0, cy + y0), size, angle),
+        rectangle_area=float(size[0] * size[1]),
+    )
+
+
+def _normalised_axis_angle_degrees(angle: float) -> float:
+    """Map a line direction to [0, 180), because opposite edges are parallel."""
+    return float(angle % 180.0)
+
+
+def _parallel_angle_delta_degrees(first: float, second: float) -> float:
+    """Smallest angle between two unoriented line directions."""
+    delta = abs(
+        _normalised_axis_angle_degrees(first)
+        - _normalised_axis_angle_degrees(second)
+    )
+    return float(min(delta, 180.0 - delta))
+
+
+def _rectangle_long_axis_angle_degrees(
+    rectangle: tuple[tuple[float, float], tuple[float, float], float],
+) -> float:
+    """Return the direction of a min-area rectangle's long side."""
+    _centre, (rw, rh), angle = rectangle
+    if rh > rw:
+        angle += 90.0
+    return _normalised_axis_angle_degrees(angle)
+
+
+def _feature_points(
+    mask: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+) -> np.ndarray | None:
+    """Feature texel centres inside one clamped region, in absolute pixels."""
+    x, y, w, h = bounds
+    height, width = mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    points = cv2.findNonZero(mask[y0:y1, x0:x1].astype(np.uint8))
+    if points is None or len(points) < max(config.rotated_bounds_min_points, 3):
+        return None
+    absolute = points.reshape(-1, 2).astype(np.float32)
+    absolute[:, 0] += x0
+    absolute[:, 1] += y0
+    return absolute
+
+
+def _oriented_rectangle_outline(
+    points: np.ndarray,
+    angle_degrees: float,
+) -> tuple[tuple[float, float], ...]:
+    """Axis-aligned bounds in a rotated basis, returned as image-space corners."""
+    radians = math.radians(angle_degrees)
+    along = np.asarray((math.cos(radians), math.sin(radians)), dtype=np.float32)
+    across = np.asarray((-math.sin(radians), math.cos(radians)), dtype=np.float32)
+    projected_along = points @ along
+    projected_across = points @ across
+    min_along, max_along = float(projected_along.min()), float(projected_along.max())
+    min_across, max_across = float(projected_across.min()), float(projected_across.max())
+    corners = (
+        along * min_along + across * min_across,
+        along * max_along + across * min_across,
+        along * max_along + across * max_across,
+        along * min_along + across * max_across,
+    )
+    return tuple((float(point[0]), float(point[1])) for point in corners)
+
+
+def edge_aligned_feature_outline(
+    mask: np.ndarray,
+    uv_mask: np.ndarray | None,
+    bounds: tuple[int, int, int, int],
+    shape: FeatureShape,
+    config: MserConfig,
+    uv_boundary: np.ndarray | None = None,
+) -> EdgeAlignment | None:
+    """Return a rotated feature outline whose side follows a nearby UV edge.
+
+    Proximity is measured from the feature pixels, not from the box centre.  A
+    long word beside a trim edge can be many pixels from that edge at its
+    centre while one long side is still genuinely close.  The UV-edge angle is
+    fitted from the boundary samples nearest that closest approach, which keeps
+    corners and neighbouring islands from dominating the tangent.
+    """
+    if uv_mask is None:
+        return None
+    feature_points = _feature_points(mask, bounds, config)
+    if feature_points is None:
+        return None
+
+    search = max(int(config.rotation_edge_search_px), 0)
+    band = max(int(config.rotation_edge_band_px), 0)
+    x, y, w, h = expanded_box(bounds, search)
+    clamped = clamp_group((x, y, w, h), uv_mask.shape)
+    if clamped is None:
+        return None
+    sx, sy, sw, sh = clamped
+
+    if uv_boundary is None:
+        domain = uv_mask.astype(np.uint8)
+        uv_boundary = cv2.morphologyEx(
+            domain,
+            cv2.MORPH_GRADIENT,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        ).astype(bool)
+    boundary = uv_boundary
+    boundary_crop = boundary[sy : sy + sh, sx : sx + sw]
+    if not bool(boundary_crop.any()):
+        return None
+
+    feature_crop = np.zeros((sh, sw), dtype=bool)
+    local_x = np.rint(feature_points[:, 0] - sx).astype(np.int32)
+    local_y = np.rint(feature_points[:, 1] - sy).astype(np.int32)
+    inside = (local_x >= 0) & (local_x < sw) & (local_y >= 0) & (local_y < sh)
+    if not bool(inside.any()):
+        return None
+    feature_crop[local_y[inside], local_x[inside]] = True
+
+    distance_to_boundary = cv2.distanceTransform(
+        (~boundary_crop).astype(np.uint8), cv2.DIST_L2, 3
+    )
+    distances = distance_to_boundary[feature_crop]
+    if distances.size == 0:
+        return None
+    closest = float(distances.min())
+    minimum_gap = max(float(config.rotation_edge_min_gap_px), 0.0)
+    if closest < minimum_gap:
+        return None
+    if closest > search:
+        return None
+
+    distance_to_feature = cv2.distanceTransform(
+        (~feature_crop).astype(np.uint8), cv2.DIST_L2, 3
+    )
+    nearby_edge = boundary_crop & (distance_to_feature <= closest + band)
+    edge_points = cv2.findNonZero(nearby_edge.astype(np.uint8))
+    minimum = max(int(config.rotation_edge_min_points), 2)
+    if edge_points is None or len(edge_points) < minimum:
+        return None
+
+    vx, vy, _px, _py = cv2.fitLine(
+        edge_points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01
+    ).reshape(4)
+    edge_angle = _normalised_axis_angle_degrees(
+        math.degrees(math.atan2(float(vy), float(vx)))
+    )
+    feature_angle = _rectangle_long_axis_angle_degrees(shape.rectangle)
+    delta = _parallel_angle_delta_degrees(edge_angle, feature_angle)
+    if delta > float(config.max_rotation_edge_angle_degrees):
+        return None
+
+    radians = math.radians(edge_angle)
+    along = np.asarray((math.cos(radians), math.sin(radians)), dtype=np.float32)
+    across = np.asarray((-math.sin(radians), math.cos(radians)), dtype=np.float32)
+    feature_along = feature_points @ along
+    feature_across = feature_points @ across
+    min_along, max_along = float(feature_along.min()), float(feature_along.max())
+    min_across, max_across = float(feature_across.min()), float(feature_across.max())
+
+    edge_absolute = edge_points.reshape(-1, 2).astype(np.float32)
+    edge_absolute[:, 0] += sx
+    edge_absolute[:, 1] += sy
+    edge_along = edge_absolute @ along
+    edge_across = edge_absolute @ across
+    overlaps_side = (
+        (edge_along >= min_along - band)
+        & (edge_along <= max_along + band)
+    )
+    min_side_distances = np.abs(edge_across - min_across)
+    max_side_distances = np.abs(edge_across - max_across)
+    eligible_edge = overlaps_side & (
+        np.minimum(min_side_distances, max_side_distances) >= minimum_gap
+    ) & (
+        np.minimum(min_side_distances, max_side_distances) <= search
+    )
+    min_side_candidates = (
+        eligible_edge
+        & (min_side_distances <= max_side_distances)
+    )
+    max_side_candidates = (
+        eligible_edge
+        & (max_side_distances < min_side_distances)
+    )
+    min_support = int(min_side_candidates.sum())
+    max_support = int(max_side_candidates.sum())
+    primary_support = max(min_support, max_support)
+    opposite_support = min(min_support, max_support)
+    if primary_support < minimum:
+        return None
+    opposite_fraction = opposite_support / max(float(primary_support), 1.0)
+    if opposite_fraction > float(config.max_opposite_rotation_edge_fraction):
+        return None
+    side_candidates = (
+        min_side_candidates if min_support >= max_support else max_side_candidates
+    )
+    side_distances = (
+        min_side_distances if min_support >= max_support else max_side_distances
+    )
+
+    outline = (
+        (along * min_along + across * min_across),
+        (along * max_along + across * min_across),
+        (along * max_along + across * max_across),
+        (along * min_along + across * max_across),
+    )
+
+    return EdgeAlignment(
+        outline=tuple(
+            (float(point[0]), float(point[1]))
+            for point in outline
+        ),
+        edge_angle_degrees=edge_angle,
+        feature_angle_degrees=feature_angle,
+        angle_delta_degrees=delta,
+        distance_px=float(side_distances[side_candidates].min()),
+        edge_points=int(side_candidates.sum()),
+    )
+
+
+def rotated_feature_bounds(
+    mask: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[tuple[float, float], tuple[float, float], float] | None:
+    """Smallest rotated rectangle around the feature inside a region.
+
+    Rotating calipers over the convex hull, which is not the cost: measured on
+    a 4096 atlas the median region takes 18 microseconds and all of them
+    together 8 ms, against 79 ms for one gradient pass.  What costs is walking
+    the crop for its set pixels, so it scales with the region's area rather
+    than with how complicated its shape is.
+
+    Worth having because an axis-aligned box measures a tilted mark badly: the
+    box of a diagonal streak is mostly background, which flatters its aspect
+    ratio and dilutes anything measured over its interior.  The rotated
+    rectangle gives the mark's true proportions and how much of its own box it
+    really occupies.
+
+    ``None`` when there are too few feature pixels to fit anything to.
+    """
+    x, y, w, h = bounds
+    height, width = mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    points = cv2.findNonZero(mask[y0:y1, x0:x1].astype(np.uint8))
+    if points is None or len(points) < max(config.rotated_bounds_min_points, 3):
+        return None
+    (cx, cy), (rw, rh), angle = cv2.minAreaRect(points)
+    return (cx + x0, cy + y0), (rw, rh), angle
+
+
+def rotated_bounds_measures(
+    rectangle: tuple[tuple[float, float], tuple[float, float], float],
+    bounds: tuple[int, int, int, int],
+) -> tuple[float, float]:
+    """Return (fill, aspect) for a rotated rectangle against its region.
+
+    ``fill`` is the rotated rectangle's area over the axis-aligned box's, so a
+    mark that sits square in its box approaches 1 while a thin diagonal streak
+    -- a seam fragment, a bevel edge -- collapses towards 0.  ``aspect`` is the
+    true long-over-short, which for anything tilted the axis-aligned box gets
+    wrong.
+    """
+    _centre, (rw, rh), _angle = rectangle
+    _x, _y, w, h = bounds
+    fill = (rw * rh) / max(float(w * h), 1.0)
+    aspect = max(rw, rh) / max(min(rw, rh), 1.0)
+    return fill, aspect
+
+
+def text_line_measures(
+    mask: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[int, float] | None:
+    """How many separate marks a region holds, and how well they line up.
+
+    This is the question the other filters do not answer.  They separate a mark
+    from the material around it; none of them separates a word from a symbol,
+    and a horn or a seat pictogram passes every one of them because it is a
+    real mark on plain trim -- it simply is not text.
+
+    What makes text text is that it is several similar marks in a row.  So the
+    region's feature is split into components and two things measured: how many
+    there are, and how close their centres lie to a single straight line, as
+    the smaller singular value of the centred centres over the larger.  Zero is
+    a perfect line.
+
+    Measured on the ardente: AIRBAG gives 6 components scattering 0.019 and
+    ARDENTE 14 scattering 0.072, while every horn and seat icon gives one
+    component and the non-text regions that do have several scatter 0.18 to
+    0.56.
+
+    Returns ``None`` when there are too few components to say anything -- two
+    points lie on a perfect line by definition, so scatter is meaningless
+    below three and would wave every two-part icon through.
+    """
+    x, y, w, h = bounds
+    height, width = mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask[y0:y1, x0:x1].astype(np.uint8), connectivity=8
+    )
+    centres = np.asarray(
+        [
+            centroids[index]
+            for index in range(1, count)
+            if stats[index, cv2.CC_STAT_AREA] >= max(config.text_min_component_px, 1)
+        ],
+        dtype=float,
+    )
+    if len(centres) < 3:
+        return (len(centres), float("inf")) if len(centres) else None
+
+    centred = centres - centres.mean(axis=0)
+    singular = np.linalg.svd(centred, compute_uv=False)
+    scatter = float(singular[1] / max(singular[0], 1e-6))
+    return len(centres), scatter
+
+
+def region_flatness(
+    response: np.ndarray,
+    uv_mask: np.ndarray | None,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+    reference: float,
+) -> float | None:
+    """How much relief a region actually contains.
+
+    The companion to ``ring_roughness``, and it catches the opposite mistake.
+    The ring test asks whether a region is isolated, which rejects a patch of
+    grille because the grille goes on around it; it has nothing to say about a
+    region that is isolated and also empty.  Those arrive in numbers -- the
+    soft roll of a bolster, the curve of a fascia, anywhere the surface bends
+    enough to raise an edge but carries no mark -- and to the ring test they
+    look exactly like lettering on plain trim.
+
+    Read as a high percentile rather than a mean, because a small glyph in a
+    generous box is mostly background: what matters is whether anything in
+    there stands up, not how much of the box it fills.
+
+    Expressed against the atlas's typical gradient, so it is a multiple and
+    travels between vehicles.  ``None`` when too little of the region is inside
+    the UV domain to judge.
+    """
+    x, y, w, h = bounds
+    height, width = response.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    window = response[y0:y1, x0:x1]
+    if uv_mask is not None:
+        inside = uv_mask[y0:y1, x0:x1]
+        if int(inside.sum()) < max(config.region_flatness_min_domain_px, 1):
+            return None
+        values = window[inside]
+    else:
+        if window.size < max(config.region_flatness_min_domain_px, 1):
+            return None
+        values = window.ravel()
+
+    level = float(
+        np.percentile(values, min(max(config.region_flatness_percentile, 0.0), 100.0))
+    )
+    return level / max(reference, 1e-6)
+
+
+def ring_roughness(
+    response: np.ndarray,
+    uv_mask: np.ndarray | None,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+    reference: float,
+) -> float | None:
+    """How busy the material immediately around a region is.
+
+    A moulded mark is put on trim that is otherwise plain: lettering on a
+    fascia, a symbol on a switch face.  The things that keep being mistaken for
+    one are not -- a perforated speaker grille, a woven insert, carpet -- and
+    what separates them is not the region at all but what surrounds it.  Inside
+    its own bounds a patch of grille looks much like a glyph: strong, closed,
+    stroke-like edges.  One ring further out, the grille carries on and the
+    fascia does not.
+
+    Measured as the ring's typical gradient over the atlas's typical gradient,
+    so it is a multiple rather than a level and does not need retuning per
+    vehicle.  Roughly 1 is ordinary material; a grille runs several times that.
+
+    A gap is left between the region and the ring, or the mark's own outer edge
+    is counted as surrounding busyness and every real mark looks rough.
+
+    ``None`` when too little of the ring is inside the UV domain to judge --
+    a region at an island edge is measuring the void, not the material.
+    """
+    x, y, w, h = bounds
+    height, width = response.shape[:2]
+    margin = max(int(config.ring_smoothness_margin_px), 0)
+    band = max(int(config.ring_smoothness_width_px), 1)
+    outer = margin + band
+
+    ox0, oy0 = max(x - outer, 0), max(y - outer, 0)
+    ox1, oy1 = min(x + w + outer, width), min(y + h + outer, height)
+    if ox1 <= ox0 or oy1 <= oy0:
+        return None
+
+    ring = np.ones((oy1 - oy0, ox1 - ox0), dtype=bool)
+    ring[
+        max(y - margin, 0) - oy0 : min(y + h + margin, height) - oy0,
+        max(x - margin, 0) - ox0 : min(x + w + margin, width) - ox0,
+    ] = False
+    if uv_mask is not None:
+        ring &= uv_mask[oy0:oy1, ox0:ox1]
+    if int(ring.sum()) < max(config.ring_smoothness_min_domain_px, 1):
+        return None
+
+    values = response[oy0:oy1, ox0:ox1][ring]
+    busy = float(
+        np.percentile(values, min(max(config.ring_smoothness_percentile, 0.0), 100.0))
+    )
+    return busy / max(reference, 1e-6)
+
+
+def stroke_width_transform(
+    grey: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> np.ndarray:
+    """Per-texel stroke width, after Epshtein et al.
+
+    From every edge texel a ray is cast along the gradient.  If it meets
+    another edge texel whose gradient is roughly opposite, the two are the
+    facing sides of one stroke and the distance between them is its width;
+    every texel on the ray is labelled with it.  What makes this worth having
+    is not the width itself but its *consistency*: a letter is drawn with a
+    pen of one thickness, and a panel seam, a bevel or a run of stitching is
+    not, however strong an edge it makes.  That is the discriminator the
+    gradient alone never had.
+
+    Expects a height-like image, where a raised stroke is a band brighter than
+    the material either side of it.  On a shaded render the middle of a stroke
+    sits back at the flat level, so a stroke shows as four edges rather than
+    two and the ray pairing means nothing.  Set the relief mode to height or
+    tophat before turning this on.
+
+    Returns a float32 map, zero where no valid stroke was found.
+
+    Marched a step at a time across all rays at once rather than ray by ray:
+    on a 4k atlas there are hundreds of thousands of edge texels, and the
+    per-ray loop the paper describes is far too slow in Python.  The paper's
+    second pass, which resets each ray to its own median, is approximated by a
+    small median filter over the map; that costs exact per-ray widths, which
+    only matter for grouping letters, and this is used for statistics per box.
+    """
+    mask, response = edge_mask(grey, uv_mask, config)
+    height, width = grey.shape[:2]
+    widths = np.zeros((height, width), dtype=np.float32)
+    if not bool(mask.any()):
+        return widths
+
+    source = grey.astype(np.float32)
+    if config.edge_blur_sigma > 0:
+        source = cv2.GaussianBlur(source, (0, 0), config.edge_blur_sigma)
+    dx = cv2.Scharr(source, cv2.CV_32F, 1, 0)
+    dy = cv2.Scharr(source, cv2.CV_32F, 0, 1)
+    magnitude = np.maximum(np.hypot(dx, dy), 1e-6)
+    gx, gy = dx / magnitude, dy / magnitude
+
+    rows, columns = np.nonzero(mask)
+    if rows.size == 0:
+        return widths
+    # A raised stroke is brighter than its surround, so the gradient at both of
+    # its edges points inwards and a ray along +g reaches the far side.  An
+    # engraved one is the same picture upside down.
+    directions = []
+    if config.swt_polarity in ("raised", "both"):
+        directions.append(1.0)
+    if config.swt_polarity in ("engraved", "both"):
+        directions.append(-1.0)
+    tolerance = float(np.cos(np.radians(config.swt_gradient_tolerance_degrees)))
+    maximum = max(int(config.swt_max_stroke_px), 1)
+    minimum = max(int(config.swt_min_stroke_px), 1)
+
+    for sign in directions:
+        start_x = columns.astype(np.float32)
+        start_y = rows.astype(np.float32)
+        ray_x = gx[rows, columns] * sign
+        ray_y = gy[rows, columns] * sign
+        found = np.zeros(rows.size, dtype=np.float32)
+        live = np.ones(rows.size, dtype=bool)
+        for step in range(1, maximum + 1):
+            if not bool(live.any()):
+                break
+            px = np.rint(start_x + ray_x * step).astype(np.int32)
+            py = np.rint(start_y + ray_y * step).astype(np.int32)
+            inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+            live &= inside
+            if not bool(live.any()):
+                break
+            hit = np.zeros(rows.size, dtype=bool)
+            index = np.nonzero(live)[0]
+            hit[index] = mask[py[index], px[index]]
+            candidate = np.nonzero(live & hit)[0]
+            if candidate.size:
+                # Opposing means the far edge faces back the way we came.
+                opposite = (
+                    ray_x[candidate] * gx[py[candidate], px[candidate]]
+                    + ray_y[candidate] * gy[py[candidate], px[candidate]]
+                ) <= -tolerance
+                settled = candidate[opposite]
+                if settled.size:
+                    found[settled] = step
+                    live[settled] = False
+                # An edge that faces the wrong way is not the other side of a
+                # stroke; the ray carries on through it.
+
+        valid = np.nonzero((found >= minimum) & (found <= maximum))[0]
+        if valid.size == 0:
+            continue
+        # Paint the width along each accepted ray, keeping the narrowest claim
+        # where rays cross, as the paper does.
+        for step in range(0, maximum + 1):
+            active = valid[found[valid] >= step]
+            if active.size == 0:
+                break
+            px = np.clip(
+                np.rint(start_x[active] + ray_x[active] * step).astype(np.int32),
+                0, width - 1,
+            )
+            py = np.clip(
+                np.rint(start_y[active] + ray_y[active] * step).astype(np.int32),
+                0, height - 1,
+            )
+            current = widths[py, px]
+            claim = found[active]
+            narrower = (current == 0) | (claim < current)
+            widths[py[narrower], px[narrower]] = claim[narrower]
+
+    if config.swt_median_px > 1:
+        size = int(config.swt_median_px) | 1
+        smoothed = cv2.medianBlur(widths, size)
+        widths = np.where(widths > 0, smoothed, widths)
+    return widths
+
+
+def stroke_width_stats(
+    widths: np.ndarray,
+    bounds: tuple[int, int, int, int],
+) -> tuple[float, float, float]:
+    """Return (median width, variation, coverage) for one rectangle.
+
+    Variation is the standard deviation over the mean, which is the number the
+    text/not-text decision actually rests on: a stroke drawn with one pen is
+    consistent whatever its absolute width, so a ratio travels between fonts,
+    resolutions and vehicles where an absolute tolerance would not.
+    """
+    x, y, w, h = bounds
+    height, width = widths.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0, float("inf"), 0.0
+    window = widths[y0:y1, x0:x1]
+    marked = window[window > 0]
+    area = max((x1 - x0) * (y1 - y0), 1)
+    if marked.size == 0:
+        return 0.0, float("inf"), 0.0
+    mean = float(marked.mean())
+    variation = float(marked.std() / mean) if mean > 1e-6 else float("inf")
+    return float(np.median(marked)), variation, marked.size / area
 
 
 def context_box(
@@ -1208,6 +2193,15 @@ class DetectionState:
     # reference: the labelling is read-only and depends only on the UV mask,
     # which never changes within a run or across a resumed one.
     domain: UvDomainIndex | None = None
+    # One entry per group, once the rotated-bounds step has run: the corner
+    # points of the rectangle fitted to that group's feature, or None where
+    # none was fitted or adopted.  Carried in the state rather than rebuilt per
+    # stage so the outline survives every later filter -- refitting after each
+    # one would cost a gradient pass apiece and could quietly disagree with
+    # what the earlier stage decided on.
+    rotations: list[tuple[tuple[float, float], ...] | None] = field(
+        default_factory=list
+    )
 
     def copy(self) -> "DetectionState":
         return DetectionState(
@@ -1215,6 +2209,7 @@ class DetectionState:
             groups=list(self.groups),
             candidates=list(self.candidates),
             domain=self.domain,
+            rotations=list(self.rotations),
         )
 
 
@@ -1224,13 +2219,77 @@ def _step_mser(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
+    """Produce the raw boxes, by whichever front-end the config selects."""
     grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    boxes = detect_mser_boxes(grey, config)
+    if config.box_source == "edge":
+        boxes = detect_edge_boxes(grey, uv_mask, config)
+        detail = (
+            f"{config.edge_operator} gradient, threshold at the "
+            f"{config.edge_threshold_percentile:g}th percentile inside the UV "
+            f"domain (floor {config.edge_threshold_floor:g}), closed by "
+            f"{config.edge_close_px} px"
+        )
+        title = "Edge boxes"
+    else:
+        boxes = detect_mser_boxes(grey, config)
+        detail = f"delta={config.delta}, area {config.min_area}-{config.max_area} px"
+        title = "MSER boxes"
     return DetectionState(boxes, []), DetectionStage(
         key="mser",
-        title="MSER boxes",
+        title=title,
         kept=tuple(tuple(int(v) for v in box) for box in boxes),  # type: ignore[misc]
-        detail=f"delta={config.delta}, area {config.min_area}-{config.max_area} px",
+        detail=detail,
+    )
+
+
+def _step_stroke_width(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Keep only boxes whose strokes are of one consistent thickness."""
+    if not config.enable_stroke_width_filter or len(state.boxes) == 0:
+        return state, DetectionStage(
+            key="stroke_width",
+            title="Stroke width",
+            kept=tuple(tuple(int(v) for v in box) for box in state.boxes),  # type: ignore[misc]
+            detail=(
+                "disabled"
+                if not config.enable_stroke_width_filter
+                else "no boxes to test"
+            ),
+        )
+
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    widths = stroke_width_transform(grey, uv_mask, config)
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    for raw in state.boxes:
+        box = (int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
+        _median, variation, coverage = stroke_width_stats(widths, box)
+        if coverage < config.swt_min_coverage:
+            rejected.append(box)
+        elif variation > config.swt_max_width_variation:
+            rejected.append(box)
+        else:
+            kept.append(box)
+    boxes = (
+        np.asarray(kept, dtype=np.int32) if kept else np.empty((0, 4), dtype=np.int32)
+    )
+    marked = float((widths > 0).mean())
+    return DetectionState(boxes, []), DetectionStage(
+        key="stroke_width",
+        title="Stroke width",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        detail=(
+            f"{config.swt_polarity} strokes of {config.swt_min_stroke_px}-"
+            f"{config.swt_max_stroke_px} px, facing edges within "
+            f"{config.swt_gradient_tolerance_degrees:g} degrees; keep variation "
+            f"<= {config.swt_max_width_variation:g} and coverage >= "
+            f"{config.swt_min_coverage:.0%}; {marked:.2%} of the atlas carries a stroke"
+        ),
     )
 
 
@@ -1303,6 +2362,309 @@ def _step_pattern_group(
     )
 
 
+def _rotations_for_subset(
+    rotations: list[tuple[tuple[float, float], ...] | None],
+    original: list[tuple[int, int, int, int]],
+    kept: list[tuple[int, int, int, int]],
+) -> list[tuple[tuple[float, float], ...] | None]:
+    """Realign carried outlines to an order-preserving subset of the regions.
+
+    Matched by walking both lists forward rather than by looking each region
+    up, because two regions can have identical bounds and a lookup would give
+    them the same outline.
+    """
+    if not rotations:
+        return []
+    aligned: list[tuple[tuple[float, float], ...] | None] = []
+    index = 0
+    for group in kept:
+        while index < len(original) and original[index] != group:
+            index += 1
+        aligned.append(rotations[index] if index < len(rotations) else None)
+        index += 1
+    return aligned
+
+
+def _step_rotated_bounds(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Judge each region by the true shape of the feature inside it."""
+    if not config.enable_rotated_bounds_filter or not state.groups:
+        return state, DetectionStage(
+            key="rotated_bounds",
+            title="Rotated bounds",
+            kept=tuple(state.groups),
+            detail=(
+                "disabled"
+                if not config.enable_rotated_bounds_filter
+                else "no regions to test"
+            ),
+        )
+
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mask, _response = edge_mask(grey, uv_mask, config)
+    uv_boundary = None
+    if config.enable_edge_aligned_rotation and uv_mask is not None:
+        uv_boundary = cv2.morphologyEx(
+            uv_mask.astype(np.uint8),
+            cv2.MORPH_GRADIENT,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        ).astype(bool)
+
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    unfitted = 0
+    unadopted = 0
+    edge_unadopted = 0
+    edge_adopted = 0
+    for group in state.groups:
+        shape = feature_shape(mask, group, config)
+        if shape is None:
+            # Nothing was fitted, so nothing is concluded.
+            unfitted += 1
+            kept.append(group)
+            rotations.append(None)
+            continue
+        fill, aspect = rotated_bounds_measures(shape.rectangle, group)
+        if fill < config.min_rotated_fill or aspect > config.max_rotated_aspect:
+            rejected.append(group)
+            continue
+        kept.append(group)
+        # Whether to adopt the outline is a separate question from whether to
+        # keep the region: a shape wrapping mostly empty space describes the
+        # feature badly, but that is not evidence the region holds no mark.
+        if (
+            shape.tightness(config.bounds_shape) < config.min_feature_tightness
+            or aspect < config.min_rotated_elongation
+        ):
+            unadopted += 1
+            rotations.append(None)
+            continue
+        if config.enable_edge_aligned_rotation:
+            alignment = edge_aligned_feature_outline(
+                mask, uv_mask, group, shape, config, uv_boundary
+            )
+            if alignment is None:
+                edge_unadopted += 1
+                rotations.append(None)
+                continue
+            edge_adopted += 1
+            rotations.append(alignment.outline)
+            continue
+        # Points from OpenCV rather than re-derived, so what is drawn is the
+        # shape that was measured, to the pixel.
+        rotations.append(shape.outline(config.bounds_shape))
+
+    adopted_shape = (
+        "edge-aligned rectangle"
+        if config.enable_edge_aligned_rotation
+        else f"{config.bounds_shape} outline"
+    )
+    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+        key="rotated_bounds",
+        title="Rotated bounds",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        rotations=tuple(rotations),
+        detail=(
+            f"keep fill >= {config.min_rotated_fill:g} of the axis-aligned box "
+            f"and true aspect <= {config.max_rotated_aspect:g}; adopt the "
+            f"{adopted_shape} only where it is >= "
+            f"{config.min_feature_tightness:.0%} feature and elongated "
+            f">= {config.min_rotated_elongation:g}"
+            + (
+                f"; edge-aligned rotation adopted {edge_adopted} and declined "
+                f"{edge_unadopted} closer than {config.rotation_edge_min_gap_px:g} px, "
+                f"outside {config.rotation_edge_search_px} px, or "
+                f"{config.max_rotation_edge_angle_degrees:g} degrees off the edge; "
+                f"opposite side support must be <= "
+                f"{config.max_opposite_rotation_edge_fraction:.0%}"
+                if config.enable_edge_aligned_rotation
+                else ""
+            )
+            + (f"; {unfitted} had too few feature pixels to fit" if unfitted else "")
+            + (f"; {unadopted} kept their axis-aligned box" if unadopted else "")
+        ),
+    )
+
+
+def _step_region_flatness(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Drop regions with no relief in them at all."""
+    if not config.enable_region_flatness_filter or not state.groups:
+        return state, DetectionStage(
+            key="region_flatness",
+            title="Region flatness",
+            kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
+            detail=(
+                "disabled"
+                if not config.enable_region_flatness_filter
+                else "no regions to test"
+            ),
+        )
+
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    response = edge_response(grey, config)
+    domain = uv_mask if uv_mask is not None else np.ones(grey.shape[:2], bool)
+    inside = response[domain]
+    reference = float(np.median(inside)) if inside.size else 0.0
+
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    unjudged = 0
+    for index, group in enumerate(state.groups):
+        outline = state.rotations[index] if index < len(state.rotations) else None
+        relief = region_flatness(response, uv_mask, group, config, reference)
+        if relief is None:
+            unjudged += 1
+            kept.append(group)
+            rotations.append(outline)
+        elif relief < config.min_region_relief:
+            rejected.append(group)
+        else:
+            kept.append(group)
+            rotations.append(outline)
+
+    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+        key="region_flatness",
+        rotations=tuple(rotations),
+        title="Region flatness",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        detail=(
+            f"reject below {config.min_region_relief:g}x the atlas's median "
+            f"gradient at the {config.region_flatness_percentile:g}th percentile "
+            "inside the region"
+            + (f"; {unjudged} had too little domain to judge" if unjudged else "")
+        ),
+    )
+
+
+def _step_ring_smoothness(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Keep only regions whose surroundings are plain material."""
+    if not config.enable_ring_smoothness_filter or not state.groups:
+        return state, DetectionStage(
+            key="ring_smoothness",
+            title="Ring smoothness",
+            kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
+            detail=(
+                "disabled"
+                if not config.enable_ring_smoothness_filter
+                else "no regions to test"
+            ),
+        )
+
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    response = edge_response(grey, config)
+    domain = uv_mask if uv_mask is not None else np.ones(grey.shape[:2], bool)
+    inside = response[domain]
+    reference = float(np.median(inside)) if inside.size else 0.0
+
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    unjudged = 0
+    for index, group in enumerate(state.groups):
+        outline = state.rotations[index] if index < len(state.rotations) else None
+        roughness = ring_roughness(response, uv_mask, group, config, reference)
+        if roughness is None:
+            # Nothing was measured, so nothing is concluded.
+            unjudged += 1
+            kept.append(group)
+            rotations.append(outline)
+        elif roughness > config.max_ring_roughness:
+            rejected.append(group)
+        else:
+            kept.append(group)
+            rotations.append(outline)
+
+    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+        key="ring_smoothness",
+        rotations=tuple(rotations),
+        title="Ring smoothness",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        detail=(
+            f"reject above {config.max_ring_roughness:g}x the atlas's median "
+            f"gradient, measured over a {config.ring_smoothness_width_px} px ring "
+            f"held {config.ring_smoothness_margin_px} px off the region"
+            + (f"; {unjudged} had too little domain to judge" if unjudged else "")
+        ),
+    )
+
+
+def _step_text_line(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Keep only regions holding several marks in a row."""
+    if not config.enable_text_line_filter or not state.groups:
+        return state, DetectionStage(
+            key="text_line",
+            title="Text lines",
+            kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
+            detail=(
+                "disabled"
+                if not config.enable_text_line_filter
+                else "no regions to test"
+            ),
+        )
+
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mask, _response = edge_mask(grey, uv_mask, config)
+
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    for index, group in enumerate(state.groups):
+        outline = state.rotations[index] if index < len(state.rotations) else None
+        measures = text_line_measures(mask, group, config)
+        if measures is None:
+            rejected.append(group)
+            continue
+        characters, scatter = measures
+        if (
+            characters < config.text_min_characters
+            or scatter > config.max_baseline_scatter
+        ):
+            rejected.append(group)
+            continue
+        kept.append(group)
+        rotations.append(outline)
+
+    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+        key="text_line",
+        title="Text lines",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        rotations=tuple(rotations),
+        detail=(
+            f"keep >= {config.text_min_characters} components of "
+            f">= {config.text_min_component_px} px whose centres scatter "
+            f"<= {config.max_baseline_scatter:g} from a straight line"
+        ),
+    )
+
+
 def _step_size(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
@@ -1310,11 +2672,13 @@ def _step_size(
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
     groups, rejected = filter_groups_by_final_size(state.groups, config)
-    return DetectionState(state.boxes, groups), DetectionStage(
+    rotations = _rotations_for_subset(state.rotations, state.groups, groups)
+    return DetectionState(state.boxes, groups, rotations=rotations), DetectionStage(
         key="size",
         title="Final size",
         kept=tuple(groups),
         rejected=tuple(rejected),
+        rotations=tuple(rotations),
         detail=(
             f"min {config.final_min_width_px}x{config.final_min_height_px} px, "
             f"min area {config.final_min_area_px} px^2, "
@@ -1709,13 +3073,18 @@ def _step_final_padding(
         if requested
         else "0 px; final bounds unchanged"
     )
-    return DetectionState(state.boxes, padded), DetectionStage(
+    # Outlines pass through unpadded: they describe the feature, not the box
+    # that was grown around it, and growing one would misreport the fit.
+    return DetectionState(
+        state.boxes, padded, rotations=list(state.rotations)
+    ), DetectionStage(
         key="final_padding",
         title="Final padding",
         kept=tuple(padded),
         detail=detail,
         adjusted=adjusted,
         circles=tuple(circles),
+        rotations=tuple(state.rotations),
     )
 
 
@@ -1727,59 +3096,137 @@ GROUP_STAGE_KEYS = frozenset(
 
 PIPELINE_STEPS = (
     _step_mser,
+    _step_stroke_width,
     _step_box_filter,
     _step_grouped,
     _step_region_domain,
     _step_overlap_group,
     _step_pattern_group,
+    _step_rotated_bounds,
+    _step_region_flatness,
+    _step_ring_smoothness,
+    _step_text_line,
     _step_size,
     _step_final_padding,
 )
+
+# Named so the table below cannot drift when a step is inserted.  It was ints
+# before; adding stroke width in the middle would have shifted every later
+# entry by one, and a parameter left pointing at the wrong step resumes from
+# the wrong place and shows stale boxes while it is being tuned.
+STEP_INDEX = {
+    name: index
+    for index, name in enumerate(
+        (
+            "boxes",
+            "stroke_width",
+            "box_filter",
+            "grouped",
+            "region_domain",
+            "overlap_group",
+            "pattern_group",
+            "rotated_bounds",
+            "region_flatness",
+            "ring_smoothness",
+            "text_line",
+            "size",
+            "final_padding",
+        )
+    )
+}
+assert len(STEP_INDEX) == len(PIPELINE_STEPS)
 
 # Which step first reads each parameter.  A parameter read by more than one step
 # maps to the earliest.  Anything missing here forces a full re-run, so a new
 # MserConfig field is safe by default -- it just will not resume.
 PARAMETER_STEP = {
-    "delta": 0,
-    "min_area": 0,
-    "max_area": 0,
-    "max_variation": 0,
-    "min_diversity": 0,
-    "enable_aspect_ratio_filter": 0,
-    "min_aspect": 0,
-    "max_aspect": 0,
-    "enable_box_feature_filter": 1,
-    "min_box_width_px": 1,
-    "min_box_height_px": 1,
-    "box_feature_colour_tolerance": 1,
-    "box_feature_min_domain_px": 1,
-    "box_feature_context_px": 1,
-    "min_box_uv_coverage": 1,
-    "box_min_feature_px": 1,
-    "merge_distance_px": 2,
-    "min_group_union_region_px": 2,
-    "enable_island_bounded_grouping": 2,
-    "enable_circular_groups": 2,
-    "circular_group_min_squareness": 2,
-    "circular_group_padding_px": 2,
-    "circular_group_colour_tolerance": 2,
-    "circular_group_max_corner_content": 2,
-    "enable_region_domain_filter": 3,
-    "min_region_uv_coverage": 3,
-    "enable_overlap_group_merge": 4,
-    "enable_pattern_group_filter": 5,
-    "max_pattern_autocorrelation": 5,
-    "pattern_window_scale": 5,
-    "pattern_min_window_px": 5,
-    "pattern_min_period_px": 5,
-    "pattern_max_period_px": 5,
-    "enable_final_size_filter": 6,
-    "final_min_width_px": 6,
-    "final_min_height_px": 6,
-    "final_min_area_px": 6,
-    "enable_final_aspect_filter": 6,
-    "final_max_aspect": 6,
-    "final_region_padding_px": 7,
+    "box_source": STEP_INDEX["boxes"],
+    "delta": STEP_INDEX["boxes"],
+    "min_area": STEP_INDEX["boxes"],
+    "max_area": STEP_INDEX["boxes"],
+    "max_variation": STEP_INDEX["boxes"],
+    "min_diversity": STEP_INDEX["boxes"],
+    "edge_operator": STEP_INDEX["boxes"],
+    "edge_kernel_px": STEP_INDEX["boxes"],
+    "edge_blur_sigma": STEP_INDEX["boxes"],
+    "edge_local_window_px": STEP_INDEX["boxes"],
+    "edge_local_k": STEP_INDEX["boxes"],
+    "edge_threshold_percentile": STEP_INDEX["boxes"],
+    "edge_threshold_floor": STEP_INDEX["boxes"],
+    "edge_close_px": STEP_INDEX["boxes"],
+    "edge_dilate_px": STEP_INDEX["boxes"],
+    "edge_min_component_px": STEP_INDEX["boxes"],
+    "enable_stroke_width_filter": STEP_INDEX["stroke_width"],
+    "swt_polarity": STEP_INDEX["stroke_width"],
+    "swt_gradient_tolerance_degrees": STEP_INDEX["stroke_width"],
+    "swt_min_stroke_px": STEP_INDEX["stroke_width"],
+    "swt_max_stroke_px": STEP_INDEX["stroke_width"],
+    "swt_median_px": STEP_INDEX["stroke_width"],
+    "swt_max_width_variation": STEP_INDEX["stroke_width"],
+    "swt_min_coverage": STEP_INDEX["stroke_width"],
+    "enable_aspect_ratio_filter": STEP_INDEX["boxes"],
+    "min_aspect": STEP_INDEX["boxes"],
+    "max_aspect": STEP_INDEX["boxes"],
+    "enable_box_feature_filter": STEP_INDEX["box_filter"],
+    "min_box_width_px": STEP_INDEX["box_filter"],
+    "min_box_height_px": STEP_INDEX["box_filter"],
+    "box_feature_colour_tolerance": STEP_INDEX["box_filter"],
+    "box_feature_min_domain_px": STEP_INDEX["box_filter"],
+    "box_feature_context_px": STEP_INDEX["box_filter"],
+    "min_box_uv_coverage": STEP_INDEX["box_filter"],
+    "box_min_feature_px": STEP_INDEX["box_filter"],
+    "merge_distance_px": STEP_INDEX["grouped"],
+    "min_group_union_region_px": STEP_INDEX["grouped"],
+    "enable_island_bounded_grouping": STEP_INDEX["grouped"],
+    "enable_circular_groups": STEP_INDEX["grouped"],
+    "circular_group_min_squareness": STEP_INDEX["grouped"],
+    "circular_group_padding_px": STEP_INDEX["grouped"],
+    "circular_group_colour_tolerance": STEP_INDEX["grouped"],
+    "circular_group_max_corner_content": STEP_INDEX["grouped"],
+    "enable_region_domain_filter": STEP_INDEX["region_domain"],
+    "min_region_uv_coverage": STEP_INDEX["region_domain"],
+    "enable_overlap_group_merge": STEP_INDEX["overlap_group"],
+    "enable_pattern_group_filter": STEP_INDEX["pattern_group"],
+    "max_pattern_autocorrelation": STEP_INDEX["pattern_group"],
+    "pattern_window_scale": STEP_INDEX["pattern_group"],
+    "pattern_min_window_px": STEP_INDEX["pattern_group"],
+    "pattern_min_period_px": STEP_INDEX["pattern_group"],
+    "pattern_max_period_px": STEP_INDEX["pattern_group"],
+    "enable_rotated_bounds_filter": STEP_INDEX["rotated_bounds"],
+    "rotated_bounds_min_points": STEP_INDEX["rotated_bounds"],
+    "min_rotated_fill": STEP_INDEX["rotated_bounds"],
+    "max_rotated_aspect": STEP_INDEX["rotated_bounds"],
+    "min_feature_tightness": STEP_INDEX["rotated_bounds"],
+    "min_rotated_elongation": STEP_INDEX["rotated_bounds"],
+    "bounds_shape": STEP_INDEX["rotated_bounds"],
+    "enable_edge_aligned_rotation": STEP_INDEX["rotated_bounds"],
+    "rotation_edge_min_gap_px": STEP_INDEX["rotated_bounds"],
+    "rotation_edge_search_px": STEP_INDEX["rotated_bounds"],
+    "rotation_edge_band_px": STEP_INDEX["rotated_bounds"],
+    "rotation_edge_min_points": STEP_INDEX["rotated_bounds"],
+    "max_rotation_edge_angle_degrees": STEP_INDEX["rotated_bounds"],
+    "max_opposite_rotation_edge_fraction": STEP_INDEX["rotated_bounds"],
+    "enable_region_flatness_filter": STEP_INDEX["region_flatness"],
+    "region_flatness_percentile": STEP_INDEX["region_flatness"],
+    "region_flatness_min_domain_px": STEP_INDEX["region_flatness"],
+    "min_region_relief": STEP_INDEX["region_flatness"],
+    "enable_ring_smoothness_filter": STEP_INDEX["ring_smoothness"],
+    "ring_smoothness_width_px": STEP_INDEX["ring_smoothness"],
+    "ring_smoothness_margin_px": STEP_INDEX["ring_smoothness"],
+    "ring_smoothness_percentile": STEP_INDEX["ring_smoothness"],
+    "ring_smoothness_min_domain_px": STEP_INDEX["ring_smoothness"],
+    "max_ring_roughness": STEP_INDEX["ring_smoothness"],
+    "enable_text_line_filter": STEP_INDEX["text_line"],
+    "text_min_component_px": STEP_INDEX["text_line"],
+    "text_min_characters": STEP_INDEX["text_line"],
+    "max_baseline_scatter": STEP_INDEX["text_line"],
+    "enable_final_size_filter": STEP_INDEX["size"],
+    "final_min_width_px": STEP_INDEX["size"],
+    "final_min_height_px": STEP_INDEX["size"],
+    "final_min_area_px": STEP_INDEX["size"],
+    "enable_final_aspect_filter": STEP_INDEX["size"],
+    "final_max_aspect": STEP_INDEX["size"],
+    "final_region_padding_px": STEP_INDEX["final_padding"],
     "uv_island_mask_path": len(PIPELINE_STEPS),
     "green_colour": len(PIPELINE_STEPS),
     "red_colour": len(PIPELINE_STEPS),

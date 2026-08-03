@@ -11,12 +11,29 @@ drives it, so what is shown here is exactly what a production run produces.
 Tune the parameters on the right, press Run, and step through the stage tabs to
 see which filter removed a region.
 
+"Detect on" chooses what the detector reads.  Colour is the base colour map,
+which is what a production RHD run uses.  Relief renders the same material's
+normal map through ``relief_from_normals``, for marks that are moulded into the
+trim but never printed on it -- the ardente's "AIRBAG" and "ARDENTE" are relief
+and nothing else, so no amount of tuning on the colour map will ever find them,
+and mirrored geometry leaves them reading backwards.
+
+The relief render is the part that still needs work.  Integrating the normal
+field to height puts a mark on screen as a solid plateau, which is the shape
+the detector expects, but these marks are shallow: on the ardente, "ARDENTE"
+spans 4 levels of height detail where the trim seam beside it spans 96 and the
+carpet 54.  The Relief parameters are there to search for that separation.  The
+"Go to" box jumps to known marks and reports how deep each one actually is, in
+the field's own units, so a miss can be attributed to the mark being too
+shallow rather than merely beside something louder.
+
 Usage:
     python mesh_segmentation_transform/annotate_texture_tuning_app.py
 """
 
 from __future__ import annotations
 
+import json
 import queue
 import shutil
 import sys
@@ -39,6 +56,8 @@ if __package__ in (None, ""):
 
 from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     DEFAULT_CONFIG,
+    DEFAULT_COLOUR_CONFIG,
+    DEFAULT_RELIEF_DETECTION_CONFIG,
     DEFAULT_UV_ISLAND_SYMMETRY_CONFIG,
     DetectionRun,
     DetectionStage,
@@ -59,6 +78,7 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (  # noqa:
     _material_targets_by_symbol,
     _normalise_material_alias,
     _resolve_collada_material_for_symbol,
+    application_settings_path,
     archive_texture_choices_for_part,
     extract_archive_member,
     load_dae,
@@ -71,6 +91,18 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (  # noqa:
 )
 from mesh_segmentation_transform.extract_uv_island_paths import (  # noqa: E402
     uv_island_mask,
+)
+from mesh_segmentation_transform.relief_from_normals import (  # noqa: E402
+    DEFAULT_RELIEF_CONFIG,
+    RELIEF_MODES,
+    ReliefConfig,
+    region_relief_report,
+    render_relief,
+)
+from mesh_segmentation_transform.mirror_texture_for_rhd import (  # noqa: E402
+    DEFAULT_RHD_CONFIG,
+    companion_maps_for_binding,
+    export_part_preview,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,34 +138,188 @@ MAX_SCALE = 16.0
 
 # Parameters are grouped in this order; anything MserConfig gains later that is
 # not listed here still appears, under "Other".
-PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+# Detection sources.  "Colour" is the base colour map, which is what the
+# production RHD run detects on.  "Relief" renders the same material's normal
+# map, and exists for marks that are moulded but never printed -- the ardente's
+# AIRBAG and ARDENTE are both relief only, so nothing on the colour map can
+# find them and the mirrored geometry leaves them reading backwards.
+SOURCE_COLOUR = "Colour (base colour map)"
+SOURCE_RELIEF = "Relief (normal map)"
+DETECTION_SOURCES = (SOURCE_COLOUR, SOURCE_RELIEF)
+
+# The box source follows the detection source rather than being chosen.  MSER
+# finds regions of uniform intensity, which is what print is; relief has none,
+# only the edges where the surface steps.  Offering the wrong pairing only ever
+# produces an empty result and time spent working out why.
+BOX_SOURCE_FOR_SOURCE = {SOURCE_COLOUR: "mser", SOURCE_RELIEF: "edge"}
+
+# Where the harness remembers what was last open.  Deliberately not the POC's
+# settings file: save_dialog_directories rewrites that whole payload, so
+# anything else stored beside it is silently dropped on the next save.
+SESSION_FILE_NAME = "annotate_tuning_session.json"
+
+
+def session_settings_path() -> Path:
+    return application_settings_path().with_name(SESSION_FILE_NAME)
+
+
+SESSION_TEXT_KEYS = ("vehicle", "dae_member", "part_filter")
+
+
+def load_session() -> dict[str, object]:
+    """Recall the last vehicle, DAE, part filter and per-source parameters.
+
+    Anything absent, malformed or unrecognised is dropped rather than raising:
+    a settings file is a convenience, and a stale one must never stop the
+    harness opening.
+    """
+    try:
+        payload = json.loads(session_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    session: dict[str, object] = {
+        key: value
+        for key, value in payload.items()
+        if key in SESSION_TEXT_KEYS and isinstance(value, str)
+    }
+    parameters = payload.get("parameters")
+    if isinstance(parameters, dict):
+        session["parameters"] = {
+            source: {
+                name: value
+                for name, value in values.items()
+                if isinstance(name, str) and isinstance(value, (str, bool, int, float))
+            }
+            for source, values in parameters.items()
+            if isinstance(source, str) and isinstance(values, dict)
+        }
+    return session
+
+
+def save_session(session: dict[str, object]) -> None:
+    """Persist the session atomically; failing to remember is never fatal."""
+    path = session_settings_path()
+    payload: dict[str, object] = {
+        key: value
+        for key, value in session.items()
+        if key in SESSION_TEXT_KEYS and isinstance(value, str) and value.strip()
+    }
+    parameters = session.get("parameters")
+    if isinstance(parameters, dict) and parameters:
+        payload["parameters"] = parameters
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        pass
+
+
+# Known emboss-only marks, as somewhere to start from rather than a hunt.  These
+# are the two the ardente preview showed reading backwards, plus the door sill.
+# Type a name into the Go to box to jump the viewer there.
+RELIEF_LANDMARKS: dict[str, dict[str, tuple[int, int, int, int]]] = {
+    "ardente_interior": {
+        "ARDENTE (fascia)": (3370, 120, 270, 50),
+        "AIRBAG": (830, 1300, 120, 35),
+        "ARDENTE (sill)": (3350, 3450, 180, 400),
+    },
+}
+
+RELIEF_CHOICE_PARAMETERS: dict[str, tuple[str, ...]] = {
+    "form_removal": ("tophat", "highpass"),
+    "tophat_polarity": ("raised", "engraved", "both"),
+}
+
+# Parameters in the order the pipeline reads them, so walking down the panel
+# walks down the stage tabs.  The third element is which detection source the
+# section applies to; a section that applies to neither image is hidden rather
+# than shown inert, because a knob that cannot move the result is worse than no
+# knob at all.  None means it applies to both.
+PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
     (
-        "MSER detector",
+        "1. MSER detector",
         ("delta", "min_area", "max_area", "max_variation", "min_diversity"),
+        SOURCE_COLOUR,
     ),
     (
-        "Box filtering",
+        "1. Edge detector",
         (
-            "min_box_width_px",
-            "min_box_height_px",
-            "enable_aspect_ratio_filter",
-            "min_aspect",
-            "max_aspect",
+            "edge_operator",
+            "edge_kernel_px",
+            "edge_blur_sigma",
+            "edge_local_window_px",
+            "edge_local_k",
+            "edge_threshold_percentile",
+            "edge_threshold_floor",
+            "edge_close_px",
+            "edge_dilate_px",
+            "edge_min_component_px",
         ),
+        SOURCE_RELIEF,
     ),
     (
-        "Box features",
+        "1. Box shape (both sources)",
+        ("enable_aspect_ratio_filter", "min_aspect", "max_aspect"),
+        None,
+    ),
+    (
+        "2. Stroke width",
+        (
+            "enable_stroke_width_filter",
+            "swt_polarity",
+            "swt_gradient_tolerance_degrees",
+            "swt_min_stroke_px",
+            "swt_max_stroke_px",
+            "swt_median_px",
+            "swt_max_width_variation",
+            "swt_min_coverage",
+        ),
+        None,
+    ),
+    (
+        "3. Box filtering",
         (
             "enable_box_feature_filter",
+            "min_box_width_px",
+            "min_box_height_px",
             "min_box_uv_coverage",
             "box_feature_colour_tolerance",
             "box_feature_context_px",
             "box_feature_min_domain_px",
             "box_min_feature_px",
         ),
+        None,
     ),
     (
-        "Repeating pattern",
+        "4. Initial grouping",
+        (
+            "merge_distance_px",
+            "min_group_union_region_px",
+            "enable_island_bounded_grouping",
+            "enable_circular_groups",
+            "circular_group_min_squareness",
+            "circular_group_padding_px",
+            "circular_group_colour_tolerance",
+            "circular_group_max_corner_content",
+        ),
+        None,
+    ),
+    (
+        "5. Domain recovery",
+        ("enable_region_domain_filter", "min_region_uv_coverage"),
+        None,
+    ),
+    (
+        "6. Post-circle forced merge",
+        ("enable_overlap_group_merge",),
+        None,
+    ),
+    (
+        "7. Repeating pattern",
         (
             "enable_pattern_group_filter",
             "max_pattern_autocorrelation",
@@ -142,25 +328,62 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "pattern_min_period_px",
             "pattern_max_period_px",
         ),
+        None,
     ),
     (
-        "Grouping",
+        "8. Rotated bounds",
         (
-            "merge_distance_px",
-            "min_group_union_region_px",
-            "enable_island_bounded_grouping",
-            "enable_overlap_group_merge",
-            "enable_circular_groups",
-            "circular_group_min_squareness",
-            "circular_group_padding_px",
-            "circular_group_colour_tolerance",
-            "circular_group_max_corner_content",
-            "enable_region_domain_filter",
-            "min_region_uv_coverage",
+            "enable_rotated_bounds_filter",
+            "rotated_bounds_min_points",
+            "min_rotated_fill",
+            "max_rotated_aspect",
+            "bounds_shape",
+            "enable_edge_aligned_rotation",
+            "rotation_edge_min_gap_px",
+            "rotation_edge_search_px",
+            "rotation_edge_band_px",
+            "rotation_edge_min_points",
+            "max_rotation_edge_angle_degrees",
+            "max_opposite_rotation_edge_fraction",
+            "min_feature_tightness",
+            "min_rotated_elongation",
         ),
+        None,
     ),
     (
-        "Final filters",
+        "9. Region flatness",
+        (
+            "enable_region_flatness_filter",
+            "region_flatness_percentile",
+            "region_flatness_min_domain_px",
+            "min_region_relief",
+        ),
+        None,
+    ),
+    (
+        "10. Ring smoothness",
+        (
+            "enable_ring_smoothness_filter",
+            "ring_smoothness_width_px",
+            "ring_smoothness_margin_px",
+            "ring_smoothness_percentile",
+            "ring_smoothness_min_domain_px",
+            "max_ring_roughness",
+        ),
+        None,
+    ),
+    (
+        "11. Text lines",
+        (
+            "enable_text_line_filter",
+            "text_min_component_px",
+            "text_min_characters",
+            "max_baseline_scatter",
+        ),
+        None,
+    ),
+    (
+        "12. Final size",
         (
             "enable_final_size_filter",
             "final_min_width_px",
@@ -168,14 +391,22 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "final_min_area_px",
             "enable_final_aspect_filter",
             "final_max_aspect",
-            "final_region_padding_px",
         ),
+        None,
+    ),
+    (
+        "13. Final padding",
+        ("final_region_padding_px",),
+        None,
     ),
 )
 
 # Driven by the loaded part or irrelevant to detection.
 HIDDEN_PARAMETERS = frozenset(
     {
+        # Follows the detection source; see BOX_SOURCE_FOR_SOURCE.  Listed here
+        # as well as omitted from the sections, or it reappears under "Other".
+        "box_source",
         "uv_island_mask_path",
         "green_colour",
         "red_colour",
@@ -186,6 +417,35 @@ HIDDEN_PARAMETERS = frozenset(
 
 UV_SYMMETRY_HIDDEN_PARAMETERS = frozenset({"blue_colour", "blue_thickness"})
 UV_SYMMETRY_OUTLINE_WIDTH = 2
+
+# MserConfig fields that are a choice rather than a number, and what they take.
+# box_source is absent deliberately: it is not the operator's to pick, because
+# only one front-end can work on each kind of image.  See BOX_SOURCE_FOR_SOURCE.
+CHOICE_PARAMETERS: dict[str, tuple[str, ...]] = {
+    "edge_operator": ("scharr", "sobel", "laplacian"),
+    "swt_polarity": ("raised", "engraved", "both"),
+    "bounds_shape": ("hull", "rotated"),
+}
+
+RELIEF_PARAMETER_ORDER: tuple[str, ...] = (
+    "mode",
+    "invert",
+    "form_removal",
+    "tophat_radius_px",
+    "tophat_polarity",
+    "light_elevation_degrees",
+    "light_azimuth_degrees",
+    "light_count",
+    "grain_blur_sigma",
+    "form_blur_sigma",
+    "local_scale_sigma",
+    "local_scale_floor_percentile",
+    "global_scale_percentile",
+    "gain",
+    "clahe_clip_limit",
+    "clahe_tile_count",
+    "slope_saturation_levels",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +463,11 @@ class TextureSource:
     uv_stats: dict[str, object]
     texture_path: Path
     material_symbols: tuple[str, ...] = ()
+    # The material's normal map, decoded once.  Held raw rather than rendered
+    # because the render is what is being tuned: every parameter change redraws
+    # it, and decoding a 4k BC5 each time would make the harness unusable.
+    normal_rgb: np.ndarray | None = None
+    normal_member: str | None = None
 
 
 def material_symbols_for_binding(
@@ -256,10 +521,52 @@ class RunResult:
     symmetry_config: UvIslandSymmetryConfig
     symmetric_uv_islands: tuple[UvIslandSymmetryMatch, ...]
     seconds: float
+    # What the detector actually saw, and what the viewer therefore shows.  For
+    # a relief run this is the rendered normal map, so a box can be judged
+    # against the image that produced it rather than against the colour map.
+    detect_image: np.ndarray | None = None
+    source_kind: str = SOURCE_COLOUR
+    relief_config: ReliefConfig | None = None
 
     @property
     def stages(self) -> list[DetectionStage]:
         return self.run.stages
+
+    @property
+    def image(self) -> np.ndarray:
+        return self.detect_image if self.detect_image is not None else self.source.image
+
+
+def load_normal_map(
+    archive: VehicleArchive,
+    binding: ArchiveTextureBinding,
+    size: tuple[int, int],
+) -> tuple[np.ndarray | None, str | None, str]:
+    """Decode the material's normal map, if it has one at the same size.
+
+    A normal map authored smaller than the base colour is refused rather than
+    resampled: boxes found on it would be reported in its own texels and would
+    not line up with the colour map's, which is the space every other stage and
+    the flip plan work in.
+    """
+    companions = companion_maps_for_binding(archive, binding)
+    normal = next((c for c in companions if c.kind == "normal"), None)
+    if normal is None:
+        return None, None, "this material declares no normal map"
+    try:
+        path = extract_archive_member(archive, normal.member)
+        with Image.open(path) as image:
+            found = image.size
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    except Exception as exc:
+        return None, normal.member, f"{type(exc).__name__}: {exc}"
+    if found != size:
+        return (
+            None,
+            normal.member,
+            f"normal map is {found[0]}x{found[1]}, base colour is {size[0]}x{size[1]}",
+        )
+    return rgb, normal.member, ""
 
 
 def build_texture_source(
@@ -301,13 +608,23 @@ def build_texture_source(
     if not used:
         raise ValueError("; ".join(failures) or "no UV triangles found")
 
+    normal_rgb, normal_member, normal_note = load_normal_map(
+        archive, binding, (width, height)
+    )
+
     return TextureSource(
         key=(binding.texture_member, binding.dae_material),
         image=image,
         uv_mask=mask,
-        uv_stats={"triangles": triangles, "symbols": len(used)},
+        uv_stats={
+            "triangles": triangles,
+            "symbols": len(used),
+            "normal_note": normal_note,
+        },
         texture_path=texture_path,
         material_symbols=tuple(used),
+        normal_rgb=normal_rgb,
+        normal_member=normal_member,
     )
 
 
@@ -488,6 +805,7 @@ class StageCanvas:
                     width,
                     height,
                     stage.circles,
+                    stage.rotations,
                 )
             if self.app.show_uv_symmetry.get():
                 self._draw_uv_symmetry(
@@ -510,6 +828,7 @@ class StageCanvas:
         width: int,
         height: int,
         circles: tuple[int | None, ...] = (),
+        rotations: tuple[tuple[tuple[float, float], ...] | None, ...] = (),
     ) -> None:
         for index, (x, y, w, h) in enumerate(boxes):
             x0 = (x - view.origin_x) * view.scale
@@ -517,6 +836,23 @@ class StageCanvas:
             x1 = x0 + max(w * view.scale, MINIMUM_BOX_DISPLAY_PX)
             y1 = y0 + max(h * view.scale, MINIMUM_BOX_DISPLAY_PX)
             if x1 < 0 or y1 < 0 or x0 > width or y0 > height:
+                continue
+            corners = rotations[index] if index < len(rotations) else None
+            if corners:
+                # The shape that was actually measured, not the box it sat in.
+                points = [
+                    (
+                        (px - view.origin_x) * view.scale,
+                        (py - view.origin_y) * view.scale,
+                    )
+                    for px, py in corners
+                ]
+                draw.line(
+                    points + [points[0]],
+                    fill=colour,
+                    width=BOX_OUTLINE_WIDTH,
+                    joint="curve",
+                )
                 continue
             radius = circles[index] if index < len(circles) else None
             if radius:
@@ -597,6 +933,31 @@ class TuningApp(tk.Tk):
         self._pyramid: list[tuple[Image.Image, Image.Image, float]] = []  # plain, masked, ratio
         self.parameter_vars: dict[str, tk.Variable] = {}
         self.symmetry_parameter_vars: dict[str, tk.Variable] = {}
+        self.relief_parameter_vars: dict[str, tk.Variable] = {}
+        self.section_widgets: dict[str, list[tk.Widget]] = {}
+        self.section_source: dict[str, str | None] = {}
+        self.session = load_session()
+        # Colour and relief keep their own values for every parameter; the
+        # widgets show one set at a time and the other is held here.
+        stored = self.session.get("parameters")
+        self.mode_parameters: dict[str, dict[str, object]] = (
+            {source: dict(values) for source, values in stored.items()}
+            if isinstance(stored, dict)
+            else {}
+        )
+        self.active_source = SOURCE_COLOUR
+        # What the cached session still has to catch up on, consumed as each
+        # load completes: the archive scan cannot pick a DAE, and the DAE load
+        # cannot filter parts, until each has actually finished.
+        self.pending_dae: str | None = None
+        self.pending_part_filter: str | None = None
+        self.detect_source_var = tk.StringVar(value=SOURCE_COLOUR)
+        self.landmark_var = tk.StringVar(value="")
+        self.relief_var = tk.StringVar(value="")
+        self.landmark_by_label: dict[str, tuple[int, int, int, int]] = {}
+        # The render the last run was displayed with, so a relief parameter
+        # change is known to need a new pyramid while a pure MSER change is not.
+        self._displayed_signature: tuple | None = None
         self.stage_canvases: dict[str, StageCanvas] = {}
 
         self.source_var = tk.StringVar()
@@ -616,6 +977,33 @@ class TuningApp(tk.Tk):
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_handle: str | None = self.after(60, self._poll_worker)
+        self.after(0, self._restore_session)
+
+    def _restore_session(self) -> None:
+        """Reopen whatever was last loaded, up to but not including detection.
+
+        Deliberately stops short of running: a run costs seconds and commits to
+        parameters from the last session that may be the first thing to change.
+        The archive scan, the DAE and the part filter are all cheap enough to be
+        worth having ready.
+        """
+        vehicle = self.session.get("vehicle")
+        if not isinstance(vehicle, str) or not vehicle:
+            return
+        path = Path(vehicle)
+        if not path.is_file():
+            self.status_var.set(
+                f"Last vehicle is no longer at {path}; choose another."
+            )
+            return
+        self.source_var.set(str(path))
+        remembered_dae = self.session.get("dae_member")
+        remembered_filter = self.session.get("part_filter")
+        self.pending_dae = remembered_dae if isinstance(remembered_dae, str) else None
+        self.pending_part_filter = (
+            remembered_filter if isinstance(remembered_filter, str) else None
+        )
+        self._start_archive_scan(path)
 
     # -- construction ----------------------------------------------------
     def _build_ui(self) -> None:
@@ -672,7 +1060,38 @@ class TuningApp(tk.Tk):
         self.run_button = ttk.Button(
             controls, text="Run detection", command=self._run, state="disabled"
         )
-        self.run_button.grid(row=3, column=2, rowspan=2, columnspan=2, sticky="nsew", padx=(8, 0), pady=(6, 0))
+        self.run_button.grid(row=3, column=2, columnspan=2, sticky="nsew", padx=(8, 0), pady=(6, 0))
+        self.export_button = ttk.Button(
+            controls, text="Export Blender preview", command=self._export_preview,
+            state="disabled",
+        )
+        self.export_button.grid(
+            row=4, column=2, columnspan=2, sticky="nsew", padx=(8, 0), pady=(6, 0)
+        )
+
+        ttk.Label(controls, text="Detect on").grid(
+            row=5, column=0, sticky="w", padx=(0, 8), pady=(6, 0)
+        )
+        source_row = ttk.Frame(controls)
+        source_row.grid(row=5, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        self.source_combo = ttk.Combobox(
+            source_row,
+            textvariable=self.detect_source_var,
+            values=DETECTION_SOURCES,
+            state="readonly",
+            width=26,
+        )
+        self.source_combo.pack(side="left")
+        self.source_combo.bind("<<ComboboxSelected>>", lambda _e: self._source_changed())
+        ttk.Label(source_row, text="Go to").pack(side="left", padx=(12, 4))
+        self.landmark_combo = ttk.Combobox(
+            source_row, textvariable=self.landmark_var, state="disabled", width=20
+        )
+        self.landmark_combo.pack(side="left")
+        self.landmark_combo.bind("<<ComboboxSelected>>", lambda _e: self._goto_landmark())
+        ttk.Label(source_row, textvariable=self.relief_var, foreground="#4a6fa5").pack(
+            side="left", padx=(12, 0)
+        )
 
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=10, pady=(4, 0))
@@ -768,6 +1187,7 @@ class TuningApp(tk.Tk):
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.parameter_canvas = canvas
         canvas.bind_all(
             "<MouseWheel>",
             lambda event: (
@@ -778,64 +1198,235 @@ class TuningApp(tk.Tk):
         )
         self._build_parameter_widgets(inner)
 
+    def _scroll_parameters(self, event: tk.Event) -> str:
+        """Scroll the parameter panel and stop the event going any further.
+
+        Returning "break" is the point: without it the widget under the pointer
+        also handles the wheel, and a readonly combobox handles it by stepping
+        its own value.
+        """
+        canvas = getattr(self, "parameter_canvas", None)
+        if canvas is not None:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:  # X11 sends buttons 4 and 5 rather than a delta
+                delta = 1 if getattr(event, "num", 5) == 4 else -1
+            canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+        return "break"
+
+    def _parameter_row(
+        self,
+        parent: ttk.Frame,
+        name: str,
+        value: object,
+        choices: tuple[str, ...] | None,
+        row: int,
+        owned: list[tk.Widget],
+        store: dict[str, tk.Variable],
+    ) -> None:
+        """Lay out one parameter and register it with its section."""
+        if isinstance(value, bool):
+            variable: tk.Variable = tk.BooleanVar(value=value)
+            box = ttk.Checkbutton(parent, text=name, variable=variable)
+            box.grid(row=row, column=0, columnspan=2, sticky="w", padx=4)
+            owned.append(box)
+        else:
+            label = ttk.Label(parent, text=name)
+            label.grid(row=row, column=0, sticky="w", padx=4)
+            owned.append(label)
+            variable = tk.StringVar(value=str(value))
+            if choices:
+                combo = ttk.Combobox(
+                    parent, textvariable=variable, values=choices,
+                    state="readonly", width=11,
+                )
+                # A wheel event over a ttk.Combobox steps its value.  In a long
+                # scrolling panel that means scrolling past one silently
+                # retunes it, which is how a render mode gets changed without
+                # anyone touching it.  Swallow the wheel and let the panel
+                # scroll instead.
+                combo.bind("<MouseWheel>", self._scroll_parameters)
+                combo.bind("<Button-4>", self._scroll_parameters)
+                combo.bind("<Button-5>", self._scroll_parameters)
+                widget: tk.Widget = combo
+            else:
+                entry = ttk.Entry(parent, textvariable=variable, width=11)
+                entry.bind("<Return>", lambda _e: self._run())
+                widget = entry
+            widget.grid(row=row, column=1, sticky="e", padx=4)
+            owned.append(widget)
+        store[name] = variable
+
+    def _begin_section(
+        self,
+        parent: ttk.Frame,
+        title: str,
+        applies_to: str | None,
+        row: int,
+    ) -> tuple[list[tk.Widget], int]:
+        owned: list[tk.Widget] = []
+        self.section_widgets[title] = owned
+        self.section_source[title] = applies_to
+        heading = ttk.Label(parent, text=title, font=("", 9, "bold"))
+        heading.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 2), padx=4)
+        owned.append(heading)
+        return owned, row + 1
+
     def _build_parameter_widgets(self, parent: ttk.Frame) -> None:
         by_name = {field.name: field for field in fields(MserConfig)}
-        listed = {name for _title, names in PARAMETER_SECTIONS for name in names}
+        listed = {name for _title, names, _mode in PARAMETER_SECTIONS for name in names}
         remainder = tuple(
             name
             for name in by_name
             if name not in listed and name not in HIDDEN_PARAMETERS
         )
-        sections = PARAMETER_SECTIONS + (("Other", remainder),) if remainder else PARAMETER_SECTIONS
+        sections = (
+            PARAMETER_SECTIONS + (("Other", remainder, None),)
+            if remainder
+            else PARAMETER_SECTIONS
+        )
 
         row = 0
         parent.columnconfigure(0, weight=1)
-        for title, names in sections:
-            ttk.Label(parent, text=title, font=("", 9, "bold")).grid(
-                row=row, column=0, columnspan=2, sticky="w", pady=(10, 2), padx=4
-            )
-            row += 1
+        for title, names, applies_to in sections:
+            owned, row = self._begin_section(parent, title, applies_to, row)
             for name in names:
-                field = by_name.get(name)
-                if field is None or name in HIDDEN_PARAMETERS:
+                if name not in by_name or name in HIDDEN_PARAMETERS:
                     continue
-                value = getattr(DEFAULT_CONFIG, name)
-                if isinstance(value, bool):
-                    variable: tk.Variable = tk.BooleanVar(value=value)
-                    ttk.Checkbutton(parent, text=name, variable=variable).grid(
-                        row=row, column=0, columnspan=2, sticky="w", padx=4
-                    )
-                else:
-                    variable = tk.StringVar(value=str(value))
-                    ttk.Label(parent, text=name).grid(row=row, column=0, sticky="w", padx=4)
-                    entry = ttk.Entry(parent, textvariable=variable, width=11)
-                    entry.grid(row=row, column=1, sticky="e", padx=4)
-                    entry.bind("<Return>", lambda _e: self._run())
-                self.parameter_vars[name] = variable
+                self._parameter_row(
+                    parent, name, getattr(DEFAULT_CONFIG, name),
+                    CHOICE_PARAMETERS.get(name), row, owned, self.parameter_vars,
+                )
                 row += 1
 
-        ttk.Label(parent, text="UV island symmetry", font=("", 9, "bold")).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(10, 2), padx=4
-        )
-        row += 1
+        owned, row = self._begin_section(parent, "UV island symmetry", None, row)
         for field in fields(UvIslandSymmetryConfig):
-            name = field.name
-            if name in UV_SYMMETRY_HIDDEN_PARAMETERS:
+            if field.name in UV_SYMMETRY_HIDDEN_PARAMETERS:
                 continue
-            value = getattr(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, name)
-            if isinstance(value, bool):
-                variable = tk.BooleanVar(value=value)
-                ttk.Checkbutton(parent, text=name, variable=variable).grid(
-                    row=row, column=0, columnspan=2, sticky="w", padx=4
-                )
-            else:
-                variable = tk.StringVar(value=str(value))
-                ttk.Label(parent, text=name).grid(row=row, column=0, sticky="w", padx=4)
-                entry = ttk.Entry(parent, textvariable=variable, width=11)
-                entry.grid(row=row, column=1, sticky="e", padx=4)
-                entry.bind("<Return>", lambda _e: self._run())
-            self.symmetry_parameter_vars[name] = variable
+            self._parameter_row(
+                parent, field.name,
+                getattr(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, field.name),
+                None, row, owned, self.symmetry_parameter_vars,
+            )
             row += 1
+
+        owned, row = self._begin_section(
+            parent, "Relief from normals", SOURCE_RELIEF, row
+        )
+        note = ttk.Label(
+            parent,
+            text="How the normal map is rendered before anything looks at it.",
+            wraplength=320,
+            justify="left",
+            foreground="#777777",
+        )
+        note.grid(row=row, column=0, columnspan=2, sticky="w", padx=4)
+        owned.append(note)
+        row += 1
+        relief_fields = {field.name: field for field in fields(ReliefConfig)}
+        ordered = RELIEF_PARAMETER_ORDER + tuple(
+            name for name in relief_fields if name not in RELIEF_PARAMETER_ORDER
+        )
+        for name in ordered:
+            if name not in relief_fields:
+                continue
+            choices = (
+                RELIEF_MODES if name == "mode" else RELIEF_CHOICE_PARAMETERS.get(name)
+            )
+            self._parameter_row(
+                parent, name, getattr(DEFAULT_RELIEF_CONFIG, name),
+                choices, row, owned, self.relief_parameter_vars,
+            )
+            row += 1
+
+        remembered = self.mode_parameters.get(self.active_source)
+        if remembered:
+            self._apply_parameters(remembered)
+        self._apply_parameter_visibility()
+
+    # -- per-source parameter sets ---------------------------------------
+    def _mser_default_for_source(self, source: str | None = None) -> MserConfig:
+        return (
+            DEFAULT_RELIEF_DETECTION_CONFIG
+            if (source or self.active_source) == SOURCE_RELIEF
+            else DEFAULT_COLOUR_CONFIG
+        )
+
+    def _parameter_stores(self) -> tuple[tuple[str, dict[str, tk.Variable]], ...]:
+        return (
+            ("mser", self.parameter_vars),
+            ("uv", self.symmetry_parameter_vars),
+            ("relief", self.relief_parameter_vars),
+        )
+
+    def _capture_parameters(self) -> dict[str, object]:
+        """Read every widget into a plain dict, prefixed by which config it is.
+
+        Prefixed because the three configurations are free to use the same
+        field name, and a collision would silently write one into the other.
+        """
+        return {
+            f"{prefix}:{name}": variable.get()
+            for prefix, store in self._parameter_stores()
+            for name, variable in store.items()
+        }
+
+    def _default_parameters(self, source: str | None = None) -> dict[str, object]:
+        defaults = {
+            "mser": self._mser_default_for_source(source),
+            "uv": DEFAULT_UV_ISLAND_SYMMETRY_CONFIG,
+            "relief": DEFAULT_RELIEF_CONFIG,
+        }
+        return {
+            f"{prefix}:{name}": getattr(defaults[prefix], name)
+            for prefix, store in self._parameter_stores()
+            for name in store
+        }
+
+    def _apply_parameters(self, values: dict[str, object]) -> None:
+        for prefix, store in self._parameter_stores():
+            for name, variable in store.items():
+                value = values.get(f"{prefix}:{name}")
+                if value is None:
+                    continue
+                variable.set(value if isinstance(value, bool) else str(value))
+
+    def _remember_parameters(self) -> None:
+        """Store the visible values against the source they were tuned for."""
+        self.mode_parameters[self.active_source] = self._capture_parameters()
+        self.session["parameters"] = self.mode_parameters
+        save_session(self.session)
+
+    def _switch_parameter_set(self, incoming: str) -> None:
+        """Swap the whole panel over to the incoming source's own values.
+
+        Colour and relief are different enough that one set cannot serve both:
+        the magic-wand tolerance that suits print swallows a moulded stroke
+        whole, and the domain coverage that suits relief throws print away.
+        Sharing them means every switch silently detunes the other side.
+        """
+        if incoming == self.active_source:
+            return
+        self._remember_parameters()
+        self._apply_parameters(
+            self.mode_parameters.get(incoming) or self._default_parameters(incoming)
+        )
+        self.active_source = incoming
+
+    def _apply_parameter_visibility(self) -> None:
+        """Show only the sections that can affect the selected source.
+
+        A parameter the current image never reaches is not merely useless, it
+        is misleading: it invites tuning that cannot change the result.
+        """
+        current = self.detect_source_var.get()
+        for title, widgets in self.section_widgets.items():
+            applies_to = self.section_source.get(title)
+            visible = applies_to is None or applies_to == current
+            for widget in widgets:
+                if visible:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
 
     def _placeholder_stages(self) -> list[DetectionStage]:
         return [
@@ -873,6 +1464,41 @@ class TuningApp(tk.Tk):
                 self._syncing = False
 
     # -- parameters ------------------------------------------------------
+    def _coerce_config_value(self, name: str, default: object, raw: object) -> object:
+        if isinstance(default, bool):
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).strip().lower() in ("1", "true", "yes", "on")
+        text = str(raw).strip()
+        if isinstance(default, str):
+            choices = CHOICE_PARAMETERS.get(name)
+            if choices and text not in choices:
+                raise ValueError(
+                    f"{name}: {text!r} is not one of {', '.join(choices)}"
+                )
+            return text
+        try:
+            return int(text) if isinstance(default, int) else float(text)
+        except ValueError as exc:
+            raise ValueError(f"{name}: {text!r} is not a valid number") from exc
+
+    def _mser_config_from_values(
+        self,
+        values: dict[str, object],
+        source: str,
+    ) -> MserConfig:
+        defaults = self._mser_default_for_source(source)
+        overrides: dict[str, object] = {}
+        for field in fields(MserConfig):
+            key = f"mser:{field.name}"
+            if key not in values:
+                continue
+            overrides[field.name] = self._coerce_config_value(
+                field.name, getattr(defaults, field.name), values[key]
+            )
+        overrides["box_source"] = BOX_SOURCE_FOR_SOURCE.get(source, "mser")
+        return replace(defaults, **overrides)
+
     def current_config(self) -> MserConfig:
         """Build an MserConfig from the widgets, raising on a bad value."""
         overrides: dict[str, object] = {}
@@ -880,18 +1506,15 @@ class TuningApp(tk.Tk):
             variable = self.parameter_vars.get(field.name)
             if variable is None:
                 continue
-            default = getattr(DEFAULT_CONFIG, field.name)
-            raw = variable.get()
-            if isinstance(default, bool):
-                overrides[field.name] = bool(raw)
-                continue
-            text = str(raw).strip()
-            try:
-                overrides[field.name] = (
-                    int(text) if isinstance(default, int) else float(text)
-                )
-            except ValueError as exc:
-                raise ValueError(f"{field.name}: {text!r} is not a valid number") from exc
+            default = getattr(self._mser_default_for_source(), field.name)
+            overrides[field.name] = self._coerce_config_value(
+                field.name, default, variable.get()
+            )
+        # Not offered as a choice: only one front-end can work on each kind of
+        # image, so it follows the detection source.
+        overrides["box_source"] = BOX_SOURCE_FOR_SOURCE.get(
+            self.detect_source_var.get(), "mser"
+        )
         return replace(DEFAULT_CONFIG, **overrides)
 
     def current_uv_symmetry_config(self) -> UvIslandSymmetryConfig:
@@ -917,20 +1540,62 @@ class TuningApp(tk.Tk):
                 ) from exc
         return replace(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, **overrides)
 
+    def current_relief_config(self) -> ReliefConfig:
+        """Build the relief render configuration from its widgets."""
+        overrides: dict[str, object] = {}
+        for field in fields(ReliefConfig):
+            variable = self.relief_parameter_vars.get(field.name)
+            if variable is None:
+                continue
+            default = getattr(DEFAULT_RELIEF_CONFIG, field.name)
+            raw = variable.get()
+            if isinstance(default, bool):
+                overrides[field.name] = bool(raw)
+                continue
+            text = str(raw).strip()
+            if isinstance(default, str):
+                choices = (
+                    RELIEF_MODES
+                    if field.name == "mode"
+                    else RELIEF_CHOICE_PARAMETERS.get(field.name)
+                )
+                if choices and text not in choices:
+                    raise ValueError(
+                        f"{field.name}: {text!r} is not one of {', '.join(choices)}"
+                    )
+                overrides[field.name] = text
+                continue
+            try:
+                overrides[field.name] = (
+                    int(text) if isinstance(default, int) else float(text)
+                )
+            except ValueError as exc:
+                raise ValueError(f"{field.name}: {text!r} is not a valid number") from exc
+        return replace(DEFAULT_RELIEF_CONFIG, **overrides)
+
     def _reset_parameters(self) -> None:
         for name, variable in self.parameter_vars.items():
-            default = getattr(DEFAULT_CONFIG, name)
+            default = getattr(self._mser_default_for_source(), name)
             variable.set(default if isinstance(default, bool) else str(default))
         for name, variable in self.symmetry_parameter_vars.items():
             default = getattr(DEFAULT_UV_ISLAND_SYMMETRY_CONFIG, name)
             variable.set(default if isinstance(default, bool) else str(default))
-        self.status_var.set("Parameters reset to the module defaults.")
+        for name, variable in self.relief_parameter_vars.items():
+            default = getattr(DEFAULT_RELIEF_CONFIG, name)
+            variable.set(default if isinstance(default, bool) else str(default))
+        # Only the source on screen: the other one's tuning is not being
+        # looked at and must not be thrown away from behind a hidden panel.
+        self._remember_parameters()
+        self.status_var.set(
+            f"{self.active_source} parameters reset to the module defaults."
+        )
 
     def _copy_parameters(self) -> None:
         """Copy changed values as MserConfig assignments, ready to paste."""
         try:
             config = self.current_config()
             symmetry_config = self.current_uv_symmetry_config()
+            relief_config = self.current_relief_config()
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -939,7 +1604,8 @@ class TuningApp(tk.Tk):
             f"{getattr(config, field.name)!r}"
             for field in fields(MserConfig)
             if field.name not in HIDDEN_PARAMETERS
-            and getattr(config, field.name) != getattr(DEFAULT_CONFIG, field.name)
+            and getattr(config, field.name)
+            != getattr(self._mser_default_for_source(), field.name)
         ]
         symmetry_lines = [
             f"    {field.name}: {'bool' if isinstance(getattr(symmetry_config, field.name), bool) else type(getattr(symmetry_config, field.name)).__name__} = "
@@ -954,6 +1620,18 @@ class TuningApp(tk.Tk):
                 lines.append("")
             lines.append("# UvIslandSymmetryConfig")
             lines.extend(symmetry_lines)
+        relief_lines = [
+            f"    {field.name}: {'bool' if isinstance(getattr(relief_config, field.name), bool) else type(getattr(relief_config, field.name)).__name__} = "
+            f"{getattr(relief_config, field.name)!r}"
+            for field in fields(ReliefConfig)
+            if getattr(relief_config, field.name)
+            != getattr(DEFAULT_RELIEF_CONFIG, field.name)
+        ]
+        if relief_lines:
+            if lines:
+                lines.append("")
+            lines.append("# ReliefConfig (relief_from_normals.py)")
+            lines.extend(relief_lines)
         if not lines:
             self.status_var.set("No parameters differ from the module defaults.")
             return
@@ -1058,22 +1736,40 @@ class TuningApp(tk.Tk):
             self._dae_loaded(loaded, member)
         elif kind == "run":
             self._run_finished(payload)  # type: ignore[arg-type]
+        elif kind == "preview":
+            preview, lines = payload  # type: ignore[misc]
+            self._preview_finished(preview, lines)
 
     def _archive_loaded(self, archive: VehicleArchive) -> None:
         self.archive = archive
+        self.session["vehicle"] = str(archive.path)
+        save_session(self.session)
         self.archive_dae_by_label = {
             f"{member}  ({archive.member_sizes.get(member, 0) / 1024 / 1024:.1f} MB)": member
             for member in archive.dae_members
         }
         labels = tuple(self.archive_dae_by_label)
         self.archive_dae_combo.configure(values=labels, state="readonly")
-        if labels:
+        remembered = next(
+            (
+                label
+                for label, member in self.archive_dae_by_label.items()
+                if member == self.pending_dae
+            ),
+            None,
+        )
+        if remembered is not None:
+            self.archive_dae_var.set(remembered)
+        elif labels:
             self.archive_dae_var.set(labels[0])
         self._set_busy(
             False,
             f"{archive.path.name}: {len(archive.dae_members)} DAE(s), "
             f"{len(archive.materials)} materials-JSON entries. Pick a DAE and load it.",
         )
+        if remembered is not None:
+            self.pending_dae = None
+            self._load_selected_archive_dae()
 
     def _dae_loaded(self, loaded: LoadedDae, member: str) -> None:
         self.loaded = loaded
@@ -1083,11 +1779,21 @@ class TuningApp(tk.Tk):
         self.part_combo.configure(values=self.all_part_labels, state="readonly")
         if self.all_part_labels:
             self.part_var.set(self.all_part_labels[0])
+        self.session["dae_member"] = member
+        save_session(self.session)
         self._set_busy(False, f"{PurePosixPath(member).name}: {len(loaded.parts)} part(s).")
         self._part_changed()
+        if self.pending_part_filter:
+            # Applied only now: the search has nothing to search until the DAE
+            # has produced its part list.
+            self.search_var.set(self.pending_part_filter)
+            self.pending_part_filter = None
+            self._filter_parts()
 
     def _filter_parts(self) -> None:
         query = self.search_var.get().strip().lower()
+        self.session["part_filter"] = self.search_var.get()
+        save_session(self.session)
         labels = [label for label in self.all_part_labels if query in label.lower()]
         self.part_combo.configure(values=labels)
         if self.part_var.get() not in labels:
@@ -1133,11 +1839,170 @@ class TuningApp(tk.Tk):
         labels = tuple(self.texture_by_label)
         self.texture_combo.configure(values=labels, state="readonly")
         self.texture_var.set(labels[0])
-        self.run_button.configure(state="disabled" if self.busy else "normal")
+        state = "disabled" if self.busy else "normal"
+        self.run_button.configure(state=state)
+        self.export_button.configure(state=state)
         self.status_var.set(f"{part.label}: {len(labels)} trim texture(s) resolved.")
 
     def _texture_changed(self) -> None:
-        self.run_button.configure(state="disabled" if self.busy else "normal")
+        state = "disabled" if self.busy else "normal"
+        self.run_button.configure(state=state)
+        self.export_button.configure(state=state)
+
+    def _export_preview(self) -> None:
+        """Export the selected part, converted and retextured, for Blender.
+
+        Runs with the settings currently on screen, which is the point: the
+        harness exists to tune detection, and the export has to show what those
+        settings actually do to a vehicle rather than what the module defaults
+        would have done.
+        """
+        part = self.part_by_label.get(self.part_var.get())
+        archive, loaded = self.archive, self.loaded
+        if part is None or archive is None or loaded is None:
+            return
+        try:
+            active_mser_config = self.current_config()
+            relief_config = self.current_relief_config()
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        if self.detect_source_var.get() == SOURCE_RELIEF:
+            colour_mser_config = self._mser_config_from_values(
+                self.mode_parameters.get(SOURCE_COLOUR)
+                or self._default_parameters(SOURCE_COLOUR),
+                SOURCE_COLOUR,
+            )
+            relief_mser_config = active_mser_config
+        else:
+            colour_mser_config = active_mser_config
+            relief_mser_config = self._mser_config_from_values(
+                self.mode_parameters.get(SOURCE_RELIEF)
+                or self._default_parameters(SOURCE_RELIEF),
+                SOURCE_RELIEF,
+            )
+
+        directory = filedialog.askdirectory(
+            title="Export the Blender preview into",
+            initialdir=self.dialog_directories.get("export") or None,
+        )
+        if not directory:
+            return
+        output = Path(directory)
+        self.dialog_directories["export"] = str(output)
+        save_dialog_directories(self.dialog_directories)
+
+        # Relief detection is switched on only when that is the source being
+        # tuned; exporting from the colour side must reproduce a colour run.
+        rhd_config = replace(
+            DEFAULT_RHD_CONFIG,
+            relief=relief_config,
+            detect_on_normal_map=self.detect_source_var.get() == SOURCE_RELIEF,
+        )
+        self._set_busy(True, f"Exporting {part.label} for Blender…")
+        lines: list[str] = []
+
+        def job() -> tuple[str, object]:
+            preview = export_part_preview(
+                archive, loaded, part, output, rhd_config, colour_mser_config,
+                relief_mser_config=relief_mser_config,
+                log=lines.append,
+            )
+            return "preview", (preview, lines)
+
+        self._start_worker(job)
+
+    def _preview_finished(self, preview, lines: list[str]) -> None:
+        for line in lines:
+            print(line)
+        if preview.blend_path is not None:
+            message = f"Open {preview.blend_path}"
+        else:
+            message = (
+                f"Wrote {preview.dae_path.name}; no Blender found, so run "
+                f"{preview.script_path.name if preview.script_path else 'the script'} "
+                "by hand"
+            )
+        self._set_busy(
+            False,
+            f"{len(preview.textures)} texture(s) rebuilt in "
+            f"{preview.seconds:.1f} s.  {message}",
+        )
+
+    def _source_changed(self) -> None:
+        """Report up front whether a relief run is even possible."""
+        self._switch_parameter_set(self.detect_source_var.get())
+        state = "disabled" if self.busy else "normal"
+        self.run_button.configure(state=state)
+        self.export_button.configure(state=state)
+        self._apply_parameter_visibility()
+        if self.detect_source_var.get() != SOURCE_RELIEF:
+            self.relief_var.set("")
+            return
+        source = self.texture_source
+        if source is None:
+            self.relief_var.set("run once to resolve the normal map")
+        elif source.normal_rgb is None:
+            self.relief_var.set(
+                str(source.uv_stats.get("normal_note") or "no usable normal map")
+            )
+        else:
+            self.relief_var.set(PurePosixPath(source.normal_member or "").name)
+
+    def _refresh_landmarks(self) -> None:
+        """Offer the known emboss-only marks for the loaded material."""
+        binding = self.texture_by_label.get(self.texture_var.get())
+        self.landmark_by_label = {}
+        if binding is not None:
+            for material, marks in RELIEF_LANDMARKS.items():
+                if _normalise_material_alias(material) == _normalise_material_alias(
+                    binding.dae_material
+                ):
+                    self.landmark_by_label = dict(marks)
+                    break
+        labels = tuple(self.landmark_by_label)
+        self.landmark_combo.configure(
+            values=labels, state="readonly" if labels else "disabled"
+        )
+        if not labels:
+            self.landmark_var.set("")
+
+    def _goto_landmark(self) -> None:
+        """Centre the viewer on a known mark and report how deep it is.
+
+        The measurement is taken from the relief field itself rather than the
+        rendered image, so it says whether a mark the detector missed was too
+        shallow to see or simply beside something louder.
+        """
+        bounds = self.landmark_by_label.get(self.landmark_var.get())
+        if bounds is None:
+            return
+        x, y, w, h = bounds
+        canvas = self._active_canvas()
+        if canvas is not None:
+            self.view.scale = 4.0
+            width = max(canvas.canvas.winfo_width(), 1)
+            height = max(canvas.canvas.winfo_height(), 1)
+            self.view.origin_x = x + w / 2 - width / (2 * self.view.scale)
+            self.view.origin_y = y + h / 2 - height / (2 * self.view.scale)
+            self.view.initialised = True
+            self.invalidate_views()
+            self.render_active()
+        source = self.texture_source
+        if source is not None and source.normal_rgb is not None:
+            try:
+                report = region_relief_report(
+                    source.normal_rgb, bounds, self.current_relief_config()
+                )
+            except ValueError:
+                return
+            if report:
+                self.status_var.set(
+                    f"{self.landmark_var.get()} at ({x},{y}) {w}x{h}: "
+                    f"relief spread {report['inner_spread']:.3g} inside, "
+                    f"{report['ring_spread']:.3g} in the ring around it "
+                    f"(prominence {report['prominence']:.2f})"
+                )
 
     # -- detection -------------------------------------------------------
     def _run(self) -> None:
@@ -1148,28 +2013,49 @@ class TuningApp(tk.Tk):
         try:
             config = self.current_config()
             symmetry_config = self.current_uv_symmetry_config()
+            relief_config = self.current_relief_config()
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
 
+        self._remember_parameters()
         cached = self.texture_source
         reuse = cached is not None and cached.key == (
             binding.texture_member,
             binding.dae_material,
         )
+        kind = self.detect_source_var.get()
         self._set_busy(
             True,
-            "Detecting…" if reuse else "Extracting texture and rasterising UV islands…",
+            ("Rendering relief and detecting…" if kind == SOURCE_RELIEF else "Detecting…")
+            if reuse
+            else "Extracting texture and rasterising UV islands…",
         )
 
-        previous = self.result.run if reuse and self.result is not None else None
+        # Stage resumption only holds when the image is the same one; a relief
+        # render is a different image entirely, so the run starts clean.
+        signature = (kind, relief_config if kind == SOURCE_RELIEF else None)
+        previous = (
+            self.result.run
+            if reuse and self.result is not None and self._displayed_signature == signature
+            else None
+        )
 
         def job() -> tuple[str, object]:
             source = cached if reuse and cached is not None else build_texture_source(
                 archive, loaded, binding
             )
+            image = source.image
+            if kind == SOURCE_RELIEF:
+                if source.normal_rgb is None:
+                    raise ValueError(
+                        "No usable normal map for this material"
+                        + (f": {source.uv_stats.get('normal_note')}"
+                           if source.uv_stats.get("normal_note") else "")
+                    )
+                image = render_relief(source.normal_rgb, relief_config)
             started = time.perf_counter()
-            run = run_detection(source.image, source.uv_mask, config, previous)
+            run = run_detection(image, source.uv_mask, config, previous)
             symmetric_uv_islands = analyse_uv_island_symmetry(
                 source.uv_mask, symmetry_config
             )
@@ -1179,6 +2065,9 @@ class TuningApp(tk.Tk):
                 symmetry_config=symmetry_config,
                 symmetric_uv_islands=symmetric_uv_islands,
                 seconds=time.perf_counter() - started,
+                detect_image=image,
+                source_kind=kind,
+                relief_config=relief_config if kind == SOURCE_RELIEF else None,
             )
 
         self._start_worker(job)
@@ -1187,10 +2076,15 @@ class TuningApp(tk.Tk):
         first_load = (
             self.texture_source is None or self.texture_source.key != result.source.key
         )
+        signature = (result.source_kind, result.relief_config)
         self.texture_source = result.source
         self.result = result
+        if first_load or signature != self._displayed_signature:
+            self._build_pyramid(result.image, result.source.uv_mask)
+        self._displayed_signature = signature
+        self._refresh_landmarks()
+        self._source_changed()
         if first_load:
-            self._build_pyramid(result.source)
             self.view.initialised = False
         self._build_stage_tabs(result.stages)
         self._update_summary(result)
@@ -1199,7 +2093,7 @@ class TuningApp(tk.Tk):
         else:
             self.invalidate_views()
             self.render_active()
-        height, width = result.source.image.shape[:2]
+        height, width = result.image.shape[:2]
         islands = int(result.source.uv_mask.sum())
         resumed = result.run.resumed_from
         reused = (
@@ -1209,9 +2103,32 @@ class TuningApp(tk.Tk):
             if resumed < len(result.stages)
             else "nothing to redo"
         )
+        # Name the front-end that produced what is on screen.  Without it there
+        # is no way to tell a result that ignored a parameter change from one
+        # that honoured it and simply looks similar.
+        front_end = (
+            f"edge/{result.run.config.edge_operator}"
+            if result.run.config.box_source == "edge"
+            else "mser"
+        )
+        if result.run.config.enable_stroke_width_filter:
+            front_end += "+swt"
+        # Name the render too, not just the source.  A flat-looking view is
+        # otherwise unattributable: shaded, height and top-hat all arrive
+        # through the same "relief" label and look nothing alike.
+        if result.source_kind == SOURCE_RELIEF and result.relief_config is not None:
+            relief = result.relief_config
+            source_name = f"relief:{relief.mode}/{relief.form_removal}"
+            if relief.form_removal == "tophat":
+                source_name += f" r{relief.tophat_radius_px}"
+            else:
+                source_name += f" s{relief.form_blur_sigma:g}"
+        else:
+            source_name = "colour"
         self._set_busy(
             False,
             f"{result.source.texture_path.name}  {width}x{height}  "
+            f"[{source_name} / {front_end}]  "
             f"UV domain {islands / (width * height):.1%}  "
             f"{len(result.symmetric_uv_islands):,} symmetric UV islands  "
             f"{result.source.uv_stats.get('triangles', 0):,} UV triangles from "
@@ -1278,14 +2195,18 @@ class TuningApp(tk.Tk):
         self.detail_var.set(detail)
 
     # -- view ------------------------------------------------------------
-    def _build_pyramid(self, source: TextureSource) -> None:
+    def _build_pyramid(self, image: np.ndarray, uv_mask: np.ndarray) -> None:
         """Cache full and reduced levels so panning a 4k atlas stays responsive.
 
         Each level holds the plain texture and a pre-masked copy, so toggling
         the overlay is a choice of source image rather than per-frame work.
+
+        Built from whatever the detector ran on, so a relief run shows the
+        rendered normal map: a box has to be judged against the image that
+        produced it, not against a colour map where the mark may not exist.
         """
-        rgb = source.image[:, :, ::-1]
-        blocked = ~source.uv_mask if UV_BLOCKED_REGION == "outside" else source.uv_mask
+        rgb = image[:, :, ::-1]
+        blocked = ~uv_mask if UV_BLOCKED_REGION == "outside" else uv_mask
         full = Image.fromarray(rgb)
         masked = build_masked_texture(rgb, blocked)
         self._pyramid = [(full, masked, 1.0)]
@@ -1317,7 +2238,7 @@ class TuningApp(tk.Tk):
     def source_size(self) -> tuple[int, int]:
         if self.result is None:
             return (1, 1)
-        height, width = self.result.source.image.shape[:2]
+        height, width = self.result.image.shape[:2]
         return (width, height)
 
     def clamp_view(self, canvas: tk.Canvas) -> None:
@@ -1466,6 +2387,12 @@ class TuningApp(tk.Tk):
         if self._poll_handle is not None:
             self.after_cancel(self._poll_handle)
             self._poll_handle = None
+        # Otherwise a session spent adjusting values without pressing Run is
+        # remembered as though nothing had been touched.
+        try:
+            self._remember_parameters()
+        except Exception:
+            pass
         self._cleanup_archive()
         self.destroy()
 
