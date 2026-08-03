@@ -33,6 +33,7 @@ MODE_COLORS = {
     "mirror": (0.95, 0.60, 0.25),
     "mirrorStructural": (0.85, 0.45, 0.75),
     "replaceSource": (0.46, 0.75, 0.58),
+    "equivalent": (0.54, 0.84, 0.40),
     "output": (0.95, 0.60, 0.25),
 }
 SELECTED_COLOR = (1.0, 0.85, 0.20)
@@ -323,7 +324,7 @@ class SceneData:
     color_ids: np.ndarray  # (N,) float32 palette index
     # addressable name -> list of (tri_start, tri_end, vert_start, vert_end).
     # Base mesh names address all rendered placements of that mesh. Duplicate
-    # placement aliases like mesh@@1 address one placement for table selection.
+    # placement aliases use stable payload refs to address one table selection.
     groups: dict[str, list[tuple[int, int, int, int]]]
     modes: dict[str, str]
     label: str = ""
@@ -349,6 +350,7 @@ MODE_PALETTE_ORDER = [
     "mirror",
     "mirrorStructural",
     "replaceSource",
+    "equivalent",
     "output",
 ]
 
@@ -439,7 +441,12 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
         mesh_name = str(inst.get("mesh"))
         ordinal = mesh_ordinals.get(mesh_name, 0) + 1
         mesh_ordinals[mesh_name] = ordinal
-        instance_name = f"{mesh_name}@@{ordinal}" if mesh_counts.get(mesh_name, 0) > 1 else mesh_name
+        instance_ref = str(inst.get("instance_ref") or "")
+        instance_name = (
+            instance_ref
+            if instance_ref and mesh_counts.get(mesh_name, 0) > 1
+            else f"{mesh_name}@@{ordinal}" if mesh_counts.get(mesh_name, 0) > 1 else mesh_name
+        )
         modes.setdefault(mesh_name, mode)
         modes.setdefault(instance_name, mode)
         alias_to_mesh.setdefault(mesh_name, mesh_name)
@@ -549,7 +556,7 @@ void main() {
 
 FRAGMENT_SHADER = """
 #version 330
-uniform vec3 palette[8];
+uniform vec3 palette[9];
 uniform vec3 background;
 uniform float dimmed_opacity;
 uniform float global_opacity;
@@ -562,11 +569,11 @@ void main() {
     vec3 normal = normalize(cross(dFdx(v_viewpos), dFdy(v_viewpos)));
     float diffuse = abs(normal.z);                       // headlight
     float rim = pow(1.0 - abs(normal.z), 2.0) * 0.10;
-    int index = clamp(int(v_color + 0.5), 0, 6);
+    int index = clamp(int(v_color + 0.5), 0, 7);
     float selected = clamp(v_selected, 0.0, 1.0);
     float dimmed = clamp(v_dimmed, 0.0, 1.0) * (1.0 - selected);
     vec3 base = palette[index];
-    base = mix(base, palette[7], selected);
+    base = mix(base, palette[8], selected);
     vec3 color = base * (0.38 + 0.62 * diffuse) + rim;
     // Dimmed (out-of-filter) parts recede toward the background but stay solid.
     color = mix(background, color, mix(1.0, dimmed_opacity, dimmed));

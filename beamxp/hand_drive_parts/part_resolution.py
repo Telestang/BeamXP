@@ -914,17 +914,194 @@ def resolve_slot_pair_plan(
     }
 
 
+def _side_pair_base_ref(ref: object) -> str:
+    return str(ref or "").split("@@", 1)[0]
+
+
+def _selected_instance_ref(instance: dict[str, object]) -> str:
+    part_id = str(instance.get("part_id") or "")
+    slot_path = str(instance.get("slot_path") or "")
+    return f"{part_id}@@{slot_path}" if slot_path else part_id
+
+
+def _side_pair_matches_ref(instance: dict[str, object], ref: object) -> bool:
+    text = str(ref or "")
+    if not text:
+        return False
+    return text == str(instance.get("part_id") or "") or text == _selected_instance_ref(instance)
+
+
+def _side_pair_counterpart(pairs: Iterable[dict[str, object]], part_id: str) -> str:
+    for pair in pairs:
+        left = str(pair.get("left") or "")
+        right = str(pair.get("right") or "")
+        if _side_pair_base_ref(left) == part_id:
+            return _side_pair_base_ref(right)
+        if _side_pair_base_ref(right) == part_id:
+            return _side_pair_base_ref(left)
+    return ""
+
+
+def resolve_side_pair_plan(
+    context: VehicleContext,
+    config_name: str,
+    side_pairs: Iterable[dict[str, object]],
+) -> dict[str, object] | None:
+    """Turn Equivalent Parts rows into trim-specific slot updates.
+
+    The table is vehicle-level: it declares that two part ids are left/right
+    alternatives. For one trim, only the selected side matters. If the
+    opposite part fits the mirrored slot, we use it directly; otherwise the
+    selected part becomes a relocation clone, which the build bakes as a
+    generated opposite-side mesh.
+    """
+    normalized = [
+        pair
+        for pair in side_pairs
+        if isinstance(pair, dict)
+        and str(pair.get("left") or "")
+        and str(pair.get("right") or "")
+    ]
+    if not normalized:
+        return None
+
+    selected = selected_parts_for_config(context, config_name)
+    usage = slot_usage_for_configs(context, [config_name])
+    instances = selected_part_instances(selected)
+    selections: list[dict[str, object]] = []
+    relocations: list[dict[str, object]] = []
+    clears: list[dict[str, str]] = []
+    covered: set[str] = set()
+    occupied_targets: set[str] = set()
+    handled_sources: set[str] = set()
+
+    for instance in instances:
+        source_part = str(instance.get("part_id") or "")
+        source_slot = str(instance.get("slot_id") or "")
+        source_path = str(instance.get("slot_path") or "")
+        if not source_part or not source_slot or not source_path:
+            continue
+        matching_pairs = [
+            pair for pair in normalized
+            if _side_pair_matches_ref(instance, pair.get("left"))
+            or _side_pair_matches_ref(instance, pair.get("right"))
+        ]
+        if not matching_pairs:
+            continue
+        target_part = _side_pair_counterpart(matching_pairs, source_part)
+        target_slot = mirror_lateral_node_id(source_slot)
+        if not target_part or not target_slot or target_slot == source_slot:
+            continue
+        target_usage = usage.get(target_slot)
+        target_path = (
+            str(target_usage.paths_by_config.get(config_name) or "")
+            if target_usage is not None
+            else ""
+        ) or source_path.replace(source_slot, target_slot, 1)
+        target_slot_def = (
+            slot_def_for_usage(context, target_usage)
+            if target_usage is not None
+            else None
+        ) or SlotDef(target_slot, "", allow_types=(target_slot,))
+
+        covered.add(source_part)
+        handled_sources.add(source_slot)
+        found = part_body_for_context(context, target_part)
+        if found is not None and part_fits_slot(
+            transform_helpers.extract_part_slot_types(found[0]),
+            target_slot_def,
+        ):
+            selections.append(
+                {
+                    "sourceSlotId": source_slot,
+                    "sourceSlotPath": source_path,
+                    "slotId": target_slot,
+                    "slotPath": target_path,
+                    "partId": target_part,
+                }
+            )
+            _map_paired_children(
+                context,
+                selected,
+                source_part,
+                target_part,
+                source_path,
+                target_path,
+                _side_pair_strategy(),
+                selections,
+                clears,
+                covered,
+                set(),
+            )
+        else:
+            relocations.append(
+                {
+                    "sourceSlotId": source_slot,
+                    "sourceSlotPath": source_path,
+                    "slotId": target_slot,
+                    "slotPath": target_path,
+                    "partId": source_part,
+                }
+            )
+        occupied_targets.add(target_slot)
+
+    for instance in instances:
+        source_part = str(instance.get("part_id") or "")
+        source_slot = str(instance.get("slot_id") or "")
+        source_path = str(instance.get("slot_path") or "")
+        if (
+            source_part
+            and source_slot in handled_sources
+            and source_slot not in occupied_targets
+        ):
+            clears.append({"slotId": source_slot, "slotPath": source_path, "setEmpty": "1"})
+
+    if not selections and not relocations and not clears:
+        return None
+    return {
+        "selections": selections,
+        "relocations": relocations,
+        "clears": clears,
+        "sourceParts": sorted(covered),
+    }
+
+
 def slot_pair_plans_for_variants(
     context: VehicleContext,
     conversion: dict[str, object],
     config_names: Iterable[str],
 ) -> dict[str, dict[str, object]]:
-    pairs = active_slot_pairs(conversion)
-    if not pairs:
+    slot_pairs = active_slot_pairs(conversion)
+    side_pairs = normalized_side_pairs(conversion.get("sidePairs"))
+    if not slot_pairs and not side_pairs:
         return {}
     plans: dict[str, dict[str, object]] = {}
     for config_name in config_names:
-        plan = resolve_slot_pair_plan(context, config_name, pairs)
+        slot_plan = resolve_slot_pair_plan(context, config_name, slot_pairs)
+        side_plan = resolve_side_pair_plan(context, config_name, side_pairs)
+        if slot_plan is None:
+            plan = side_plan
+        elif side_plan is None:
+            plan = slot_plan
+        else:
+            plan = {
+                "selections": [
+                    *slot_plan.get("selections", ()),
+                    *side_plan.get("selections", ()),
+                ],
+                "relocations": [
+                    *slot_plan.get("relocations", ()),
+                    *side_plan.get("relocations", ()),
+                ],
+                "clears": [
+                    *slot_plan.get("clears", ()),
+                    *side_plan.get("clears", ()),
+                ],
+                "sourceParts": sorted(
+                    set(authored_group_source_parts(slot_plan))
+                    | set(authored_group_source_parts(side_plan))
+                ),
+            }
         if plan is not None:
             plans[config_name] = plan
     return plans
@@ -1483,4 +1660,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']

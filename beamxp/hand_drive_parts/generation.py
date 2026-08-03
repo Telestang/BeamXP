@@ -1268,6 +1268,29 @@ def output_vehicle_preview_payload(
     }
 
 
+def _changed_selected_slot_paths(
+    source_selected: dict[str, object],
+    target_selected: dict[str, object],
+) -> set[str]:
+    def selected_paths(selected_tree: dict[str, object]) -> dict[str, str]:
+        selected_by_path = selected_tree.get("selected_by_path", {})
+        if not isinstance(selected_by_path, dict):
+            return {}
+        return {
+            str(path): str(part_id)
+            for path, part_id in selected_by_path.items()
+            if str(path) and str(part_id)
+        }
+
+    source_paths = selected_paths(source_selected)
+    target_paths = selected_paths(target_selected)
+    return {
+        path
+        for path, part_id in target_paths.items()
+        if path != "/" and source_paths.get(path, "") != part_id
+    }
+
+
 def full_vehicle_preview_payload(
     context: VehicleContext,
     conversion: dict[str, object],
@@ -1295,6 +1318,13 @@ def full_vehicle_preview_payload(
         conversion,
         config_name,
     )
+    slot_plan = slot_pair_plans_for_variants(context, conversion, [config_name]).get(config_name)
+    source_preview_pc = copy.deepcopy(preview_pc)
+    plan_preview_pc = copy.deepcopy(preview_pc)
+    if slot_plan is not None:
+        apply_hand_authored_group(plan_preview_pc, slot_plan)
+    if slot_plan is not None:
+        apply_hand_authored_group(preview_pc, slot_plan)
     preview_part_index = dict(context.part_body_index)
     preview_part_index.update(
         {
@@ -1308,13 +1338,32 @@ def full_vehicle_preview_payload(
         vehicle_id=context.source_vehicle_id,
         part_body_index=preview_part_index,
     )
+    source_selected = resolve_selected_parts(
+        source_preview_pc,
+        context.jbeam_texts,
+        vehicle_id=context.source_vehicle_id,
+        part_body_index=preview_part_index,
+    )
+    plan_selected = resolve_selected_parts(
+        plan_preview_pc,
+        context.jbeam_texts,
+        vehicle_id=context.source_vehicle_id,
+        part_body_index=preview_part_index,
+    )
     selected_nodes = selected_node_positions_for_parts(
         selected,
         context.jbeam_texts,
         preview_part_index,
     )
+    source_selected_nodes = selected_node_positions_for_parts(
+        source_selected,
+        context.jbeam_texts,
+        preview_part_index,
+    )
     node_positions = dict(context.node_positions)
     node_positions.update(selected_nodes)
+    source_node_positions = dict(context.node_positions)
+    source_node_positions.update(source_selected_nodes)
     mirror = mirror_x_matrix4()
     convertible = {MODE_TRANSLATE, MODE_MIRROR_POSITION, MODE_MIRROR, MODE_REPLACE_SOURCE}
     source_meshes = structural_mirror_sources(context, conversion, object_modes)
@@ -1360,6 +1409,16 @@ def full_vehicle_preview_payload(
     # engine, so it must not appear in the preview scene either -- the parts
     # table reads Active straight off the built scene.
     populated_groups = node_groups_for_selection(selected, preview_part_array)
+    source_populated_groups = node_groups_for_selection(source_selected, preview_part_array)
+    equivalent_changed_paths = _changed_selected_slot_paths(source_selected, plan_selected)
+
+    def equivalent_path_changed(slot_path: str) -> bool:
+        if not slot_path:
+            return False
+        return any(
+            slot_path == path or slot_path.startswith(path)
+            for path in equivalent_changed_paths
+        )
 
     def part_meshes(part_id: str) -> set[str]:
         found = part_body_for_context(context, part_id)
@@ -1648,6 +1707,8 @@ def full_vehicle_preview_payload(
                     if not mesh or mesh in ("SPOTLIGHT", "POINTLIGHT"):
                         continue
                     mode = force_mode or object_modes.get(mesh, MODE_SKIP)
+                    if force_mode is None and mode == MODE_SKIP and equivalent_path_changed(slot_path):
+                        mode = "equivalent"
                     geometry_mesh = mesh if force_mode == MODE_REPLACE_SOURCE else source_meshes.get(mesh, mesh)
                     obj = context.objects.get(geometry_mesh)
                     if obj is None or not obj.dae_path:
@@ -1681,6 +1742,7 @@ def full_vehicle_preview_payload(
                             "node": obj.id,
                             "node_names": preview_node_names(obj),
                             "mesh": mesh,
+                            "instance_ref": mesh_instance_ref(mesh, slot_path),
                             **({"row_mesh": row_meshes[mesh]} if mesh in row_meshes else {}),
                             **({"row_parent_mesh": row_parent_mesh} if row_parent_mesh and mesh in row_meshes else {}),
                             "part": part_id,
@@ -1714,6 +1776,20 @@ def full_vehicle_preview_payload(
             force_mode=MODE_REPLACE_SOURCE,
             row_meshes=row_meshes,
             row_parent_mesh=root_mesh,
+        )
+    relocation_paths = {
+        str(relocation.get("sourceSlotPath") or "")
+        for relocation in slot_pair_plan_relocations(slot_plan)
+        if isinstance(relocation, dict) and str(relocation.get("sourceSlotPath") or "")
+    }
+    for source_path in sorted(relocation_paths):
+        append_selected_instances(
+            source_selected,
+            source_selected_nodes,
+            source_node_positions,
+            source_populated_groups,
+            only_child_root=source_path,
+            force_mode=MODE_MIRROR,
         )
 
     # Temporarily-shown parts that are NOT in this config's part tree: find
@@ -1763,6 +1839,7 @@ def full_vehicle_preview_payload(
                 "node": obj.id,
                 "node_names": preview_node_names(obj),
                 "mesh": mesh,
+                "instance_ref": mesh,
                 "part": extra_part_id,
                 "kind": kind,
                 "mode": mode if target_hand is not None else MODE_SKIP,
@@ -1791,4 +1868,4 @@ def full_vehicle_preview_payload(
         "rotation_calibration": rotation_counts,
     }
 
-__all__ = ['generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', 'full_vehicle_preview_payload']
+__all__ = ['generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload']

@@ -38,7 +38,22 @@ class PartsWorkflowMixin:
             for row_id in self.part_tree.selection()
             if self.part_tree.exists(row_id)
         }
+        selected_refs = {
+            self._part_row_side_ref(row_id)
+            for row_id in self.part_tree.selection()
+            if self.part_tree.exists(row_id)
+        }
+        selected.update(ref for ref in selected_refs if ref)
         scene = getattr(self.viewer, "scene", None) if getattr(self, "viewer", None) is not None else None
+        groups = getattr(scene, "groups", {}) if scene is not None else {}
+        if isinstance(groups, dict):
+            for mesh_id in selected_meshes:
+                if (
+                    mesh_id not in selected
+                    and mesh_id in groups
+                    and len(groups.get(mesh_id, ())) == 1
+                ):
+                    selected.add(mesh_id)
         pick_to_row = getattr(scene, "pick_to_row", {}) if scene is not None else {}
         if isinstance(pick_to_row, dict):
             for preview_mesh, row_mesh in pick_to_row.items():
@@ -93,7 +108,7 @@ class PartsWorkflowMixin:
             return None
         for config_name in sorted(self.context.variants):
             try:
-                instances = core.selected_mesh_transform_instances_for_config(self.context, config_name)
+                instances = self._mesh_transform_instances_for_config(config_name)
             except Exception:
                 continue
             for instance in instances:
@@ -119,10 +134,45 @@ class PartsWorkflowMixin:
         ordinal, count = numbered
         return f"{display} #{ordinal}" if count > 1 else display
 
+    def _mesh_transform_instances_for_config(self, config_name: str) -> list[core.MeshTransformInstance]:
+        if self.context is None:
+            return []
+        conversion = getattr(self, "conversion", {})
+        if not isinstance(conversion, dict):
+            conversion = {}
+        plan = core.slot_pair_plans_for_variants(self.context, conversion, [config_name]).get(config_name)
+        if plan is None:
+            return core.selected_mesh_transform_instances_for_config(self.context, config_name)
+        pc = core.load_pc(self.context.source_zip, self.context.variants[config_name].pc_path)
+        core.apply_hand_authored_group(pc, plan)
+        selected = core.resolve_selected_parts(
+            pc,
+            self.context.jbeam_texts,
+            vehicle_id=self.context.source_vehicle_id,
+            part_body_index=self.context.part_body_index,
+        )
+        return core.selected_mesh_transform_instances_for_selection(self.context, selected)
+
+    def _mesh_numbering_cache_key(self) -> tuple[object, str]:
+        conversion = getattr(self, "conversion", {})
+        if not isinstance(conversion, dict):
+            return (id(self.context), "")
+        try:
+            fingerprint = json.dumps(
+                {
+                    "slotPairs": core.normalized_slot_pairs(conversion.get("slotPairs")),
+                    "sidePairs": core.normalized_side_pairs(conversion.get("sidePairs")),
+                },
+                sort_keys=True,
+            )
+        except Exception:
+            fingerprint = ""
+        return (id(self.context), fingerprint)
+
     def _vehicle_mesh_instance_numbering(self) -> dict[str, dict[str, int]]:
         if self.context is None:
             return {}
-        cache_key = id(self.context)
+        cache_key = self._mesh_numbering_cache_key()
         if (
             getattr(self, "mesh_instance_numbering_key", None) == cache_key
             and isinstance(getattr(self, "mesh_instance_numbering_cache", None), dict)
@@ -131,10 +181,12 @@ class PartsWorkflowMixin:
         keys_by_mesh: dict[str, set[str]] = {}
         for config_name in sorted(self.context.variants):
             try:
-                instances = core.selected_mesh_transform_instances_for_config(self.context, config_name)
+                instances = self._mesh_transform_instances_for_config(config_name)
             except Exception:
                 continue
             for instance in instances:
+                if instance.count_for_mesh <= 1:
+                    continue
                 mesh_id = str(instance.mesh_id)
                 key = self._mesh_instance_number_key(instance)
                 if mesh_id and key:
@@ -161,7 +213,7 @@ class PartsWorkflowMixin:
         row_id_counts: dict[str, int] = {}
         if config is not None and config in self.context.variants:
             try:
-                instances = core.selected_mesh_transform_instances_for_config(self.context, config)
+                instances = self._mesh_transform_instances_for_config(config)
             except Exception:
                 instances = []
             for instance in instances:
@@ -171,8 +223,12 @@ class PartsWorkflowMixin:
                 used.add(mesh_id)
                 number_key = self._mesh_instance_number_key(instance)
                 mesh_numbering = vehicle_numbering.get(mesh_id, {})
-                display_ordinal = mesh_numbering.get(number_key, instance.ordinal_for_mesh)
-                display_count = len(mesh_numbering) if mesh_numbering else instance.count_for_mesh
+                if number_key in mesh_numbering:
+                    display_ordinal = mesh_numbering[number_key]
+                    display_count = len(mesh_numbering)
+                else:
+                    display_ordinal = instance.ordinal_for_mesh
+                    display_count = instance.count_for_mesh
                 base_row_id = f"{mesh_id}@@{display_ordinal}" if display_count > 1 else mesh_id
                 row_occurrence = row_id_counts.get(base_row_id, 0) + 1
                 row_id_counts[base_row_id] = row_occurrence

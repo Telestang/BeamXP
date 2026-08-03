@@ -209,6 +209,99 @@ class SlotPairPlanTests(unittest.TestCase):
         self.assertIn("seat_FL", core.authored_group_source_parts(plan))
 
 
+class EquivalentPartPlanTests(unittest.TestCase):
+    def _context(self, instances: tuple[tuple[str, str, str], ...]) -> core.VehicleContext:
+        return context_with_parts(CABIN_PARTS, {"trim": selection(instances)})
+
+    def test_equivalent_part_moves_to_authored_counterpart(self) -> None:
+        context = self._context((
+            ("car", "main", "/"),
+            ("seat_FL", "seat_FL", "/seat_FL/"),
+        ))
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{"left": "seat_FL", "right": "seat_FR", "kind": "seat"}],
+        )
+        assert plan is not None
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["selections"]],
+            [("seat_FR", "seat_FR")],
+        )
+        self.assertEqual(
+            [(entry["slotId"], entry.get("setEmpty")) for entry in plan["clears"]],
+            [("seat_FL", "1")],
+        )
+
+    def test_equivalent_part_exchanges_mismatched_seats(self) -> None:
+        context = self._context((
+            ("car", "main", "/"),
+            ("seat_FL", "seat_FL", "/seat_FL/"),
+            ("race_seat_FR", "seat_FR", "/seat_FR/"),
+            ("skin_FR_red", "skin_FR", "/seat_FR/skin_FR/"),
+        ))
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [
+                {"left": "seat_FL", "right": "seat_FR", "kind": "seat"},
+                {"left": "race_seat_FL", "right": "race_seat_FR", "kind": "seat"},
+            ],
+        )
+        assert plan is not None
+        updates = {entry["slotId"]: entry["partId"] for entry in plan["selections"]}
+        self.assertEqual(updates["seat_FR"], "seat_FR")
+        self.assertEqual(updates["seat_FL"], "race_seat_FL")
+        self.assertEqual(updates["skin_FL"], "skin_FL_red")
+
+    def test_equivalent_part_without_counterpart_becomes_relocation(self) -> None:
+        parts = dict(CABIN_PARTS)
+        parts["rally_seat_FL"] = (
+            part("rally_seat_FL", "seat_FL", "Rally Co-driver Seat"),
+            "seats.jbeam",
+        )
+        context = context_with_parts(
+            parts,
+            {"trim": selection((
+                ("car", "main", "/"),
+                ("rally_seat_FL", "seat_FL", "/seat_FL/"),
+            ))},
+        )
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{"left": "rally_seat_FL", "right": "rally_seat_FR", "kind": "seat"}],
+        )
+        assert plan is not None
+        self.assertEqual(plan["selections"], [])
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["relocations"]],
+            [("seat_FR", "rally_seat_FL")],
+        )
+
+    def test_equivalent_preview_color_paths_only_include_written_changes(self) -> None:
+        source = {
+            "selected_by_path": {
+                "/": "car",
+                "/seat_FL/": "seat_FL",
+                "/seat_FR/": "race_seat_FR",
+            }
+        }
+        target = {
+            "selected_by_path": {
+                "/": "car",
+                "/seat_FL/": "seat_FL",
+                "/seat_FR/": "seat_FR",
+                "/seat_FR/race_seat_FR/": "race_seat_FR",
+            }
+        }
+
+        self.assertEqual(
+            core._changed_selected_slot_paths(source, target),
+            {"/seat_FR/", "/seat_FR/race_seat_FR/"},
+        )
+
+
 class SlotPairSettingsTests(unittest.TestCase):
     def test_pairing_is_a_bijection(self) -> None:
         conversion: dict[str, object] = {"slotPairs": []}

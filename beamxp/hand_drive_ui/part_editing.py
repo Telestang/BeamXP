@@ -1031,7 +1031,7 @@ class PartEditingMixin:
             self.filter_var.set("")
         if not self.part_tree.exists(object_id):
             for row_id in self.part_tree.get_children():
-                if self._part_row_mesh_id(row_id) == object_id:
+                if self._part_row_side_ref(row_id) == object_id or self._part_row_mesh_id(row_id) == object_id:
                     object_id = row_id
                     break
         if not self.part_tree.exists(object_id):
