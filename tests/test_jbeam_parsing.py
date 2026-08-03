@@ -64,6 +64,31 @@ class StrayCommaPartKeyTests(unittest.TestCase):
         self.assertEqual(nodes, {"n1": (1.0, 2.0, 3.0)})
 
 
+class StrayCommaBeforeColonTests(unittest.TestCase):
+    # Stock etk800 844_police_A.pc ships a key with a comma between the key and
+    # its colon ("lightbar_sign",:""); the game's lenient parser accepts it.
+    def test_config_with_comma_before_colon_parses(self) -> None:
+        text = (
+            '{\n"format":2,\n"parts":{\n'
+            '    "lightbar_floodlights":"",\n'
+            '    "lightbar_sign",:"",\n'
+            '    "lightbar_antenna":""\n'
+            "}\n}\n"
+        )
+        parsed = core.parse_beamng_json(text, label="acme.pc")
+        self.assertEqual(
+            parsed["parts"],
+            {"lightbar_floodlights": "", "lightbar_sign": "", "lightbar_antenna": ""},
+        )
+
+    def test_commas_inside_strings_are_preserved(self) -> None:
+        text = '{"a": "x,: y", "b",: 1}'
+        self.assertEqual(
+            core.parse_beamng_json(text, label="acme.pc"),
+            {"a": "x,: y", "b": 1},
+        )
+
+
 class MalformedRowTests(unittest.TestCase):
     def test_iter_top_level_rows_skips_unbalanced_commented_row(self) -> None:
         rows = core.iter_top_level_rows(MALFORMED_COMMENTED_ROW_ARRAY)
@@ -350,6 +375,38 @@ class VariableTableTests(unittest.TestCase):
             '["rw1l", 0.0, 0.0, 0.0]', (0.5, 0.0, 0.0), (offset_opt,), {"$trackoffset_R": 0.05}
         )
         self.assertAlmostEqual(pos[0], 0.5 + 0.55)  # +x side: base 0.5 + (0.05+0.5)
+
+
+class MirrorPositionTransformTests(unittest.TestCase):
+    def test_flexbody_mirror_position_preserves_rotation(self) -> None:
+        row = (
+            '["gearlever", ["grp"], '
+            '{"pos":{"x":0.42,"y":1.1,"z":0.3}, '
+            '"rot":{"x":10,"y":20,"z":30}}]'
+        )
+        rewritten = core.transform_flexbody_row(row, "mirrorPosition")
+        self.assertEqual(core.vector_from_row(rewritten, "pos"), (-0.42, 1.1, 0.3))
+        self.assertEqual(core.vector_from_row(rewritten, "rot"), (10.0, 20.0, 30.0))
+
+    def test_prop_mirror_position_preserves_rotation(self) -> None:
+        props = (
+            "[\n"
+            '  ["func", "mesh", "idRef:"],\n'
+            '  ["gear", "gearlever", "n1", '
+            '{"baseTranslationGlobal":{"x":0.42,"y":1.1,"z":0.3}, '
+            '"baseRotationGlobal":{"x":10,"y":20,"z":30}}]\n'
+            "]"
+        )
+        rewritten = core.rewrite_prop_meshes_with_globals(
+            props,
+            {"gearlever": "gearlever_xp_rhd"},
+            {},
+            {"gearlever": ("mirrorPosition", 0.0)},
+            {},
+        )
+        row = next(row for row in core.iter_top_level_rows(rewritten) if "gearlever_xp_rhd" in row)
+        self.assertEqual(core.vector_from_row(row, "baseTranslationGlobal"), (-0.42, 1.1, 0.3))
+        self.assertEqual(core.vector_from_row(row, "baseRotationGlobal"), (10.0, 20.0, 30.0))
 
 
 class NodeMergeOrderTests(unittest.TestCase):

@@ -7,7 +7,9 @@ from .parts_workflow import PartsWorkflowMixin
 from .plates_workflow import PlatesWorkflowMixin
 from .recommendations_ui import RecommendationsUIMixin
 from .shared import *
+from .slots_workflow import SlotsWorkflowMixin
 from .variant_workflow import VariantWorkflowMixin
+from .vehicle_browser import VehicleBrowserMixin
 from .vehicle_workflow import VehicleWorkflowMixin
 from .windowing import WindowingMixin
 from .worker_handlers import WorkerHandlersMixin
@@ -16,9 +18,11 @@ from .worker_handlers import WorkerHandlersMixin
 class HandDriveToolApp(
     WindowingMixin,
     LayoutMixin,
+    VehicleBrowserMixin,
     VehicleWorkflowMixin,
     VariantWorkflowMixin,
     PartsWorkflowMixin,
+    SlotsWorkflowMixin,
     PlatesWorkflowMixin,
     RecommendationsUIMixin,
     PartEditingMixin,
@@ -43,9 +47,22 @@ class HandDriveToolApp(
         self.conversion: dict[str, object] = {}
         self.source_zip: Path | None = None
         self.vehicle_ids: list[str] = []
-        # Model dropdown history: combo label -> (zip path, vehicle id)
+        # Model dropdown: combo label -> (zip path, vehicle id)
         self.model_entries: dict[str, tuple[Path, str]] = {}
         self.model_load_busy = False
+        # Vehicles discovered by scanning the configured game/mods folders.
+        self.vehicle_listings: list[object] = []
+        self.inventory_scan_seq = 0
+        # Thumbnail beside the Model dropdown; the hover override previews the
+        # highlighted entry before the user commits to it.
+        self.model_preview_photo = None
+        self.model_preview_hover: str | None = None
+        # Last label the user actually committed to, used to put the box back
+        # when they click the recents divider.
+        self.last_model_label = ""
+        self.preview_photo_cache: dict[str, object] = {}
+        self._model_popdown_listbox: str | None = None
+        self._model_hover_after: str | None = None
         self.settings = core.load_app_settings()
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_running = False
@@ -88,14 +105,20 @@ class HandDriveToolApp(
         self.status_var = tk.StringVar(value="Ready")
         self.detail_var = tk.StringVar(value="")
         self.filter_var = tk.StringVar()
+        self.slot_filter_var = tk.StringVar()
         self.auto_delta_var = tk.StringVar(value="")
         self.manual_delta_enabled = tk.BooleanVar(value=False)
         self.manual_delta_var = tk.StringVar(value="")
         self.plate_choice_var = tk.StringVar(value="Off")
         self.plate_choice_to_id: dict[str, str] = {}
         self.mods_folder_var = tk.StringVar(value=str(self.settings.get("modsFolder") or ""))
+        self.folder_hint_var = tk.StringVar(value="")
+        self.include_automation_var = tk.BooleanVar(
+            value=bool(self.settings.get("includeAutomationVehicles"))
+        )
         self.blender_var = tk.StringVar(value=str(self.settings.get("blenderExecutable") or ""))
         self.preview_output_var = tk.StringVar(value="")
+        self.derived_output_var = tk.StringVar(value="")
         self.preview_output_to_config: dict[str, str] = {}
         self.preview_output_to_output: dict[str, str] = {}
         # While the Config dropdown list is open, the highlighted (not
@@ -117,19 +140,36 @@ class HandDriveToolApp(
         self.mesh_scene_hash: str | None = None
         self.mesh_scene_reset_pending = True
         self.current_part_ids: list[str] = []
+        self.part_row_mesh_ids: dict[str, str] = {}
+        self.part_row_side_refs: dict[str, str] = {}
+        self.part_row_positions: dict[str, tuple[tuple[float, float, float], bool]] = {}
+        self.part_instance_rows: dict[str, dict[str, object]] = {}
+        self.part_child_overrides: dict[str, dict[str, str]] = {}
+        self.mesh_instance_numbering_key: int | None = None
+        self.mesh_instance_numbering_cache: dict[str, dict[str, int]] = {}
+        self.current_slot_ids: list[str] = []
+        self.slot_usage_key: tuple[str, ...] | None = None
+        self.slot_usage_cache: dict[str, object] | None = None
+        self.side_pair_pick_target: dict[str, str] | None = None
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._configure_theme()
         self._build_ui()
         self.bind("<KeyPress-h>", self._toggle_selected_parts_visibility_shortcut)
         self.bind("<KeyPress-H>", self._toggle_selected_parts_visibility_shortcut)
+        self.bind("<Control-p>", self._focus_side_pair_table_shortcut)
+        self.bind("<Control-P>", self._focus_side_pair_table_shortcut)
         for hotkey, hotkey_mode in MODE_HOTKEYS.items():
             self.bind(f"<KeyPress-{hotkey}>", lambda event, m=hotkey_mode: self._set_selected_part_mode_shortcut(event, m))
             self.bind(f"<KeyPress-{hotkey.upper()}>", lambda event, m=hotkey_mode: self._set_selected_part_mode_shortcut(event, m))
         self.bind_all("<Button-1>", self._clear_part_filter_focus_on_click, add="+")
+        self._refresh_folder_buttons()
         self._rebuild_model_combo()
         self.after_idle(self._maximize_on_start)
         self.after(120, self._poll_worker_queue)
+        # Folder scan is ~1s over 190 zips, so it runs off the UI thread once
+        # the window is up rather than blocking startup.
+        self.after(60, self._start_inventory_scan)
 
 
 def parse_args() -> argparse.Namespace:

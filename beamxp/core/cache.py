@@ -17,7 +17,17 @@ from beamxp.core.models import VehicleContext
 # Bump whenever context-building logic changes in a way that affects cached
 # VehicleContext content. Structural dataclass changes are also caught by the
 # field-name fingerprint.
-CONTEXT_CACHE_VERSION = 11
+#
+# 12: BeamNG 0.39 support. Catalog grouping moved to the engine's own rule, so a
+#     cached context can hold the wrong trim set entirely (etk800 cached 7 of its
+#     29 variants); config/info reading moved to the SJSON parser, which recovers
+#     names, slot options and component trees that the old reader silently
+#     dropped. Neither shows up in the game-file fingerprint, so without this
+#     bump an existing install keeps loading the stale context.
+# 13: flexbodies whose node groups this trim leaves empty are excluded, so the
+#     used-part sets and preview scenes cached under 12 list meshes that never
+#     spawn (the BX race trims' door controls).
+CONTEXT_CACHE_VERSION = 13
 HAND_DETECTION_CACHE_VERSION = 1
 
 
@@ -59,6 +69,7 @@ def load_cached_vehicle_context(source_zip: Path, vehicle_id: str) -> VehicleCon
     context.vehicle_id = vehicle_id
     context.selected_parts_cache = {}
     context.mesh_roles_cache = {}
+    context.node_groups_cache = {}
     context.selected_node_positions_cache = {}
     context.part_array_cache = {}
     context.variant_hands_cache = {}
@@ -75,6 +86,7 @@ def save_vehicle_context_cache(context: VehicleContext) -> Path | None:
                 context,
                 selected_parts_cache={},
                 mesh_roles_cache={},
+                node_groups_cache={},
                 selected_node_positions_cache={},
                 part_array_cache={},
                 variant_hands_cache={},

@@ -83,6 +83,7 @@ def default_part_settings(context: VehicleContext) -> dict[str, dict[str, object
             "mirrorSource": None,
             "translateOffset": None,
             "steeringRef": is_default_steering_ref(object_id, obj),
+            "includeChildren": False,
             "viewerVisible": True,
             "viewerSolo": False,
         }
@@ -90,6 +91,117 @@ def default_part_settings(context: VehicleContext) -> dict[str, dict[str, object
     # variants, columns, ...); auto-detect must flag only the best one.
     keep_single_steering_ref(context, settings)
     return settings
+
+
+def normalized_slot_pairs(
+    value: object,
+    known_slots: set[str] | None = None,
+) -> list[dict[str, object]]:
+    """Clean a saved ``slotPairs`` list.
+
+    Pairs are keyed by slot type because that is what the user sees and what
+    survives a vehicle update; slot paths differ per trim. A slot may appear in
+    only one pair -- pairing is a bijection between the two sides of the car,
+    so a second pair naming an already-paired slot is dropped rather than
+    silently overriding the first.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    pairs: list[dict[str, object]] = []
+    claimed: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        slot_a = str(entry.get("a") or "")
+        slot_b = str(entry.get("b") or "")
+        if not slot_a or not slot_b or slot_a == slot_b:
+            continue
+        if known_slots is not None and not {slot_a, slot_b} <= known_slots:
+            continue
+        if slot_a in claimed or slot_b in claimed:
+            continue
+        claimed.update((slot_a, slot_b))
+        # Ordered so the same pairing always serialises identically.
+        first, second = sorted((slot_a, slot_b))
+        pairs.append({"a": first, "b": second, "enabled": bool(entry.get("enabled", True))})
+    pairs.sort(key=lambda pair: (str(pair["a"]), str(pair["b"])))
+    return pairs
+
+
+def normalized_side_pairs(
+    value: object,
+    *,
+    known_parts: set[str] | None = None,
+) -> list[dict[str, object]]:
+    """Clean saved explicit side-pair records.
+
+    These records are the user-facing intent: this left-side part is the
+    equivalent of this right-side part. Authored RHD/LHD source substitution is
+    handled by per-part Replace Source settings, not by this equivalence table.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    def base_part_id(ref: str) -> str:
+        return ref.split("@@", 1)[0]
+
+    pairs: list[dict[str, object]] = []
+    claimed: set[tuple[str, str]] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        left = str(entry.get("left") or "")
+        right = str(entry.get("right") or "")
+        if not left or not right or left == right:
+            continue
+        if not bool(entry.get("enabled", True)):
+            continue
+        if known_parts is not None and not {base_part_id(left), base_part_id(right)} <= known_parts:
+            continue
+        key = tuple(sorted((left, right)))
+        if key in claimed:
+            continue
+        claimed.add(key)
+        kind = str(entry.get("kind") or "part").lower()
+        if kind not in {"seat", "mirror", "door", "part"}:
+            kind = "part"
+        pair = {
+            "left": left,
+            "right": right,
+            "kind": kind,
+        }
+        pairs.append(pair)
+    pairs.sort(key=lambda pair: (str(pair["kind"]), str(pair["left"]), str(pair["right"])))
+    return pairs
+
+
+def set_side_pair(
+    conversion: dict[str, object],
+    left: str,
+    right: str,
+    *,
+    kind: str = "part",
+) -> None:
+    """Add or replace one explicit side-pair record."""
+    left = left.strip()
+    right = right.strip()
+    if not left or not right or left == right:
+        return
+    pairs = [
+        pair
+        for pair in normalized_side_pairs(conversion.get("sidePairs"))
+        if left not in {pair["left"], pair["right"]} and right not in {pair["left"], pair["right"]}
+    ]
+    entry: dict[str, object] = {
+        "left": left,
+        "right": right,
+        "kind": kind,
+    }
+    pairs.append(entry)
+    conversion["sidePairs"] = normalized_side_pairs(pairs)
+
+
+def clear_side_pairs(conversion: dict[str, object]) -> None:
+    conversion["sidePairs"] = []
 
 
 def default_variant_settings(context: VehicleContext) -> dict[str, dict[str, object]]:
@@ -137,6 +249,8 @@ def base_conversion_config(context: VehicleContext) -> dict[str, object]:
         },
         "variants": default_variant_settings(context),
         "parts": default_part_settings(context),
+        "slotPairs": [],
+        "sidePairs": [],
         "plate": plate_generator.default_plate_binding(),
         "delta": {
             "manual": False,
@@ -222,6 +336,7 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
                             "mirrorSource",
                             "translateOffset",
                             "steeringRef",
+                            "includeChildren",
                             "viewerVisible",
                             "viewerSolo",
                         )
@@ -233,6 +348,9 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
     # A save without any ref (older tool, different detection rules) must not
     # pin detection off forever: re-run it whenever the merge ends up empty.
     ensure_default_steering_ref(context, merged["parts"])
+
+    merged["slotPairs"] = normalized_slot_pairs(data.get("slotPairs"))
+    merged["sidePairs"] = normalized_side_pairs(data.get("sidePairs"))
 
     old_delta = data.get("delta", {})
     if isinstance(old_delta, dict):
@@ -314,6 +432,7 @@ def import_matching_conversion(
                             "mirrorSource",
                             "translateOffset",
                             "steeringRef",
+                            "includeChildren",
                             "viewerVisible",
                             "viewerSolo",
                         )
@@ -325,6 +444,14 @@ def import_matching_conversion(
                 counts["partSkipped"] += 1
         keep_single_steering_ref(context, out["parts"])
     ensure_default_steering_ref(context, out["parts"])
+    imported_pairs = normalized_slot_pairs(imported.get("slotPairs"))
+    if imported_pairs:
+        out["slotPairs"] = imported_pairs
+        counts["slotPairImported"] = len(imported_pairs)
+    imported_side_pairs = normalized_side_pairs(imported.get("sidePairs"))
+    if imported_side_pairs:
+        out["sidePairs"] = imported_side_pairs
+        counts["sidePairImported"] = len(imported_side_pairs)
     if isinstance(imported.get("plate"), dict):
         out["plate"] = plate_generator.normalized_plate_binding(imported["plate"])
     return out, counts
@@ -334,6 +461,8 @@ def save_conversion(context: VehicleContext, conversion: dict[str, object]) -> P
     context.project_dir.mkdir(parents=True, exist_ok=True)
     conversion["toolVersion"] = TOOL_VERSION
     conversion["plate"] = plate_generator.normalized_plate_binding(conversion.get("plate"))
+    conversion["slotPairs"] = normalized_slot_pairs(conversion.get("slotPairs"))
+    conversion["sidePairs"] = normalized_side_pairs(conversion.get("sidePairs"))
     variants = conversion.get("variants", {})
     if isinstance(variants, dict):
         for settings in variants.values():
@@ -386,4 +515,42 @@ def load_app_settings() -> dict[str, object]:
 def save_app_settings(settings: dict[str, object]) -> None:
     write_text_file(APP_SETTINGS_PATH, json.dumps(settings, indent=2), encoding="utf-8")
 
-__all__ = ['default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
+def active_slot_pairs(conversion: dict[str, object]) -> list[tuple[str, str]]:
+    """Enabled slot pairings as (slot_a, slot_b) tuples."""
+    return [
+        (str(pair["a"]), str(pair["b"]))
+        for pair in normalized_slot_pairs(conversion.get("slotPairs"))
+        if pair.get("enabled")
+    ]
+
+
+def slot_pair_partner(conversion: dict[str, object], slot_type: str) -> str:
+    """The slot ``slot_type`` is paired with, or "" when it is unpaired."""
+    for slot_a, slot_b in active_slot_pairs(conversion):
+        if slot_a == slot_type:
+            return slot_b
+        if slot_b == slot_type:
+            return slot_a
+    return ""
+
+
+def set_slot_pair(conversion: dict[str, object], slot_type: str, partner: str) -> None:
+    """Pair ``slot_type`` with ``partner``, or unpair it when partner is empty.
+
+    Both slots are freed of any previous pairing first, so pairing always
+    stays a bijection and the user never has to unpair the old partner by
+    hand before choosing a new one.
+    """
+    pairs = [
+        pair
+        for pair in normalized_slot_pairs(conversion.get("slotPairs"))
+        if slot_type not in {pair["a"], pair["b"]}
+        and (not partner or partner not in {pair["a"], pair["b"]})
+    ]
+    if partner and partner != slot_type:
+        first, second = sorted((slot_type, partner))
+        pairs.append({"a": first, "b": second, "enabled": True})
+    conversion["slotPairs"] = normalized_slot_pairs(pairs)
+
+
+__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']

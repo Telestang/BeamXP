@@ -72,63 +72,6 @@ class VehicleWorkflowMixin:
             suffix += 1
         return label
 
-    def _rebuild_model_combo(self) -> None:
-        """Rebuild the Model dropdown to hold the currently-open zip's vehicles
-        plus recently-opened (zip, vehicle) combos, and remember which load each
-        label maps to. Current-zip vehicles keep bare vehicle-id labels so the
-        existing load path (which reads the id straight off the combo) is
-        unchanged; cross-zip history entries are labelled with the zip stem."""
-        entries: dict[str, tuple[Path, str]] = {}
-        values: list[str] = []
-        current_zip = str(self.source_zip) if self.source_zip is not None else None
-        if self.source_zip is not None:
-            for vid in self.vehicle_ids:
-                if vid in entries:
-                    continue
-                entries[vid] = (self.source_zip, vid)
-                values.append(vid)
-        for zip_path, vid in self._recent_vehicle_entries():
-            if current_zip is not None and str(zip_path) == current_zip and vid in self.vehicle_ids:
-                continue  # already represented by the open zip's bare label
-            label = self._model_history_label(zip_path, vid, entries)
-            entries[label] = (zip_path, vid)
-            values.append(label)
-        self.model_entries = entries
-        self.vehicle_combo.configure(values=values)
-        self._update_model_combo_state()
-
-    def _update_model_combo_state(self) -> None:
-        count = len(self.vehicle_combo.cget("values"))
-        if self.model_load_busy or count < 2:
-            self.vehicle_combo.configure(state="disabled")
-        else:
-            self.vehicle_combo.configure(state="readonly")
-
-    def _on_model_selected(self) -> None:
-        label = self.vehicle_var.get()
-        entry = self.model_entries.get(label)
-        if entry is None:
-            # Bare vehicle id from the open zip (older/direct path).
-            self._load_selected_vehicle()
-            return
-        zip_path, vehicle_id = entry
-        if self.source_zip is not None and str(zip_path) == str(self.source_zip):
-            self.vehicle_var.set(vehicle_id)  # bare label for the load path
-            self._load_selected_vehicle()
-            return
-        if not zip_path.exists():
-            self._show_error(
-                "Vehicle unavailable",
-                f"This zip no longer exists and was removed from history:\n{zip_path}",
-            )
-            self._prune_recent_vehicle(zip_path, vehicle_id)
-            # Restore the dropdown to the loaded vehicle and refresh the list.
-            if self.context is not None:
-                self.vehicle_var.set(self.context.vehicle_id)
-            self._rebuild_model_combo()
-            return
-        self._load_source_zip(zip_path, vehicle_id)
-
     def _load_source_zip(self, source_zip: Path, vehicle_id: str | None = None) -> None:
         try:
             vehicle_ids = core.vehicle_ids_in_zip(source_zip)
@@ -140,18 +83,46 @@ class VehicleWorkflowMixin:
             self.vehicle_ids = vehicle_ids
             self.source_var.set(str(source_zip))
             selected_vehicle = vehicle_id if vehicle_id in vehicle_ids else vehicle_ids[0]
-            self.vehicle_var.set(selected_vehicle)
             self._rebuild_model_combo()
-            self._load_selected_vehicle()
+            self.vehicle_var.set(self._combo_label_for(source_zip, selected_vehicle))
+            self.last_model_label = self.vehicle_var.get()
+            self._show_model_preview(self.vehicle_var.get())
+            self._load_selected_vehicle(vehicle_id=selected_vehicle)
         except Exception as exc:
             self._show_error("Open zip failed", str(exc))
             self.status_var.set("Open zip failed")
 
-    def _load_selected_vehicle(self, *, force_reload: bool = False) -> None:
+    @staticmethod
+    def _same_zip(left: Path, right: Path) -> bool:
+        """Compare zip paths the way the filesystem does.
+
+        The settings file and the folder scan can disagree on case and
+        separators for the same file, and a mismatch silently strands the
+        loaded vehicle outside its own dropdown entry.
+        """
+        return os.path.normcase(os.path.normpath(str(left))) == os.path.normcase(
+            os.path.normpath(str(right))
+        )
+
+    def _combo_label_for(self, source_zip: Path, vehicle_id: str) -> str:
+        """The dropdown label standing for (zip, vehicle), or the bare id."""
+        for label, (zip_path, vid) in self.model_entries.items():
+            if vid == vehicle_id and self._same_zip(zip_path, source_zip):
+                return label
+        return vehicle_id
+
+    def _load_selected_vehicle(
+        self, *, force_reload: bool = False, vehicle_id: str | None = None
+    ) -> None:
         if self.source_zip is None:
             return
-        self._cancel_structural_prompt()
-        vehicle_id = self.vehicle_var.get() or (self.vehicle_ids[0] if self.vehicle_ids else None)
+        if vehicle_id is None:
+            # The combo shows display names ("ETK 800-Series"), so map back.
+            label = self.vehicle_var.get()
+            entry = self.model_entries.get(label)
+            vehicle_id = entry[1] if entry else label
+        if not vehicle_id:
+            vehicle_id = self.vehicle_ids[0] if self.vehicle_ids else None
         if not vehicle_id:
             return
         self.vehicle_load_seq += 1
@@ -192,8 +163,13 @@ class VehicleWorkflowMixin:
         self.open_button.configure(state=state)
         self.refresh_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.recommend_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.new_side_pair_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.remove_side_pair_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.clear_slot_pairs_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.show_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.hide_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.active_only_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.clear_solo_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.model_load_busy = busy
         self._update_model_combo_state()
         self._set_busy(busy)
@@ -213,11 +189,15 @@ class VehicleWorkflowMixin:
         self.settings["lastVehicleId"] = vehicle_id
         self._record_recent_vehicle(source_zip, vehicle_id)
         core.save_app_settings(self.settings)
-        self.vehicle_var.set(vehicle_id)
         self._rebuild_model_combo()
+        self.vehicle_var.set(self._combo_label_for(source_zip, vehicle_id))
+        self.last_model_label = self.vehicle_var.get()
+        self._show_model_preview(self.vehicle_var.get())
         self.part_refresh_seq += 1
         self.resolved_part_ids = []
         self.current_part_ids = []
+        self.mesh_instance_numbering_key = None
+        self.mesh_instance_numbering_cache = {}
         self.mesh_scene_hash = None
         self.mesh_scene_reset_pending = True
         self._set_load_busy(False)

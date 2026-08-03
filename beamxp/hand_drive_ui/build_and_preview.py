@@ -291,9 +291,11 @@ class BuildAndPreviewMixin:
         assert self.viewer is not None
         self.viewer.show_scene(scene, reset_view=self.mesh_scene_reset_pending)
         self.mesh_scene_reset_pending = False
-        self._refresh_viewer()
-        # The previewed trim (and thus its part set) may have changed; resync
-        # the Active column to the scene now on screen.
+        # Replacement-source children can render as meshes that belong to the
+        # replacement part rather than the original child row. Once the GPU
+        # scene has its pick-to-row map, rebuild the table so green preview
+        # children and table rows agree about their inherited transform.
+        self._refresh_parts()
         self._refresh_active_cells()
         self._schedule_pending_mesh_scene()
 

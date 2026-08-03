@@ -5,6 +5,7 @@ import re
 import zipfile
 from pathlib import Path
 
+from beamxp.core import sjson
 from beamxp.core.files import vehicle_prefix
 
 
@@ -92,27 +93,52 @@ def add_missing_json_commas(text: str) -> str:
     return "".join(out)
 
 
+def strip_commas_before_colons(text: str) -> str:
+    """Drop commas that sit between a key and its colon.
+
+    BeamNG's own parser tolerates typos such as ``"lightbar_sign",:""`` (stock
+    etk800 ``844_police_A.pc`` as of 0.39), so a config the game loads must not
+    fail here. Commas inside string literals are left alone.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    length = len(text)
+    for idx, ch in enumerate(text):
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == ",":
+            probe = idx + 1
+            while probe < length and text[probe] in " \t\r\n":
+                probe += 1
+            if probe < length and text[probe] == ":":
+                continue
+        out.append(ch)
+        if ch == '"':
+            in_string = True
+    return "".join(out)
+
+
 def parse_beamng_json(text: str, *, label: str) -> dict[str, object]:
+    """Read a BeamNG config/jbeam document the way the game reads it.
+
+    Delegates to the SJSON reader ported from the engine's own ``ljson.lua``
+    (see :mod:`beamxp.core.sjson`), which accepts everything BeamNG accepts --
+    most importantly, commas as pure whitespace. The repair-into-strict-JSON
+    passes below it are kept only for callers that still import them; nothing in
+    the read path needs them now.
+    """
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as first_error:
-        cleaned = strip_json_comments(text.lstrip("\ufeff"))
-        cleaned = re.sub(r",\s*,+", ",", cleaned)
-        cleaned = add_missing_json_commas(cleaned)
-        cleaned = re.sub(r",(\s*[\]}])", r"\1", cleaned)
-        try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError as second_error:
-            try:
-                parsed, end = json.JSONDecoder().raw_decode(cleaned)
-                remainder = cleaned[end:].strip()
-                if remainder.strip("}").strip():
-                    raise
-            except json.JSONDecodeError:
-                raise RuntimeError(
-                    f"Could not parse BeamNG config {label}: {second_error}. "
-                    f"Initial strict JSON error was: {first_error}"
-                ) from second_error
+        parsed = sjson.decode(text)
+    except sjson.SJSONError as error:
+        raise RuntimeError(f"Could not parse BeamNG config {label}: {error}") from error
     if not isinstance(parsed, dict):
         raise TypeError(f"BeamNG config {label} did not parse to an object")
     return parsed

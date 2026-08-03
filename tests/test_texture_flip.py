@@ -108,12 +108,12 @@ class TextureFlipTests(unittest.TestCase):
             }
         )
         modes = {
-            "screen": core.MODE_MIRROR,           # nav + mirror -> flipped
-            "dash": core.MODE_MIRROR,             # mirror but not a nav screen
-            "gauge": core.MODE_TRANSLATE,         # nav but translated, not reflected
-            "panel": core.MODE_MIRROR_STRUCTURAL, # display + mirrored geometry
+            "screen": core.MODE_MIRROR,     # nav + mirror -> flipped
+            "dash": core.MODE_MIRROR,       # mirror but not a nav screen
+            "gauge": core.MODE_TRANSLATE,   # nav but translated, not reflected
+            "panel": core.MODE_SKIP,        # display but nothing reflects it
         }
-        self.assertEqual(core.texture_flip_mesh_ids(context, modes), {"screen", "panel"})
+        self.assertEqual(core.texture_flip_mesh_ids(context, modes), {"screen"})
 
 
 class DisplayScreenDetectionTests(unittest.TestCase):

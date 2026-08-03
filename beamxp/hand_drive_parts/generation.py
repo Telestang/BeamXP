@@ -48,6 +48,8 @@ from beamxp.core.constants import (
     MODE_CHOICES,
     MODE_MIRROR,
     MODE_MIRROR_STRUCTURAL,
+    MODE_MIRROR_POSITION,
+    MODE_REPLACE_SOURCE,
     MODE_SKIP,
     MODE_TRANSLATE,
     NS,
@@ -206,7 +208,7 @@ def generate_daes(
                 translate_delta = None
                 if matrix_elem is not None and matrix_elem.text:
                     parsed_matrix = transform_helpers.parse_matrix(matrix_elem.text)
-                    if mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
+                    if mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
                         matrix_elem.text = transform_helpers.format_matrix(transform_helpers.mirror_matrix_x(parsed_matrix))
                     elif mode == MODE_TRANSLATE:
                         if object_id in translated_prop_meshes or (
@@ -237,7 +239,7 @@ def generate_daes(
                         continue
                     new_geom_id = safe_id(f"{old_geom_id}{suffix}_{object_id}")
                     if new_geom_id not in generated_geometry:
-                        if mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
+                        if mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
                             generated_geometry[new_geom_id] = transform_helpers.mirrored_geometry(
                                 old_geom,
                                 new_geom_id,
@@ -292,7 +294,7 @@ def generate_daes(
                     continue
                 new_geom_id = safe_id(f"{old_geom_id}_{spec.output_mesh}")
                 if new_geom_id not in generated_geometry:
-                    if spec.mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
+                    if spec.mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
                         generated_geometry[new_geom_id] = transform_helpers.mirrored_geometry(
                             old_geom,
                             new_geom_id,
@@ -366,6 +368,370 @@ def generated_info_description(info: dict[str, object]) -> str:
     return ""
 
 
+def apply_hand_authored_group(
+    pc: dict[str, object],
+    group: dict[str, object],
+) -> None:
+    """Apply a resolved authored LHD/RHD subtree swap to a configuration."""
+    main_part = group.get("mainPart")
+    if isinstance(main_part, str) and main_part:
+        pc["mainPartName"] = main_part
+
+    parts = dict(pc.get("parts", {}))
+    original_parts = dict(parts)
+    clears = group.get("clears", ())
+    if not isinstance(clears, (list, tuple)):
+        clears = ()
+    for clear in clears:
+        if not isinstance(clear, dict):
+            continue
+        slot_id = str(clear.get("slotId") or "")
+        slot_path = str(clear.get("slotPath") or "")
+        if slot_path:
+            parts.pop(slot_path, None)
+        if slot_id:
+            parts.pop(slot_id, None)
+
+    removals: list[str] = []
+    writes: list[tuple[str, str]] = []
+    selections = group.get("selections", ())
+    if isinstance(selections, (list, tuple)):
+        for selection in selections:
+            if not isinstance(selection, dict):
+                continue
+            part_id = str(selection.get("partId") or "")
+            slot_id = str(selection.get("slotId") or "")
+            slot_path = str(selection.get("slotPath") or "")
+            source_slot_id = str(selection.get("sourceSlotId") or slot_id)
+            source_slot_path = str(selection.get("sourceSlotPath") or slot_path)
+            if not part_id or not slot_id:
+                continue
+
+            used_path = bool(source_slot_path and source_slot_path in original_parts)
+            if source_slot_path and source_slot_path != slot_path:
+                removals.append(source_slot_path)
+            if source_slot_id and source_slot_id != slot_id:
+                removals.append(source_slot_id)
+            key = slot_path if used_path and slot_path else slot_id
+            writes.append((key, part_id))
+
+    # Every vacated key goes before every write. A two-way swap has each side
+    # naming the other as its source, so interleaving would let the second
+    # selection's vacate delete what the first selection just placed.
+    for key in removals:
+        parts.pop(key, None)
+    for key, part_id in writes:
+        parts[key] = part_id
+
+    # Last, because a selection moving out of a slot pops that slot's key on
+    # its way past. Dropping the key would let the engine re-apply the slot's
+    # authored default -- for bx_seat_FL, the very seat that just moved across
+    # -- so a slot a swap deliberately emptied has to say so explicitly.
+    for clear in clears:
+        if not isinstance(clear, dict) or not clear.get("setEmpty"):
+            continue
+        slot_id = str(clear.get("slotId") or "")
+        if slot_id and slot_id not in parts:
+            parts[slot_id] = ""
+    pc["parts"] = parts
+
+
+def write_converted_config(
+    context: VehicleContext,
+    output_vehicle_dir: Path,
+    variant: VariantInfo,
+    config_name: str,
+    target_hand: str,
+    pc: dict[str, object],
+) -> str:
+    output_config = variant_output_name(config_name, target_hand)
+    pc["licenseName"] = append_hand_label(pc.get("licenseName") or context.vehicle_id, target_hand)
+    output_vehicle_dir.mkdir(parents=True, exist_ok=True)
+    write_text_file(
+        output_vehicle_dir / f"{output_config}.pc",
+        json.dumps(pc, indent=2),
+        encoding="utf-8",
+    )
+
+    info: dict[str, object] = {}
+    if variant.info_path:
+        try:
+            info = load_info(context.source_zip, variant.info_path)
+        except Exception:
+            info = {}
+    existing_name = generated_info_display_name(info, variant)
+    existing_description = generated_info_description(info)
+    converted_name = append_hand_label(existing_name, target_hand)
+    info["Configuration"] = converted_name
+    info["Name"] = converted_name
+    info["Description"] = converted_description(existing_description, target_hand)
+    info["Config Type"] = "Custom"
+    info["Source"] = conversion_source_name(context)
+    write_text_file(
+        output_vehicle_dir / f"info_{output_config}.json",
+        json.dumps(info, indent=2),
+        encoding="utf-8",
+    )
+    write_mirrored_preview(context, output_vehicle_dir, config_name, output_config)
+    return output_config
+
+
+def _relocation_rewrite_context(context: VehicleContext) -> dict[str, object]:
+    """The vehicle-wide name maps a relocation clone rewrites against.
+
+    Built once per build: the node mirror map is an O(n^2) scan of every node
+    in the vehicle, and every relocation in every trim wants the same one.
+    """
+    groups = vehicle_node_group_names(context)
+    slots = {
+        slot_def.slot_type
+        for part_id in context.part_body_index
+        for slot_def in extract_slot_defs(context.part_body_index[part_id][0])
+    }
+    return {
+        "node_mirror_map": build_node_mirror_map(context.node_positions),
+        "known_nodes": set(context.node_positions),
+        "group_map": build_lateral_name_map(groups),
+        "known_groups": groups,
+        "slot_map": build_lateral_name_map(slots),
+        "known_slots": slots,
+    }
+
+
+def relocated_part_name(source_part: str, target_hand: str, target_slot: str) -> str:
+    """Name a relocation clone after where it is going.
+
+    Unlike an ordinary generated part, one source part can produce two
+    differently-slotted clones, so the target slot has to be part of the name.
+    """
+    return f"{source_part}{suffix_for_hand(target_hand)}__{target_slot}"
+
+
+def _relocation_node_offset(
+    context: VehicleContext,
+    config_name: str,
+    source_slot: str,
+    target_slot: str,
+) -> tuple[float, float, float]:
+    """How far the target slot's own mounting misses the mirrored original.
+
+    Zero for an ordinary mirrored pair. Non-zero when the two slots are not
+    mirror images -- a co-driver seat mounted further back and higher -- in
+    which case the difference is cancelled so the part lands where a driver
+    sits on the other side rather than where the co-driver sat.
+    """
+    usage = slot_usage_for_configs(context, [config_name])
+    source_usage = usage.get(source_slot)
+    target_usage = usage.get(target_slot)
+    if source_usage is None or target_usage is None:
+        return (0.0, 0.0, 0.0)
+    source_offset = slot_node_offset(source_usage, config_name)
+    target_offset = slot_node_offset(target_usage, config_name)
+    mirrored = (-source_offset[0], source_offset[1], source_offset[2])
+    return tuple(mirrored[axis] - target_offset[axis] for axis in range(3))
+
+
+def _relocation_clone_body(
+    context: VehicleContext,
+    config_name: str,
+    target_hand: str,
+    relocation: dict[str, object],
+    new_part_id: str,
+    object_modes: dict[str, str],
+    node_mirror_map: dict[str, str],
+    prop_node_positions: dict[str, tuple[float, float, float]],
+    inherited_options: tuple[str, ...],
+    baked_shared_specs: list[BakedMeshSpec],
+    rewrite_context: dict[str, object],
+) -> str | None:
+    source_part_id = str(relocation.get("partId") or "")
+    target_slot = str(relocation.get("slotId") or "")
+    source_slot = str(relocation.get("sourceSlotId") or "")
+    found = part_body_for_context(context, source_part_id)
+    if found is None or not target_slot:
+        return None
+
+    part_body = found[0]
+    suffix = suffix_for_hand(target_hand)
+    meshes = sorted(transform_helpers.extract_part_mesh_names(part_body))
+    mesh_map = {
+        mesh: f"{mesh}{suffix}"
+        for mesh in meshes
+        if context.objects.get(mesh) is not None and context.objects[mesh].dae_path
+    }
+    # A relocated part always mirrors: it is moving to the other side of the
+    # car, whatever mode its individual meshes were left on.
+    row_transforms = {mesh: ("mirror", 0.0) for mesh in meshes}
+    prop_globals = {
+        mesh: mirrored_object_position(context, mesh, config_name)
+        for mesh in meshes
+        if mesh in context.objects
+    }
+
+    shared_bake = SharedBakeContext(
+        context=context,
+        config_name=config_name,
+        target_hand=target_hand,
+        source_part_id=source_part_id,
+        object_modes=object_modes,
+        structural_sources={},
+        translate_magnitudes={},
+        baked_specs=baked_shared_specs,
+    )
+    body = clone_part_for_target(
+        part_body,
+        source_part_id,
+        target_hand,
+        new_part_id,
+        mesh_map,
+        row_transforms,
+        prop_globals,
+        {},
+        prop_node_positions,
+        node_mirror_map,
+        inherited_options,
+        shared_bake,
+        context.mesh_pivots,
+    )
+    return relocate_part_for_slot(
+        body,
+        SlotRelocation(
+            source_slot=source_slot,
+            target_slot=target_slot,
+            node_offset=_relocation_node_offset(
+                context, config_name, source_slot, target_slot
+            ),
+        ),
+        rewrite_context["node_mirror_map"],
+        rewrite_context["known_nodes"],
+        rewrite_context["group_map"],
+        rewrite_context["known_groups"],
+        rewrite_context["slot_map"],
+        rewrite_context["known_slots"],
+    )
+
+
+def _generated_clone_excluded(source_part_id: str, part_body: str) -> bool:
+    tokens = [source_part_id.lower()]
+    tokens.extend(slot_type.lower() for slot_type in transform_helpers.extract_part_slot_types(part_body))
+    return any("seat" in token for token in tokens)
+
+
+def _part_has_handed_light_slots(part_body: str) -> bool:
+    has_beam_electric = re.search(
+        r'"\$electric"\s*:\s*"(?:lowbeam|highbeam|lowhighbeam)',
+        part_body,
+    ) is not None
+    has_light_pattern = re.search(
+        r'"\$lightPattern"\s*:\s*"(?:LHD|RHD|US)"',
+        part_body,
+    ) is not None
+    return has_beam_electric and has_light_pattern
+
+
+def _part_needs_generated_clone(
+    context: VehicleContext,
+    source_part_id: str,
+    part_body: str,
+    object_modes: dict[str, str],
+    node_mirror_map: dict[str, str],
+) -> bool:
+    part_meshes = transform_helpers.extract_part_mesh_names(part_body)
+    return (
+        any(mesh in object_modes for mesh in part_meshes)
+        or part_has_transformable_internal_camera(part_body, node_mirror_map)
+        or _part_has_handed_light_slots(part_body)
+    )
+
+
+def _generated_clone_plan(
+    context: VehicleContext,
+    selected: dict[str, object],
+    target_hand: str,
+    config_name: str,
+    object_modes: dict[str, str],
+    node_mirror_map: dict[str, str],
+    authored_parts: set[str],
+) -> dict[str, str]:
+    """Generated source part -> output part id for one config.
+
+    Seed the plan from parts with actual handed content: mesh transforms,
+    internal cameras, or semantic rewrites such as ``$lightPattern``. Then add
+    bridge ancestors from the resolved slot tree so selecting a generated root
+    carries its handed child-slot namespace down to those leaves.
+    """
+    generated_parts: dict[str, str] = {}
+    parts_with_child_slots: set[str] = set()
+    part_children: dict[str, set[str]] = {}
+    selected_part_ids = {str(part_id) for part_id in selected["parts"]}
+    selected_instances = [
+        instance
+        for instance in selected.get("part_instances", ())
+        if isinstance(instance, dict)
+    ]
+    part_by_instance = {
+        str(instance.get("instance_id") or ""): str(instance.get("part_id") or "")
+        for instance in selected_instances
+        if instance.get("instance_id")
+    }
+    for instance in selected_instances:
+        parent_id = str(instance.get("parent_instance_id") or "")
+        parent_part = part_by_instance.get(parent_id)
+        part_id = str(instance.get("part_id") or "")
+        if parent_part and part_id:
+            part_children.setdefault(parent_part, set()).add(part_id)
+
+    pending_part_ids = set(selected_part_ids)
+    inspected_part_ids: set[str] = set()
+    while pending_part_ids:
+        source_part_id = pending_part_ids.pop()
+        if source_part_id in inspected_part_ids:
+            continue
+        inspected_part_ids.add(source_part_id)
+        if source_part_id in authored_parts:
+            continue
+        found = part_body_for_context(context, source_part_id)
+        if found is None:
+            continue
+        part_body, _filename = found
+        if _generated_clone_excluded(source_part_id, part_body):
+            continue
+        slot_defs = extract_slot_defs(part_body)
+        if slot_defs:
+            parts_with_child_slots.add(source_part_id)
+            for slot_def in slot_defs:
+                default_part = slot_def.default_part
+                if not default_part:
+                    continue
+                part_children.setdefault(source_part_id, set()).add(default_part)
+                if default_part not in inspected_part_ids:
+                    pending_part_ids.add(default_part)
+        if _part_needs_generated_clone(
+            context, source_part_id, part_body, object_modes, node_mirror_map
+        ):
+            generated_parts[source_part_id] = generated_variant_part_name(
+                source_part_id, target_hand, config_name
+            )
+
+    changed = True
+    while changed:
+        changed = False
+        for source_part_id in sorted(parts_with_child_slots):
+            if source_part_id in generated_parts:
+                continue
+            if source_part_id == selected.get("main_part"):
+                continue
+            if any(
+                child_part_id in generated_parts
+                for child_part_id in part_children.get(source_part_id, ())
+            ):
+                generated_parts[source_part_id] = generated_variant_part_name(
+                    source_part_id, target_hand, config_name
+                )
+                changed = True
+    return generated_parts
+
+
 def write_generated_jbeam_and_configs(
     context: VehicleContext,
     output_vehicle_dir: Path,
@@ -378,16 +744,33 @@ def write_generated_jbeam_and_configs(
     translated_prop_meshes: set[str],
     translated_flexbody_meshes: set[str],
     mirrored_prop_meshes: set[str],
+    mirror_position_prop_meshes: set[str],
+    mirror_position_flexbody_meshes: set[str],
     structural_prop_meshes: set[str],
     baked_shared_specs: list[BakedMeshSpec],
+    authored_groups: dict[str, dict[str, object]] | None = None,
+    slot_pair_plans: dict[str, dict[str, object]] | None = None,
 ) -> list[str]:
+    authored_groups = authored_groups or {}
+    slot_pair_plans = slot_pair_plans or {}
     cloned_bodies: list[str] = []
     cloned_part_ids: set[str] = set()
     generated_configs: list[str] = []
+    relocation_context = (
+        _relocation_rewrite_context(context) if slot_pair_plans else None
+    )
 
     for config_name, target_hand in sorted(variant_targets.items()):
         variant = context.variants[config_name]
         pc = load_pc(context.source_zip, variant.pc_path)
+        authored_group = authored_groups.get(config_name)
+        slot_plan = slot_pair_plans.get(config_name)
+        # Parts an authored swap or a slot pair resolves are already correct
+        # for the target hand; everything else in the trim still goes through
+        # the generated mirroring below.
+        authored_parts = authored_group_source_parts(authored_group)
+        authored_parts |= authored_group_source_parts(slot_plan)
+
         selected = selected_parts_for_config(context, config_name)
         selected_node_positions = selected_node_positions_for_config(context, config_name)
         prop_node_positions = dict(context.node_positions)
@@ -397,31 +780,48 @@ def write_generated_jbeam_and_configs(
         slot_updates: dict[str, str] = {}
         main_update: str | None = None
         suffix = suffix_for_hand(target_hand)
+        selected_part_ids = {str(part_id) for part_id in selected["parts"]}
+        generated_parts_for_source = _generated_clone_plan(
+            context,
+            selected,
+            target_hand,
+            config_name,
+            object_modes,
+            node_mirror_map,
+            authored_parts,
+        )
 
-        for source_part_id in sorted(selected["parts"]):
+        clone_source_part_ids = selected_part_ids | set(generated_parts_for_source)
+        for source_part_id in sorted(clone_source_part_ids):
+            if str(source_part_id) in authored_parts:
+                continue
             found = part_body_for_context(context, str(source_part_id))
             if found is None:
                 continue
             part_body, _filename = found
+            if _generated_clone_excluded(str(source_part_id), part_body):
+                continue
             part_meshes = transform_helpers.extract_part_mesh_names(part_body)
             mesh_hits = sorted(mesh for mesh in part_meshes if mesh in object_modes)
             camera_hit = part_has_transformable_internal_camera(part_body, node_mirror_map)
-            if not mesh_hits and not camera_hit:
+            new_part_id = generated_parts_for_source.get(str(source_part_id))
+            if not new_part_id:
                 continue
 
-            new_part_id = generated_variant_part_name(str(source_part_id), target_hand, config_name)
             if str(source_part_id) == selected["main_part"]:
                 main_update = new_part_id
-            selected_slot_types = []
-            if isinstance(selected_by_slot, dict):
-                selected_slot_types = [
-                    str(slot_type)
-                    for slot_type, part_id in selected_by_slot.items()
-                    if slot_type != "main" and str(part_id) == str(source_part_id)
-                ]
-            slot_types = selected_slot_types or transform_helpers.extract_part_slot_types(part_body)
-            for slot_type in slot_types:
-                slot_updates[slot_type] = new_part_id
+            if str(source_part_id) in selected_part_ids:
+                selected_slot_types = []
+                if isinstance(selected_by_slot, dict):
+                    selected_slot_types = [
+                        str(slot_type)
+                        for slot_type, part_id in selected_by_slot.items()
+                        if slot_type != "main" and str(part_id) == str(source_part_id)
+                    ]
+                slot_types = selected_slot_types or transform_helpers.extract_part_slot_types(part_body)
+                for slot_type in slot_types:
+                    slot_updates[slot_type] = new_part_id
+                    slot_updates[f"{slot_type}{suffix}"] = new_part_id
 
             if new_part_id in cloned_part_ids:
                 continue
@@ -439,7 +839,9 @@ def write_generated_jbeam_and_configs(
                         "translate",
                         signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0)),
                     )
-                elif object_modes.get(mesh) in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
+                elif object_modes.get(mesh) == MODE_MIRROR_POSITION and mesh in mirror_position_flexbody_meshes:
+                    flexbody_row_transforms[mesh] = ("mirrorPosition", 0.0)
+                elif object_modes.get(mesh) in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
                     # Structural rows must carry the mirror in the jbeam pos/rot
                     # like plain mirror rows: the engine drops the DAE node
                     # translation for flexbodies, so a side-swap baked into the
@@ -452,6 +854,8 @@ def write_generated_jbeam_and_configs(
                         "translate",
                         signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0)),
                     )
+                elif object_modes.get(mesh) == MODE_MIRROR_POSITION and mesh in mirror_position_prop_meshes:
+                    prop_row_transforms[mesh] = ("mirrorPosition", 0.0)
                 elif object_modes.get(mesh) == MODE_MIRROR and mesh in mirrored_prop_meshes:
                     prop_row_transforms[mesh] = ("mirror", 0.0)
             # config_name: these positions are written into ONE trim's jbeam,
@@ -473,10 +877,6 @@ def write_generated_jbeam_and_configs(
                     if mesh in mirrored_prop_meshes and object_modes.get(mesh) == MODE_MIRROR
                 }
             )
-            # Structural-mirror props reach rewrite_prop_meshes_with_globals
-            # through prop_globals rather than prop_row_transforms, so this is
-            # the one build path that positions a mesh from a stored coordinate
-            # rather than the row it is rewriting.
             prop_globals.update(
                 {
                     mesh: mirrored_object_position(
@@ -484,7 +884,7 @@ def write_generated_jbeam_and_configs(
                     )
                     for mesh in mesh_hits
                     if mesh in structural_prop_meshes
-                    and object_modes.get(mesh) == MODE_MIRROR_STRUCTURAL
+                    and object_modes.get(mesh) in {MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
                     and mesh in structural_sources
                 }
             )
@@ -518,40 +918,54 @@ def write_generated_jbeam_and_configs(
                     inherited_options,
                     shared_bake,
                     context.mesh_pivots,
+                    generated_parts_for_source,
                 )
             )
 
+        for relocation in slot_pair_plan_relocations(slot_plan):
+            source_part_id = str(relocation.get("partId") or "")
+            target_slot = str(relocation.get("slotId") or "")
+            new_part_id = relocated_part_name(source_part_id, target_hand, target_slot)
+            slot_updates[target_slot] = new_part_id
+            if new_part_id in cloned_part_ids or relocation_context is None:
+                continue
+            inherited_options = ()
+            if isinstance(part_slot_options, dict):
+                raw_options = part_slot_options.get(source_part_id, ())
+                if isinstance(raw_options, (list, tuple)):
+                    inherited_options = tuple(str(item) for item in raw_options if item)
+            body = _relocation_clone_body(
+                context,
+                config_name,
+                target_hand,
+                relocation,
+                new_part_id,
+                object_modes,
+                node_mirror_map,
+                prop_node_positions,
+                inherited_options,
+                baked_shared_specs,
+                relocation_context,
+            )
+            if body is not None:
+                cloned_part_ids.add(new_part_id)
+                cloned_bodies.append(body)
+
+        # The authored swap moves whole slots around (bx_shifter_lhd ->
+        # bx_shifter_rhd), so it lands first and the generated clones then
+        # overwrite their own -- disjoint -- slots on top of the swapped tree.
+        if authored_group is not None:
+            apply_hand_authored_group(pc, authored_group)
+        if slot_plan is not None:
+            apply_hand_authored_group(pc, slot_plan)
         if main_update:
             pc["mainPartName"] = main_update
         parts = dict(pc.get("parts", {}))
         parts.update(slot_updates)
         pc["parts"] = parts
-        output_config = variant_output_name(config_name, target_hand)
-        pc["licenseName"] = append_hand_label(pc.get("licenseName") or context.vehicle_id, target_hand)
-        output_vehicle_dir.mkdir(parents=True, exist_ok=True)
-        write_text_file(output_vehicle_dir / f"{output_config}.pc", json.dumps(pc, indent=2), encoding="utf-8")
-
-        info = {}
-        if variant.info_path:
-            try:
-                info = load_info(context.source_zip, variant.info_path)
-            except Exception:
-                info = {}
-        existing_name = generated_info_display_name(info, variant)
-        existing_description = generated_info_description(info)
-        converted_name = append_hand_label(existing_name, target_hand)
-        info["Configuration"] = converted_name
-        info["Name"] = converted_name
-        info["Description"] = converted_description(existing_description, target_hand)
-        info["Config Type"] = "Custom"
-        info["Source"] = conversion_source_name(context)
-        write_text_file(
-            output_vehicle_dir / f"info_{output_config}.json",
-            json.dumps(info, indent=2),
-            encoding="utf-8",
-        )
-        write_mirrored_preview(context, output_vehicle_dir, config_name, output_config)
-        generated_configs.append(output_config)
+        generated_configs.append(write_converted_config(
+            context, output_vehicle_dir, variant, config_name, target_hand, pc
+        ))
 
     if cloned_bodies:
         jbeam_dir = output_vehicle_dir / "jbeam"
@@ -765,6 +1179,14 @@ def output_vehicle_preview_payload(
     )
     node_positions = build_node_position_index(combined_jbeam_texts)
     node_positions.update(selected_nodes)
+    output_populated_groups = node_groups_for_selection(
+        selected,
+        lambda part_id, section: (
+            lambda found: transform_helpers.extract_named_array(found[0], section)
+            if found is not None
+            else None
+        )(find_part_body(part_id, combined_jbeam_texts, combined_part_index)),
+    )
     rotation_counts: dict[str, int] = {}
 
     for part_instance in selected_part_instances(selected):
@@ -793,6 +1215,9 @@ def output_vehicle_preview_payload(
                     continue
                 if kind == "prop" and not prop_row_nodes_present(row, selected_nodes):
                     skipped.setdefault(mesh, "inactive row (prop nodes not in this config)")
+                    continue
+                if kind == "flex" and not flexbody_row_is_bound(row, output_populated_groups):
+                    skipped.setdefault(mesh, "inactive row (node group empty in this config)")
                     continue
                 rotation_source = None
                 if kind == "flex":
@@ -864,13 +1289,7 @@ def full_vehicle_preview_payload(
     if config_name not in context.variants:
         raise RuntimeError(f"Unknown config {config_name!r}")
     target_hand = variant_target_hand(context, conversion, config_name)
-    object_modes = fallback_structural_part_modes(
-        context,
-        conversion,
-        active_part_modes(conversion),
-        selected_configs=(config_name,),
-    )
-    structural = structural_mirror_sources(context, conversion, object_modes)
+    object_modes = active_part_modes(conversion)
     preview_pc, generated_plate_parts = plate_generator.preview_pc_with_plate_parts(
         context,
         conversion,
@@ -897,7 +1316,8 @@ def full_vehicle_preview_payload(
     node_positions = dict(context.node_positions)
     node_positions.update(selected_nodes)
     mirror = mirror_x_matrix4()
-    convertible = {MODE_TRANSLATE, MODE_MIRROR, MODE_MIRROR_STRUCTURAL}
+    convertible = {MODE_TRANSLATE, MODE_MIRROR_POSITION, MODE_MIRROR, MODE_REPLACE_SOURCE}
+    source_meshes = structural_mirror_sources(context, conversion, object_modes)
     rotation_counts: dict[str, int] = {}
 
     dae_index: dict[tuple[str, str], int] = {}
@@ -924,6 +1344,10 @@ def full_vehicle_preview_payload(
                 part_translate_magnitude(context, conversion, mesh),
             )
             return multiply_matrix(translation_matrix((delta, 0.0, 0.0)), world)
+        if mode == MODE_MIRROR_POSITION:
+            return multiply_matrix(translation_matrix((-2.0 * world[0][3], 0.0, 0.0)), world)
+        if mode == MODE_REPLACE_SOURCE:
+            return world
         return multiply_matrix(mirror, world)
 
     def preview_part_array(part_id: str, array_key: str) -> str | None:
@@ -932,65 +1356,365 @@ def full_vehicle_preview_payload(
             return transform_helpers.extract_named_array(body, array_key)
         return part_named_array_for_context(context, part_id, array_key)
 
-    for part_instance in selected_part_instances(selected):
-        part_id = str(part_instance.get("part_id") or "")
-        instance_id = str(part_instance.get("instance_id") or "")
-        slot_path = str(part_instance.get("slot_path") or "/")
-        opts = part_instance_options(part_instance)
-        variables = part_instance_variable_scope(selected, part_instance)
-        for kind, array_key in (("flex", "flexbodies"), ("prop", "props")):
-            array_text = preview_part_array(part_id, array_key)
-            if not array_text:
+    # A flexbody bound only to groups this trim leaves empty is ignored by the
+    # engine, so it must not appear in the preview scene either -- the parts
+    # table reads Active straight off the built scene.
+    populated_groups = node_groups_for_selection(selected, preview_part_array)
+
+    def part_meshes(part_id: str) -> set[str]:
+        found = part_body_for_context(context, part_id)
+        if found is None:
+            return set()
+        return set(transform_helpers.extract_part_mesh_names(found[0]))
+
+    def replacement_root_part(slot_id: str, source_mesh: str) -> str:
+        slot_def = SlotDef(slot_id, "", allow_types=(slot_id,))
+        for candidate_part, (candidate_body, _filename) in context.part_body_index.items():
+            if source_mesh not in transform_helpers.extract_part_mesh_names(candidate_body):
                 continue
-            for raw_row in iter_active_top_level_rows(array_text):
-                row = resolve_jbeam_row_strings(raw_row, variables)
-                mesh = flexbody_row_mesh(row) if kind == "flex" else prop_row_mesh(row)
-                if not mesh or mesh in ("SPOTLIGHT", "POINTLIGHT"):
-                    continue
-                mode = object_modes.get(mesh, MODE_SKIP)
-                geometry_mesh = structural.get(mesh, mesh) if mode == MODE_MIRROR_STRUCTURAL else mesh
-                obj = context.objects.get(geometry_mesh)
-                if obj is None or not obj.dae_path:
-                    skipped.setdefault(mesh, "no DAE geometry indexed")
-                    continue
-                if kind == "prop" and not prop_row_nodes_present(row, selected_nodes):
-                    skipped.setdefault(mesh, "inactive row (prop nodes not in this config)")
-                    continue
-                rotation_source = None
-                if kind == "flex":
-                    world = flexbody_row_source_matrix(row, opts, variables)
-                else:
-                    pivot = context.mesh_pivots.get(mesh)
-                    rotation_override, rotation_source = prop_rest_rotation_override(row, node_positions)
-                    rotation_counts[rotation_source] = rotation_counts.get(rotation_source, 0) + 1
-                    world = prop_row_world_matrix(
-                        row, node_positions, pivot, opts, rotation_override, variables
-                    )
-                if world is None:
-                    skipped.setdefault(mesh, "placement unresolved (inactive row?)")
-                    continue
-                if math.hypot(world[0][3], world[1][3], world[2][3]) > PREVIEW_FAR_LIMIT:
-                    skipped.setdefault(mesh, "placed far outside the vehicle (hidden by its jbeam)")
-                    continue
-                instances.append(
-                    {
-                        "dae": dae_ref(obj),
-                        "node": obj.id,
-                        "node_names": preview_node_names(obj),
-                        "mesh": mesh,
-                        "part": part_id,
-                        "part_instance": instance_id,
-                        "slot_path": slot_path,
-                        "kind": kind,
-                        "mode": mode if target_hand is not None else MODE_SKIP,
-                        "matrix": matrix4_flat(final_matrix(mesh, mode, world)),
-                        "stock_matrix": matrix4_flat(world),
-                        "keep_node_translation": (
-                            kind != "flex" or flexbody_row_needs_node_translation(context, geometry_mesh)
-                        ),
-                        **({"rotation_source": rotation_source} if rotation_source else {}),
-                    }
+            if part_fits_slot(transform_helpers.extract_part_slot_types(candidate_body), slot_def):
+                return candidate_part
+        return ""
+
+    hand_token_re = re.compile(
+        r"(?<![a-z0-9])(?:rhd|lhd|right[-_ ]*hand(?:[-_ ]*drive)?|"
+        r"left[-_ ]*hand(?:[-_ ]*drive)?|jdm|ukdm|uk)(?![a-z0-9])",
+        re.IGNORECASE,
+    )
+
+    def handless_identity(value: str) -> str:
+        stripped = hand_token_re.sub(" ", value.lower())
+        return re.sub(r"[^a-z0-9]+", "", stripped)
+
+    def part_info_name(part_body: str) -> str:
+        info = transform_helpers.extract_keyed_object(part_body, "information")
+        if not info:
+            return ""
+        match = re.search(r'"name"\s*:\s*"((?:[^"\\]|\\.)*)"', info)
+        return match.group(1) if match is not None else ""
+
+    def part_hand_neutral(part_id: str, part_body: str) -> bool:
+        label = f"{part_id} {part_info_name(part_body)}"
+        return handless_identity(label) == re.sub(r"[^a-z0-9]+", "", label.lower())
+
+    def paired_target_slot(source_slot: SlotDef, target_slots: list[SlotDef]) -> SlotDef | None:
+        ranked: list[tuple[tuple[int, int, int], SlotDef]] = []
+        source_identity = handless_identity(source_slot.slot_type)
+        source_default = handless_identity(source_slot.default_part)
+        for target_slot in target_slots:
+            exact = source_slot.slot_type == target_slot.slot_type
+            identity_match = bool(source_identity and source_identity == handless_identity(target_slot.slot_type))
+            default_match = bool(source_default and source_default == handless_identity(target_slot.default_part))
+            if exact or identity_match or default_match:
+                ranked.append(((int(exact), int(identity_match), int(default_match)), target_slot))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda item: tuple(-score for score in item[0]) + (item[1].slot_type,))
+        best = ranked[0][0]
+        return ranked[0][1] if sum(score == best for score, _slot in ranked) == 1 else None
+
+    def selected_child_part(slot_type: str, slot_path: str) -> str:
+        selected_by_path = selected.get("selected_by_path", {})
+        if isinstance(selected_by_path, dict) and selected_by_path.get(slot_path):
+            return str(selected_by_path[slot_path])
+        selected_by_slot = selected.get("selected_by_slot", {})
+        if isinstance(selected_by_slot, dict) and selected_by_slot.get(slot_type):
+            return str(selected_by_slot[slot_type])
+        return ""
+
+    def child_counterpart_part(source_part: str, target_slot: SlotDef) -> str:
+        source_found = part_body_for_context(context, source_part)
+        if source_found is None:
+            return ""
+        source_body = source_found[0]
+        source_part_identity = handless_identity(source_part)
+        source_name_identity = handless_identity(part_info_name(source_body))
+        ranked: list[tuple[tuple[int, int], str]] = []
+        for candidate_part, (candidate_body, _filename) in context.part_body_index.items():
+            if candidate_part == source_part:
+                continue
+            if not part_fits_slot(transform_helpers.extract_part_slot_types(candidate_body), target_slot):
+                continue
+            part_match = bool(source_part_identity and source_part_identity == handless_identity(candidate_part))
+            name_match = bool(source_name_identity and source_name_identity == handless_identity(part_info_name(candidate_body)))
+            if part_match or name_match:
+                ranked.append(((int(part_match), int(name_match)), candidate_part))
+        if not ranked:
+            return ""
+        ranked.sort(key=lambda item: tuple(-score for score in item[0]) + (item[1],))
+        best = ranked[0][0]
+        return ranked[0][1] if sum(score == best for score, _part in ranked) == 1 else ""
+
+    def mesh_map_for_parts(source_part: str, target_part: str) -> dict[str, str]:
+        source_found = part_body_for_context(context, source_part)
+        target_found = part_body_for_context(context, target_part)
+        if source_found is None or target_found is None:
+            return {}
+        source_meshes = sorted(transform_helpers.extract_part_mesh_names(source_found[0]))
+        target_meshes = sorted(transform_helpers.extract_part_mesh_names(target_found[0]))
+        fallback_source = source_meshes[0] if source_meshes else ""
+        target_by_identity: dict[str, list[str]] = {}
+        for target_mesh in target_meshes:
+            target_by_identity.setdefault(handless_identity(target_mesh), []).append(target_mesh)
+        out: dict[str, str] = {}
+        for source_mesh in source_meshes:
+            matches = target_by_identity.get(handless_identity(source_mesh), [])
+            if len(matches) == 1:
+                out[matches[0]] = source_mesh
+        if fallback_source:
+            for target_mesh in target_meshes:
+                out.setdefault(target_mesh, fallback_source)
+        return out
+
+    def apply_replacement_child_choices(
+        child_parts: dict[object, object],
+        replacement_row_meshes: dict[str, str],
+        source_part: str,
+        target_part: str,
+        source_path: str,
+        target_path: str,
+        visited: set[tuple[str, str, str, str]],
+    ) -> None:
+        visit = (source_part, target_part, source_path, target_path)
+        if visit in visited:
+            return
+        visited.add(visit)
+        source_found = part_body_for_context(context, source_part)
+        target_found = part_body_for_context(context, target_part)
+        if source_found is None or target_found is None:
+            return
+        replacement_row_meshes.update(mesh_map_for_parts(source_part, target_part))
+        source_slots = extract_slot_defs(source_found[0])
+        target_slots = extract_slot_defs(target_found[0])
+        for source_slot in source_slots:
+            source_child_path = f"{source_path}{source_slot.slot_type}/"
+            source_choice = selected_child_part(source_slot.slot_type, source_child_path)
+            child_parts.pop(source_slot.slot_type, None)
+            child_parts.pop(source_child_path, None)
+            if not source_choice:
+                continue
+            target_slot = paired_target_slot(source_slot, target_slots)
+            if target_slot is None:
+                continue
+            target_child_path = f"{target_path}{target_slot.slot_type}/"
+            target_choice = ""
+            source_choice_found = part_body_for_context(context, source_choice)
+            if source_choice_found is not None:
+                source_choice_body = source_choice_found[0]
+                if (
+                    part_fits_slot(transform_helpers.extract_part_slot_types(source_choice_body), target_slot)
+                    and part_hand_neutral(source_choice, source_choice_body)
+                ):
+                    target_choice = source_choice
+            if not target_choice:
+                target_choice = child_counterpart_part(source_choice, target_slot)
+            if not target_choice:
+                target_choice = target_slot.default_part
+            if not target_choice:
+                continue
+            child_parts[target_slot.slot_type] = target_choice
+            child_parts[target_child_path] = target_choice
+            apply_replacement_child_choices(
+                child_parts,
+                replacement_row_meshes,
+                source_choice,
+                target_choice,
+                source_child_path,
+                target_child_path,
+                visited,
+            )
+
+    def selected_instance_for_mesh(mesh: str) -> dict[str, object] | None:
+        for instance in selected_part_instances(selected):
+            part_id = str(instance.get("part_id") or "")
+            if mesh in part_meshes(part_id):
+                return dict(instance)
+        return None
+
+    child_skip_paths: set[str] = set()
+    child_preview_groups: list[
+        tuple[
+            dict[str, object],
+            dict[str, tuple[float, float, float]],
+            dict[str, tuple[float, float, float]],
+            set[str],
+            str,
+            str,
+            dict[str, str],
+        ]
+    ] = []
+    child_preview_roots: set[str] = set()
+    parts_config = conversion.get("parts", {})
+    if isinstance(parts_config, dict):
+        for mesh, mode in object_modes.items():
+            settings = parts_config.get(mesh)
+            if mode != MODE_REPLACE_SOURCE or not isinstance(settings, dict) or not settings.get("includeChildren"):
+                continue
+            source_mesh = str(settings.get("mirrorSource") or "")
+            root = selected_instance_for_mesh(mesh)
+            if root is None:
+                continue
+            root_path = str(root.get("slot_path") or "")
+            root_slot = str(root.get("slot_id") or "")
+            target_part = replacement_root_part(root_slot, source_mesh)
+            if not root_path or not root_slot or not target_part:
+                continue
+            if root_path in child_preview_roots:
+                continue
+            child_preview_roots.add(root_path)
+            child_skip_paths.add(root_path)
+            child_pc = copy.deepcopy(preview_pc)
+            child_parts = child_pc.setdefault("parts", {})
+            if not isinstance(child_parts, dict):
+                child_parts = {}
+                child_pc["parts"] = child_parts
+            root_found = part_body_for_context(context, str(root.get("part_id") or ""))
+            if root_found is not None:
+                for slot_def in extract_slot_defs(root_found[0]):
+                    child_parts.pop(slot_def.slot_type, None)
+            for key in list(child_parts):
+                if str(key) != root_path and str(key).startswith(root_path):
+                    child_parts.pop(key, None)
+            child_parts[root_slot] = target_part
+            child_parts[root_path] = target_part
+            replacement_row_meshes: dict[str, str] = {}
+            apply_replacement_child_choices(
+                child_parts,
+                replacement_row_meshes,
+                str(root.get("part_id") or ""),
+                target_part,
+                root_path,
+                root_path,
+                set(),
+            )
+            child_selected = resolve_selected_parts(
+                child_pc,
+                context.jbeam_texts,
+                vehicle_id=context.source_vehicle_id,
+                part_body_index=preview_part_index,
+            )
+            child_nodes = selected_node_positions_for_parts(
+                child_selected,
+                context.jbeam_texts,
+                preview_part_index,
+            )
+            child_node_positions = dict(context.node_positions)
+            child_node_positions.update(child_nodes)
+            child_populated_groups = node_groups_for_selection(child_selected, preview_part_array)
+            child_preview_groups.append(
+                (
+                    child_selected,
+                    child_nodes,
+                    child_node_positions,
+                    child_populated_groups,
+                    root_path,
+                    mesh,
+                    replacement_row_meshes,
                 )
+            )
+
+    def append_selected_instances(
+        selected_tree: dict[str, object],
+        selected_nodes_for_tree: dict[str, tuple[float, float, float]],
+        node_positions_for_tree: dict[str, tuple[float, float, float]],
+        populated_groups_for_tree: set[str],
+        *,
+        skip_child_roots: set[str] | None = None,
+        only_child_root: str = "",
+        force_mode: str | None = None,
+        row_meshes: dict[str, str] | None = None,
+        row_parent_mesh: str = "",
+    ) -> None:
+        skip_child_roots = skip_child_roots or set()
+        row_meshes = row_meshes or {}
+        for part_instance in selected_part_instances(selected_tree):
+            part_id = str(part_instance.get("part_id") or "")
+            instance_id = str(part_instance.get("instance_id") or "")
+            slot_path = str(part_instance.get("slot_path") or "/")
+            if only_child_root:
+                if not slot_path.startswith(only_child_root):
+                    continue
+            elif any(slot_path.startswith(root_path) for root_path in skip_child_roots):
+                continue
+            opts = part_instance_options(part_instance)
+            variables = part_instance_variable_scope(selected_tree, part_instance)
+            for kind, array_key in (("flex", "flexbodies"), ("prop", "props")):
+                array_text = preview_part_array(part_id, array_key)
+                if not array_text:
+                    continue
+                for raw_row in iter_active_top_level_rows(array_text):
+                    row = resolve_jbeam_row_strings(raw_row, variables)
+                    mesh = flexbody_row_mesh(row) if kind == "flex" else prop_row_mesh(row)
+                    if not mesh or mesh in ("SPOTLIGHT", "POINTLIGHT"):
+                        continue
+                    mode = force_mode or object_modes.get(mesh, MODE_SKIP)
+                    geometry_mesh = mesh if force_mode == MODE_REPLACE_SOURCE else source_meshes.get(mesh, mesh)
+                    obj = context.objects.get(geometry_mesh)
+                    if obj is None or not obj.dae_path:
+                        skipped.setdefault(mesh, "no DAE geometry indexed")
+                        continue
+                    if kind == "prop" and not prop_row_nodes_present(row, selected_nodes_for_tree):
+                        skipped.setdefault(mesh, "inactive row (prop nodes not in this config)")
+                        continue
+                    if kind == "flex" and not flexbody_row_is_bound(row, populated_groups_for_tree):
+                        skipped.setdefault(mesh, "inactive row (node group empty in this config)")
+                        continue
+                    rotation_source = None
+                    if kind == "flex":
+                        world = flexbody_row_source_matrix(row, opts, variables)
+                    else:
+                        pivot = context.mesh_pivots.get(mesh)
+                        rotation_override, rotation_source = prop_rest_rotation_override(row, node_positions_for_tree)
+                        rotation_counts[rotation_source] = rotation_counts.get(rotation_source, 0) + 1
+                        world = prop_row_world_matrix(
+                            row, node_positions_for_tree, pivot, opts, rotation_override, variables
+                        )
+                    if world is None:
+                        skipped.setdefault(mesh, "placement unresolved (inactive row?)")
+                        continue
+                    if math.hypot(world[0][3], world[1][3], world[2][3]) > PREVIEW_FAR_LIMIT:
+                        skipped.setdefault(mesh, "placed far outside the vehicle (hidden by its jbeam)")
+                        continue
+                    instances.append(
+                        {
+                            "dae": dae_ref(obj),
+                            "node": obj.id,
+                            "node_names": preview_node_names(obj),
+                            "mesh": mesh,
+                            **({"row_mesh": row_meshes[mesh]} if mesh in row_meshes else {}),
+                            **({"row_parent_mesh": row_parent_mesh} if row_parent_mesh and mesh in row_meshes else {}),
+                            "part": part_id,
+                            "part_instance": instance_id,
+                            "slot_path": slot_path,
+                            "kind": kind,
+                            "mode": mode if target_hand is not None else MODE_SKIP,
+                            "matrix": matrix4_flat(final_matrix(mesh, mode, world)),
+                            "stock_matrix": matrix4_flat(world),
+                            "keep_node_translation": (
+                                kind != "flex" or flexbody_row_needs_node_translation(context, geometry_mesh)
+                            ),
+                            **({"rotation_source": rotation_source} if rotation_source else {}),
+                        }
+                    )
+
+    append_selected_instances(
+        selected,
+        selected_nodes,
+        node_positions,
+        populated_groups,
+        skip_child_roots=child_skip_paths,
+    )
+    for child_selected, child_nodes, child_node_positions, child_populated_groups, root_path, root_mesh, row_meshes in child_preview_groups:
+        append_selected_instances(
+            child_selected,
+            child_nodes,
+            child_node_positions,
+            child_populated_groups,
+            only_child_root=root_path,
+            force_mode=MODE_REPLACE_SOURCE,
+            row_meshes=row_meshes,
+            row_parent_mesh=root_mesh,
+        )
 
     # Temporarily-shown parts that are NOT in this config's part tree: find
     # each mesh's flexbody/prop row in any part of the vehicle and place it
@@ -1013,7 +1737,7 @@ def full_vehicle_preview_payload(
                         extra_rows[mesh] = (extra_part_id, kind, row)
     for mesh in sorted(extra_wanted):
         mode = object_modes.get(mesh, MODE_SKIP)
-        geometry_mesh = structural.get(mesh, mesh) if mode == MODE_MIRROR_STRUCTURAL else mesh
+        geometry_mesh = source_meshes.get(mesh, mesh)
         obj = context.objects.get(geometry_mesh)
         if obj is None or not obj.dae_path:
             skipped.setdefault(mesh, "no DAE geometry indexed")
@@ -1067,4 +1791,4 @@ def full_vehicle_preview_payload(
         "rotation_calibration": rotation_counts,
     }
 
-__all__ = ['generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', 'full_vehicle_preview_payload']
+__all__ = ['generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', 'full_vehicle_preview_payload']

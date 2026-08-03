@@ -5,10 +5,14 @@ from .shared import *
 
 
 class RecommendationsUIMixin:
-    """Structural-pair selection and the recommendation review/apply workflow."""
+    """The recommendation review/apply workflow."""
 
-    def _part_option_label(self, object_id: str) -> str:
-        display = self._part_display_name(object_id)
+    def _part_option_label(
+        self,
+        object_id: str,
+        object_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> str:
+        display = self._part_display_label(object_id, object_ids)
         if display == object_id:
             return object_id
         return f"{display} ({object_id})"
@@ -22,6 +26,8 @@ class RecommendationsUIMixin:
             ("_RR", "_RL"),
             ("_left", "_right"),
             ("_right", "_left"),
+            ("_lhd", "_rhd"),
+            ("_rhd", "_lhd"),
             ("_driver", "_passenger"),
             ("_passenger", "_driver"),
             ("_L", "_R"),
@@ -67,16 +73,19 @@ class RecommendationsUIMixin:
     def _structural_candidate_ids(self, object_id: str) -> list[str]:
         if self.context is None:
             return []
-        base_ids = self.resolved_part_ids or list(self.context.objects)
+        candidates: list[str] = []
         seen: set[str] = set()
-        out: list[str] = []
-        for candidate in base_ids:
-            if candidate == object_id or candidate not in self.context.objects or candidate in seen:
+        for candidate in self.resolved_part_ids or self.current_part_ids:
+            candidate = self._part_row_mesh_id(candidate)
+            if candidate == object_id or candidate in seen:
                 continue
-            out.append(candidate)
+            obj = self.context.objects.get(candidate)
+            if obj is None or not obj.dae_path:
+                continue
+            candidates.append(candidate)
             seen.add(candidate)
-        out.sort(key=lambda item: self._part_display_name(item).lower())
-        return out
+        candidates.sort(key=lambda item: self._part_display_name(item).lower())
+        return candidates
 
     def _suggest_structural_source(self, object_id: str, candidates: list[str]) -> str | None:
         return self._name_pair_candidate(object_id, candidates) or self._geometry_pair_candidate(
@@ -95,44 +104,44 @@ class RecommendationsUIMixin:
         if suggested and suggested not in candidates:
             candidates.append(suggested)
         if not candidates:
-            self._show_error("Mirror Structural", "No other used mesh is available to mirror from.")
+            self._show_error("Swap Mesh", "No other used mesh is available to mirror from.")
             return None
 
-        value_by_label = {self._part_option_label(candidate): candidate for candidate in candidates}
+        label_universe = [object_id, *candidates]
+        value_by_label = {
+            self._part_option_label(candidate, label_universe): candidate
+            for candidate in candidates
+        }
         label_by_value = {value: label for label, value in value_by_label.items()}
 
         modal = tk.Toplevel(self)
-        modal.title("Mirror Structural")
+        modal.title("Swap Mesh")
         modal.transient(self)
         modal.resizable(False, False)
         modal.columnconfigure(1, weight=1)
 
-        ttk.Label(modal, text="Part").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
-        ttk.Label(modal, text=self._part_option_label(object_id)).grid(
+        ttk.Label(modal, text="Mesh").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        ttk.Label(modal, text=self._part_option_label(object_id, label_universe)).grid(
             row=0,
             column=1,
-            sticky="ew",
+            sticky="w",
             padx=(0, 10),
             pady=(10, 4),
         )
-        ttk.Label(modal, text="Swap with").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        ttk.Label(modal, text="Mirror From").grid(row=1, column=0, sticky="w", padx=10, pady=4)
         source_var = tk.StringVar()
-        initial = existing if existing in label_by_value else suggested
-        if initial in label_by_value:
-            source_var.set(label_by_value[initial])
-        else:
-            source_var.set(self._part_option_label(candidates[0]))
         combo = ttk.Combobox(
             modal,
             textvariable=source_var,
             values=list(value_by_label),
             state="readonly",
-            width=72,
+            width=52,
+            height=min(max(len(value_by_label), 1), 16),
         )
         combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=4)
 
         suggestion_text = (
-            f"Suggested: {self._part_option_label(suggested)}"
+            f"Suggested: {self._part_option_label(suggested, label_universe)}"
             if suggested
             else "Suggested: no obvious pair found"
         )
@@ -145,41 +154,35 @@ class RecommendationsUIMixin:
             pady=(0, 8),
         )
 
-        result: dict[str, str | None] = {"source": None}
+        if existing and existing in label_by_value:
+            source_var.set(label_by_value[existing])
+        elif suggested and suggested in label_by_value:
+            source_var.set(label_by_value[suggested])
 
-        def use_suggested() -> None:
-            if suggested and suggested in label_by_value:
-                source_var.set(label_by_value[suggested])
+        result: dict[str, str | None] = {"source": None}
 
         def commit() -> None:
             selected = value_by_label.get(source_var.get())
             if not selected:
-                self._show_error("Mirror Structural", "Select a source mesh to mirror from.", parent=modal)
+                self._show_error("Swap Mesh", "Select a source mesh to mirror from.", parent=modal)
                 return
             if selected == object_id:
-                self._show_error(
-                    "Mirror Structural",
-                    "A mesh cannot structurally mirror from itself.",
-                    parent=modal,
-                )
+                self._show_error("Swap Mesh", "A mesh cannot swap from itself.", parent=modal)
                 return
             result["source"] = selected
             modal.destroy()
 
-        def cancel() -> None:
-            modal.destroy()
-
         buttons = ttk.Frame(modal)
         buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="Use Suggested", command=use_suggested).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="OK", command=commit).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=modal.destroy).pack(side="right")
+        ttk.Button(buttons, text="Apply", command=commit).pack(side="right", padx=(0, 6))
 
+        modal.protocol("WM_DELETE_WINDOW", modal.destroy)
+        modal.bind("<Escape>", lambda _event: modal.destroy())
         modal.bind("<Return>", lambda _event: commit())
-        modal.bind("<Escape>", lambda _event: cancel())
         self._place_modal_on_app_monitor(modal)
-        modal.grab_set()
         combo.focus_set()
+        modal.grab_set()
         self.wait_window(modal)
         return result["source"]
 
@@ -205,7 +208,7 @@ class RecommendationsUIMixin:
 
         modal = tk.Toplevel(self)
         self.recommendation_modal = modal
-        modal.title("Recommended Part Modes")
+        modal.title("Recommended Mesh Transforms")
         modal.transient(self)
         modal.geometry("1040x560")
         modal.minsize(820, 420)
@@ -244,9 +247,9 @@ class RecommendationsUIMixin:
         self.recommendation_tree = tree
         headings = {
             "apply": "Selected",
-            "mode": "Recommended",
-            "part": "Part",
-            "source": "Pair / Source",
+            "mode": "Transform",
+            "part": "Mesh",
+            "source": "Swap Source",
             "current": "Current",
             "reason": "Reason",
         }
@@ -331,6 +334,12 @@ class RecommendationsUIMixin:
         for item in tree.get_children():
             tree.delete(item)
         self.recommendation_rows = {}
+        label_universe = sorted({
+            str(recommendation.get(key) or "")
+            for recommendation in recommendations
+            for key in ("object_id", "source_id")
+            if recommendation.get(key)
+        })
         for index, recommendation in enumerate(recommendations):
             row_id = f"rec_{index}"
             self.recommendation_rows[row_id] = recommendation
@@ -345,8 +354,8 @@ class RecommendationsUIMixin:
                 values=(
                     "Y",
                     mode_label(recommendation["mode"]),
-                    self._part_option_label(object_id),
-                    self._part_option_label(source_id) if source_id else "",
+                    self._part_option_label(object_id, label_universe),
+                    self._part_option_label(source_id, label_universe) if source_id else "",
                     current,
                     recommendation.get("reason", ""),
                 ),

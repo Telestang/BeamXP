@@ -29,8 +29,10 @@ GEOMETRY_CACHE_VERSION = 3  # 3: apply COLLADA <unit> scale (cm-authored DAEs)
 MODE_COLORS = {
     "skip": (0.62, 0.64, 0.67),
     "translate": (0.36, 0.62, 0.92),
+    "mirrorPosition": (0.25, 0.78, 0.82),
     "mirror": (0.95, 0.60, 0.25),
     "mirrorStructural": (0.85, 0.45, 0.75),
+    "replaceSource": (0.46, 0.75, 0.58),
     "output": (0.95, 0.60, 0.25),
 }
 SELECTED_COLOR = (1.0, 0.85, 0.20)
@@ -319,7 +321,9 @@ class SceneData:
     verts_stock: np.ndarray  # (N,3) float32
     triangles: np.ndarray  # (M,3) int32
     color_ids: np.ndarray  # (N,) float32 palette index
-    # mesh name -> list of (tri_start, tri_end, vert_start, vert_end)
+    # addressable name -> list of (tri_start, tri_end, vert_start, vert_end).
+    # Base mesh names address all rendered placements of that mesh. Duplicate
+    # placement aliases like mesh@@1 address one placement for table selection.
     groups: dict[str, list[tuple[int, int, int, int]]]
     modes: dict[str, str]
     label: str = ""
@@ -327,13 +331,26 @@ class SceneData:
     # Meshes injected on top of the config's own part set (selected-but-
     # inactive parts shown temporarily); excluded from "active" bookkeeping.
     extra: set[str] = field(default_factory=set)
+    base_groups: set[str] = field(default_factory=set)
+    alias_to_mesh: dict[str, str] = field(default_factory=dict)
+    pick_to_row: dict[str, str] = field(default_factory=dict)
+    pick_to_parent: dict[str, str] = field(default_factory=dict)
+    pick_names: list[str] = field(default_factory=list)
 
     @property
     def triangle_count(self) -> int:
         return len(self.triangles)
 
 
-MODE_PALETTE_ORDER = ["skip", "translate", "mirror", "mirrorStructural", "output"]
+MODE_PALETTE_ORDER = [
+    "skip",
+    "translate",
+    "mirrorPosition",
+    "mirror",
+    "mirrorStructural",
+    "replaceSource",
+    "output",
+]
 
 
 def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
@@ -358,6 +375,16 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
     modes: dict[str, str] = {}
     skipped: list[str] = []
     extra: set[str] = set()
+    mesh_counts: dict[str, int] = {}
+    for inst in payload.get("instances", []):
+        mesh_name = str(inst.get("mesh"))
+        if mesh_name:
+            mesh_counts[mesh_name] = mesh_counts.get(mesh_name, 0) + 1
+    mesh_ordinals: dict[str, int] = {}
+    pick_names: list[str] = []
+    alias_to_mesh: dict[str, str] = {}
+    pick_to_row: dict[str, str] = {}
+    pick_to_parent: dict[str, str] = {}
     vert_base = 0
     tri_base = 0
 
@@ -410,7 +437,21 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
         matrix_stock = np.asarray(stock_flat, dtype=np.float64).reshape(4, 4)
         mode = str(inst.get("mode") or "skip")
         mesh_name = str(inst.get("mesh"))
+        ordinal = mesh_ordinals.get(mesh_name, 0) + 1
+        mesh_ordinals[mesh_name] = ordinal
+        instance_name = f"{mesh_name}@@{ordinal}" if mesh_counts.get(mesh_name, 0) > 1 else mesh_name
         modes.setdefault(mesh_name, mode)
+        modes.setdefault(instance_name, mode)
+        alias_to_mesh.setdefault(mesh_name, mesh_name)
+        alias_to_mesh[instance_name] = mesh_name
+        row_mesh = str(inst.get("row_mesh") or "")
+        if row_mesh:
+            pick_to_row[mesh_name] = row_mesh
+            pick_to_row[instance_name] = row_mesh
+        row_parent_mesh = str(inst.get("row_parent_mesh") or "")
+        if row_parent_mesh:
+            pick_to_parent[mesh_name] = row_parent_mesh
+            pick_to_parent[instance_name] = row_parent_mesh
         if inst.get("extra"):
             extra.add(mesh_name)
         try:
@@ -420,6 +461,8 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
 
         inst_vert_start = vert_base
         inst_tri_start = tri_base
+        draw_entries = []
+        mirror_position_stock_points = []
         for node_matrix, gid in node_entries:
             verts, triangles = geometry.geoms[gid]
             full_conv = matrix_conv @ node_matrix
@@ -430,21 +473,37 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
             ):
                 continue
             verts64 = verts.astype(np.float64)
-            conv = verts64 @ full_conv[:3, :3].T + full_conv[:3, 3]
             stock = verts64 @ full_stock[:3, :3].T + full_stock[:3, 3]
+            if mode == "mirrorPosition":
+                mirror_position_stock_points.append(stock)
+                conv = stock
+            else:
+                conv = verts64 @ full_conv[:3, :3].T + full_conv[:3, 3]
+            draw_entries.append((conv, stock, triangles))
+        if mode == "mirrorPosition" and mirror_position_stock_points:
+            stock_points = np.vstack(mirror_position_stock_points)
+            center_x = float((stock_points[:, 0].min() + stock_points[:, 0].max()) * 0.5)
+            delta = np.array([-2.0 * center_x, 0.0, 0.0], dtype=np.float64)
+            draw_entries = [(conv + delta, stock, triangles) for conv, stock, triangles in draw_entries]
+        for conv, stock, triangles in draw_entries:
             verts_conv.append(conv.astype(np.float32))
             verts_stock.append(stock.astype(np.float32))
             tris.append(triangles.astype(np.int32) + vert_base)
-            color_ids.append(np.full(len(verts), float(palette_index), dtype=np.float32))
-            vert_base += len(verts)
+            color_ids.append(np.full(len(conv), float(palette_index), dtype=np.float32))
+            vert_base += len(conv)
             tri_base += len(triangles)
         if tri_base == inst_tri_start:
             # every node entry was dropped (hidden far away) - no group span
             skipped.append(mesh_name)
             continue
-        groups.setdefault(mesh_name, []).append((inst_tri_start, tri_base, inst_vert_start, vert_base))
+        span = (inst_tri_start, tri_base, inst_vert_start, vert_base)
+        groups.setdefault(mesh_name, []).append(span)
+        if instance_name != mesh_name:
+            groups.setdefault(instance_name, []).append(span)
+        pick_names.append(instance_name)
 
-    extra &= set(groups)
+    base_groups = set(mesh_counts) & set(groups)
+    extra &= base_groups
     if not tris:
         empty3 = np.zeros((0, 3), dtype=np.float32)
         return SceneData(empty3, empty3, np.zeros((0, 3), dtype=np.int32), np.zeros(0, dtype=np.float32), {}, {})
@@ -459,6 +518,11 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
         label=str(payload.get("output_name") or payload.get("config_name") or ""),
         skipped=skipped,
         extra=extra,
+        base_groups=base_groups,
+        alias_to_mesh=alias_to_mesh,
+        pick_to_row=pick_to_row,
+        pick_to_parent=pick_to_parent,
+        pick_names=pick_names,
     )
 
 
@@ -485,7 +549,7 @@ void main() {
 
 FRAGMENT_SHADER = """
 #version 330
-uniform vec3 palette[6];
+uniform vec3 palette[8];
 uniform vec3 background;
 uniform float dimmed_opacity;
 uniform float global_opacity;
@@ -498,11 +562,11 @@ void main() {
     vec3 normal = normalize(cross(dFdx(v_viewpos), dFdy(v_viewpos)));
     float diffuse = abs(normal.z);                       // headlight
     float rim = pow(1.0 - abs(normal.z), 2.0) * 0.10;
-    int index = clamp(int(v_color + 0.5), 0, 4);
+    int index = clamp(int(v_color + 0.5), 0, 6);
     float selected = clamp(v_selected, 0.0, 1.0);
     float dimmed = clamp(v_dimmed, 0.0, 1.0) * (1.0 - selected);
     vec3 base = palette[index];
-    base = mix(base, palette[5], selected);
+    base = mix(base, palette[7], selected);
     vec3 color = base * (0.38 + 0.62 * diffuse) + rim;
     // Dimmed (out-of-filter) parts recede toward the background but stay solid.
     color = mix(background, color, mix(1.0, dimmed_opacity, dimmed));
@@ -734,10 +798,9 @@ class GLRenderer:
             [(self._vbo_stock, "3f", "in_pos")],
             index_buffer=self._ibo_outline,
         )
-        # Per-vertex pick id: mesh k (in group insertion order) -> id k+1, so 0
-        # stays free for "background / nothing hit". All verts of one mesh share
-        # its id, so the flat-shaded pick pass reports the mesh under the cursor.
-        self._pick_names = list(scene.groups.keys())
+        # Per-vertex pick id: one rendered placement -> id k+1, so duplicate
+        # mesh placements can be picked as mesh@@1 / mesh@@2 table rows.
+        self._pick_names = list(scene.pick_names or scene.base_groups or scene.groups.keys())
         pick_ids = np.zeros(len(scene.color_ids), dtype=np.float32)
         for index, name in enumerate(self._pick_names):
             for _t0, _t1, v0, v1 in scene.groups.get(name, ()):
@@ -778,6 +841,13 @@ class GLRenderer:
                 flags[v0:v1] = 1.0
         self._vbo_dimmed.write(flags.tobytes())
 
+    def _name_visible(self, name: str) -> bool:
+        if self.scene is None or self._visible_names is None:
+            return True
+        mesh = self.scene.alias_to_mesh.get(name, name)
+        row = self.scene.pick_to_row.get(name, "")
+        return name in self._visible_names or mesh in self._visible_names or row in self._visible_names
+
     def set_visible(self, mesh_names: set[str] | None) -> None:
         """None -> everything visible; otherwise rebuild the index buffer."""
         if self.scene is None or self._ibo is None:
@@ -808,7 +878,7 @@ class GLRenderer:
             return
         edge_chunks: list[np.ndarray] = []
         for name in self._selected_names:
-            if self._visible_names is not None and name not in self._visible_names:
+            if not self._name_visible(name):
                 continue
             for t0, t1, _v0, _v1 in self.scene.groups.get(name, ()):
                 tris = self.scene.triangles[t0:t1]
@@ -992,7 +1062,10 @@ class GLRenderer:
         pick_id = raw[0] | (raw[1] << 8) | (raw[2] << 16)
         if pick_id <= 0 or pick_id > len(self._pick_names):
             return None
-        return self._pick_names[pick_id - 1]
+        name = self._pick_names[pick_id - 1]
+        if self.scene is not None:
+            return self.scene.pick_to_row.get(name, name)
+        return name
 
 
 def create_renderer() -> GLRenderer:
@@ -1106,7 +1179,7 @@ class MeshPreview:
         self.renderer.set_visible(self.visible_ids)
         self.renderer.set_selection(self.selected_ids)
         self.renderer.set_dimmed(self.dimmed_ids)
-        parts = len(scene.groups)
+        parts = len(scene.base_groups or scene.groups)
         self.status_var.set(
             f"{scene.label}: {parts} mesh(es), {scene.triangle_count:,} tris"
             + (f", {len(scene.skipped)} without geometry" if scene.skipped else "")

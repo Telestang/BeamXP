@@ -124,7 +124,7 @@ from beamxp.core.models import (
 )
 
 # ---------------------------------------------------------------------------
-# Spatial geometry for Recommend Modes
+# Spatial geometry for Recommend Transforms
 #
 # The classifier in beamng_hand_drive_tool.build_mode_recommendations reasons
 # from the driver's viewpoint: an eye point parsed from the jbeam internal

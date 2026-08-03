@@ -19,6 +19,18 @@ def default_beamng_mods_dir() -> Path:
     return local_appdata / "BeamNG" / "BeamNG.drive" / "current" / "mods"
 
 
+def default_beamng_vehicles_dir() -> Path | None:
+    """The game install's content/vehicles, discovered via the same Steam probe
+    used to find common.zip. None when no install is found."""
+    from beamxp.core.files import beamng_game_common_zips
+
+    for common_zip in beamng_game_common_zips():
+        folder = common_zip.parent
+        if folder.is_dir():
+            return folder
+    return None
+
+
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 SOURCE_ROOT_DIR = APP_DIR if getattr(sys, "frozen", False) else APP_DIR.parent
 USER_DATA_DIR = Path(os.environ.get("BEAMXP_DATA_DIR") or os.environ.get("BEAMHDC_DATA_DIR") or default_user_data_dir())
@@ -40,8 +52,17 @@ ACTION_SKIP = "Skip"
 MODE_SKIP = "skip"
 MODE_MIRROR = "mirror"
 MODE_MIRROR_STRUCTURAL = "mirrorStructural"
+MODE_REPLACE_SOURCE = "replaceSource"
+MODE_MIRROR_POSITION = "mirrorPosition"
 MODE_TRANSLATE = "translate"
-MODE_CHOICES = (MODE_SKIP, MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_TRANSLATE)
+MODE_CHOICES = (
+    MODE_SKIP,
+    MODE_TRANSLATE,
+    MODE_MIRROR_POSITION,
+    MODE_MIRROR,
+    MODE_MIRROR_STRUCTURAL,
+    MODE_REPLACE_SOURCE,
+)
 BUILD_OFF = "off"
 BUILD_CONVERTED = "converted"
 BUILD_ORIGINAL = "original"

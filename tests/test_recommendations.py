@@ -333,7 +333,7 @@ class ScopeTests(unittest.TestCase):
     def test_door_card_pairs_and_exterior_skin_gets_nothing(self) -> None:
         recs = recommend(make_context(base_cabin()))
         self.assertIn("veh_card_FL", recs)
-        self.assertEqual(recs["veh_card_FL"]["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(recs["veh_card_FL"]["kind"], "pair")
         self.assertEqual(recs["veh_card_FL"]["source_id"], "veh_card_FR")
         self.assertNotIn("veh_skin_FL", recs)
         self.assertNotIn("veh_skin_FR", recs)
@@ -688,7 +688,7 @@ class SymmetryAndPairingTests(unittest.TestCase):
         self.assertNotIn("veh_bench", bench_recs)
 
         bucket_recs = recommend(make_context(base_cabin()))
-        self.assertEqual(bucket_recs["veh_seat_FL"]["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(bucket_recs["veh_seat_FL"]["kind"], "pair")
         self.assertEqual(bucket_recs["veh_seat_FL"]["source_id"], "veh_seat_FR")
 
     def test_rear_bench_with_R_suffix_is_judged_by_geometry_not_name(self) -> None:
@@ -725,7 +725,7 @@ class SymmetryAndPairingTests(unittest.TestCase):
         paired_recs = recommend(paired)
         pair = paired_recs.get("fixture_base_FL") or paired_recs.get("fixture_base_FR")
         self.assertIsNotNone(pair)
-        self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(pair["kind"], "pair")
 
         single = make_context(
             meshes,
@@ -787,7 +787,7 @@ class SymmetryAndPairingTests(unittest.TestCase):
         recs = recommend(cotrim)
         pair = recs.get("veh_intmirror_lhd") or recs.get("veh_intmirror_rhd")
         self.assertIsNotNone(pair)
-        self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(pair["kind"], "pair")
 
     def test_wing_mirrors_and_door_glass_pair_by_geometry(self) -> None:
         meshes = base_cabin()
@@ -808,14 +808,14 @@ class SymmetryAndPairingTests(unittest.TestCase):
         recs = recommend(context)
         glass_pair = recs.get("veh_doorglass_FL") or recs.get("veh_doorglass_FR")
         self.assertIsNotNone(glass_pair)
-        self.assertEqual(glass_pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(glass_pair["kind"], "pair")
         self.assertEqual(
             {glass_pair["object_id"], glass_pair["source_id"]},
             {"veh_doorglass_FL", "veh_doorglass_FR"},
         )
         pair = recs.get("veh_wing_L") or recs.get("veh_wing_R")
         self.assertIsNotNone(pair)
-        self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(pair["kind"], "pair")
         self.assertEqual(
             {pair["object_id"], pair["source_id"]}, {"veh_wing_L", "veh_wing_R"}
         )
@@ -879,7 +879,7 @@ class MaterialTests(unittest.TestCase):
 
         pair = recs.get("inert_alias_L") or recs.get("inert_alias_R")
         self.assertIsNotNone(pair)
-        self.assertEqual(pair["mode"], core.MODE_MIRROR_STRUCTURAL)
+        self.assertEqual(pair["kind"], "pair")
         self.assertEqual(
             {pair["object_id"], pair["source_id"]},
             {"inert_alias_L", "inert_alias_R"},

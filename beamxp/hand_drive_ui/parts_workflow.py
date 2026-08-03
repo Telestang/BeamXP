@@ -6,8 +6,343 @@ from .shared import *
 class PartsWorkflowMixin:
     """Part inventory refresh, filtering, selection, viewer synchronisation, and variant interaction."""
 
+    def _part_row_mesh_id(self, row_id: object) -> str:
+        text = str(row_id)
+        return getattr(self, "part_row_mesh_ids", {}).get(text, text.split("@@", 1)[0])
+
+    def _part_row_side_ref(self, row_id: object) -> str:
+        text = str(row_id)
+        return getattr(self, "part_row_side_refs", {}).get(text, text)
+
+    def _selected_part_mesh_ids(self) -> set[str]:
+        if not hasattr(self, "part_tree"):
+            return set()
+        return {
+            self._part_row_mesh_id(row_id)
+            for row_id in self.part_tree.selection()
+            if self.part_tree.exists(row_id)
+        }
+
+    def _selected_preview_ids(self) -> set[str]:
+        if not hasattr(self, "part_tree"):
+            return set()
+        selected = {
+            str(row_id)
+            for row_id in self.part_tree.selection()
+            if self.part_tree.exists(row_id)
+        }
+        if not selected:
+            return set()
+        selected_meshes = {
+            self._part_row_mesh_id(row_id)
+            for row_id in self.part_tree.selection()
+            if self.part_tree.exists(row_id)
+        }
+        scene = getattr(self.viewer, "scene", None) if getattr(self, "viewer", None) is not None else None
+        pick_to_row = getattr(scene, "pick_to_row", {}) if scene is not None else {}
+        if isinstance(pick_to_row, dict):
+            for preview_mesh, row_mesh in pick_to_row.items():
+                preview_mesh = str(preview_mesh)
+                row_mesh = str(row_mesh)
+                if row_mesh in selected or row_mesh in selected_meshes:
+                    selected.add(preview_mesh)
+        return selected
+
+    def _part_row_label(
+        self,
+        row_id: str,
+        mesh_id: str,
+        label_universe: list[str],
+    ) -> str:
+        display = self._part_display_label(mesh_id, label_universe)
+        row = getattr(self, "part_instance_rows", {}).get(row_id)
+        if not row:
+            return display
+        if row.get("display_count_for_mesh", row.get("count_for_mesh", 1)) > 1:
+            display = f"{display} #{row.get('display_ordinal_for_mesh', row.get('ordinal_for_mesh', 1))}"
+        return display
+
+    @staticmethod
+    def _mesh_instance_number_key(instance: object) -> str:
+        slot_id = str(getattr(instance, "slot_id", "") or "")
+        if slot_id:
+            base = f"slot:{slot_id}"
+        slot_path = str(getattr(instance, "slot_path", "") or "")
+        if not slot_id and slot_path:
+            base = f"path:{slot_path}"
+        if not slot_id and not slot_path:
+            base = str(getattr(instance, "instance_id", "") or "")
+        position = getattr(instance, "position", None)
+        if isinstance(position, tuple) and position:
+            x = float(position[0])
+            if x > 1e-4:
+                return f"{base}|x:+"
+            if x < -1e-4:
+                return f"{base}|x:-"
+            return f"{base}|x:0"
+        return base
+
+    def _mesh_instance_number_for_ref(self, ref: str) -> tuple[int, int] | None:
+        if self.context is None:
+            return None
+        mesh_id = ref.split("@@", 1)[0]
+        if not mesh_id:
+            return None
+        numbering = self._vehicle_mesh_instance_numbering().get(mesh_id, {})
+        if not numbering:
+            return None
+        for config_name in sorted(self.context.variants):
+            try:
+                instances = core.selected_mesh_transform_instances_for_config(self.context, config_name)
+            except Exception:
+                continue
+            for instance in instances:
+                if instance.mesh_id != mesh_id:
+                    continue
+                if instance.instance_id != ref:
+                    continue
+                ordinal = numbering.get(self._mesh_instance_number_key(instance))
+                if ordinal is not None:
+                    return ordinal, len(numbering)
+        return None
+
+    def _mesh_instance_label_for_ref(
+        self,
+        ref: str,
+        label_universe: list[str] | tuple[str, ...] | None = None,
+    ) -> str:
+        mesh_id = ref.split("@@", 1)[0]
+        display = self._part_display_name(mesh_id)
+        numbered = self._mesh_instance_number_for_ref(ref)
+        if numbered is None:
+            return self._part_display_label(mesh_id, label_universe)
+        ordinal, count = numbered
+        return f"{display} #{ordinal}" if count > 1 else display
+
+    def _vehicle_mesh_instance_numbering(self) -> dict[str, dict[str, int]]:
+        if self.context is None:
+            return {}
+        cache_key = id(self.context)
+        if (
+            getattr(self, "mesh_instance_numbering_key", None) == cache_key
+            and isinstance(getattr(self, "mesh_instance_numbering_cache", None), dict)
+        ):
+            return self.mesh_instance_numbering_cache
+        keys_by_mesh: dict[str, set[str]] = {}
+        for config_name in sorted(self.context.variants):
+            try:
+                instances = core.selected_mesh_transform_instances_for_config(self.context, config_name)
+            except Exception:
+                continue
+            for instance in instances:
+                mesh_id = str(instance.mesh_id)
+                key = self._mesh_instance_number_key(instance)
+                if mesh_id and key:
+                    keys_by_mesh.setdefault(mesh_id, set()).add(key)
+        numbering = {
+            mesh_id: {
+                key: index + 1
+                for index, key in enumerate(sorted(keys, key=str.lower))
+            }
+            for mesh_id, keys in keys_by_mesh.items()
+            if len(keys) > 1
+        }
+        self.mesh_instance_numbering_key = cache_key
+        self.mesh_instance_numbering_cache = numbering
+        return numbering
+
+    def _part_table_rows(self, ids: list[str]) -> list[dict[str, object]]:
+        if self.context is None:
+            return []
+        config = self._mesh_scene_config()
+        vehicle_numbering = self._vehicle_mesh_instance_numbering()
+        rows: list[dict[str, object]] = []
+        used: set[str] = set()
+        row_id_counts: dict[str, int] = {}
+        if config is not None and config in self.context.variants:
+            try:
+                instances = core.selected_mesh_transform_instances_for_config(self.context, config)
+            except Exception:
+                instances = []
+            for instance in instances:
+                mesh_id = instance.mesh_id
+                if mesh_id not in ids or mesh_id not in self.context.objects:
+                    continue
+                used.add(mesh_id)
+                number_key = self._mesh_instance_number_key(instance)
+                mesh_numbering = vehicle_numbering.get(mesh_id, {})
+                display_ordinal = mesh_numbering.get(number_key, instance.ordinal_for_mesh)
+                display_count = len(mesh_numbering) if mesh_numbering else instance.count_for_mesh
+                base_row_id = f"{mesh_id}@@{display_ordinal}" if display_count > 1 else mesh_id
+                row_occurrence = row_id_counts.get(base_row_id, 0) + 1
+                row_id_counts[base_row_id] = row_occurrence
+                row_id = base_row_id if row_occurrence == 1 else f"{base_row_id}@@row{row_occurrence}"
+                rows.append({
+                    "row_id": row_id,
+                    "mesh_id": mesh_id,
+                    "side_ref": instance.instance_id,
+                    "part_id": instance.part_id,
+                    "slot_id": instance.slot_id,
+                    "slot_path": instance.slot_path,
+                    "position": instance.position,
+                    "count_for_mesh": instance.count_for_mesh,
+                    "ordinal_for_mesh": instance.ordinal_for_mesh,
+                    "display_count_for_mesh": display_count,
+                    "display_ordinal_for_mesh": display_ordinal,
+                    "instance_number_key": number_key,
+                })
+        for mesh_id in ids:
+            if mesh_id in used or mesh_id not in self.context.objects:
+                continue
+            rows.append({
+                "row_id": mesh_id,
+                "mesh_id": mesh_id,
+                "side_ref": mesh_id,
+                "part_id": "",
+                "slot_id": "",
+                "slot_path": "",
+                "position": None,
+                "count_for_mesh": 1,
+                "ordinal_for_mesh": 1,
+            })
+        rows.sort(key=lambda row: (str(row["mesh_id"]).lower(), str(row["row_id"])))
+        return rows
+
+    def _replace_source_child_overrides(
+        self,
+        rows: list[dict[str, object]],
+        label_universe: list[str],
+    ) -> dict[str, dict[str, str]]:
+        parts = self.conversion.get("parts", {})
+        if not isinstance(parts, dict):
+            return {}
+        parents: list[dict[str, str]] = []
+        for row in rows:
+            row_id = str(row.get("row_id") or "")
+            mesh_id = str(row.get("mesh_id") or "")
+            slot_path = str(row.get("slot_path") or "")
+            settings = parts.get(mesh_id)
+            if (
+                not row_id
+                or not mesh_id
+                or not slot_path
+                or not isinstance(settings, dict)
+                or settings.get("mode") != core.MODE_REPLACE_SOURCE
+                or not settings.get("includeChildren")
+            ):
+                continue
+            parents.append(
+                {
+                    "row_id": row_id,
+                    "mesh_id": mesh_id,
+                    "part_id": str(row.get("part_id") or ""),
+                    "slot_path": slot_path,
+                    "label": self._part_row_label(row_id, mesh_id, label_universe),
+                }
+            )
+        overrides: dict[str, dict[str, str]] = {}
+        for row in rows:
+            row_id = str(row.get("row_id") or "")
+            slot_path = str(row.get("slot_path") or "")
+            if not row_id or not slot_path:
+                continue
+            matches = [
+                parent
+                for parent in parents
+                if parent["row_id"] != row_id
+                and (
+                    (
+                        slot_path == parent["slot_path"]
+                        and str(row.get("part_id") or "") == parent.get("part_id", "")
+                    )
+                    or (
+                        slot_path != parent["slot_path"]
+                        and slot_path.startswith(parent["slot_path"])
+                    )
+                )
+            ]
+            if not matches:
+                continue
+            parent = max(matches, key=lambda item: len(item["slot_path"]))
+            override = dict(parent)
+            override["kind"] = "child"
+            overrides[row_id] = override
+        scene = getattr(self.viewer, "scene", None) if getattr(self, "viewer", None) is not None else None
+        pick_to_row = getattr(scene, "pick_to_row", {}) if scene is not None else {}
+        if isinstance(pick_to_row, dict):
+            by_mesh = {str(row.get("mesh_id") or ""): row for row in rows}
+            parents_by_mesh = {parent["mesh_id"]: parent for parent in parents}
+            pick_to_parent = getattr(scene, "pick_to_parent", {}) if scene is not None else {}
+            for preview_mesh, row_mesh in pick_to_row.items():
+                preview_mesh = str(preview_mesh)
+                row_mesh = str(row_mesh)
+                if "@@" in preview_mesh:
+                    continue
+                parent = overrides.get(row_mesh)
+                if not parent and isinstance(pick_to_parent, dict):
+                    parent = parents_by_mesh.get(str(pick_to_parent.get(preview_mesh) or ""))
+                if not parent:
+                    continue
+                preview_label = self._part_display_label(preview_mesh, [*label_universe, preview_mesh])
+                if row_mesh != preview_mesh and row_mesh != parent["mesh_id"]:
+                    replaced = dict(parent)
+                    replaced["kind"] = "replaced"
+                    replaced["preview_mesh"] = preview_mesh
+                    replaced["source_label"] = f"{preview_label} via {parent['label']}"
+                    overrides[row_mesh] = replaced
+                if preview_mesh in by_mesh:
+                    source = dict(parent)
+                    source["kind"] = "source"
+                    source["preview_mesh"] = preview_mesh
+                    source["source_label"] = f"via {parent['label']}"
+                    overrides[preview_mesh] = source
+        return overrides
+
+    def _part_child_override(self, row_id: object) -> dict[str, str] | None:
+        override = getattr(self, "part_child_overrides", {}).get(str(row_id))
+        return override if isinstance(override, dict) else None
+
+    def _part_child_source_label(self, override: dict[str, str]) -> str:
+        return str(override.get("source_label") or override.get("label") or "")
+
+    def _part_override_mode_label(self, override: dict[str, str]) -> str:
+        kind = str(override.get("kind") or "child")
+        if kind == "source":
+            return "Source"
+        if kind == "replaced":
+            return "Replaced"
+        return "Child"
+
+    def _part_override_children_label(self, override: dict[str, str]) -> str:
+        return "Child" if str(override.get("kind") or "child") == "child" else "N/A"
+
+    def _part_override_status_label(self, override: dict[str, str]) -> str:
+        source = self._part_child_source_label(override)
+        kind = str(override.get("kind") or "child")
+        if kind == "source":
+            return f"Source geometry shown {source}"
+        if kind == "replaced":
+            return f"Replaced by {source}"
+        return f"Child transform inherited from {source}"
+
+    def _part_children_label(self, object_id: str, settings: object) -> str:
+        if not isinstance(settings, dict) or settings.get("mode") != core.MODE_REPLACE_SOURCE:
+            return "N/A"
+        return yn_label(settings.get("includeChildren"))
+
     def _refresh_parts(self, *, reset_view: bool = False) -> None:
         if self.context is None:
+            if hasattr(self, "part_tree"):
+                for item in self.part_tree.get_children():
+                    self.part_tree.delete(item)
+            self.current_part_ids = []
+            self.part_row_mesh_ids = {}
+            self.part_row_side_refs = {}
+            self.part_row_positions = {}
+            self.part_instance_rows = {}
+            self.part_child_overrides = {}
+            self._refresh_slots()
+            self._refresh_derived_output_summary()
             return
         query = self.filter_var.get().strip().lower()
         # The x/y/z columns read placed geometry, so make sure it matches the
@@ -26,9 +361,25 @@ class PartsWorkflowMixin:
             self.context,
             selected_variants,
         )
+        label_universe = [object_id for object_id in ids if object_id in self.context.objects]
+        table_rows = self._part_table_rows(ids)
+        self.part_child_overrides = self._replace_source_child_overrides(table_rows, label_universe)
+        self.part_row_mesh_ids = {str(row["row_id"]): str(row["mesh_id"]) for row in table_rows}
+        self.part_row_side_refs = {str(row["row_id"]): str(row["side_ref"]) for row in table_rows}
+        self.part_instance_rows = {str(row["row_id"]): row for row in table_rows}
+        self.part_row_positions = {
+            str(row["row_id"]): (
+                row["position"],
+                str(row["mesh_id"]) in self.context.variant_dependent_meshes,
+            )
+            for row in table_rows
+            if row.get("position") is not None
+        }
         displayed: list[str] = []
         row_index = 0
-        for object_id in ids:
+        for row in table_rows:
+            row_id = str(row["row_id"])
+            object_id = str(row["mesh_id"])
             obj = self.context.objects.get(object_id)
             if obj is None:
                 continue
@@ -36,9 +387,9 @@ class PartsWorkflowMixin:
                 object_id,
                 {
                     "mode": core.MODE_SKIP,
-                    "mirrorSource": None,
                     "translateOffset": None,
                     "steeringRef": False,
+                    "includeChildren": False,
                     "viewerVisible": True,
                     "viewerSolo": False,
                 },
@@ -47,39 +398,57 @@ class PartsWorkflowMixin:
                 continue
             mode = str(settings.get("mode", core.MODE_SKIP))
             display_name = self._part_display_name(object_id)
+            display_label = self._part_row_label(row_id, object_id, label_universe)
+            child_override = self._part_child_override(row_id)
+            mode_display = self._part_override_mode_label(child_override) if child_override else mode_label(mode)
+            source_display = (
+                self._part_child_source_label(child_override)
+                if child_override
+                else self._swap_source_label(object_id, settings)
+            )
             part_type = part_type_label(object_id, flexbody_meshes, prop_meshes)
             if (
                 query
                 and query not in object_id.lower()
                 and query not in display_name.lower()
+                and query not in display_label.lower()
+                and query not in mode_display.lower()
+                and query not in source_display.lower()
+                and query not in str(row.get("slot_path") or "").lower()
+                and query not in str(row.get("part_id") or "").lower()
                 and query not in mode
                 and query not in part_type.lower()
             ):
                 continue
-            displayed.append(object_id)
+            displayed.append(row_id)
             self.part_tree.insert(
                 "",
                 "end",
-                iid=object_id,
-                text=display_name,
+                iid=row_id,
+                text=display_label,
                 tags=self._row_tags(row_index),
                 values=(
                     part_type,
                     yn_label(settings.get("viewerVisible", True)),
                     yn_label(settings.get("viewerSolo")),
                     yn_label(object_id in active_ids),
-                    mode_label(mode),
+                    mode_display,
+                    source_display,
+                    self._part_override_children_label(child_override)
+                    if child_override
+                    else self._part_children_label(object_id, settings),
                     offset_display(
-                        mode,
+                        core.MODE_SKIP if child_override else mode,
                         settings.get("translateOffset"),
                         manual_delta=self.manual_delta_enabled.get(),
                     ),
                     yn_label(settings.get("steeringRef")),
-                    *position_labels(*self._table_position(object_id)),
+                    *position_labels(*self._table_position(row_id)),
                 ),
             )
             row_index += 1
         self.current_part_ids = displayed
+        self._refresh_slots()
         self._restore_tree_order(self.part_tree, previous_order)
         visible_keep = [item for item in keep if self.part_tree.exists(item)]
         if visible_keep:
@@ -159,11 +528,14 @@ class PartsWorkflowMixin:
     def _preview_base_part_ids(self) -> list[str]:
         if self.context is None:
             return []
-        return [
-            object_id
-            for object_id in (self.resolved_part_ids or self.current_part_ids)
-            if object_id in self.context.objects
-        ]
+        seen: set[str] = set()
+        out: list[str] = []
+        for row_id in (self.resolved_part_ids or self.current_part_ids):
+            object_id = self._part_row_mesh_id(row_id)
+            if object_id in self.context.objects and object_id not in seen:
+                seen.add(object_id)
+                out.append(object_id)
+        return out
 
     def _resolved_visible_ids(self) -> set[str]:
         """The set of parts actually present in the active preview / final
@@ -201,14 +573,22 @@ class PartsWorkflowMixin:
         # the live selection hides a stale extra instantly after deselection,
         # before the scene rebuild that drops it has landed.
         scene = getattr(self.viewer, "scene", None)
-        visible_ids |= set(getattr(scene, "extra", ()) or ()) & set(self.part_tree.selection())
-        dimmed_ids = visible_ids - set(self.current_part_ids)
+        selected_meshes = self._selected_part_mesh_ids()
+        pick_to_row = getattr(scene, "pick_to_row", {}) if scene is not None else {}
+        if isinstance(pick_to_row, dict):
+            for preview_mesh, row_mesh in pick_to_row.items():
+                if str(row_mesh) in visible_ids:
+                    visible_ids.add(str(preview_mesh))
+        visible_ids |= set(getattr(scene, "extra", ()) or ()) & selected_meshes
+        current_mesh_ids = {self._part_row_mesh_id(row_id) for row_id in self.current_part_ids}
+        dimmed_ids = visible_ids - current_mesh_ids
         self.viewer.set_visible_ids(list(visible_ids), reset=reset)
         if hasattr(self.viewer, "set_dimmed_ids"):
             self.viewer.set_dimmed_ids(dimmed_ids)
         # Selection only drives the highlight outline (skipped for hidden parts
         # in the renderer); it never adds a part to the visible set above.
-        self.viewer.set_selected_ids(set(self.part_tree.selection()))
+        selected_ids = self._selected_preview_ids() if self.viewer_supports_scene else selected_meshes
+        self.viewer.set_selected_ids(selected_ids)
 
     def _preview_active_ids(self) -> set[str]:
         """Object ids present on the trim currently shown in the moderngl
@@ -238,10 +618,14 @@ class PartsWorkflowMixin:
         return {mesh for mesh in all_meshes if mesh in self.context.objects}
 
     def _selected_extra_preview_ids(self) -> list[str]:
-        """Selected table parts NOT used by the previewed config. These get
-        temporarily injected into the GPU scene so selecting an inactive part
-        still shows it; deselecting removes it again. Active parts are never
-        in this list, so their behaviour is unchanged."""
+        """Inactive table meshes that should still be present in the GPU scene.
+
+        Selection and Solo are both explicit user requests to look at a mesh.
+        If the focused trim does not use that mesh, inject it as ``extra`` so
+        the visibility filter cannot collapse the scene to an absent id.
+        Active meshes are never in this list, so normal trim preview behaviour
+        is unchanged.
+        """
         if self.context is None or not hasattr(self, "part_tree"):
             return []
         config = self._mesh_scene_config()
@@ -251,9 +635,17 @@ class PartsWorkflowMixin:
             _flex, _props, all_meshes = core.selected_mesh_roles(self.context, [config])
         except Exception:
             return []
+        parts = self.conversion.get("parts", {})
+        solo_ids = {
+            object_id
+            for object_id in self._preview_base_part_ids()
+            if isinstance(parts, dict)
+            and isinstance(parts.get(object_id), dict)
+            and parts[object_id].get("viewerSolo")
+        }
         return sorted(
             object_id
-            for object_id in self.part_tree.selection()
+            for object_id in self._selected_part_mesh_ids() | solo_ids
             if object_id in self.context.objects and object_id not in all_meshes
         )
 
@@ -263,8 +655,32 @@ class PartsWorkflowMixin:
         if not hasattr(self, "part_tree") or self.part_tree is None:
             return
         active_ids = self._preview_active_ids()
-        for object_id in self.part_tree.get_children():
-            self.part_tree.set(object_id, "active", yn_label(object_id in active_ids))
+        for row_id in self.part_tree.get_children():
+            self.part_tree.set(row_id, "active", yn_label(self._part_row_mesh_id(row_id) in active_ids))
+
+    def _refresh_derived_output_summary(self) -> None:
+        if self.context is None:
+            self.derived_output_var.set("")
+            return
+        modes = core.active_part_modes(self.conversion)
+        move = sum(1 for mode in modes.values() if mode == core.MODE_TRANSLATE)
+        mirror_move = sum(1 for mode in modes.values() if mode == core.MODE_MIRROR_POSITION)
+        mirror = sum(1 for mode in modes.values() if mode == core.MODE_MIRROR)
+        swap = sum(1 for mode in modes.values() if mode == core.MODE_MIRROR_STRUCTURAL)
+        replace = sum(1 for mode in modes.values() if mode == core.MODE_REPLACE_SOURCE)
+        pairs = len(core.active_slot_pairs(self.conversion)) + len(
+            [
+                pair
+                for pair in core.normalized_side_pairs(self.conversion.get("sidePairs"))
+                if pair.get("enabled", True)
+            ]
+        )
+        selected = len(self._selected_variant_names())
+        self.derived_output_var.set(
+            f"{selected} config(s); Move {move}, Mirror Move {mirror_move}, Mirror {mirror}, "
+            f"Swap Mesh {swap}, Replace Source {replace}; "
+            f"{pairs} equivalent pair(s); auto fixes: lights, cameras, bridge parts"
+        )
 
     def _refresh_delta_label(self) -> None:
         if self.context is None:
@@ -285,40 +701,52 @@ class PartsWorkflowMixin:
         if self.context is None:
             self.detail_var.set("")
             return
-        # Every conversion mutation (mode, translate offset, structural pairing,
+        # Every conversion mutation (mode, translate offset, equivalent parts,
         # steering ref, manual delta, variant hand override) funnels through here
         # as its final UI step, so this is where we keep the GPU preview live.
         # _schedule_mesh_scene is snapshot-guarded: pure selection/visibility
         # changes leave the fingerprint unchanged and cost only a cheap compare.
         self._schedule_mesh_scene()
+        self._refresh_derived_output_summary()
         selected_parts = self.part_tree.selection()
         if selected_parts:
-            object_id = selected_parts[0]
+            row_id = selected_parts[0]
+            object_id = self._part_row_mesh_id(row_id)
             obj = self.context.objects.get(object_id)
             settings = self.conversion.get("parts", {}).get(object_id, {})
             if obj:
-                display_name = self._part_display_name(object_id)
+                display_name = self._part_row_label(row_id, object_id, self.resolved_part_ids)
                 mode = str(settings.get("mode", core.MODE_SKIP)) if isinstance(settings, dict) else core.MODE_SKIP
+                child_override = self._part_child_override(row_id)
+                mode_display = self._part_override_mode_label(child_override) if child_override else mode_label(mode)
                 part_offset = (
                     offset_display(
                         mode,
                         settings.get("translateOffset") if isinstance(settings, dict) else None,
                         manual_delta=self.manual_delta_enabled.get(),
                     )
-                    if mode == core.MODE_TRANSLATE
+                    if mode == core.MODE_TRANSLATE and not child_override
                     else "N/A"
                 )
-                position, varies = self._table_position(object_id)
+                position, varies = self._table_position(row_id)
+                source = self._swap_source_label(object_id, settings) if isinstance(settings, dict) else ""
+                if child_override:
+                    source = self._part_child_source_label(child_override)
+                ref_note = ""
+                side_ref = self._part_row_side_ref(row_id)
+                if side_ref != object_id:
+                    row = getattr(self, "part_instance_rows", {}).get(row_id) or {}
+                    ref_note = f", instance #{row.get('ordinal_for_mesh', 1)}"
                 self.detail_var.set(
-                    f"{display_name}: {mode_label(mode)}, "
-                    f"full id {object_id}, x {fmt_float(position[0])}, offset {part_offset}, "
+                    f"{display_name}: {mode_display}, "
+                    f"full id {object_id}{ref_note}, source {source or 'N/A'}, x {fmt_float(position[0])}, offset {part_offset}, "
                     f"dae {obj.dae_path}{self._variant_position_note(object_id) if varies else ''}"
                 )
                 return
         active = len(core.active_part_modes(self.conversion))
         selected_variants = len(self._selected_variant_names())
         self.detail_var.set(
-            f"{len(self.current_part_ids)} displayed part(s), {active} transformed part setting(s), "
+            f"{len(self.current_part_ids)} displayed mesh(es), {active} transform setting(s), "
             f"{selected_variants} selected variant(s)"
         )
 

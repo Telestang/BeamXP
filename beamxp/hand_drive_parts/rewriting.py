@@ -6,6 +6,7 @@ Original source lines 4256-4884. Import the public orchestration module
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from collections.abc import Iterable
@@ -72,6 +73,7 @@ from beamxp.core.models import (
     ResolvedMeshPosition,
     SharedBakeContext,
     SlotDef,
+    SlotRelocation,
     VariantInfo,
     VehicleContext,
 )
@@ -96,7 +98,7 @@ def target_hand_for(
 
 
 def suffix_for_hand(hand: str) -> str:
-    return "_to_rhd" if hand == HAND_RHD else "_to_lhd"
+    return "_xp_rhd" if hand == HAND_RHD else "_xp_lhd"
 
 
 def signed_delta_for_target(hand: str, magnitude: float) -> float:
@@ -112,7 +114,13 @@ def generated_part_name(source_part: str, target_hand: str) -> str:
 
 
 def generated_variant_part_name(source_part: str, target_hand: str, config_name: str) -> str:
-    return f"{generated_part_name(source_part, target_hand)}__{safe_id(config_name)}"
+    """Return the generated part shared by every trim using ``source_part``.
+
+    ``config_name`` remains in the signature for compatibility with callers,
+    but trim-specific IDs make BeamNG expose one near-identical picker entry
+    per converted configuration.
+    """
+    return generated_part_name(source_part, target_hand)
 
 
 def generated_dae_output_path(
@@ -250,6 +258,14 @@ def transform_flexbody_row(
         target_pos = (source_pos[0] + delta_x, source_pos[1], source_pos[2])
         return replace_inline_vector(row, "pos", pos_before_node_transforms(row, target_pos, inherited_options))
 
+    if action == "mirrorPosition":
+        pos = vector_from_row(row, "pos")
+        if pos is None:
+            return row
+        source_pos = pos_after_node_transforms(row, pos, inherited_options)
+        target_pos = (-source_pos[0], source_pos[1], source_pos[2])
+        return replace_inline_vector(row, "pos", pos_before_node_transforms(row, target_pos, inherited_options))
+
     if action == "mirror":
         out = row
         pos = vector_from_row(out, "pos")
@@ -281,6 +297,8 @@ def transform_flexbody_row(
 
 def flexbody_row_can_carry_transform(row: str, action: str) -> bool:
     if action == "translate":
+        return vector_from_row(row, "pos") is not None
+    if action == "mirrorPosition":
         return vector_from_row(row, "pos") is not None
     if action == "mirror":
         return vector_from_row(row, "pos") is not None or vector_from_row(row, "rot") is not None
@@ -436,6 +454,8 @@ def rewrite_prop_meshes_with_globals(
             action, delta_x = prop_row_transforms[matched_old_mesh]
             if action == "translate":
                 target_position = (row_position[0] + delta_x, row_position[1], row_position[2])
+            elif action == "mirrorPosition":
+                target_position = (-row_position[0], row_position[1], row_position[2])
             elif action == "mirror":
                 target_position = (-row_position[0], row_position[1], row_position[2])
             else:
@@ -649,6 +669,445 @@ def part_has_transformable_internal_camera(
     return rewrite_internal_cameras(cameras, node_mirror_map) != cameras
 
 
+# Arrays whose leading columns are node ids. Rewriting them by "any quoted
+# value that is a known node id" is safe because the map only ever contains
+# ids that really exist in this vehicle -- unlike a textual _L/_R guess, which
+# would happily turn the material name bx_floor into bx_flool.
+_NODE_REFERENCE_ARRAYS = (
+    "beams",
+    "triangles",
+    "quads",
+    "hydros",
+    "ropes",
+    "rails",
+    "slidenodes",
+    "torsionbars",
+    "refNodes",
+)
+
+_QUOTED_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def build_lateral_name_map(names: Iterable[str]) -> dict[str, str]:
+    """Pair up names that differ only by a left/right token.
+
+    The pairing must be confirmed from both ends: ``mirror_lateral_node_id``
+    falls back to swapping a trailing l/r, which turns the group ``bx_floor``
+    into the non-existent ``bx_flool``. Requiring the swapped name to be a real
+    name too keeps that guess from ever reaching the output.
+    """
+    known = set(names)
+    return {
+        name: swapped
+        for name in known
+        if (swapped := mirror_lateral_node_id(name)) != name and swapped in known
+    }
+
+
+def relocated_reference(value: str, mirror_map: dict[str, str], known: set[str]) -> str:
+    """Mirror one node id or group name, or leave it alone.
+
+    Falls back to the lateral name swap only when the swapped name is itself
+    known, so an id with no twin stays put instead of becoming a dangling
+    reference.
+    """
+    mapped = mirror_map.get(value)
+    if mapped:
+        return mapped
+    swapped = mirror_lateral_node_id(value)
+    if swapped != value and swapped in known:
+        return swapped
+    return value
+
+
+def mirror_quoted_references(
+    array_text: str,
+    mirror_map: dict[str, str],
+    known: set[str],
+) -> str:
+    return _QUOTED_STRING_RE.sub(
+        lambda match: f'"{relocated_reference(match.group(1), mirror_map, known)}"',
+        array_text,
+    )
+
+
+def mirror_node_rows(
+    array_text: str,
+    mirror_map: dict[str, str],
+    known_nodes: set[str],
+    group_map: dict[str, str],
+    known_groups: set[str],
+) -> str:
+    """Rename node ids, negate posX, and swap group names in a nodes table."""
+    out: list[str] = []
+    cursor = 0
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] != "[":
+            idx += 1
+            continue
+        end = transform_helpers.find_matching(array_text, idx, "[", "]")
+        row = array_text[idx:end]
+        out.append(array_text[cursor:idx])
+        out.append(_mirror_node_row(row, mirror_map, known_nodes, group_map, known_groups))
+        cursor = end
+        idx = end
+    out.append(array_text[cursor:])
+    # Group names also appear as bare {"group":...} directives between rows,
+    # which carry to every following row and so must be swapped too.
+    return _mirror_group_directives("".join(out), group_map, known_groups)
+
+
+def _mirror_node_row(
+    row: str,
+    mirror_map: dict[str, str],
+    known_nodes: set[str],
+    group_map: dict[str, str],
+    known_groups: set[str],
+) -> str:
+    values = split_top_level_values(row.lstrip("[").rstrip("]"))
+    if len(values) < 4:
+        return _mirror_group_directives(row, group_map, known_groups)
+    name = values[0].strip()
+    if not (name.startswith('"') and name.endswith('"')):
+        return row
+    node_id = name[1:-1]
+    if node_id in {"id", "id:"}:
+        return row
+
+    new_id = relocated_reference(node_id, mirror_map, known_nodes)
+    row = transform_helpers.replace_first(row, f'"{node_id}"', f'"{new_id}"')
+
+    match = re.search(rf'"{re.escape(new_id)}"\s*,\s*({NUMBER_RE})', row)
+    if match is not None:
+        flipped = -float(match.group(1))
+        if abs(flipped) < 1e-9:
+            flipped = 0.0
+        row = row[: match.start(1)] + transform_helpers.format_num(flipped) + row[match.end(1) :]
+    return _mirror_group_directives(row, group_map, known_groups)
+
+
+def _mirror_group_directives(
+    text: str,
+    group_map: dict[str, str],
+    known_groups: set[str],
+) -> str:
+    def replace(match: re.Match[str]) -> str:
+        body = match.group(2)
+        swapped = _QUOTED_STRING_RE.sub(
+            lambda inner: f'"{relocated_reference(inner.group(1), group_map, known_groups)}"',
+            body,
+        )
+        return f"{match.group(1)}{swapped}"
+
+    return re.sub(
+        r'("group"\s*:\s*)((?:\[[^\]]*\])|(?:"(?:[^"\\]|\\.)*"))',
+        replace,
+        text,
+    )
+
+
+def mirror_flexbody_group_lists(
+    array_text: str,
+    group_map: dict[str, str],
+    known_groups: set[str],
+) -> str:
+    """Swap the [group]: column of every flexbody row to the other side."""
+    out: list[str] = []
+    cursor = 0
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] != "[":
+            idx += 1
+            continue
+        end = transform_helpers.find_matching(array_text, idx, "[", "]")
+        row = array_text[idx:end]
+        out.append(array_text[cursor:idx])
+        group_start = row.find("[", 1)
+        if group_start == -1:
+            out.append(row)
+        else:
+            try:
+                group_end = transform_helpers.find_matching(row, group_start, "[", "]")
+            except ValueError:
+                out.append(row)
+            else:
+                groups = mirror_quoted_references(
+                    row[group_start:group_end], group_map, known_groups
+                )
+                out.append(row[:group_start] + groups + row[group_end:])
+        cursor = end
+        idx = end
+    out.append(array_text[cursor:])
+    return "".join(out)
+
+
+def relocate_slot_rows(
+    array_text: str,
+    slot_map: dict[str, str],
+    known_slots: set[str],
+) -> str:
+    """Point a relocated part's child slots at their opposite-side names.
+
+    The nodeMove x on those rows is negated with them: a race seat mounted at
+    x=+0.35 by its parent slot has to be mounted at x=-0.35 once the part it
+    hangs off has crossed the car.
+    """
+    text = mirror_quoted_references(array_text, slot_map, known_slots)
+    return re.sub(
+        r'("node(?:Move|Offset)\d*"\s*:\s*\{[^}]*?"x"\s*:\s*)(' + NUMBER_RE + r")",
+        lambda match: f"{match.group(1)}{transform_helpers.format_num(-float(match.group(2)))}",
+        text,
+    )
+
+
+def relocate_part_for_slot(
+    part_body: str,
+    relocation: SlotRelocation,
+    node_mirror_map: dict[str, str],
+    known_nodes: set[str],
+    group_map: dict[str, str],
+    known_groups: set[str],
+    slot_map: dict[str, str],
+    known_slots: set[str],
+) -> str:
+    """Rebuild a part to live in the paired slot on the other side.
+
+    This is the fallback for a slot pair with no authored counterpart part.
+    Unlike ``clone_part_for_target``, which only ever restyles a part's visual
+    rows, this rewrites the part's own structure: its slotType, its node ids
+    and x coordinates, every reference to those ids, its flexbody group
+    bindings and its child slot names.
+    """
+    out = re.sub(
+        r'("slotType"\s*:\s*")([^"]*)(")',
+        lambda match: f"{match.group(1)}{relocation.target_slot}{match.group(3)}",
+        part_body,
+        count=1,
+    )
+    out = transform_helpers.replace_array_region(
+        out,
+        "nodes",
+        lambda text: mirror_node_rows(
+            text, node_mirror_map, known_nodes, group_map, known_groups
+        ),
+    )
+    for key in _NODE_REFERENCE_ARRAYS:
+        out = transform_helpers.replace_array_region(
+            out,
+            key,
+            lambda text: mirror_quoted_references(text, node_mirror_map, known_nodes),
+        )
+    out = transform_helpers.replace_array_region(
+        out,
+        "flexbodies",
+        lambda text: mirror_flexbody_group_lists(text, group_map, known_groups),
+    )
+    for key in ("slots", "slots2"):
+        out = transform_helpers.replace_array_region(
+            out,
+            key,
+            lambda text: relocate_slot_rows(text, slot_map, known_slots),
+        )
+    offset = relocation.node_offset
+    if any(abs(value) > 1e-9 for value in offset):
+        out = _inject_node_move(out, offset)
+    return out
+
+
+def _inject_node_move(part_body: str, offset: tuple[float, float, float]) -> str:
+    """Nudge a relocated part back to the mirror of where it started.
+
+    The target slot applies its own nodeMove to whatever lands in it. When the
+    two paired slots are not mirror images -- a co-driver seat set further back
+    and higher -- that would drag the part to the wrong place, so the
+    difference is cancelled out here.
+
+    A part that owns nodes is moved by a nodeMove directive so its physics
+    follows. A part that owns none is purely a mesh hung off someone else's
+    nodes, so its flexbody rows are offset instead.
+    """
+    directive = (
+        '{"nodeMove":{'
+        f'"x":{transform_helpers.format_num(offset[0])},'
+        f'"y":{transform_helpers.format_num(offset[1])},'
+        f'"z":{transform_helpers.format_num(offset[2])}'
+        "}},"
+    )
+
+    def insert(text: str) -> str:
+        idx = 1 if text.startswith("[") else 0
+        while idx < len(text) and text[idx] != "[":
+            idx += 1
+        if idx >= len(text):
+            return text
+        # After the header row, so the directive applies to every node row.
+        end = transform_helpers.find_matching(text, idx, "[", "]")
+        return text[: end + 1] + "\n         " + directive + text[end + 1 :]
+
+    if transform_helpers.extract_named_array(part_body, "nodes"):
+        return transform_helpers.replace_array_region(part_body, "nodes", insert)
+    return transform_helpers.replace_array_region(
+        part_body,
+        "flexbodies",
+        lambda text: _offset_flexbody_rows(text, offset),
+    )
+
+
+def _offset_flexbody_rows(array_text: str, offset: tuple[float, float, float]) -> str:
+    out: list[str] = []
+    cursor = 0
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] != "[":
+            idx += 1
+            continue
+        end = transform_helpers.find_matching(array_text, idx, "[", "]")
+        row = array_text[idx:end]
+        out.append(array_text[cursor:idx])
+        if flexbody_row_mesh(row):
+            current = vector_from_row(row, "pos") or (0.0, 0.0, 0.0)
+            moved = tuple(current[axis] + offset[axis] for axis in range(3))
+            out.append(replace_or_append_inline_vector(row + "]", "pos", moved)[:-1])
+        else:
+            out.append(row)
+        cursor = end
+        idx = end
+    out.append(array_text[cursor:])
+    return "".join(out)
+
+
+def rewrite_child_slot_defaults(
+    array_text: str,
+    child_part_map: dict[str, str],
+    default_column: int,
+    child_slot_suffix: str | None = None,
+) -> str:
+    """Point child slot defaults at generated counterparts when they exist.
+
+    For slots2, callers may also suffix the slot id/name. BeamNG config
+    selections are keyed by that name, so a handed subtree needs a handed slot
+    name to keep stale selections from the opposite-hand tree from overriding
+    the generated default.
+    """
+    if not child_part_map:
+        return array_text
+
+    out: list[str] = []
+    cursor = 0
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] != "[":
+            idx += 1
+            continue
+        try:
+            end = transform_helpers.find_matching(array_text, idx, "[", "]")
+        except ValueError:
+            idx += 1
+            continue
+        row = array_text[idx : end + 1]
+        out.append(array_text[cursor:idx])
+        out.append(
+            _rewrite_slot_default_row(
+                row,
+                child_part_map,
+                default_column,
+                child_slot_suffix,
+            )
+        )
+        cursor = end + 1
+        idx = end + 1
+    out.append(array_text[cursor:])
+    return "".join(out)
+
+
+def _rewrite_slot_default_row(
+    row: str,
+    child_part_map: dict[str, str],
+    default_column: int,
+    child_slot_suffix: str | None = None,
+) -> str:
+    columns: list[tuple[int, int]] = []
+    start = 1 if row.startswith("[") else 0
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(row)):
+        ch = row[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "[{":
+            depth += 1
+            continue
+        if ch in "]}":
+            if depth == 0 and ch == "]":
+                columns.append((start, idx))
+                break
+            depth -= 1
+            continue
+        if ch == "," and depth == 0:
+            columns.append((start, idx))
+            start = idx + 1
+    if default_column >= len(columns):
+        return row
+
+    col_start, col_end = columns[default_column]
+    value = row[col_start:col_end]
+    match = re.match(r'(\s*)"((?:[^"\\]|\\.)*)"(\s*)$', value)
+    if match is None:
+        return row
+    try:
+        part_id = json.loads(f'"{match.group(2)}"')
+    except Exception:
+        part_id = match.group(2)
+    replacement = child_part_map.get(part_id)
+    if not replacement:
+        return row
+
+    replacements = [
+        (col_start, col_end, f'{match.group(1)}"{replacement}"{match.group(3)}')
+    ]
+    if child_slot_suffix and columns:
+        slot_start, slot_end = columns[0]
+        slot_value = row[slot_start:slot_end]
+        slot_match = re.match(r'(\s*)"((?:[^"\\]|\\.)*)"(\s*)$', slot_value)
+        if slot_match is not None:
+            try:
+                slot_id = json.loads(f'"{slot_match.group(2)}"')
+            except Exception:
+                slot_id = slot_match.group(2)
+            if slot_id not in {"type", "name"} and not slot_id.endswith(child_slot_suffix):
+                replacements.append(
+                    (
+                        slot_start,
+                        slot_end,
+                        f'{slot_match.group(1)}"{slot_id}{child_slot_suffix}"{slot_match.group(3)}',
+                    )
+                )
+
+    for start, end, value in sorted(replacements, reverse=True):
+        row = row[:start] + value + row[end:]
+    return row
+
+
+def rewrite_light_pattern_for_target(part_body: str, target_hand: str) -> str:
+    pattern = "RHD" if target_hand == HAND_RHD else "LHD"
+    return re.sub(
+        r'("\$lightPattern"\s*:\s*")(?:LHD|RHD|US)(")',
+        rf"\g<1>{pattern}\2",
+        part_body,
+    )
+
+
 def clone_part_for_target(
     part_body: str,
     source_part_id: str,
@@ -663,6 +1122,7 @@ def clone_part_for_target(
     inherited_options: Iterable[str] = (),
     shared_bake: SharedBakeContext | None = None,
     mesh_pivots: dict[str, tuple[float, float, float]] | None = None,
+    child_part_map: dict[str, str] | None = None,
 ) -> str:
     new_part_id = new_part_id or generated_part_name(source_part_id, target_hand)
     out = transform_helpers.replace_first(part_body, f'"{source_part_id}"', f'"{new_part_id}"')
@@ -696,6 +1156,22 @@ def clone_part_for_target(
         "camerasInternal",
         lambda text: rewrite_internal_cameras(text, node_mirror_map),
     )
+    out = transform_helpers.replace_array_region(
+        out,
+        "slots",
+        lambda text: rewrite_child_slot_defaults(text, child_part_map or {}, 1),
+    )
+    out = transform_helpers.replace_array_region(
+        out,
+        "slots2",
+        lambda text: rewrite_child_slot_defaults(
+            text,
+            child_part_map or {},
+            3,
+            suffix_for_hand(target_hand),
+        ),
+    )
+    out = rewrite_light_pattern_for_target(out, target_hand)
     out = re.sub(
         r'("name"\s*:\s*")([^"]*)(")',
         lambda match: f"{match.group(1)}{append_hand_label(match.group(2), target_hand)}{match.group(3)}",
@@ -704,4 +1180,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'clone_part_for_target']
+__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']

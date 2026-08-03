@@ -98,6 +98,7 @@ from beamxp.core.models import (
     BakedMeshSpec,
     BuildResult,
     MeshPlacement,
+    MeshTransformInstance,
     ResolvedMeshPosition,
     SharedBakeContext,
     SlotDef,
@@ -591,6 +592,85 @@ def selected_flexbody_mesh_positions(
     }
 
 
+def mesh_instance_ref(mesh_id: str, slot_path: str) -> str:
+    return f"{mesh_id}@@{slot_path}" if slot_path else mesh_id
+
+
+def selected_mesh_transform_instances_for_config(
+    context: VehicleContext,
+    config_name: str,
+) -> list[MeshTransformInstance]:
+    """Renderable mesh placements for one trim, preserving reused instances.
+
+    ``resolved_mesh_positions_for_config`` intentionally returns one aggregate
+    per mesh id for legacy transform/build code. This view is for UI identity:
+    if the same DAE mesh is mounted by two selected part instances, each row
+    keeps the owning slot path so the user can distinguish it.
+    """
+    selected = selected_parts_for_config(context, config_name)
+    used = used_meshes_for_config(context, config_name)
+    instances: list[MeshTransformInstance] = []
+    for part_instance in selected_part_instances(selected):
+        part_id = str(part_instance.get("part_id") or "")
+        if not part_id:
+            continue
+        flexbodies = part_named_array_for_context(context, part_id, "flexbodies")
+        if not flexbodies:
+            continue
+        inherited_options = part_instance_options(part_instance)
+        variables = part_instance_variable_scope(selected, part_instance)
+        slot_id = str(part_instance.get("slot_id") or "")
+        slot_path = str(part_instance.get("slot_path") or "")
+        for raw_row in iter_active_top_level_rows(flexbodies):
+            row = resolve_jbeam_row_strings(raw_row, variables)
+            mesh = flexbody_row_mesh(row)
+            if mesh not in used:
+                continue
+            obj = context.objects.get(mesh)
+            if obj is None:
+                continue
+            pivot = flexbody_mesh_reference_point(context, mesh, obj)
+            matrix = flexbody_row_source_matrix(row, inherited_options, variables)
+            position = transform_helpers.transform_point(matrix, pivot)
+            if is_far_placement(position):
+                continue
+            instances.append(
+                MeshTransformInstance(
+                    instance_id=mesh_instance_ref(mesh, slot_path),
+                    mesh_id=mesh,
+                    part_id=part_id,
+                    slot_id=slot_id,
+                    slot_path=slot_path,
+                    position=position,
+                    matrices=(tuple(tuple(line) for line in matrix),),
+                )
+            )
+
+    counts: dict[str, int] = {}
+    for instance in instances:
+        counts[instance.mesh_id] = counts.get(instance.mesh_id, 0) + 1
+    ordinals: dict[str, int] = {}
+    out: list[MeshTransformInstance] = []
+    for instance in instances:
+        ordinal = ordinals.get(instance.mesh_id, 0) + 1
+        ordinals[instance.mesh_id] = ordinal
+        count = counts[instance.mesh_id]
+        out.append(
+            MeshTransformInstance(
+                instance_id=instance.instance_id,
+                mesh_id=instance.mesh_id,
+                part_id=instance.part_id,
+                slot_id=instance.slot_id,
+                slot_path=instance.slot_path,
+                position=instance.position,
+                matrices=instance.matrices,
+                count_for_mesh=count,
+                ordinal_for_mesh=ordinal,
+            )
+        )
+    return out
+
+
 def resolved_mesh_positions_for_config(
     context: VehicleContext,
     config_name: str,
@@ -742,4 +822,4 @@ def hand_from_stock_steering_for_variant(
 def used_meshes_for_config(context: VehicleContext, config_name: str) -> set[str]:
     return set(mesh_roles_for_config(context, config_name)[2])
 
-__all__ = ['hand_from_text', 'variant_hand_detection_signature', 'variant_hands_cache_key', '_normalized_cached_variant_hands', 'load_cached_variant_hands', 'save_cached_variant_hands', 'load_vehicle_context', 'median_value', 'steering_ref_score', 'is_default_steering_ref', 'vehicle_prefix_rank', 'keep_single_steering_ref', 'ensure_default_steering_ref', 'likely_steering_ref_ids', 'estimated_vehicle_center_x', 'hand_from_steering_positions', 'hand_from_offsets', 'stock_steering_ref_score', 'likely_stock_steering_ref_ids', 'flexbody_row_needs_node_translation', 'flexbody_mesh_reference_point', 'selected_flexbody_mesh_placements', 'selected_flexbody_mesh_positions', 'resolved_mesh_positions_for_config', 'preview_entries_for_config', 'representative_mesh_positions', 'stock_steering_positions_for_config', 'selected_vehicle_center_x', 'hand_from_stock_steering_for_variant', 'used_meshes_for_config']
+__all__ = ['hand_from_text', 'variant_hand_detection_signature', 'variant_hands_cache_key', '_normalized_cached_variant_hands', 'load_cached_variant_hands', 'save_cached_variant_hands', 'load_vehicle_context', 'median_value', 'steering_ref_score', 'is_default_steering_ref', 'vehicle_prefix_rank', 'keep_single_steering_ref', 'ensure_default_steering_ref', 'likely_steering_ref_ids', 'estimated_vehicle_center_x', 'hand_from_steering_positions', 'hand_from_offsets', 'stock_steering_ref_score', 'likely_stock_steering_ref_ids', 'flexbody_row_needs_node_translation', 'flexbody_mesh_reference_point', 'selected_flexbody_mesh_placements', 'selected_flexbody_mesh_positions', 'mesh_instance_ref', 'selected_mesh_transform_instances_for_config', 'resolved_mesh_positions_for_config', 'preview_entries_for_config', 'representative_mesh_positions', 'stock_steering_positions_for_config', 'selected_vehicle_center_x', 'hand_from_stock_steering_for_variant', 'used_meshes_for_config']

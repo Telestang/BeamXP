@@ -31,6 +31,8 @@ from beamxp.core.constants import (
     MODE_CHOICES,
     MODE_MIRROR,
     MODE_MIRROR_STRUCTURAL,
+    MODE_MIRROR_POSITION,
+    MODE_REPLACE_SOURCE,
     MODE_SKIP,
     MODE_TRANSLATE,
     NS,
@@ -154,6 +156,73 @@ def selected_output_plans(
     return plans, skipped
 
 
+def split_authored_hand_drive_targets(
+    context: VehicleContext,
+    conversion: dict[str, object],
+    variant_targets: dict[str, str],
+) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+    """Resolve authored LHD/RHD swaps, keeping every variant in the build.
+
+    An authored swap covers its own subtree only. The rest of the trim -- seats,
+    pedals, mirrors, anything hung off the body rather than the dashboard --
+    still needs the generated mirroring pass, so the two run together on the
+    same variant instead of one displacing the other.
+    """
+    generated: dict[str, str] = dict(variant_targets)
+    authored: dict[str, dict[str, object]] = {}
+    for config_name, target_hand in sorted(variant_targets.items()):
+        source_hand = effective_source_hand(context, conversion, config_name)
+        group = find_hand_authored_opposite_group(
+            context,
+            config_name,
+            source_hand,
+            target_hand,
+        )
+        if group is not None:
+            authored[config_name] = group
+    return generated, authored
+
+
+def generated_mesh_scope(
+    context: VehicleContext,
+    selected_configs: Iterable[str],
+    authored_groups: dict[str, dict[str, object]],
+    slot_pair_plans: dict[str, dict[str, object]] | None = None,
+) -> set[str]:
+    """Meshes the generated pass may transform.
+
+    Per trim, everything the trim uses minus the parts an authored swap or a
+    slot pair already resolves -- those land as stock opposite-side parts, and
+    mirroring their meshes on top would undo the swap.
+    """
+    slot_pair_plans = slot_pair_plans or {}
+    scope: set[str] = set()
+    for config_name in selected_configs:
+        covered = authored_group_meshes(context, authored_groups.get(config_name))
+        covered |= authored_group_meshes(context, slot_pair_plans.get(config_name))
+        scope.update(used_meshes_for_config(context, config_name) - covered)
+    return scope
+
+
+def relocation_meshes(
+    context: VehicleContext,
+    slot_pair_plans: dict[str, dict[str, object]],
+) -> set[str]:
+    """Meshes belonging to parts that must be rebuilt on the other side.
+
+    A relocated part has no stock counterpart to inherit geometry from, so its
+    meshes always need a mirrored bake regardless of the mode the user left on
+    them -- the part is crossing the car either way.
+    """
+    meshes: set[str] = set()
+    for plan in slot_pair_plans.values():
+        for relocation in slot_pair_plan_relocations(plan):
+            found = part_body_for_context(context, str(relocation.get("partId") or ""))
+            if found is not None:
+                meshes.update(transform_helpers.extract_part_mesh_names(found[0]))
+    return {mesh for mesh in meshes if mesh in context.objects}
+
+
 def build_batch(
     context: VehicleContext,
     conversion: dict[str, object],
@@ -166,6 +235,12 @@ def build_batch(
     if not output_plans:
         raise RuntimeError("No trim outputs are selected")
     variant_targets, skipped = selected_variant_targets(context, conversion)
+    generated_variant_targets, authored_groups = split_authored_hand_drive_targets(
+        context, conversion, variant_targets
+    )
+    slot_pair_plans = slot_pair_plans_for_variants(
+        context, conversion, sorted(variant_targets)
+    )
     original_configs = [
         str(plan["source"])
         for plan in output_plans
@@ -190,21 +265,37 @@ def build_batch(
     translated_prop_meshes: set[str] = set()
     mirrored_prop_meshes: set[str] = set()
     structural_prop_meshes: set[str] = set()
+    mirror_position_prop_meshes: set[str] = set()
+    mirror_position_flexbody_meshes: set[str] = set()
     translated_flexbody_meshes: set[str] = set()
     translate_magnitudes: dict[str, float] = {}
     texture_flip_ids: set[str] = set()
-    if variant_targets:
+    if generated_variant_targets:
         object_modes = active_part_modes(conversion)
-        if not object_modes:
-            raise RuntimeError("Converted outputs require at least one Mirror Aesthetic, Mirror Structural, or Translate part")
-        selected_configs = sorted(variant_targets)
-        flexbody_meshes, prop_meshes, all_meshes = selected_mesh_roles(context, selected_configs)
-        if all_meshes:
-            object_modes = {mesh: mode for mesh, mode in object_modes.items() if mesh in all_meshes}
-        if not object_modes:
+        # A vehicle whose every converted trim is fully covered by an authored
+        # swap needs no transformed parts at all, so an empty mode set is only
+        # an error when nothing authored is carrying the conversion.
+        swap_driven = bool(authored_groups or slot_pair_plans)
+        if not object_modes and not swap_driven:
             raise RuntimeError(
-                "No Mirror Aesthetic, Mirror Structural, or Translate parts are used by the converted trims"
+                "Converted outputs require at least one Move, Mirror Move, Mirror, "
+                "Swap Mesh, Replace Source, or slot pair"
             )
+        selected_configs = sorted(generated_variant_targets)
+        flexbody_meshes, prop_meshes, _all_meshes = selected_mesh_roles(context, selected_configs)
+        mesh_scope = generated_mesh_scope(
+            context, selected_configs, authored_groups, slot_pair_plans
+        )
+        if mesh_scope:
+            object_modes = {mesh: mode for mesh, mode in object_modes.items() if mesh in mesh_scope}
+        for mesh in relocation_meshes(context, slot_pair_plans):
+            object_modes[mesh] = MODE_MIRROR
+        if not object_modes and not swap_driven:
+            raise RuntimeError(
+                "No Move, Mirror Move, Mirror, Swap Mesh, or Replace Source entries are used "
+                "by the converted trims, and no slot pair applies to them"
+            )
+        texture_flip_ids = texture_flip_mesh_ids(context, object_modes)
         object_modes = fallback_structural_part_modes(
             context,
             conversion,
@@ -212,7 +303,6 @@ def build_batch(
             selected_configs=selected_configs,
         )
         structural_sources = structural_mirror_sources(context, conversion, object_modes)
-        texture_flip_ids = texture_flip_mesh_ids(context, object_modes)
         node_mirror_map = build_node_mirror_map(context.node_positions)
         translated_prop_meshes = {
             mesh for mesh, mode in object_modes.items() if mode == MODE_TRANSLATE and mesh in prop_meshes
@@ -220,13 +310,23 @@ def build_batch(
         mirrored_prop_meshes = {
             mesh for mesh, mode in object_modes.items() if mode == MODE_MIRROR and mesh in prop_meshes
         }
+        mirror_position_prop_meshes = {
+            mesh for mesh, mode in object_modes.items() if mode == MODE_MIRROR_POSITION and mesh in prop_meshes
+        }
         structural_prop_meshes = {
-            mesh for mesh, mode in object_modes.items() if mode == MODE_MIRROR_STRUCTURAL and mesh in prop_meshes
+            mesh
+            for mesh, mode in object_modes.items()
+            if mode in {MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE} and mesh in prop_meshes
         }
         translated_flexbody_meshes = {
             mesh
             for mesh, mode in object_modes.items()
             if mode == MODE_TRANSLATE and mesh in flexbody_meshes and mesh not in translated_prop_meshes
+        }
+        mirror_position_flexbody_meshes = {
+            mesh
+            for mesh, mode in object_modes.items()
+            if mode == MODE_MIRROR_POSITION and mesh in flexbody_meshes and mesh not in mirror_position_prop_meshes
         }
         translate_magnitudes = part_translate_magnitudes(context, conversion, object_modes)
         zero_translate = sorted(
@@ -264,16 +364,21 @@ def build_batch(
             translated_prop_meshes,
             translated_flexbody_meshes,
             mirrored_prop_meshes,
+            mirror_position_prop_meshes,
+            mirror_position_flexbody_meshes,
             structural_prop_meshes,
             baked_shared_specs,
+            authored_groups,
+            slot_pair_plans,
         ))
+    if generated_variant_targets and object_modes:
         generated_daes = generate_daes(
             context,
             output_root,
             output_vehicle_dir,
             object_modes,
             structural_sources,
-            set(variant_targets.values()),
+            set(generated_variant_targets.values()),
             translate_magnitudes,
             translated_prop_meshes,
             translated_flexbody_meshes,
@@ -312,6 +417,9 @@ def build_batch(
         "generatedConfigs": generated_configs,
         "outputs": output_plans,
         "targetHands": variant_targets,
+        "generatedTargetHands": generated_variant_targets,
+        "authoredHandDriveGroups": authored_groups,
+        "slotPairPlans": slot_pair_plans,
         "deltaMagnitude": delta_magnitude(context, conversion),
         "translateMagnitudes": translate_magnitudes,
         "mirroredPropMeshes": sorted(mirrored_prop_meshes),
@@ -364,4 +472,4 @@ def build_batch(
         installed_plates_zip=installed_plates_zip,
     )
 
-__all__ = ['package_name_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'package_name_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'build_batch']

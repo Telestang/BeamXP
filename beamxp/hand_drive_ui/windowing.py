@@ -8,7 +8,6 @@ class WindowingMixin:
 
     def _on_close(self) -> None:
         self._close_tree_combo_editor()
-        self._cancel_structural_prompt()
         self.part_resolver.shutdown(wait=False, cancel_futures=True)
         self.variant_detector.shutdown(wait=False, cancel_futures=True)
         self.destroy()
@@ -38,7 +37,7 @@ class WindowingMixin:
         try:
             if self.focus_get() is not filter_entry:
                 return
-        except tk.TclError:
+        except (tk.TclError, KeyError):
             return
         clicked = event.widget
         if clicked is not None and self._is_widget_or_child(clicked, filter_entry):
@@ -49,6 +48,8 @@ class WindowingMixin:
             self.focus_set()
 
     def _part_display_name(self, object_id: str) -> str:
+        if hasattr(self, "_part_row_mesh_id"):
+            object_id = self._part_row_mesh_id(object_id)
         if self.context is None:
             return object_id
         obj = self.context.objects.get(object_id)
@@ -58,6 +59,29 @@ class WindowingMixin:
         if object_id.startswith(prefix):
             return object_id[len(prefix) :]
         return object_id
+
+    def _part_display_label(self, object_id: str, object_ids: list[str] | tuple[str, ...] | None = None) -> str:
+        if hasattr(self, "_part_row_mesh_id"):
+            object_id = self._part_row_mesh_id(object_id)
+        display = self._part_display_name(object_id)
+        if object_ids is None:
+            object_ids = tuple(self.resolved_part_ids or self.current_part_ids or [])
+        duplicates = [
+            candidate
+            for candidate in object_ids
+            if candidate != object_id
+            and self._part_display_name(candidate) == display
+        ]
+        if not duplicates:
+            return display
+        ordered = sorted(
+            [object_id, *duplicates],
+            key=lambda candidate: (
+                getattr(self.context.objects.get(candidate), "x", 0.0) if self.context is not None else 0.0,
+                candidate,
+            ),
+        )
+        return f"{display} #{ordered.index(object_id) + 1}"
 
     def _configure_theme(self) -> None:
         self.ttk_style = ttk.Style(self)

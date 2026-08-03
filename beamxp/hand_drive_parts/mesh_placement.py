@@ -152,7 +152,7 @@ def add_baked_shared_mesh(
     # Mirrored props always need a per-row baked copy: their node-triad frame is
     # left-handed, so the mirrored orientation is a reflection that
     # baseRotationGlobal (an euler rotation) cannot express. Vehicle-local
-    # meshes on other paths keep using the shared "_to_rhd" copies.
+    # meshes on other paths keep using the shared "_xp_rhd" copies.
     if not is_shared_dae_object(bake_context.context, source_mesh) and not (
         is_prop and mode == MODE_MIRROR
     ):

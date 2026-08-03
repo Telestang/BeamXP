@@ -13,6 +13,21 @@ class MeshPlacement:
 
 
 @dataclass(frozen=True)
+class MeshTransformInstance:
+    """One renderable placement of a mesh in a selected part tree."""
+
+    instance_id: str
+    mesh_id: str
+    part_id: str
+    slot_id: str
+    slot_path: str
+    position: tuple[float, float, float]
+    matrices: tuple[tuple[tuple[float, ...], ...], ...] = ()
+    count_for_mesh: int = 1
+    ordinal_for_mesh: int = 1
+
+
+@dataclass(frozen=True)
 class ResolvedMeshPosition:
     """Where a mesh sits in one configuration.
 
@@ -34,6 +49,46 @@ class SlotDef:
     options: str | None = None
     allow_types: tuple[str, ...] = ()
     deny_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SlotUsage:
+    """How one slot type is used across the trims currently under conversion.
+
+    Slots have no persistent identity in jbeam -- they exist only as rows in
+    whichever part declares them -- so this is the tool's own view, rebuilt per
+    selection. Keyed by slot_type because that is the stable, user-facing name;
+    slot paths differ per trim and by tree position.
+    """
+
+    slot_type: str
+    part_by_config: dict[str, str]
+    paths_by_config: dict[str, str]
+    parent_parts: tuple[str, ...]
+    options_by_config: dict[str, tuple[str, ...]]
+
+    @property
+    def occupied(self) -> bool:
+        return any(self.part_by_config.values())
+
+    @property
+    def variant_dependent(self) -> bool:
+        """True when the slot holds different parts on different trims."""
+        return len(set(self.part_by_config.values())) > 1
+
+
+@dataclass(frozen=True)
+class SlotRelocation:
+    """Instruction to emit a part clone that lives in a different slot.
+
+    Used when a paired slot has no authored counterpart part, so the swap
+    cannot be done by .pc selection alone and the part itself must be rebuilt
+    for the other side of the car.
+    """
+
+    source_slot: str
+    target_slot: str
+    node_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass(frozen=True)
@@ -88,6 +143,7 @@ class VehicleContext:
     selected_parts_cache: dict[str, dict[str, object]] = field(default_factory=dict)
     resolved_positions_cache: dict[str, dict[str, ResolvedMeshPosition]] = field(default_factory=dict)
     mesh_roles_cache: dict[str, tuple[set[str], set[str], set[str]]] = field(default_factory=dict)
+    node_groups_cache: dict[str, set[str]] = field(default_factory=dict)
     selected_node_positions_cache: dict[str, dict[str, tuple[float, float, float]]] = field(default_factory=dict)
     part_array_cache: dict[tuple[str, str], str | None] = field(default_factory=dict)
     variant_hands_cache: dict[str, dict[str, str]] = field(default_factory=dict)

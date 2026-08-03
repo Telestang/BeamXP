@@ -16,6 +16,12 @@ class WorkerHandlersMixin:
         if kind == "vehicle_load_error":
             self._handle_vehicle_load_error(payload)
             return
+        if kind == "inventory_scan_done":
+            self._handle_inventory_scan_done(payload)
+            return
+        if kind == "inventory_scan_error":
+            self._handle_inventory_scan_error(payload)
+            return
         if kind == "recommendations_success":
             self._handle_recommendations_success(payload)
             return
@@ -74,6 +80,7 @@ class WorkerHandlersMixin:
             self._schedule_pending_parts_refresh()
             return
         self.resolved_part_ids = result
+        self._invalidate_slot_usage()
         core.save_cached_part_ids(context, selected, self.resolved_part_ids)
         self._refresh_parts(reset_view=reset_view)
         self._update_detail()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import re
 import subprocess
@@ -74,9 +75,11 @@ def yn_label(value: object) -> str:
 def mode_label(mode: str) -> str:
     return {
         core.MODE_SKIP: "Skip",
-        core.MODE_MIRROR: "Mirror Aesthetic",
-        core.MODE_MIRROR_STRUCTURAL: "Mirror Structural",
-        core.MODE_TRANSLATE: "Translate",
+        core.MODE_TRANSLATE: "Move",
+        core.MODE_MIRROR_POSITION: "Mirror Move",
+        core.MODE_MIRROR: "Mirror",
+        core.MODE_MIRROR_STRUCTURAL: "Swap Mesh",
+        core.MODE_REPLACE_SOURCE: "Replace Source",
     }.get(mode, "Skip")
 
 
@@ -97,13 +100,20 @@ def part_type_label(
     return "Unknown"
 
 
-MODE_CYCLE_VALUES = [core.MODE_SKIP, core.MODE_MIRROR, core.MODE_MIRROR_STRUCTURAL, core.MODE_TRANSLATE]
+MODE_CYCLE_VALUES = [
+    core.MODE_SKIP,
+    core.MODE_TRANSLATE,
+    core.MODE_MIRROR_POSITION,
+    core.MODE_MIRROR,
+    core.MODE_MIRROR_STRUCTURAL,
+    core.MODE_REPLACE_SOURCE,
+]
 MODE_VALUES_BY_LABEL = {mode_label(mode): mode for mode in MODE_CYCLE_VALUES}
 MODE_HOTKEYS = {
     "q": core.MODE_SKIP,
-    "w": core.MODE_MIRROR,
-    "e": core.MODE_MIRROR_STRUCTURAL,
-    "r": core.MODE_TRANSLATE,
+    "w": core.MODE_TRANSLATE,
+    "e": core.MODE_MIRROR,
+    "r": core.MODE_MIRROR_STRUCTURAL,
 }
 
 BUILD_LABELS = {
@@ -113,9 +123,9 @@ BUILD_LABELS = {
     core.BUILD_BOTH: "Both",
 }
 
-# How long (in milliseconds) a part may sit on Mirror Structural before the
-# source-part prompt commits it. Tweak this value to change the timeout.
-STRUCTURAL_PROMPT_DELAY_MS = 300
+# How long (in milliseconds) a mesh may sit on Swap Mesh before the source
+# prompt opens. Tweak this value to change the timeout.
+STRUCTURAL_PROMPT_DELAY_MS = 80
 
 def offset_label(value: object) -> str:
     if value in (None, ""):
@@ -185,6 +195,7 @@ __all__ = [
     "mode_label",
     "offset_display",
     "offset_label",
+    "os",
     "part_type_label",
     "plate_generator",
     "position_labels",

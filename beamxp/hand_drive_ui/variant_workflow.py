@@ -287,6 +287,7 @@ class VariantWorkflowMixin:
         # The x/y/z columns and the box viewer both show the previewed trim's
         # positions, so they have to follow the Config dropdown.
         self._refresh_box_preview()
+        self._invalidate_slot_usage()
         self._refresh_parts()
 
     def _selected_preview_output_name(self) -> str:
@@ -440,6 +441,12 @@ class VariantWorkflowMixin:
         trim on screen, so it is the same number the viewer draws."""
         if self.context is None:
             return ((0.0, 0.0, 0.0), False)
+        row_positions = getattr(self, "part_row_positions", {})
+        if object_id in row_positions:
+            position, varies = row_positions[object_id]
+            return (tuple(float(value) for value in position), bool(varies))
+        if hasattr(self, "_part_row_mesh_id"):
+            object_id = self._part_row_mesh_id(object_id)
         obj = self.context.objects.get(object_id)
         if obj is None:
             return ((0.0, 0.0, 0.0), False)
