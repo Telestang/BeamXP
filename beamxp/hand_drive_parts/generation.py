@@ -446,6 +446,7 @@ def write_converted_config(
 ) -> str:
     output_config = variant_output_name(config_name, target_hand)
     pc["licenseName"] = append_hand_label(pc.get("licenseName") or context.vehicle_id, target_hand)
+    clear_default_config_flags(pc)
     output_vehicle_dir.mkdir(parents=True, exist_ok=True)
     write_text_file(
         output_vehicle_dir / f"{output_config}.pc",
@@ -467,6 +468,7 @@ def write_converted_config(
     info["Description"] = converted_description(existing_description, target_hand)
     info["Config Type"] = "Custom"
     info["Source"] = conversion_source_name(context)
+    clear_default_config_flags(info)
     write_text_file(
         output_vehicle_dir / f"info_{output_config}.json",
         json.dumps(info, indent=2),
@@ -474,6 +476,100 @@ def write_converted_config(
     )
     write_mirrored_preview(context, output_vehicle_dir, config_name, output_config)
     return output_config
+
+
+DEFAULT_CONFIG_FLAG_KEYS = (
+    "default",
+    "defaultConfig",
+    "isDefault",
+    "isDefaultConfig",
+    "isDefaultForSubCluster",
+)
+
+
+def clear_default_config_flags(data: dict[str, object]) -> None:
+    """Generated configs must never become the vehicle selector default."""
+    for key in DEFAULT_CONFIG_FLAG_KEYS:
+        if key in data:
+            data[key] = False
+    # This is model-level metadata, but strip it if a mod placed it on an info
+    # file we are cloning into a generated config.
+    data.pop("default_pc", None)
+
+
+def _replace_source_part_for_config(
+    context: VehicleContext,
+    conversion: dict[str, object],
+    part_id: str,
+) -> str | None:
+    parts = conversion.get("parts", {})
+    if not isinstance(parts, dict):
+        return None
+    settings = parts.get(part_id)
+    if not isinstance(settings, dict) or settings.get("mode") != MODE_REPLACE_SOURCE:
+        return None
+    source_id = str(settings.get("mirrorSource") or "")
+    if not source_id or source_id == part_id:
+        return None
+    if part_body_for_context(context, source_id) is None:
+        return None
+    return source_id
+
+
+def apply_replace_source_slot_updates(
+    context: VehicleContext,
+    conversion: dict[str, object],
+    selected: dict[str, object],
+    pc: dict[str, object],
+    target_hand: str,
+) -> None:
+    """Select authored replacement parts directly in generated configs.
+
+    Mesh-level Replace Source preview/build transforms still cover cases where
+    the replacement is only a render source. When the selected JBeam part itself
+    has an authored counterpart, the output config should use that counterpart
+    instead of a generated mirror clone; otherwise parts like BX wing mirrors
+    keep their old physical nodes and attach on the wrong side.
+    """
+    raw_parts = pc.get("parts", {})
+    parts = dict(raw_parts) if isinstance(raw_parts, dict) else {}
+    suffix = suffix_for_hand(target_hand)
+    for instance in selected.get("part_instances", ()):
+        if not isinstance(instance, dict):
+            continue
+        part_id = str(instance.get("part_id") or "")
+        source_id = _replace_source_part_for_config(context, conversion, part_id)
+        if source_id is None:
+            continue
+        slot_id = str(instance.get("slot_id") or "")
+        slot_path = str(instance.get("slot_path") or "")
+        if slot_id and slot_id != "main":
+            parts[slot_id] = source_id
+            parts[f"{slot_id}{suffix}"] = source_id
+        if slot_path and slot_path != "/":
+            parts[slot_path] = source_id
+            parts.pop(f"{slot_path.rstrip('/')}{suffix}/", None)
+    pc["parts"] = parts
+
+
+def apply_authored_group_suffixed_slot_updates(
+    pc: dict[str, object],
+    authored_group: dict[str, object] | None,
+    target_hand: str,
+) -> None:
+    if authored_group is None:
+        return
+    raw_parts = pc.get("parts", {})
+    parts = dict(raw_parts) if isinstance(raw_parts, dict) else {}
+    suffix = suffix_for_hand(target_hand)
+    for selection in authored_group.get("selections", ()):
+        if not isinstance(selection, dict):
+            continue
+        slot_id = str(selection.get("slotId") or "")
+        part_id = str(selection.get("partId") or "")
+        if slot_id and slot_id != "main" and part_id:
+            parts[f"{slot_id}{suffix}"] = part_id
+    pc["parts"] = parts
 
 
 def _relocation_rewrite_context(context: VehicleContext) -> dict[str, object]:
@@ -963,6 +1059,8 @@ def write_generated_jbeam_and_configs(
         parts = dict(pc.get("parts", {}))
         parts.update(slot_updates)
         pc["parts"] = parts
+        apply_authored_group_suffixed_slot_updates(pc, authored_group, target_hand)
+        apply_replace_source_slot_updates(context, conversion, selected, pc, target_hand)
         generated_configs.append(write_converted_config(
             context, output_vehicle_dir, variant, config_name, target_hand, pc
         ))

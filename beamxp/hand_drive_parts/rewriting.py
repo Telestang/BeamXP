@@ -628,6 +628,7 @@ CAMERA_DRIVER_ROW_RE = re.compile(r'^([ \t]*)\[[ \t]*"(?:dash|driver)"', re.MULT
 def rewrite_internal_cameras(
     array_text: str,
     node_mirror_map: dict[str, str],
+    target_hand: str = HAND_RHD,
 ) -> str:
     out_lines: list[str] = []
     for line in array_text.splitlines(keepends=True):
@@ -642,10 +643,10 @@ def rewrite_internal_cameras(
     out = "".join(out_lines)
     masked = transform_helpers.mask_comments_preserve_offsets(out)
     flag_matches = list(CAMERA_HAND_FLAG_RE.finditer(masked))
+    flag_value = "true" if target_hand == HAND_RHD else "false"
     if flag_matches:
         for match in reversed(flag_matches):
-            flipped = "false" if match.group(2) == "true" else "true"
-            out = out[: match.start(2)] + flipped + out[match.end(2) :]
+            out = out[: match.start(2)] + flag_value + out[match.end(2) :]
     else:
         driver_row = CAMERA_DRIVER_ROW_RE.search(masked)
         if driver_row is not None:
@@ -653,7 +654,7 @@ def rewrite_internal_cameras(
             newline = "\r\n" if "\r\n" in out else "\n"
             out = (
                 out[: driver_row.start()]
-                + f'{indent}{{"rightHandCamera":true}},{newline}'
+                + f'{indent}{{"rightHandCamera":{flag_value}}},{newline}'
                 + out[driver_row.start() :]
             )
     return out
@@ -1154,7 +1155,7 @@ def clone_part_for_target(
     out = transform_helpers.replace_array_region(
         out,
         "camerasInternal",
-        lambda text: rewrite_internal_cameras(text, node_mirror_map),
+        lambda text: rewrite_internal_cameras(text, node_mirror_map, target_hand),
     )
     out = transform_helpers.replace_array_region(
         out,

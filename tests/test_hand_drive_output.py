@@ -232,6 +232,110 @@ class GeneratedLightPatternTests(unittest.TestCase):
         )
 
 
+class GeneratedCameraTests(unittest.TestCase):
+    CAMERA_ARRAY = (
+        "[\n"
+        '  ["type", "x", "y", "z", "fov", "id1:", "id2:"],\n'
+        '  ["dash", 0.34, 0.34, 1.07, 55, "f1ll", "f1r"]\n'
+        "]"
+    )
+
+    def test_rhd_camera_clone_sets_rhd_flag(self) -> None:
+        rewritten = core.rewrite_internal_cameras(
+            self.CAMERA_ARRAY,
+            {"f1ll": "f1rr", "f1r": "f1l"},
+            core.HAND_RHD,
+        )
+        self.assertIn('"rightHandCamera":true', rewritten)
+        self.assertIn('["dash", -0.34', rewritten)
+
+    def test_lhd_camera_clone_sets_lhd_flag(self) -> None:
+        rewritten = core.rewrite_internal_cameras(
+            self.CAMERA_ARRAY,
+            {"f1ll": "f1rr", "f1r": "f1l"},
+            core.HAND_LHD,
+        )
+        self.assertIn('"rightHandCamera":false', rewritten)
+        self.assertNotIn('"rightHandCamera":true', rewritten)
+
+
+class ReplaceSourceConfigOutputTests(unittest.TestCase):
+    def test_selected_replace_source_part_updates_output_slot(self) -> None:
+        part_index = {
+            "car": (part("car", "main", "Car", (("mirror_L", "mirror_L_rhd"),)), "car.jbeam"),
+            "mirror_L": (part("mirror_L", "mirror_L", "Mirror LHD"), "mirror.jbeam"),
+            "mirror_L_rhd": (part("mirror_L_rhd", "mirror_L", "Mirror RHD"), "mirror.jbeam"),
+        }
+        selected = {
+            "parts": {"car", "mirror_L_rhd"},
+            "main_part": "car",
+            "part_instances": [
+                {
+                    "part_id": "car",
+                    "slot_id": "main",
+                    "slot_path": "/",
+                },
+                {
+                    "part_id": "mirror_L_rhd",
+                    "slot_id": "mirror_L",
+                    "slot_path": "/mirror_L/",
+                },
+            ],
+            "selected_by_slot": {"main": "car", "mirror_L": "mirror_L_rhd"},
+            "selected_by_path": {"/": "car", "/mirror_L/": "mirror_L_rhd"},
+        }
+        context = context_with_parts(part_index, selected)
+        conversion = {
+            "parts": {
+                "mirror_L_rhd": {
+                    "mode": core.MODE_REPLACE_SOURCE,
+                    "mirrorSource": "mirror_L",
+                }
+            }
+        }
+        pc = {
+            "parts": {
+                "mirror_L": "mirror_L_rhd_xp_lhd",
+                "mirror_L_xp_lhd": "mirror_L_rhd_xp_lhd",
+            }
+        }
+
+        generation_impl.apply_replace_source_slot_updates(
+            context,
+            conversion,
+            selected,
+            pc,
+            core.HAND_LHD,
+        )
+
+        self.assertEqual(pc["parts"]["mirror_L"], "mirror_L")
+        self.assertEqual(pc["parts"]["/mirror_L/"], "mirror_L")
+        self.assertEqual(pc["parts"]["mirror_L_xp_lhd"], "mirror_L")
+
+
+class GeneratedConfigMetadataTests(unittest.TestCase):
+    def test_default_selector_flags_are_forced_off(self) -> None:
+        data = {
+            "default": True,
+            "defaultConfig": True,
+            "isDefault": True,
+            "isDefaultConfig": True,
+            "isDefaultForSubCluster": True,
+            "default_pc": "base",
+            "defaultPaintName1": "Blue",
+        }
+
+        generation_impl.clear_default_config_flags(data)
+
+        self.assertFalse(data["default"])
+        self.assertFalse(data["defaultConfig"])
+        self.assertFalse(data["isDefault"])
+        self.assertFalse(data["isDefaultConfig"])
+        self.assertFalse(data["isDefaultForSubCluster"])
+        self.assertNotIn("default_pc", data)
+        self.assertEqual(data["defaultPaintName1"], "Blue")
+
+
 class HandAuthoredGroupTests(unittest.TestCase):
     def setUp(self) -> None:
         # Model the vanilla pattern: dashboard roots share one slot, while
@@ -481,6 +585,25 @@ class HandAuthoredGroupTests(unittest.TestCase):
                 "paint": "red",
             },
         )
+
+    def test_group_application_updates_generated_parent_slot_names(self) -> None:
+        context = context_with_parts(self.part_index, self.selected)
+        group = core.find_hand_authored_opposite_group(
+            context, "trim", core.HAND_LHD, core.HAND_RHD
+        )
+        assert group is not None
+        pc: dict[str, object] = {
+            "parts": {
+                "dashboard": "dash_rhd",
+                "dashboard_xp_rhd": "dash_lhd_xp_rhd",
+            }
+        }
+        generation_impl.apply_authored_group_suffixed_slot_updates(
+            pc,
+            group,
+            core.HAND_RHD,
+        )
+        self.assertEqual(pc["parts"]["dashboard_xp_rhd"], "dash_rhd")
 
 
 if __name__ == "__main__":
