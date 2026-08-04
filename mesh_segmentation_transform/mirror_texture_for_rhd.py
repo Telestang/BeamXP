@@ -1937,7 +1937,7 @@ DDS_MAGIC = 0x20534444
 DDSD_CAPS, DDSD_HEIGHT, DDSD_WIDTH, DDSD_PIXELFORMAT = 0x1, 0x2, 0x4, 0x1000
 DDSD_MIPMAPCOUNT, DDSD_LINEARSIZE = 0x20000, 0x80000
 DDPF_FOURCC = 0x4
-DDSCAPS_COMPLEX, DDSCAPS_TEXTURE, DDSCAPS_MIPMAP = 0x8, 0x1000, 0x400
+DDSCAPS_COMPLEX, DDSCAPS_TEXTURE, DDSCAPS_MIPMAP = 0x8, 0x1000, 0x400000
 DDS_DIMENSION_TEXTURE2D = 3
 DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB = 98, 99
 
@@ -2041,11 +2041,24 @@ def write_dds(
             level_width * channels,
         )
         if format.name == "bc4":
-            blocks.append(ispc_texcomp.compress_blocks_bc4(surface))
+            block = ispc_texcomp.compress_blocks_bc4(surface)
         elif format.name == "bc5":
-            blocks.append(ispc_texcomp.compress_blocks_bc5(surface))
+            block = ispc_texcomp.compress_blocks_bc5(surface)
         else:
-            blocks.append(ispc_texcomp.compress_blocks_bc7(surface, settings))
+            block = ispc_texcomp.compress_blocks_bc7(surface, settings)
+        expected = (
+            ((level_width + 3) // 4)
+            * ((level_height + 3) // 4)
+            * format.block_bytes
+        )
+        if len(block) < expected:
+            block += b"\0" * (expected - len(block))
+        elif len(block) > expected:
+            raise ValueError(
+                f"{format.name} encoder returned {len(block)} bytes for "
+                f"{level_width}x{level_height}; expected {expected}"
+            )
+        blocks.append(block)
 
     height, width = rgba.shape[:2]
     linear_size = ((width + 3) // 4) * ((height + 3) // 4) * format.block_bytes
@@ -2059,7 +2072,7 @@ def write_dds(
             height,
             width,
             linear_size,
-            0,
+            1,
             len(levels),
         )
         + struct.pack("<11I", *((0,) * 11))

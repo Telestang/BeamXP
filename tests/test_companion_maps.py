@@ -10,6 +10,7 @@ the flipped axis has to be negated or the relief comes out inverted.
 from __future__ import annotations
 
 import json
+import struct
 import tempfile
 import unittest
 from dataclasses import replace
@@ -689,6 +690,20 @@ class DdsCodecTests(unittest.TestCase):
         four = write_dds(self.directory / "four.dds", self.image, "bc4")
         five = write_dds(self.directory / "five.dds", self.image, "bc5")
         self.assertLess(int(four["bytes"]), int(five["bytes"]))
+
+    def test_header_and_mip_payload_match_beamng_expectations(self) -> None:
+        path = self.directory / "colour.dds"
+        write_dds(path, self.image, "bc7_srgb")
+        data = path.read_bytes()
+        header = struct.unpack("<31I", data[4:128])
+        fourcc = header[20].to_bytes(4, "little")
+
+        self.assertEqual(header[5], 1)  # depth
+        self.assertEqual(header[6], 5)  # 16, 8, 4, 2, 1
+        self.assertEqual(header[26], 0x401008)  # texture | complex | mipmap
+        self.assertEqual(fourcc, b"DX10")
+        self.assertEqual(struct.unpack("<5I", data[128:148])[0], 99)
+        self.assertEqual(len(data), 148 + 256 + 64 + 16 + 16 + 16)
 
 
 if __name__ == "__main__":
