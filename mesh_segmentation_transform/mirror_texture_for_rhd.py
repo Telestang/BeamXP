@@ -61,6 +61,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -104,6 +105,8 @@ from mesh_segmentation_transform.relief_from_normals import (  # noqa: E402
     ReliefConfig,
     render_relief,
 )
+
+ProgressCallback = Callable[[dict[str, object]], None]
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -246,6 +249,19 @@ class RhdTextureConfig:
     # the colour region is left as it stands.
     max_relief_union_growth: float = 2.5
 
+    # Production preview/export should not run MSER and edge analysis over an
+    # entire 4096 atlas when only a few selected UV islands can be affected.
+    # Detection is cropped to the unioned selected-domain bounds and all
+    # detected rectangles are mapped back into full-atlas coordinates before the
+    # edit plan is applied.
+    crop_detection_to_domain: bool = True
+    detection_crop_padding_px: int = 16
+    collage_detection_islands: bool = True
+    detect_island_tiles_individually: bool = True
+    detection_tile_group_gap_px: int = 32
+    detection_tile_group_max_area_growth: float = 1.5
+    detection_collage_gutter_px: int = 16
+
     # Block-compression quality for the BC7 profile.  alpha_ultrafast ~5s,
     # alpha_fast ~30s, alpha_basic ~60s for a 4096 square.  BC4 and BC5 have no
     # quality setting.
@@ -254,6 +270,40 @@ class RhdTextureConfig:
 
 
 DEFAULT_RHD_CONFIG = RhdTextureConfig()
+
+
+def emit_progress(
+    progress: ProgressCallback | None,
+    event: str,
+    phase: str,
+    message: str,
+    **details: object,
+) -> None:
+    """Send a UI-neutral progress event to callers that want one."""
+    if progress is None:
+        return
+    payload: dict[str, object] = {
+        "event": event,
+        "phase": phase,
+        "message": message,
+    }
+    payload.update(details)
+    progress(payload)
+
+
+def record_phase(
+    timings: list[dict[str, object]],
+    phase: str,
+    started: float,
+    **details: object,
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "phase": phase,
+        "seconds": round(time.perf_counter() - started, 6),
+    }
+    entry.update(details)
+    timings.append(entry)
+    return entry
 
 
 @dataclass(slots=True)
@@ -343,6 +393,7 @@ class RhdTextureResult:
     png_path: Path | None = None
     dds_path: Path | None = None
     seconds: float = 0.0
+    report: dict[str, object] = field(default_factory=dict)
 
 
 # Stage keys whose map shares the base colour's UV layout.  Detail maps are
@@ -621,6 +672,52 @@ def parts_using_material(
                 matches.append((part, binding))
                 break
     return matches
+
+
+def parts_matching_filter(
+    loaded: LoadedDae,
+    part_filter: tuple[str, ...] = (),
+) -> list[DaePart]:
+    """Return parts whose labels match the CLI's repeated substring filter."""
+    if not part_filter:
+        return list(loaded.parts)
+    tokens = tuple(token.lower() for token in part_filter)
+    return [
+        part for part in loaded.parts
+        if any(token in part.label.lower() for token in tokens)
+    ]
+
+
+def texture_bindings_for_parts(
+    archive: VehicleArchive,
+    loaded: LoadedDae,
+    parts: list[DaePart],
+) -> dict[str, list[tuple[DaePart, ArchiveTextureBinding]]]:
+    """Group exact selected parts by the archive texture they paint."""
+    by_texture: dict[str, list[tuple[DaePart, ArchiveTextureBinding]]] = {}
+    seen: set[tuple[str, str]] = set()
+    for part in parts:
+        try:
+            choices = archive_texture_choices_for_part(archive, loaded, part)
+        except Exception:
+            continue
+        for binding in choices:
+            key = (part.key, binding.texture_member)
+            if key in seen:
+                continue
+            seen.add(key)
+            by_texture.setdefault(binding.texture_member, []).append((part, binding))
+    return by_texture
+
+
+def scoped_parts_using_material(
+    archive: VehicleArchive,
+    loaded: LoadedDae,
+    texture_member: str,
+    parts: list[DaePart],
+) -> list[tuple[DaePart, ArchiveTextureBinding]]:
+    """Resolve one texture over an exact part scope without scanning the DAE."""
+    return texture_bindings_for_parts(archive, loaded, parts).get(texture_member, [])
 
 
 def sweep_part(
@@ -2144,6 +2241,558 @@ class RegionDetection:
     rotations: list[tuple[tuple[float, float], ...] | None] = field(default_factory=list)
     uncontained: list[tuple[int, int, int, int, float]] = field(default_factory=list)
     blobs: list[tuple[int, int, int, int, float]] = field(default_factory=list)
+    work_views: list[dict[str, object]] = field(default_factory=list)
+    seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionTile:
+    """One atlas rectangle copied into a temporary detection collage."""
+
+    source: tuple[int, int, int, int]
+    dest: tuple[int, int, int, int]
+
+
+@dataclass(slots=True)
+class DetectionView:
+    """Image/masks supplied to detection plus coordinates back to the atlas."""
+
+    bgr: np.ndarray
+    mirror_mask: np.ndarray
+    domain_mask: np.ndarray
+    tiles: tuple[DetectionTile, ...]
+    atlas_shape: tuple[int, int]
+    mode: str
+
+
+def _mask_crop_bounds(
+    mask: np.ndarray,
+    padding: int,
+) -> tuple[int, int, int, int] | None:
+    """Return inclusive-exclusive pixel bounds around a mask's true area."""
+    if mask.size == 0 or not bool(mask.any()):
+        return None
+    ys, xs = np.nonzero(mask)
+    height, width = mask.shape[:2]
+    pad = max(int(padding), 0)
+    x0 = max(int(xs.min()) - pad, 0)
+    y0 = max(int(ys.min()) - pad, 0)
+    x1 = min(int(xs.max()) + pad + 1, width)
+    y1 = min(int(ys.max()) + pad + 1, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _component_crop_bounds(
+    mask: np.ndarray,
+    padding: int,
+) -> list[tuple[int, int, int, int]]:
+    """Return padded bounds for each connected component in a mask."""
+    if mask.size == 0 or not bool(mask.any()):
+        return []
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    height, width = mask.shape[:2]
+    pad = max(int(padding), 0)
+    rects: list[tuple[int, int, int, int]] = []
+    for label in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[label])
+        if area <= 0 or w <= 0 or h <= 0:
+            continue
+        rects.append(
+            (
+                max(x - pad, 0),
+                max(y - pad, 0),
+                min(x + w + pad, width),
+                min(y + h + pad, height),
+            )
+        )
+    return rects
+
+
+def _rects_touch_or_overlap(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> bool:
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _merge_overlapping_rects(
+    rects: list[tuple[int, int, int, int]]
+) -> list[tuple[int, int, int, int]]:
+    """Merge padded component rectangles that already touch or overlap."""
+    merged: list[tuple[int, int, int, int]] = []
+    for rect in sorted(rects, key=lambda item: (item[1], item[0], item[3], item[2])):
+        current = rect
+        index = 0
+        while index < len(merged):
+            other = merged[index]
+            if not _rects_touch_or_overlap(current, other):
+                index += 1
+                continue
+            current = (
+                min(current[0], other[0]),
+                min(current[1], other[1]),
+                max(current[2], other[2]),
+                max(current[3], other[3]),
+            )
+            merged.pop(index)
+            index = 0
+        merged.append(current)
+    return sorted(merged, key=lambda item: (item[1], item[0]))
+
+
+def _rect_gap(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> int:
+    """Chebyshev gap between two inclusive-exclusive rectangles."""
+    dx = max(b[0] - a[2], a[0] - b[2], 0)
+    dy = max(b[1] - a[3], a[1] - b[3], 0)
+    return max(dx, dy)
+
+
+def _rect_area(rect: tuple[int, int, int, int]) -> int:
+    return max(rect[2] - rect[0], 0) * max(rect[3] - rect[1], 0)
+
+
+def _rect_union(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+
+
+def _merge_neighbouring_rects(
+    rects: list[tuple[int, int, int, int]],
+    max_gap: int,
+    max_area_growth: float,
+) -> list[tuple[int, int, int, int]]:
+    """Group nearby island crops when the union stays compact.
+
+    This keeps neighbouring UV islands in one local detection run, preserving
+    cross-island grouping where the atlas layout intentionally places related
+    marks together.  The area-growth guard prevents a few distant islands from
+    recreating a near-full-atlas bounding crop.
+    """
+    groups = _merge_overlapping_rects(rects)
+    gap = max(int(max_gap), 0)
+    growth_limit = max(float(max_area_growth), 1.0)
+    changed = True
+    while changed:
+        changed = False
+        best_pair: tuple[int, int] | None = None
+        best_gap = 0
+        best_growth = 0.0
+        for left in range(len(groups)):
+            for right in range(left + 1, len(groups)):
+                current_gap = _rect_gap(groups[left], groups[right])
+                if current_gap > gap:
+                    continue
+                union = _rect_union(groups[left], groups[right])
+                separate_area = max(_rect_area(groups[left]) + _rect_area(groups[right]), 1)
+                growth = _rect_area(union) / separate_area
+                if growth > growth_limit:
+                    continue
+                if (
+                    best_pair is None
+                    or current_gap < best_gap
+                    or (current_gap == best_gap and growth < best_growth)
+                ):
+                    best_pair = (left, right)
+                    best_gap = current_gap
+                    best_growth = growth
+        if best_pair is None:
+            continue
+        left, right = best_pair
+        merged = _rect_union(groups[left], groups[right])
+        groups.pop(right)
+        groups.pop(left)
+        groups.append(merged)
+        groups.sort(key=lambda item: (item[1], item[0]))
+        changed = True
+    return sorted(groups, key=lambda item: (item[1], item[0]))
+
+
+def _pack_detection_rects(
+    rects: list[tuple[int, int, int, int]],
+    max_width: int,
+    gutter: int,
+) -> tuple[tuple[DetectionTile, ...], tuple[int, int]]:
+    """Shelf-pack atlas rectangles into one detection work image."""
+    if not rects:
+        return (), (0, 0)
+    max_width = max(1, int(max_width))
+    gutter = max(0, int(gutter))
+    ordered = sorted(
+        rects,
+        key=lambda rect: (-(rect[3] - rect[1]), -(rect[2] - rect[0]), rect[1], rect[0]),
+    )
+    x = y = shelf_height = 0
+    used_width = 0
+    tiles: list[DetectionTile] = []
+    for rect in ordered:
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+        if width <= 0 or height <= 0:
+            continue
+        if x > 0 and x + gutter + width > max_width:
+            y += shelf_height + gutter
+            x = 0
+            shelf_height = 0
+        if x > 0:
+            x += gutter
+        dest = (x, y, x + width, y + height)
+        tiles.append(DetectionTile(source=rect, dest=dest))
+        x += width
+        shelf_height = max(shelf_height, height)
+        used_width = max(used_width, dest[2])
+    return tuple(tiles), (used_width, y + shelf_height)
+
+
+def _build_collage_view(
+    bgr: np.ndarray,
+    mirror_mask: np.ndarray,
+    domain_mask: np.ndarray,
+    crop_mask: np.ndarray,
+    config: RhdTextureConfig,
+) -> DetectionView | None:
+    """Build a packed island collage, or decline when it cannot save work."""
+    height, width = crop_mask.shape[:2]
+    rects = _merge_neighbouring_rects(
+        _component_crop_bounds(crop_mask, config.detection_crop_padding_px),
+        config.detection_tile_group_gap_px,
+        config.detection_tile_group_max_area_growth,
+    )
+    if len(rects) <= 1:
+        return None
+    tiles, (collage_width, collage_height) = _pack_detection_rects(
+        rects, width, config.detection_collage_gutter_px
+    )
+    if not tiles or collage_width <= 0 or collage_height <= 0:
+        return None
+    bbox = _mask_crop_bounds(crop_mask, config.detection_crop_padding_px)
+    bbox_area = (
+        (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        if bbox is not None
+        else width * height
+    )
+    collage_area = collage_width * collage_height
+    if collage_area >= bbox_area:
+        return None
+
+    collage_bgr = np.zeros((collage_height, collage_width, bgr.shape[2]), dtype=bgr.dtype)
+    collage_mirror = np.zeros((collage_height, collage_width), dtype=bool)
+    collage_domain = np.zeros((collage_height, collage_width), dtype=bool)
+    for tile in tiles:
+        sx0, sy0, sx1, sy1 = tile.source
+        dx0, dy0, dx1, dy1 = tile.dest
+        collage_bgr[dy0:dy1, dx0:dx1] = bgr[sy0:sy1, sx0:sx1]
+        collage_mirror[dy0:dy1, dx0:dx1] = mirror_mask[sy0:sy1, sx0:sx1]
+        collage_domain[dy0:dy1, dx0:dx1] = domain_mask[sy0:sy1, sx0:sx1]
+    return DetectionView(
+        bgr=collage_bgr,
+        mirror_mask=collage_mirror,
+        domain_mask=collage_domain,
+        tiles=tiles,
+        atlas_shape=(height, width),
+        mode="collage",
+    )
+
+
+def _build_individual_detection_views(
+    bgr: np.ndarray,
+    mirror_mask: np.ndarray,
+    domain_mask: np.ndarray,
+    crop_mask: np.ndarray,
+    config: RhdTextureConfig,
+) -> tuple[DetectionView, ...]:
+    """Build one detection view per selected UV island crop."""
+    height, width = crop_mask.shape[:2]
+    rects = _merge_neighbouring_rects(
+        _component_crop_bounds(crop_mask, config.detection_crop_padding_px),
+        config.detection_tile_group_gap_px,
+        config.detection_tile_group_max_area_growth,
+    )
+    if len(rects) <= 1:
+        return ()
+    bbox = _mask_crop_bounds(crop_mask, config.detection_crop_padding_px)
+    bbox_area = (
+        (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        if bbox is not None
+        else width * height
+    )
+    tile_area = sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in rects)
+    if tile_area >= bbox_area:
+        return ()
+
+    views: list[DetectionView] = []
+    for rect in rects:
+        x0, y0, x1, y1 = rect
+        tile = DetectionTile(source=rect, dest=(0, 0, x1 - x0, y1 - y0))
+        views.append(
+            DetectionView(
+                bgr=bgr[y0:y1, x0:x1],
+                mirror_mask=mirror_mask[y0:y1, x0:x1],
+                domain_mask=domain_mask[y0:y1, x0:x1],
+                tiles=(tile,),
+                atlas_shape=(height, width),
+                mode="tile",
+            )
+        )
+    return tuple(views)
+
+
+def _build_crop_view(
+    bgr: np.ndarray,
+    mirror_mask: np.ndarray,
+    domain_mask: np.ndarray,
+    crop_mask: np.ndarray,
+    config: RhdTextureConfig,
+) -> DetectionView:
+    height, width = crop_mask.shape[:2]
+    crop = _mask_crop_bounds(crop_mask, config.detection_crop_padding_px)
+    if crop is None:
+        crop = (0, 0, width, height)
+    x0, y0, x1, y1 = crop
+    tile = DetectionTile(source=crop, dest=(0, 0, x1 - x0, y1 - y0))
+    return DetectionView(
+        bgr=bgr[y0:y1, x0:x1],
+        mirror_mask=mirror_mask[y0:y1, x0:x1],
+        domain_mask=domain_mask[y0:y1, x0:x1],
+        tiles=(tile,),
+        atlas_shape=(height, width),
+        mode="crop" if (x0, y0, x1, y1) != (0, 0, width, height) else "full",
+    )
+
+
+def _build_detection_views(
+    bgr: np.ndarray,
+    mirror_mask: np.ndarray,
+    domain_mask: np.ndarray,
+    config: RhdTextureConfig,
+) -> tuple[DetectionView, ...]:
+    height, width = domain_mask.shape[:2]
+    crop_mask = mirror_mask if bool(mirror_mask.any()) else domain_mask
+    if not config.crop_detection_to_domain:
+        tile = DetectionTile(source=(0, 0, width, height), dest=(0, 0, width, height))
+        return (DetectionView(bgr, mirror_mask, domain_mask, (tile,), (height, width), "full"),)
+    if config.detect_island_tiles_individually:
+        views = _build_individual_detection_views(
+            bgr, mirror_mask, domain_mask, crop_mask, config
+        )
+        if views:
+            return views
+    if config.collage_detection_islands:
+        collage = _build_collage_view(
+            bgr, mirror_mask, domain_mask, crop_mask, config
+        )
+        if collage is not None:
+            return (collage,)
+    return (_build_crop_view(bgr, mirror_mask, domain_mask, crop_mask, config),)
+
+
+def _tile_intersection_area(
+    bounds: tuple[int, int, int, int],
+    tile: DetectionTile,
+) -> int:
+    x, y, w, h = bounds
+    bx0, by0, bx1, by1 = x, y, x + w, y + h
+    tx0, ty0, tx1, ty1 = tile.dest
+    ix0, iy0 = max(bx0, tx0), max(by0, ty0)
+    ix1, iy1 = min(bx1, tx1), min(by1, ty1)
+    return max(ix1 - ix0, 0) * max(iy1 - iy0, 0)
+
+
+def _tile_for_bounds(
+    bounds: tuple[int, int, int, int],
+    view: DetectionView,
+) -> DetectionTile | None:
+    best: DetectionTile | None = None
+    best_area = 0
+    for tile in view.tiles:
+        area = _tile_intersection_area(bounds, tile)
+        if area > best_area:
+            best = tile
+            best_area = area
+    return best if best_area > 0 else None
+
+
+def _clamp_bounds_to_atlas(
+    bounds: tuple[int, int, int, int],
+    shape: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    x, y, w, h = bounds
+    height, width = shape
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def _map_bounds_from_detection_view(
+    bounds: tuple[int, int, int, int],
+    view: DetectionView,
+) -> tuple[int, int, int, int] | None:
+    tile = _tile_for_bounds(bounds, view)
+    if tile is None:
+        return None
+    sx0, sy0, _sx1, _sy1 = tile.source
+    dx0, dy0, _dx1, _dy1 = tile.dest
+    x, y, w, h = bounds
+    return _clamp_bounds_to_atlas(
+        (x - dx0 + sx0, y - dy0 + sy0, w, h), view.atlas_shape
+    )
+
+
+def _map_rotation_from_detection_view(
+    rotation: tuple[tuple[float, float], ...] | None,
+    bounds: tuple[int, int, int, int],
+    view: DetectionView,
+) -> tuple[tuple[float, float], ...] | None:
+    if rotation is None:
+        return None
+    tile = _tile_for_bounds(bounds, view)
+    if tile is None:
+        return None
+    sx0, sy0, _sx1, _sy1 = tile.source
+    dx0, dy0, _dx1, _dy1 = tile.dest
+    return tuple((x - dx0 + sx0, y - dy0 + sy0) for x, y in rotation)
+
+
+def _view_report(view: DetectionView) -> dict[str, object]:
+    height, width = view.domain_mask.shape[:2]
+    atlas_height, atlas_width = view.atlas_shape
+    return {
+        "mode": view.mode,
+        "size": [width, height],
+        "area_px": width * height,
+        "atlas_fraction": round(
+            (width * height) / max(atlas_width * atlas_height, 1), 6
+        ),
+        "tiles": [
+            {
+                "source": list(tile.source),
+                "dest": list(tile.dest),
+            }
+            for tile in view.tiles
+        ],
+    }
+
+
+def _detect_flip_regions_in_view(
+    view: DetectionView,
+    config: RhdTextureConfig,
+    mser_config: MserConfig,
+    source: str,
+    log=print,
+) -> RegionDetection:
+    """Run detection and post-filters on one crop/collage/tile view."""
+    started = time.perf_counter()
+    detection_bgr = view.bgr
+    detection_mirror_mask = view.mirror_mask
+    detection_domain_mask = view.domain_mask
+    detection = run_detection(detection_bgr, detection_domain_mask, mser_config)
+    final = detection.stages[-1]
+    detected = list(final.kept)
+    use_rotated_regions = (
+        mser_config.enable_edge_aligned_rotation
+        or mser_config.bounds_shape == SHAPE_ROTATED
+    )
+    detected_rotations = [
+        final.rotations[index]
+        if use_rotated_regions
+        and index < len(final.rotations)
+        and final.rotations[index]
+        and len(final.rotations[index]) == 4
+        else None
+        for index in range(len(detected))
+    ]
+    log(f"  [{source}] {len(detected)} region(s) detected across the work area")
+
+    height, width = detection_mirror_mask.shape[:2]
+    result = RegionDetection(source=source, detected=len(detected))
+    mirrored: list[tuple[int, int, int, int]] = []
+    mirrored_rotations: list[tuple[tuple[float, float], ...] | None] = []
+    for (x, y, w, h), rotation in zip(detected, detected_rotations):
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + w, width), min(y + h, height)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if (
+            detection_mirror_mask[y0:y1, x0:x1].mean()
+            >= config.min_region_mirror_overlap
+        ):
+            mirrored.append((x, y, w, h))
+            mirrored_rotations.append(rotation)
+    log(f"  [{source}] {len(mirrored)} of them sit on mirrored geometry")
+
+    if config.enable_containment_filter:
+        contained: list[tuple[int, int, int, int]] = []
+        contained_rotations: list[tuple[tuple[float, float], ...] | None] = []
+        for bounds, rotation in zip(mirrored, mirrored_rotations):
+            escape = feature_escape(
+                detection_bgr, detection_mirror_mask, bounds, config
+            )
+            if escape is not None and escape > config.max_feature_escape:
+                mapped = _map_bounds_from_detection_view(bounds, view)
+                if mapped is not None:
+                    result.uncontained.append((*mapped, escape))
+                continue
+            contained.append(bounds)
+            contained_rotations.append(rotation)
+        for x, y, w, h, escape in result.uncontained:
+            log(f"    - ({x},{y}) {w}x{h}: {escape:.0%} of its feature runs "
+                "past the region; not a self-contained mark, left alone")
+        mirrored = contained
+        mirrored_rotations = contained_rotations
+        log(f"  [{source}] {len(mirrored)} are self-contained enough to flip")
+
+    if config.enable_blob_filter:
+        keep: list[tuple[int, int, int, int]] = []
+        keep_rotations: list[tuple[tuple[float, float], ...] | None] = []
+        for bounds, rotation in zip(mirrored, mirrored_rotations):
+            if bounds[2] * bounds[3] < config.min_blob_filter_area_px:
+                keep.append(bounds)
+                keep_rotations.append(rotation)
+                continue
+            solidity = hull_solidity(
+                detection_bgr, detection_mirror_mask, bounds, config
+            )
+            if solidity is None or solidity < config.max_blob_solidity:
+                keep.append(bounds)
+                keep_rotations.append(rotation)
+                continue
+            # Solid, but a switch pad is solid too.  Only a blob with nothing
+            # printed on it is safe to dismiss.
+            contrast = blob_interior_contrast(
+                detection_bgr, detection_mirror_mask, bounds, config
+            )
+            if contrast is None or contrast >= config.min_blob_interior_contrast:
+                keep.append(bounds)
+                keep_rotations.append(rotation)
+                continue
+            mapped = _map_bounds_from_detection_view(bounds, view)
+            if mapped is not None:
+                result.blobs.append((*mapped, solidity))
+        for x, y, w, h, solidity in result.blobs:
+            log(f"    - ({x},{y}) {w}x{h}: fills {solidity:.2f} of its hull; "
+                "a blob rather than a mark, left alone")
+        mirrored = keep
+        mirrored_rotations = keep_rotations
+
+    for bounds, rotation in zip(mirrored, mirrored_rotations):
+        mapped = _map_bounds_from_detection_view(bounds, view)
+        if mapped is None:
+            continue
+        result.regions.append(mapped)
+        result.rotations.append(_map_rotation_from_detection_view(rotation, bounds, view))
+    result.work_views = [_view_report(view)]
+    result.seconds = time.perf_counter() - started
+    return result
 
 
 def detect_flip_regions(
@@ -2163,84 +2812,54 @@ def detect_flip_regions(
     its own surround, not about colour, so they read a normal map's relief as
     readily as they read print.
     """
-    detection = run_detection(bgr, domain_mask, mser_config)
-    final = detection.stages[-1]
-    detected = list(final.kept)
-    use_rotated_regions = (
-        mser_config.enable_edge_aligned_rotation
-        or mser_config.bounds_shape == SHAPE_ROTATED
-    )
-    detected_rotations = [
-        final.rotations[index]
-        if use_rotated_regions
-        and index < len(final.rotations)
-        and final.rotations[index]
-        and len(final.rotations[index]) == 4
-        else None
-        for index in range(len(detected))
-    ]
-    log(f"  [{source}] {len(detected)} region(s) detected across the material domain")
+    views = _build_detection_views(bgr, mirror_mask, domain_mask, config)
+    atlas_height, atlas_width = domain_mask.shape[:2]
+    total_work_area = sum(view.domain_mask.shape[0] * view.domain_mask.shape[1] for view in views)
+    if len(views) > 1:
+        log(
+            f"  [{source}] detecting in {len(views)} individual UV-island tile(s), "
+            f"{total_work_area / max(atlas_width * atlas_height, 1):.1%} "
+            "of the atlas"
+        )
+    else:
+        view = views[0]
+        if view.mode == "collage":
+            work_height, work_width = view.domain_mask.shape[:2]
+            log(
+                f"  [{source}] detecting in UV-island collage "
+                f"{work_width}x{work_height}, {len(view.tiles)} tile(s), "
+                f"{work_width * work_height / max(atlas_width * atlas_height, 1):.1%} "
+                "of the atlas"
+            )
+        elif view.mode == "crop":
+            tile = view.tiles[0]
+            x0, y0, x1, y1 = tile.source
+            work_height, work_width = view.domain_mask.shape[:2]
+            log(
+                f"  [{source}] detecting in crop {work_width}x{work_height} "
+                f"at ({x0},{y0}), "
+                f"{work_width * work_height / max(atlas_width * atlas_height, 1):.1%} "
+                "of the atlas"
+            )
 
-    height, width = mirror_mask.shape[:2]
-    result = RegionDetection(source=source, detected=len(detected))
-    mirrored: list[tuple[int, int, int, int]] = []
-    mirrored_rotations: list[tuple[tuple[float, float], ...] | None] = []
-    for (x, y, w, h), rotation in zip(detected, detected_rotations):
-        x0, y0 = max(x, 0), max(y, 0)
-        x1, y1 = min(x + w, width), min(y + h, height)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        if mirror_mask[y0:y1, x0:x1].mean() >= config.min_region_mirror_overlap:
-            mirrored.append((x, y, w, h))
-            mirrored_rotations.append(rotation)
-    log(f"  [{source}] {len(mirrored)} of them sit on mirrored geometry")
-
-    if config.enable_containment_filter:
-        contained: list[tuple[int, int, int, int]] = []
-        contained_rotations: list[tuple[tuple[float, float], ...] | None] = []
-        for bounds, rotation in zip(mirrored, mirrored_rotations):
-            escape = feature_escape(bgr, mirror_mask, bounds, config)
-            if escape is not None and escape > config.max_feature_escape:
-                result.uncontained.append((*bounds, escape))
-                continue
-            contained.append(bounds)
-            contained_rotations.append(rotation)
-        for x, y, w, h, escape in result.uncontained:
-            log(f"    - ({x},{y}) {w}x{h}: {escape:.0%} of its feature runs "
-                "past the region; not a self-contained mark, left alone")
-        mirrored = contained
-        mirrored_rotations = contained_rotations
-        log(f"  [{source}] {len(mirrored)} are self-contained enough to flip")
-
-    if config.enable_blob_filter:
-        keep: list[tuple[int, int, int, int]] = []
-        keep_rotations: list[tuple[tuple[float, float], ...] | None] = []
-        for bounds, rotation in zip(mirrored, mirrored_rotations):
-            if bounds[2] * bounds[3] < config.min_blob_filter_area_px:
-                keep.append(bounds)
-                keep_rotations.append(rotation)
-                continue
-            solidity = hull_solidity(bgr, mirror_mask, bounds, config)
-            if solidity is None or solidity < config.max_blob_solidity:
-                keep.append(bounds)
-                keep_rotations.append(rotation)
-                continue
-            # Solid, but a switch pad is solid too.  Only a blob with nothing
-            # printed on it is safe to dismiss.
-            contrast = blob_interior_contrast(bgr, mirror_mask, bounds, config)
-            if contrast is None or contrast >= config.min_blob_interior_contrast:
-                keep.append(bounds)
-                keep_rotations.append(rotation)
-                continue
-            result.blobs.append((*bounds, solidity))
-        for x, y, w, h, solidity in result.blobs:
-            log(f"    - ({x},{y}) {w}x{h}: fills {solidity:.2f} of its hull; "
-                "a blob rather than a mark, left alone")
-        mirrored = keep
-        mirrored_rotations = keep_rotations
-
-    result.regions = mirrored
-    result.rotations = mirrored_rotations
+    result = RegionDetection(source=source, detected=0)
+    started = time.perf_counter()
+    result.work_views = [_view_report(view) for view in views]
+    for view in views:
+        partial = _detect_flip_regions_in_view(
+            view, config, mser_config, source, log
+        )
+        result.detected += partial.detected
+        result.regions.extend(partial.regions)
+        result.rotations.extend(partial.rotations)
+        result.uncontained.extend(partial.uncontained)
+        result.blobs.extend(partial.blobs)
+        if len(views) == 1:
+            result.work_views = partial.work_views
+    if len(views) > 1:
+        log(f"  [{source}] {result.detected} total region(s) detected")
+        log(f"  [{source}] {len(result.regions)} total mirrored region(s) kept")
+    result.seconds = time.perf_counter() - started
     return result
 
 
@@ -2441,10 +3060,12 @@ def build_rhd_texture(
     mser_config: MserConfig = DEFAULT_CONFIG,
     relief_mser_config: MserConfig | None = None,
     part_filter: tuple[str, ...] = (),
+    part_scope: list[DaePart] | None = None,
     masks: DomainMasks | None = None,
     sweep_cache: dict[str, object] | None = None,
     written_companions: set[str] | None = None,
     log=print,
+    progress: ProgressCallback | None = None,
 ) -> RhdTextureResult:
     """Run the whole correction and write the PNG and DDS outputs.
 
@@ -2460,14 +3081,58 @@ def build_rhd_texture(
     and the rest say so.
     """
     started = time.perf_counter()
+    phase_timings: list[dict[str, object]] = []
+    texture_name = PurePosixPath(texture_member).name
+    emit_progress(
+        progress,
+        "begin",
+        "texture_job",
+        f"Processing {texture_name}",
+        texture=texture_member,
+    )
     relief_mser_config = relief_mser_config or DEFAULT_RELIEF_DETECTION_CONFIG
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "load_texture",
+        f"Loading {texture_name}",
+        texture=texture_member,
+    )
     texture_path = extract_archive_member(archive, texture_member)
     with Image.open(texture_path) as image:
         width, height = image.size
         rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
     rgb = rgba[:, :, :3]
+    timing = record_phase(
+        phase_timings,
+        "load_texture",
+        phase_started,
+        texture=texture_member,
+        size=[width, height],
+    )
+    emit_progress(
+        progress,
+        "end",
+        "load_texture",
+        f"Loaded {texture_name}",
+        texture=texture_member,
+        seconds=timing["seconds"],
+    )
 
-    candidates = parts_using_material(archive, loaded, texture_member)
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "resolve_texture_scope",
+        f"Resolving mesh/material scope for {texture_name}",
+        texture=texture_member,
+    )
+    candidates = (
+        scoped_parts_using_material(archive, loaded, texture_member, part_scope)
+        if part_scope is not None
+        else parts_using_material(archive, loaded, texture_member)
+    )
     if part_filter:
         candidates = [
             (part, binding)
@@ -2476,26 +3141,84 @@ def build_rhd_texture(
         ]
     if not candidates:
         raise ValueError(f"No part in the DAE resolves to {texture_member}")
-    symbols = set(material_symbols_for_binding(loaded, candidates[0][1]))
+    symbols: set[str] = set()
+    for _part, binding in candidates:
+        symbols.update(material_symbols_for_binding(loaded, binding))
     if not symbols:
         raise ValueError(f"No COLLADA symbol resolved for {texture_member}")
+    timing = record_phase(
+        phase_timings,
+        "resolve_texture_scope",
+        phase_started,
+        texture=texture_member,
+        selected_parts=len(candidates),
+        collada_symbols=sorted(symbols),
+    )
+    emit_progress(
+        progress,
+        "end",
+        "resolve_texture_scope",
+        f"Resolved {len(candidates)} mesh/material binding(s) for {texture_name}",
+        texture=texture_member,
+        selected_parts=len(candidates),
+        seconds=timing["seconds"],
+    )
 
     if masks is None:
+        phase_started = time.perf_counter()
+        emit_progress(
+            progress,
+            "begin",
+            "build_domain_masks",
+            f"Building UV domain masks for {texture_name}",
+            texture=texture_member,
+        )
         log(f"  {len(candidates)} part(s) use this texture; symbols {sorted(symbols)}")
         masks = build_domain_masks(
             loaded, [part for part, _b in candidates], symbols,
             (width, height), config, sweep_cache, log,
         )
+        timing = record_phase(
+            phase_timings,
+            "build_domain_masks",
+            phase_started,
+            texture=texture_member,
+            selected_parts=len(candidates),
+        )
+        emit_progress(
+            progress,
+            "end",
+            "build_domain_masks",
+            f"Built UV domain masks for {texture_name}",
+            texture=texture_member,
+            seconds=timing["seconds"],
+        )
     else:
         log(f"  {len(candidates)} part(s); reusing the masks for this UV layout "
             f"(mirrored {masks.mirror.mean():.2%})")
+        phase_timings.append(
+            {
+                "phase": "build_domain_masks",
+                "seconds": 0.0,
+                "texture": texture_member,
+                "reused": True,
+            }
+        )
     mirror_mask, rigid_mask = masks.mirror, masks.rigid
     analysed = masks.parts_analysed
 
     # Resolved whether or not they are being rebuilt: the normal map is also a
     # detection source, and reading relief off it is worth doing even for a run
     # that only wants the colour map out the other end.
-    companions = companion_maps_for_binding(archive, candidates[0][1])
+    companion_list: list[CompanionMap] = []
+    seen_companions: set[str] = set()
+    for _part, binding in candidates:
+        for companion in companion_maps_for_binding(archive, binding):
+            if companion.member.lower() in seen_companions:
+                continue
+            seen_companions.add(companion.member.lower())
+            companion_list.append(companion)
+    companions = tuple(companion_list)
     if companions:
         log("  companion maps on this layout: "
             + ", ".join(
@@ -2503,10 +3226,48 @@ def build_rhd_texture(
             ))
 
     domain_mask = mirror_mask | rigid_mask
+    emit_progress(
+        progress,
+        "begin",
+        "detect_texture_regions",
+        f"Detecting colour regions for {texture_name}",
+        texture=texture_member,
+        source="colour",
+    )
     colour = detect_flip_regions(
         rgb[:, :, ::-1].copy(), mirror_mask, domain_mask, config, mser_config,
         "colour", log,
     )
+    phase_timings.append(
+        {
+            "phase": "detect_texture_regions",
+            "seconds": round(colour.seconds, 6),
+            "texture": texture_member,
+            "source": "colour",
+            "regions_detected": colour.detected,
+            "mirrored_regions": len(colour.regions),
+        }
+    )
+    emit_progress(
+        progress,
+        "end",
+        "detect_texture_regions",
+        f"Detected {len(colour.regions)} mirrored colour region(s) for {texture_name}",
+        texture=texture_member,
+        source="colour",
+        regions_detected=colour.detected,
+        mirrored_regions=len(colour.regions),
+        seconds=round(colour.seconds, 6),
+    )
+    detection_reports: list[dict[str, object]] = [
+        {
+            "source": "colour",
+            "seconds": round(colour.seconds, 6),
+            "regions_detected": colour.detected,
+            "mirrored_regions": len(colour.regions),
+            "work_views": colour.work_views,
+        }
+    ]
     mirrored_regions = colour.regions
     mirrored_rotations = colour.rotations
     uncontained = list(colour.uncontained)
@@ -2533,9 +3294,47 @@ def build_rhd_texture(
                     f"{relief_size[0]}x{relief_size[1]}, not {width}x{height}; "
                     "relief detection skipped")
             else:
+                emit_progress(
+                    progress,
+                    "begin",
+                    "detect_texture_regions",
+                    f"Detecting relief regions for {texture_name}",
+                    texture=texture_member,
+                    source="relief",
+                )
                 relief = detect_flip_regions(
                     normal_map_relief(normal_rgb, config), mirror_mask, domain_mask,
                     config, relief_mser_config, "relief", log,
+                )
+                phase_timings.append(
+                    {
+                        "phase": "detect_texture_regions",
+                        "seconds": round(relief.seconds, 6),
+                        "texture": texture_member,
+                        "source": "relief",
+                        "regions_detected": relief.detected,
+                        "mirrored_regions": len(relief.regions),
+                    }
+                )
+                emit_progress(
+                    progress,
+                    "end",
+                    "detect_texture_regions",
+                    f"Detected {len(relief.regions)} mirrored relief region(s) for {texture_name}",
+                    texture=texture_member,
+                    source="relief",
+                    regions_detected=relief.detected,
+                    mirrored_regions=len(relief.regions),
+                    seconds=round(relief.seconds, 6),
+                )
+                detection_reports.append(
+                    {
+                        "source": "relief",
+                        "seconds": round(relief.seconds, 6),
+                        "regions_detected": relief.detected,
+                        "mirrored_regions": len(relief.regions),
+                        "work_views": relief.work_views,
+                    }
                 )
                 detected_total += relief.detected
                 uncontained.extend(relief.uncontained)
@@ -2552,6 +3351,14 @@ def build_rhd_texture(
                 log(f"  {relief_added} of {len(relief.regions)} relief mark(s) "
                     f"joined the plan; {len(mirrored_regions)} region(s) to flip")
 
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "plan_texture_flips",
+        f"Planning texture flips for {texture_name}",
+        texture=texture_member,
+    )
     flips, flipped_islands = plan_island_flips(
         mirror_mask, mirrored_regions, config, masks.axis_map
     )
@@ -2653,7 +3460,33 @@ def build_rhd_texture(
         + (f", {marginal} marginal" if marginal else "")
         + (f"; {expanded} used full domain" if expanded else "")
         + (f"; {skipped} skipped" if skipped else "") + ")")
+    timing = record_phase(
+        phase_timings,
+        "plan_texture_flips",
+        phase_started,
+        texture=texture_member,
+        island_flips=len(flips),
+        in_place_flips=len(in_place),
+    )
+    emit_progress(
+        progress,
+        "end",
+        "plan_texture_flips",
+        f"Planned {len(flips)} island and {len(in_place)} in-place flip(s) for {texture_name}",
+        texture=texture_member,
+        island_flips=len(flips),
+        in_place_flips=len(in_place),
+        seconds=timing["seconds"],
+    )
 
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "apply_texture_flips",
+        f"Applying texture flips for {texture_name}",
+        texture=texture_member,
+    )
     apply_flip_plan(
         rgba,
         steps,
@@ -2663,6 +3496,22 @@ def build_rhd_texture(
         domain_mask,
         config.region_boundary_blend_px,
     )
+    timing = record_phase(
+        phase_timings,
+        "apply_texture_flips",
+        phase_started,
+        texture=texture_member,
+        steps=len(steps),
+    )
+    emit_progress(
+        progress,
+        "end",
+        "apply_texture_flips",
+        f"Applied {len(steps)} texture flip step(s) for {texture_name}",
+        texture=texture_member,
+        steps=len(steps),
+        seconds=timing["seconds"],
+    )
 
     stem = _texture_stem(texture_member)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -2671,6 +3520,14 @@ def build_rhd_texture(
 
     # Stored uncompressed: this is a scratch file for inspecting the result in
     # Blender, not something that ships, and deflate costs more than the disk.
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "write_base_texture",
+        f"Writing corrected base texture for {texture_name}",
+        texture=texture_member,
+    )
     Image.fromarray(rgba).save(png_path, compress_level=0)
     log(f"  wrote {png_path.name}")
     info = write_dds(
@@ -2678,9 +3535,38 @@ def build_rhd_texture(
     )
     log(f"  wrote {dds_path.name}  {str(info['codec']).upper()} "
         f"{info['levels']} mips  {info['bytes']:,} bytes")
+    timing = record_phase(
+        phase_timings,
+        "write_base_texture",
+        phase_started,
+        texture=texture_member,
+        png=str(png_path),
+        dds=str(dds_path),
+        codec=str(info["codec"]),
+        mip_levels=info["levels"],
+        bytes=info["bytes"],
+    )
+    emit_progress(
+        progress,
+        "end",
+        "write_base_texture",
+        f"Wrote corrected base texture for {texture_name}",
+        texture=texture_member,
+        seconds=timing["seconds"],
+        codec=str(info["codec"]),
+    )
 
     companion_results: list[CompanionResult] = []
     if companions and config.rebuild_companion_maps:
+        phase_started = time.perf_counter()
+        emit_progress(
+            progress,
+            "begin",
+            "rebuild_companion_maps",
+            f"Rebuilding {len(companions)} companion map(s) for {texture_name}",
+            texture=texture_member,
+            companion_maps=len(companions),
+        )
         log(f"  replaying the plan onto {len(companions)} companion map(s)")
         for companion in companions:
             if written_companions is not None:
@@ -2700,6 +3586,23 @@ def build_rhd_texture(
                 continue
             if rebuilt is not None:
                 companion_results.append(rebuilt)
+        timing = record_phase(
+            phase_timings,
+            "rebuild_companion_maps",
+            phase_started,
+            texture=texture_member,
+            companion_maps=len(companions),
+            rebuilt=len(companion_results),
+        )
+        emit_progress(
+            progress,
+            "end",
+            "rebuild_companion_maps",
+            f"Rebuilt {len(companion_results)} companion map(s) for {texture_name}",
+            texture=texture_member,
+            rebuilt=len(companion_results),
+            seconds=timing["seconds"],
+        )
 
     if config.write_debug_overlays:
         overlay_path = output_directory / f"{stem}_rhd.debug.png"
@@ -2708,100 +3611,177 @@ def build_rhd_texture(
         )
         log(f"  wrote {overlay_path.name}")
 
+    material_aliases = tuple(
+        dict.fromkeys(
+            value
+            for _part, binding in candidates
+            for value in (
+                binding.dae_material,
+                binding.material_key,
+                *symbols,
+            )
+            if value
+        )
+    )
+    texture_report: dict[str, object] = {
+        "texture": texture_member,
+        "size": [width, height],
+        "source_texture_path": str(texture_path),
+        "selected_parts": [
+            {
+                "key": part.key,
+                "label": part.label,
+                "node_id": part.node_id,
+                "node_name": part.node_name,
+                "geometry_ids": [instance.geometry_id for instance in part.instances],
+                "dae_material": binding.dae_material,
+                "material_key": binding.material_key,
+            }
+            for part, binding in candidates
+        ],
+        "material_aliases": list(material_aliases),
+        "collada_symbols": sorted(symbols),
+        "parts_analysed": analysed,
+        "mirror_coverage": round(float(mirror_mask.mean()), 6),
+        "rigid_coverage": round(float(rigid_mask.mean()), 6),
+        "conflict_coverage": round(masks.conflict_coverage, 6),
+        "mirrored_triangles": masks.mirrored_triangles,
+        "rigid_triangles": masks.rigid_triangles,
+        "phase_timings": phase_timings,
+        "detection": detection_reports,
+        "reflect_flipped_normal_vectors": config.reflect_flipped_normal_vectors,
+        "correct_flipped_normal_background": (
+            config.correct_flipped_normal_background
+        ),
+        "regions_detected": detected_total,
+        "mirrored_regions": len(mirrored_regions),
+        "relief_regions_added": relief_added,
+        "outputs": {
+            "png": str(png_path),
+            "dds": str(dds_path),
+        },
+        "companion_maps": [
+            {
+                "member": rebuilt.member,
+                "stage_key": rebuilt.stage_key,
+                "kind": rebuilt.kind,
+                "codec": rebuilt.codec,
+                "texels_moved": rebuilt.texels_moved,
+                "png": str(rebuilt.png_path) if rebuilt.png_path is not None else None,
+                "dds": str(rebuilt.dds_path) if rebuilt.dds_path is not None else None,
+                "preview": (
+                    str(rebuilt.preview_path)
+                    if rebuilt.preview_path is not None
+                    else None
+                ),
+            }
+            for rebuilt in companion_results
+        ],
+        "island_flips": [
+            {
+                "label": flip.label,
+                "x": flip.bounds[0], "y": flip.bounds[1],
+                "w": flip.bounds[2], "h": flip.bounds[3],
+                "area_px": flip.area_px,
+                "axis": flip.axis,
+                "horizontal_similarity": round(flip.horizontal_similarity, 6),
+                "vertical_similarity": round(flip.vertical_similarity, 6),
+                "glyph_count": flip.glyph_count,
+            }
+            for flip in flips
+        ],
+        "in_place_flips": [
+            {
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "axis": axis,
+                "stencil": stencil,
+                "rotated_axis": rotated_axis,
+                "rotated_corners": (
+                    [[round(px, 3), round(py, 3)] for px, py in rotation]
+                    if rotation is not None
+                    else None
+                ),
+                "exchangeable": round(share, 4),
+            }
+            for (
+                (x, y, w, h),
+                axis,
+                rotated_axis,
+                rotation,
+                stencil,
+                share,
+            ) in zip(
+                in_place,
+                in_place_axes,
+                in_place_rotated_axes,
+                in_place_rotations,
+                in_place_stencils,
+                in_place_shares,
+            )
+        ],
+        "blob_regions": [
+            {"x": x, "y": y, "w": w, "h": h, "solidity": round(v, 3)}
+            for x, y, w, h, v in blobs
+        ],
+        "uncontained_regions": [
+            {"x": x, "y": y, "w": w, "h": h, "escape": round(e, 4)}
+            for x, y, w, h, e in uncontained
+        ],
+        "imperfect_regions": [
+            {"x": x, "y": y, "w": w, "h": h, "axis": axis,
+             "exchangeable": round(share, 4)}
+            for x, y, w, h, axis, share in imperfect
+        ],
+    }
+
+    seconds = time.perf_counter() - started
+    texture_report["seconds"] = round(seconds, 6)
     # Record exactly which texels moved and how, so the result can be checked
     # against the source without re-deriving the plan from a pixel diff.
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "write_texture_report",
+        f"Writing texture report for {texture_name}",
+        texture=texture_member,
+    )
     plan_path = output_directory / f"{stem}_rhd.plan.json"
     plan_path.write_text(
-        json.dumps(
-            {
-                "texture": texture_member,
-                "size": [width, height],
-                "parts_analysed": analysed,
-                "mirror_coverage": round(float(mirror_mask.mean()), 6),
-                "rigid_coverage": round(float(rigid_mask.mean()), 6),
-                "conflict_coverage": round(masks.conflict_coverage, 6),
-                "reflect_flipped_normal_vectors": config.reflect_flipped_normal_vectors,
-                "correct_flipped_normal_background": (
-                    config.correct_flipped_normal_background
-                ),
-                "regions_detected": detected_total,
-                "relief_regions_added": relief_added,
-                "companion_maps": [
-                    {
-                        "member": rebuilt.member,
-                        "stage_key": rebuilt.stage_key,
-                        "kind": rebuilt.kind,
-                        "codec": rebuilt.codec,
-                        "texels_moved": rebuilt.texels_moved,
-                    }
-                    for rebuilt in companion_results
-                ],
-                "island_flips": [
-                    {
-                        "label": flip.label,
-                        "x": flip.bounds[0], "y": flip.bounds[1],
-                        "w": flip.bounds[2], "h": flip.bounds[3],
-                        "area_px": flip.area_px,
-                        "axis": flip.axis,
-                        "horizontal_similarity": round(flip.horizontal_similarity, 6),
-                        "vertical_similarity": round(flip.vertical_similarity, 6),
-                        "glyph_count": flip.glyph_count,
-                    }
-                    for flip in flips
-                ],
-                "in_place_flips": [
-                    {
-                        "x": x,
-                        "y": y,
-                        "w": w,
-                        "h": h,
-                        "axis": axis,
-                        "stencil": stencil,
-                        "rotated_axis": rotated_axis,
-                        "rotated_corners": (
-                            [[round(px, 3), round(py, 3)] for px, py in rotation]
-                            if rotation is not None
-                            else None
-                        ),
-                        "exchangeable": round(share, 4),
-                    }
-                    for (
-                        (x, y, w, h),
-                        axis,
-                        rotated_axis,
-                        rotation,
-                        stencil,
-                        share,
-                    ) in zip(
-                        in_place,
-                        in_place_axes,
-                        in_place_rotated_axes,
-                        in_place_rotations,
-                        in_place_stencils,
-                        in_place_shares,
-                    )
-                ],
-                "blob_regions": [
-                    {"x": x, "y": y, "w": w, "h": h, "solidity": round(v, 3)}
-                    for x, y, w, h, v in blobs
-                ],
-                "uncontained_regions": [
-                    {"x": x, "y": y, "w": w, "h": h, "escape": round(e, 4)}
-                    for x, y, w, h, e in uncontained
-                ],
-                "imperfect_regions": [
-                    {"x": x, "y": y, "w": w, "h": h, "axis": axis,
-                     "exchangeable": round(share, 4)}
-                    for x, y, w, h, axis, share in imperfect
-                ],
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps(texture_report, indent=2) + "\n",
         encoding="utf-8",
     )
     log(f"  wrote {plan_path.name}")
-
+    timing = record_phase(
+        phase_timings,
+        "write_texture_report",
+        phase_started,
+        texture=texture_member,
+        report=str(plan_path),
+    )
+    plan_path.write_text(
+        json.dumps(texture_report, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    emit_progress(
+        progress,
+        "end",
+        "write_texture_report",
+        f"Wrote texture report for {texture_name}",
+        texture=texture_member,
+        seconds=timing["seconds"],
+    )
+    emit_progress(
+        progress,
+        "end",
+        "texture_job",
+        f"Finished {texture_name}",
+        texture=texture_member,
+        seconds=round(seconds, 6),
+    )
     return RhdTextureResult(
         texture_member=texture_member,
         size=(width, height),
@@ -2813,24 +3793,15 @@ def build_rhd_texture(
         conflict_coverage=masks.conflict_coverage,
         glyph_regions=detected_total,
         mirrored_glyph_regions=len(mirrored_regions),
-        material_aliases=tuple(
-            dict.fromkeys(
-                value
-                for value in (
-                    candidates[0][1].dae_material,
-                    candidates[0][1].material_key,
-                    *symbols,
-                )
-                if value
-            )
-        ),
+        material_aliases=material_aliases,
         relief_regions=relief_added,
         island_flips=flips,
         in_place_flips=in_place,
         companions=companion_results,
         png_path=png_path,
         dds_path=dds_path,
-        seconds=time.perf_counter() - started,
+        seconds=seconds,
+        report=texture_report,
     )
 
 
@@ -3124,6 +4095,448 @@ class PartPreview:
     script_path: Path | None = None
     blend_path: Path | None = None
     seconds: float = 0.0
+    dae_paths: tuple[Path, ...] = ()
+    blend_paths: tuple[Path, ...] = ()
+    report_path: Path | None = None
+    report: dict[str, object] = field(default_factory=dict)
+
+
+def _base_colours_by_alias(results: list[RhdTextureResult]) -> dict[str, Path]:
+    """Map every resolved material alias to the corrected base-colour texture."""
+    base_colours: dict[str, Path] = {}
+    for result in results:
+        if result.png_path is None:
+            continue
+        for alias in result.material_aliases:
+            base_colours.setdefault(alias, result.png_path)
+    return base_colours
+
+
+def _unique_output_path(directory: Path, stem: str, suffix: str, used: set[str]) -> Path:
+    base = safe_name(stem) or "beamxp_part"
+    candidate = f"{base}{suffix}"
+    counter = 2
+    while candidate.lower() in used:
+        candidate = f"{base}_{counter}{suffix}"
+        counter += 1
+    used.add(candidate.lower())
+    return directory / candidate
+
+
+def _json_safe(value: object) -> object:
+    """Convert numpy/path-heavy exporter metadata into JSON-safe values."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _part_report(part: DaePart) -> dict[str, object]:
+    return {
+        "key": part.key,
+        "label": part.label,
+        "node_id": part.node_id,
+        "node_name": part.node_name,
+        "geometry_ids": [instance.geometry_id for instance in part.instances],
+    }
+
+
+def _generated_mesh_rows_from_export(
+    export_info: dict[str, object],
+) -> list[dict[str, object]]:
+    """Summarise generated preview nodes for eventual flexbody expansion."""
+    rows: list[dict[str, object]] = []
+    carrier = export_info.get("carrier")
+    if isinstance(carrier, dict) and carrier.get("node_id"):
+        rows.append(
+            {
+                "node_id": carrier.get("node_id"),
+                "geometry_ids": carrier.get("geometry_ids", []),
+                "role": "mirrored_carrier",
+                "triangle_count": carrier.get("triangle_count", 0),
+            }
+        )
+    for candidate in export_info.get("rigid_symmetric_nodes", []):
+        if not isinstance(candidate, dict):
+            continue
+        rows.append(
+            {
+                "node_id": candidate.get("node_id"),
+                "geometry_ids": candidate.get("geometry_ids", []),
+                "role": "rigid_symmetric",
+                "candidate_id": candidate.get("candidate_id"),
+                "triangle_count": candidate.get("triangle_count", 0),
+            }
+        )
+    return rows
+
+
+def export_parts_preview(
+    archive: VehicleArchive,
+    loaded: LoadedDae,
+    parts: list[DaePart],
+    output_directory: Path,
+    config: RhdTextureConfig = DEFAULT_RHD_CONFIG,
+    mser_config: MserConfig = DEFAULT_CONFIG,
+    bake: bool = True,
+    relief_mser_config: MserConfig | None = None,
+    log=print,
+    progress: ProgressCallback | None = None,
+) -> PartPreview:
+    """Export selected parts, converted and retextured, ready to open in Blender.
+
+    The texture pass is grouped by atlas across the selected mesh set.  If two
+    selected meshes share one material texture, their UV domains are unioned and
+    detected once, so the output is one corrected texture instead of competing
+    per-part copies.  Work is intentionally scoped to the selected meshes; this
+    is the standalone stepping stone for the production island-scoped pipeline.
+
+    Textures are rebuilt before the DAE is written so the DAE can point at the
+    corrected base colours rather than the originals; the script then attaches
+    the normal, roughness, metallic and AO maps the COLLADA importer drops.
+    """
+    started = time.perf_counter()
+    phase_timings: list[dict[str, object]] = []
+    emit_progress(
+        progress,
+        "begin",
+        "preview_export",
+        "Exporting texture-corrected preview",
+        selected_parts=len(parts),
+    )
+    output_directory.mkdir(parents=True, exist_ok=True)
+    if not parts:
+        raise ValueError("No parts selected for preview export.")
+
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "resolve_materials",
+        "Resolving texture/material jobs",
+        selected_parts=len(parts),
+    )
+    bindings_by_texture = texture_bindings_for_parts(archive, loaded, parts)
+    if not bindings_by_texture:
+        labels = ", ".join(part.label for part in parts)
+        raise ValueError(f"No materials-JSON texture resolved for {labels}")
+    timing = record_phase(
+        phase_timings,
+        "resolve_materials",
+        phase_started,
+        selected_parts=len(parts),
+        texture_jobs=len(bindings_by_texture),
+    )
+    emit_progress(
+        progress,
+        "end",
+        "resolve_materials",
+        f"Resolved {len(bindings_by_texture)} texture job(s)",
+        selected_parts=len(parts),
+        texture_jobs=len(bindings_by_texture),
+        seconds=timing["seconds"],
+    )
+
+    sweep_cache: dict[str, object] = {}
+    mask_cache: dict[tuple, DomainMasks] = {}
+    written: set[str] = set()
+    results: list[RhdTextureResult] = []
+    for texture_index, (member, entries) in enumerate(bindings_by_texture.items(), start=1):
+        texture_name = PurePosixPath(member).name
+        texture_parts: list[DaePart] = []
+        seen_part_keys: set[str] = set()
+        for part, _binding in entries:
+            if part.key in seen_part_keys:
+                continue
+            seen_part_keys.add(part.key)
+            texture_parts.append(part)
+        symbols: set[str] = set()
+        for _part, binding in entries:
+            symbols.update(material_symbols_for_binding(loaded, binding))
+        if not symbols:
+            log(f"\n{PurePosixPath(member).name}")
+            log("  ! failed: no COLLADA symbol resolved")
+            continue
+        log(f"\n{texture_name}")
+        try:
+            with Image.open(extract_archive_member(archive, member)) as image:
+                size = image.size
+            mask_key = (
+                frozenset(symbols),
+                size,
+                tuple(sorted(part.key for part in texture_parts)),
+            )
+            masks = mask_cache.get(mask_key)
+            if masks is None:
+                phase_started = time.perf_counter()
+                emit_progress(
+                    progress,
+                    "begin",
+                    "build_domain_masks",
+                    f"Building UV masks for {texture_name}",
+                    texture=member,
+                    texture_index=texture_index,
+                    texture_total=len(bindings_by_texture),
+                    selected_parts=len(texture_parts),
+                )
+                masks = build_domain_masks(
+                    loaded, texture_parts, symbols, size, config, sweep_cache, log
+                )
+                mask_cache[mask_key] = masks
+                timing = record_phase(
+                    phase_timings,
+                    "build_domain_masks",
+                    phase_started,
+                    texture=member,
+                    texture_index=texture_index,
+                    texture_total=len(bindings_by_texture),
+                    selected_parts=len(texture_parts),
+                    mirrored_triangles=masks.mirrored_triangles,
+                    rigid_triangles=masks.rigid_triangles,
+                )
+                emit_progress(
+                    progress,
+                    "end",
+                    "build_domain_masks",
+                    f"Built UV masks for {texture_name}",
+                    texture=member,
+                    texture_index=texture_index,
+                    texture_total=len(bindings_by_texture),
+                    seconds=timing["seconds"],
+                )
+            if not bool(masks.mirror.any()):
+                log("  nothing mirrored on this selected texture domain; skipped")
+                continue
+            result = build_rhd_texture(
+                archive, loaded, member, output_directory,
+                config, mser_config, relief_mser_config,
+                part_scope=texture_parts,
+                masks=masks,
+                sweep_cache=sweep_cache,
+                written_companions=written,
+                log=log,
+                progress=progress,
+            )
+            results.append(result)
+        except Exception as exc:
+            log(f"  ! failed: {type(exc).__name__}: {exc}")
+
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "write_blender_preview_assets",
+        "Writing Blender preview material wiring",
+        texture_jobs=len(results),
+    )
+    script = write_blender_preview(output_directory, results, log)
+    timing = record_phase(
+        phase_timings,
+        "write_blender_preview_assets",
+        phase_started,
+        texture_jobs=len(results),
+        script=str(script) if script is not None else None,
+    )
+    emit_progress(
+        progress,
+        "end",
+        "write_blender_preview_assets",
+        "Wrote Blender preview material wiring",
+        texture_jobs=len(results),
+        seconds=timing["seconds"],
+    )
+
+    base_colours = _base_colours_by_alias(results)
+    dae_paths: list[Path] = []
+    dae_exports: list[dict[str, object]] = []
+    used_names: set[str] = set()
+    for part_index, part in enumerate(parts, start=1):
+        log(f"\nsweeping {part.label} for the hand conversion")
+        phase_started = time.perf_counter()
+        emit_progress(
+            progress,
+            "begin",
+            "export_part_dae",
+            f"Exporting transformed DAE for {part.label}",
+            part=part.key,
+            part_index=part_index,
+            part_total=len(parts),
+        )
+        sweep = sweep_part(loaded, part, config, sweep_cache)
+        dae_path = _unique_output_path(
+            output_directory, part.node_name or part.label, "_rhd.dae", used_names
+        )
+        export_info = export_transformed_part_dae(
+            loaded,
+            sweep,
+            dae_path,
+            blender_base_colours=base_colours or None,  # type: ignore[arg-type]
+        )
+        dae_paths.append(dae_path)
+        generated_rows = _generated_mesh_rows_from_export(export_info)
+        dae_exports.append(
+            {
+                "source_part": _part_report(part),
+                "dae_path": str(dae_path),
+                "generated_flexbody_rows": generated_rows,
+                "export_info": _json_safe(export_info),
+            }
+        )
+        log(f"wrote {dae_path.name}")
+        timing = record_phase(
+            phase_timings,
+            "export_part_dae",
+            phase_started,
+            part=part.key,
+            part_index=part_index,
+            part_total=len(parts),
+            dae=str(dae_path),
+            generated_mesh_rows=len(generated_rows),
+        )
+        emit_progress(
+            progress,
+            "end",
+            "export_part_dae",
+            f"Exported transformed DAE for {part.label}",
+            part=part.key,
+            part_index=part_index,
+            part_total=len(parts),
+            generated_mesh_rows=len(generated_rows),
+            seconds=timing["seconds"],
+        )
+
+    blend_paths: list[Path] = []
+    if bake and script is not None:
+        for dae_path in dae_paths:
+            phase_started = time.perf_counter()
+            emit_progress(
+                progress,
+                "begin",
+                "bake_blender_preview",
+                f"Baking Blender preview for {dae_path.name}",
+                dae=str(dae_path),
+            )
+            blend_name = (
+                "rhd_preview.blend"
+                if len(dae_paths) == 1
+                else f"{dae_path.stem}.blend"
+            )
+            blend = bake_blender_scene(
+                script, dae_path, output_directory / blend_name, log=log
+            )
+            if blend is not None:
+                blend_paths.append(blend)
+                log(f"wrote {blend.name} -- open this")
+            timing = record_phase(
+                phase_timings,
+                "bake_blender_preview",
+                phase_started,
+                dae=str(dae_path),
+                blend=str(blend) if blend is not None else None,
+            )
+            emit_progress(
+                progress,
+                "end",
+                "bake_blender_preview",
+                f"Finished Blender preview bake for {dae_path.name}",
+                dae=str(dae_path),
+                blend=str(blend) if blend is not None else None,
+                seconds=timing["seconds"],
+            )
+
+    seconds = time.perf_counter() - started
+    report: dict[str, object] = {
+        "mode": "standalone_texture_corrected_preview",
+        "source_archive": str(getattr(archive, "path", "")),
+        "source_dae": str(getattr(loaded, "path", "")),
+        "output_directory": str(output_directory),
+        "selected_parts": [_part_report(part) for part in parts],
+        "texture_jobs": [result.report for result in results],
+        "dae_exports": dae_exports,
+        "phase_timings": phase_timings,
+        "outputs": {
+            "dae_paths": [str(path) for path in dae_paths],
+            "script_path": str(script) if script is not None else None,
+            "blend_paths": [str(path) for path in blend_paths],
+        },
+        "config": {
+            "crop_detection_to_domain": config.crop_detection_to_domain,
+            "detection_crop_padding_px": config.detection_crop_padding_px,
+            "detect_island_tiles_individually": (
+                config.detect_island_tiles_individually
+            ),
+            "detection_tile_group_gap_px": config.detection_tile_group_gap_px,
+            "detection_tile_group_max_area_growth": (
+                config.detection_tile_group_max_area_growth
+            ),
+            "collage_detection_islands": config.collage_detection_islands,
+            "detection_collage_gutter_px": config.detection_collage_gutter_px,
+            "rebuild_companion_maps": config.rebuild_companion_maps,
+            "detect_on_normal_map": config.detect_on_normal_map,
+            "bc7_profile": config.bc7_profile,
+        },
+        "seconds": round(seconds, 6),
+    }
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "write_preview_report",
+        "Writing texture-corrected preview report",
+        output_directory=str(output_directory),
+    )
+    report_path = output_directory / "rhd_preview.report.json"
+    report_path.write_text(
+        json.dumps(_json_safe(report), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    log(f"wrote {report_path.name}")
+    timing = record_phase(
+        phase_timings,
+        "write_preview_report",
+        phase_started,
+        report=str(report_path),
+    )
+    report_path.write_text(
+        json.dumps(_json_safe(report), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    emit_progress(
+        progress,
+        "end",
+        "write_preview_report",
+        "Wrote texture-corrected preview report",
+        report=str(report_path),
+        seconds=timing["seconds"],
+    )
+    emit_progress(
+        progress,
+        "end",
+        "preview_export",
+        "Finished texture-corrected preview export",
+        texture_jobs=len(results),
+        dae_exports=len(dae_paths),
+        seconds=round(seconds, 6),
+    )
+
+    return PartPreview(
+        dae_path=dae_paths[0],
+        textures=results,
+        script_path=script,
+        blend_path=blend_paths[0] if blend_paths else None,
+        seconds=seconds,
+        dae_paths=tuple(dae_paths),
+        blend_paths=tuple(blend_paths),
+        report_path=report_path,
+        report=report,
+    )
 
 
 def export_part_preview(
@@ -3136,74 +4549,20 @@ def export_part_preview(
     bake: bool = True,
     relief_mser_config: MserConfig | None = None,
     log=print,
+    progress: ProgressCallback | None = None,
 ) -> PartPreview:
-    """Export one part, converted and retextured, ready to open in Blender.
-
-    The whole loop in one call: sweep the part, rebuild every texture it paints
-    with the detection settings in force, export the part already converted to
-    the opposite hand, wire the rebuilt maps onto it and bake a .blend.
-
-    Textures are rebuilt before the DAE is written so the DAE can point at the
-    corrected base colours rather than the originals; the script then attaches
-    the normal, roughness, metallic and AO maps the COLLADA importer drops.
-    """
-    started = time.perf_counter()
-    output_directory.mkdir(parents=True, exist_ok=True)
-
-    bindings = archive_texture_choices_for_part(archive, loaded, part)
-    if not bindings:
-        raise ValueError(f"No materials-JSON texture resolved for {part.label}")
-
-    sweep_cache: dict[str, object] = {}
-    written: set[str] = set()
-    results: list[RhdTextureResult] = []
-    seen: set[str] = set()
-    for binding in bindings:
-        if binding.texture_member in seen:
-            continue
-        seen.add(binding.texture_member)
-        log(f"\n{PurePosixPath(binding.texture_member).name}")
-        try:
-            results.append(
-                build_rhd_texture(
-                    archive, loaded, binding.texture_member, output_directory,
-                    config, mser_config, relief_mser_config,
-                    sweep_cache=sweep_cache,
-                    written_companions=written, log=log,
-                )
-            )
-        except Exception as exc:
-            log(f"  ! failed: {type(exc).__name__}: {exc}")
-
-    script = write_blender_preview(output_directory, results, log)
-
-    log(f"\nsweeping {part.label} for the hand conversion")
-    sweep = sweep_part(loaded, part, config, sweep_cache)
-    base_colours = {
-        result.material_aliases[0]: result.png_path
-        for result in results
-        if result.material_aliases and result.png_path is not None
-    }
-    dae_path = output_directory / f"{safe_name(part.node_name or part.label)}_rhd.dae"
-    export_transformed_part_dae(
-        loaded, sweep, dae_path, blender_base_colours=base_colours  # type: ignore[arg-type]
-    )
-    log(f"wrote {dae_path.name}")
-
-    blend = None
-    if bake and script is not None:
-        blend = bake_blender_scene(
-            script, dae_path, output_directory / "rhd_preview.blend", log=log
-        )
-        if blend is not None:
-            log(f"wrote {blend.name} -- open this")
-
-    return PartPreview(
-        dae_path=dae_path,
-        textures=results,
-        script_path=script,
-        blend_path=blend,
-        seconds=time.perf_counter() - started,
+    """Export one part via the multi-part preview pipeline."""
+    return export_parts_preview(
+        archive,
+        loaded,
+        [part],
+        output_directory,
+        config,
+        mser_config,
+        bake,
+        relief_mser_config,
+        log,
+        progress,
     )
 
 
@@ -3335,6 +4694,19 @@ def main() -> int:
         help="Restrict to parts whose label contains this. Repeatable.",
     )
     parser.add_argument(
+        "--export-preview",
+        action="store_true",
+        help=(
+            "Export transformed RHD preview DAE(s) for all selected --part "
+            "matches, grouping shared texture-atlas correction into one pass."
+        ),
+    )
+    parser.add_argument(
+        "--no-bake-preview",
+        action="store_true",
+        help="With --export-preview, skip launching Blender to create .blend files.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -3414,6 +4786,32 @@ def main() -> int:
     )
 
     started = time.perf_counter()
+    if args.export_preview:
+        if not args.part:
+            parser.error("--export-preview requires at least one --part selector")
+        selected_parts = parts_matching_filter(loaded, tuple(args.part))
+        if not selected_parts:
+            parser.error("No DAE parts matched --part for preview export")
+        preview = export_parts_preview(
+            archive,
+            loaded,
+            selected_parts,
+            output,
+            config,
+            DEFAULT_CONFIG,
+            bake=not args.no_bake_preview,
+            relief_mser_config=DEFAULT_RELIEF_DETECTION_CONFIG,
+        )
+        print(
+            f"\n{'=' * 70}\n"
+            f"{len(preview.dae_paths)} preview DAE(s), "
+            f"{len(preview.textures)} texture(s) rebuilt in "
+            f"{preview.seconds:.1f}s"
+        )
+        for dae_path in preview.dae_paths:
+            print(f"  {dae_path.name}")
+        return 0
+
     if members:
         sweep_cache: dict[str, object] = {}
         written_companions: set[str] = set()
