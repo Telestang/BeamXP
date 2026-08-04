@@ -59,3 +59,6 @@ docs/
 
 # Generated RHD texture outputs (large binaries)
 rhd_textures/
+
+# Local reveal GIF scratch/output assets
+reveal_gif_work/

@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import copy
 import json
+import math
+import re
 import shutil
+from collections.abc import Callable, Iterable
+from dataclasses import replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from xml.etree import ElementTree as ET
+from beamxp import transform_helpers
 from beamxp.core.constants import (
     ACTION_OPPOSITE,
     ACTION_SKIP,
@@ -37,6 +43,7 @@ from beamxp.core.constants import (
     MODE_TRANSLATE,
     NS,
     NUMBER_RE,
+    PART_TEXTURE_CORRECTION_KEY,
     PREVIEW_FAR_LIMIT,
     PROJECTS_DIR,
     SOURCE_ROOT_DIR,
@@ -223,6 +230,1016 @@ def relocation_meshes(
     return {mesh for mesh in meshes if mesh in context.objects}
 
 
+def _atomic_copy_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    shutil.copy2(source, temporary)
+    temporary.replace(target)
+
+
+def _texture_correction_output_stem(source_zip: Path, dae_path: str) -> str:
+    normalised_dae_path = dae_path.replace("\\", "/")
+    stem = f"{source_zip.stem}_{Path(normalised_dae_path).stem}"
+    return safe_project_segment(stem) or "texture_correction"
+
+
+def _matching_loaded_dae_parts(loaded: object, mesh_ids: Iterable[str]) -> tuple[list[object], list[str]]:
+    wanted = {str(mesh_id) for mesh_id in mesh_ids}
+    matched: list[object] = []
+    matched_ids: set[str] = set()
+    for part in getattr(loaded, "parts", ()) or ():
+        aliases = {
+            str(getattr(part, "key", "") or ""),
+            str(getattr(part, "node_id", "") or ""),
+            str(getattr(part, "node_name", "") or ""),
+        }
+        aliases.discard("")
+        hits = aliases & wanted
+        if not hits:
+            continue
+        matched.append(part)
+        matched_ids.update(hits)
+    return matched, sorted(wanted - matched_ids)
+
+
+def texture_correction_asset_archives(context: VehicleContext) -> list[Path]:
+    """Ordered BeamNG virtual-asset search path for texture correction.
+
+    A marked mesh's DAE can bind materials/textures shipped by the vehicle, a
+    sibling stock archive, or any stock game vehicle archive. The source archive
+    stays first so mods override stock assets when paths collide.
+    """
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    def add(candidate: Path) -> None:
+        try:
+            resolved = str(candidate.resolve(strict=False)).lower()
+        except OSError:
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        if candidate.is_file():
+            paths.append(candidate)
+
+    add(context.source_zip)
+    if context.source_zip.parent.is_dir():
+        for candidate in sorted(context.source_zip.parent.glob("*.zip"), key=lambda item: item.name.lower()):
+            add(candidate)
+    for common_zip in beamng_game_common_zips():
+        parent = common_zip.parent
+        if parent.is_dir():
+            for candidate in sorted(parent.glob("*.zip"), key=lambda item: item.name.lower()):
+                add(candidate)
+        else:
+            add(common_zip)
+    return paths
+
+
+def export_texture_correction_artifacts(
+    context: VehicleContext,
+    output_root: Path,
+    mesh_ids: Iterable[str],
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    """Run the standalone atlas-correction exporter for marked meshes."""
+    selected = sorted({str(mesh_id) for mesh_id in mesh_ids if str(mesh_id) in context.objects})
+    report: dict[str, object] = {
+        "enabled": bool(selected),
+        "requestedMeshes": selected,
+        "jobs": [],
+        "missing": [],
+        "failures": [],
+    }
+    if not selected:
+        return report
+    if progress is not None:
+        progress(f"Preparing texture correction for {len(selected)} mesh(es)...")
+
+    try:
+        from mesh_segmentation_transform.mirror_texture_for_rhd import (
+            DEFAULT_CONFIG as DEFAULT_MSER_CONFIG,
+            DEFAULT_RELIEF_DETECTION_CONFIG,
+            DEFAULT_RHD_CONFIG,
+            export_parts_preview,
+        )
+        from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
+            extract_archive_member,
+            load_dae,
+            scan_vehicle_archive,
+        )
+    except Exception as exc:  # pragma: no cover - depends on optional packages in packaged builds
+        raise RuntimeError(
+            "Texture correction was requested, but the standalone texture tooling "
+            f"could not be loaded: {type(exc).__name__}: {exc}"
+        ) from exc
+    texture_config = replace(DEFAULT_RHD_CONFIG, detect_on_normal_map=True)
+
+    by_source: dict[tuple[Path, str], list[str]] = {}
+    for mesh_id in selected:
+        obj = context.objects.get(mesh_id)
+        if obj is None or not obj.dae_path:
+            continue
+        source_zip = obj.dae_source_zip or context.source_zip
+        by_source.setdefault((source_zip, obj.dae_path), []).append(mesh_id)
+
+    output_dir = output_root / "handedness_conversion" / "texture_correction"
+    workspace_root = context.project_dir / "build" / "texture_correction_workspace"
+    clean_dir(workspace_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_cache: dict[Path, object] = {}
+
+    for (source_zip, dae_member), source_meshes in sorted(by_source.items(), key=lambda item: (str(item[0][0]).lower(), item[0][1].lower())):
+        try:
+            archive = archive_cache.get(source_zip)
+            if archive is None:
+                archive_workspace = workspace_root / safe_project_segment(source_zip.stem)
+                asset_archives = [
+                    candidate
+                    for candidate in texture_correction_asset_archives(context)
+                    if candidate != source_zip
+                ]
+                archive = scan_vehicle_archive(
+                    source_zip,
+                    archive_workspace,
+                    asset_archives=asset_archives,
+                )
+                archive_cache[source_zip] = archive
+            loaded = load_dae(extract_archive_member(archive, dae_member))
+        except Exception as exc:
+            report["failures"].append(
+                {
+                    "sourceZip": str(source_zip),
+                    "dae": dae_member,
+                    "meshes": sorted(source_meshes),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            if progress is not None:
+                progress(f"Texture correction failed loading {Path(dae_member).name}")
+            continue
+
+        for source_mesh in sorted(source_meshes):
+            job_stem = _texture_correction_output_stem(source_zip, dae_member)
+            mesh_stem = safe_project_segment(source_mesh) or "mesh"
+            job_dir = output_dir / job_stem / mesh_stem
+            clean_dir(job_dir)
+            job_dir.mkdir(parents=True, exist_ok=True)
+            log_lines: list[str] = []
+            if progress is not None:
+                progress(
+                    "Texture correction: "
+                    f"{source_mesh} from {Path(dae_member).name}..."
+                )
+
+            def log(line: object = "") -> None:
+                log_lines.append(str(line))
+
+            parts, missing = _matching_loaded_dae_parts(loaded, [source_mesh])
+            if missing:
+                report["missing"].append(
+                    {
+                        "sourceZip": str(source_zip),
+                        "dae": dae_member,
+                        "meshes": missing,
+                    }
+                )
+            if not parts:
+                continue
+
+            try:
+                preview = export_parts_preview(
+                    archive,
+                    loaded,
+                    parts,
+                    job_dir,
+                    texture_config,
+                    DEFAULT_MSER_CONFIG,
+                    bake=False,
+                    relief_mser_config=DEFAULT_RELIEF_DETECTION_CONFIG,
+                    log=log,
+                )
+                (job_dir / "texture_correction.log").write_text(
+                    "\n".join(log_lines) + ("\n" if log_lines else ""),
+                    encoding="utf-8",
+                )
+                report["jobs"].append(
+                    {
+                        "sourceZip": str(source_zip),
+                        "dae": dae_member,
+                        "meshes": [source_mesh],
+                        "selectedParts": [
+                            {
+                                "key": str(getattr(part, "key", "") or ""),
+                                "nodeId": str(getattr(part, "node_id", "") or ""),
+                                "nodeName": str(getattr(part, "node_name", "") or ""),
+                            }
+                            for part in parts
+                        ],
+                        "outputDirectory": str(job_dir),
+                        "reportPath": str(preview.report_path) if preview.report_path is not None else None,
+                        "daePaths": [str(path) for path in preview.dae_paths],
+                        "textureCount": len(preview.textures),
+                        "seconds": round(float(preview.seconds), 6),
+                    }
+                )
+                if progress is not None:
+                    progress(
+                        "Texture correction finished "
+                        f"{source_mesh} in {float(preview.seconds):.1f}s"
+                    )
+            except Exception as exc:
+                if log_lines:
+                    (job_dir / "texture_correction.log").write_text(
+                        "\n".join(log_lines) + "\n",
+                        encoding="utf-8",
+                    )
+                report["failures"].append(
+                    {
+                        "sourceZip": str(source_zip),
+                        "dae": dae_member,
+                        "meshes": [source_mesh],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                if progress is not None:
+                    progress(f"Texture correction failed for {source_mesh}")
+
+    if report["failures"] and not report["jobs"]:
+        first = report["failures"][0]
+        raise RuntimeError(
+            "Texture correction failed for marked mesh(es): "
+            f"{', '.join(first.get('meshes', []))}: {first.get('error')}"
+        )
+    summary_path = output_dir / "texture_correction.report.json"
+    report["reportPath"] = str(summary_path)
+    summary_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
+COLLADA_NS = "http://www.collada.org/2005/11/COLLADASchema"
+ET.register_namespace("", COLLADA_NS)
+
+
+def _collada_q(tag: str) -> str:
+    return f"{{{COLLADA_NS}}}{tag}"
+
+
+def _identity_matrix4() -> list[list[float]]:
+    return [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _parse_collada_matrix(node: ET.Element) -> list[list[float]]:
+    matrix = node.find("c:matrix", NS)
+    if matrix is None or not matrix.text:
+        return _identity_matrix4()
+    try:
+        values = [float(value) for value in matrix.text.split()]
+    except ValueError:
+        return _identity_matrix4()
+    if len(values) != 16:
+        return _identity_matrix4()
+    return [values[0:4], values[4:8], values[8:12], values[12:16]]
+
+
+def _matrix_multiply4(
+    left: list[list[float]],
+    right: list[list[float]],
+) -> list[list[float]]:
+    return [
+        [sum(left[row][index] * right[index][col] for index in range(4)) for col in range(4)]
+        for row in range(4)
+    ]
+
+
+def _collada_parent_map(root: ET.Element) -> dict[ET.Element, ET.Element]:
+    parents: dict[ET.Element, ET.Element] = {}
+    for parent in root.iter():
+        for child in list(parent):
+            parents[child] = parent
+    return parents
+
+
+def _collada_world_matrix(
+    node: ET.Element,
+    parents: dict[ET.Element, ET.Element],
+) -> list[list[float]]:
+    chain: list[ET.Element] = []
+    current: ET.Element | None = node
+    while current is not None:
+        if current.tag == _collada_q("node"):
+            chain.append(current)
+        current = parents.get(current)
+    matrix = _identity_matrix4()
+    for item in reversed(chain):
+        matrix = _matrix_multiply4(matrix, _parse_collada_matrix(item))
+    return matrix
+
+
+def _transform_point4(matrix: list[list[float]], point: list[float]) -> list[float]:
+    x, y, z = point
+    return [
+        matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3],
+        matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3],
+        matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3],
+    ]
+
+
+def _transform_direction4(matrix: list[list[float]], direction: list[float]) -> list[float]:
+    x, y, z = direction
+    transformed = [
+        matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z,
+        matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z,
+        matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z,
+    ]
+    length = math.sqrt(sum(value * value for value in transformed))
+    if length > 0.0:
+        return [value / length for value in transformed]
+    return transformed
+
+
+def _format_collada_floats(values: list[float]) -> str:
+    return " ".join(f"{value:.9g}" for value in values)
+
+
+def _bake_geometry_transform(geometry: ET.Element, matrix: list[list[float]]) -> None:
+    for source in geometry.findall(".//c:source", NS):
+        source_id = source.get("id", "").lower()
+        if not (source_id.endswith("-positions") or source_id.endswith("-normals")):
+            continue
+        array = source.find("c:float_array", NS)
+        if array is None or not array.text:
+            continue
+        try:
+            values = [float(value) for value in array.text.split()]
+        except ValueError:
+            continue
+        baked: list[float] = []
+        transform = _transform_direction4 if source_id.endswith("-normals") else _transform_point4
+        for index in range(0, len(values) - 2, 3):
+            baked.extend(transform(matrix, values[index : index + 3]))
+        array.text = _format_collada_floats(baked)
+
+
+def _set_identity_node_transform(node: ET.Element) -> None:
+    transform_tags = {
+        _collada_q("matrix"),
+        _collada_q("translate"),
+        _collada_q("rotate"),
+        _collada_q("scale"),
+    }
+    for child in list(node):
+        if child.tag in transform_tags:
+            node.remove(child)
+    matrix = ET.Element(_collada_q("matrix"))
+    matrix.text = "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
+    node.insert(0, matrix)
+
+
+def _normalise_material_alias(value: str) -> str:
+    value = value.strip().lstrip("#").lower()
+    for suffix in ("-material", "_material"):
+        value = value.removesuffix(suffix)
+    return value
+
+
+def _material_source_for_beamng(job_dir: Path, relative_path: str) -> Path:
+    source = job_dir / relative_path
+    name = source.name
+    candidates: list[Path] = []
+    if name.lower().endswith(".preview.png"):
+        candidates.append(source.with_name(name[: -len(".preview.png")] + ".dds"))
+    if source.suffix.lower() == ".png":
+        candidates.append(source.with_suffix(".dds"))
+    candidates.append(source)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return source
+
+
+def _texture_correction_material_name(alias: str, used: set[str]) -> str:
+    base = safe_id(f"{_normalise_material_alias(alias)}_beamxp_tc") or "beamxp_texture_corrected"
+    candidate = base
+    counter = 2
+    while candidate.lower() in used:
+        candidate = f"{base}_{counter}"
+        counter += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _vehicle_virtual_path(output_root: Path, path: Path) -> str:
+    try:
+        rel = path.relative_to(output_root)
+    except ValueError:
+        rel = path
+    return "/" + rel.as_posix()
+
+
+def _texture_reference_keys(value: str) -> tuple[str, ...]:
+    value = value.replace("\\", "/").strip()
+    if not value or value.startswith("@"):
+        return ()
+    path = value.lstrip("/")
+    name = PurePosixPath(path).name.lower()
+    stem = PurePosixPath(name).with_suffix("").as_posix().lower()
+    keys = [path.lower(), name]
+    if stem:
+        keys.append(stem)
+    return tuple(dict.fromkeys(keys))
+
+
+def _register_texture_output(
+    mapping: dict[str, str],
+    source_reference: str,
+    virtual_path: str,
+) -> None:
+    for key in _texture_reference_keys(source_reference):
+        mapping.setdefault(key, virtual_path)
+
+
+def _entry_corrected_texture_outputs(
+    job_dir: Path,
+    target_dir: Path,
+    output_root: Path,
+    material_name: str,
+    entry: dict[str, object],
+) -> tuple[dict[str, str], dict[str, str]]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    by_source: dict[str, str] = {}
+    by_stage: dict[str, str] = {}
+    output_maps = entry.get("outputMaps")
+    if isinstance(output_maps, list):
+        for item in output_maps:
+            if not isinstance(item, dict):
+                continue
+            member = item.get("member")
+            stage_key = item.get("stageKey")
+            relative = item.get("dds") or item.get("png") or item.get("preview")
+            if not isinstance(member, str) or not isinstance(relative, str):
+                continue
+            source = _material_source_for_beamng(job_dir, relative)
+            if not source.is_file():
+                continue
+            destination = target_dir / f"{safe_id(material_name)}_{source.name}"
+            shutil.copy2(source, destination)
+            virtual_path = _vehicle_virtual_path(output_root, destination)
+            _register_texture_output(by_source, member, virtual_path)
+            if isinstance(stage_key, str):
+                by_stage.setdefault(stage_key, virtual_path)
+
+    maps = entry.get("maps", {})
+    if isinstance(maps, dict):
+        for stage_key, relative in maps.items():
+            if not isinstance(stage_key, str) or not isinstance(relative, str):
+                continue
+            source = _material_source_for_beamng(job_dir, relative)
+            if not source.is_file():
+                continue
+            destination = target_dir / f"{safe_id(material_name)}_{source.name}"
+            shutil.copy2(source, destination)
+            virtual_path = _vehicle_virtual_path(output_root, destination)
+            by_stage.setdefault(stage_key, virtual_path)
+            _register_texture_output(by_source, relative, virtual_path)
+    return by_source, by_stage
+
+
+def _stage_texture_reference(stage: dict[str, object]) -> str:
+    for key in ("baseColorMap", "colorMap", "diffuseMap"):
+        value = stage.get(key)
+        if isinstance(value, str) and value.strip() and not value.lstrip().startswith("@"):
+            return value
+    return ""
+
+
+def _source_material_score(
+    material: dict[str, object],
+    base_member: str,
+) -> int:
+    stages = material.get("Stages")
+    if not isinstance(stages, list):
+        return 0
+    wanted = set(_texture_reference_keys(base_member))
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        if any(key in wanted for key in _texture_reference_keys(_stage_texture_reference(stage))):
+            return 2
+    return 1
+
+
+def _select_source_material(entry: dict[str, object]) -> dict[str, object] | None:
+    materials = entry.get("sourceMaterials")
+    if not isinstance(materials, list):
+        return None
+    output_maps = entry.get("outputMaps")
+    base_member = ""
+    if isinstance(output_maps, list):
+        for item in output_maps:
+            if isinstance(item, dict) and item.get("stageKey") == "baseColorMap":
+                member = item.get("member")
+                if isinstance(member, str):
+                    base_member = member
+                    break
+    best: tuple[int, dict[str, object]] | None = None
+    for item in materials:
+        if not isinstance(item, dict):
+            continue
+        material = item.get("material")
+        if not isinstance(material, dict):
+            continue
+        score = _source_material_score(material, base_member) if base_member else 1
+        if best is None or score > best[0]:
+            best = (score, material)
+    return copy.deepcopy(best[1]) if best is not None else None
+
+
+def _retarget_material_document(
+    material: dict[str, object],
+    material_name: str,
+    by_source: dict[str, str],
+    _by_stage: dict[str, str],
+) -> dict[str, object]:
+    material["name"] = material_name
+    material["mapTo"] = material_name
+    stages = material.get("Stages")
+    if not isinstance(stages, list):
+        stages = [{}]
+        material["Stages"] = stages
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        for key, value in list(stage.items()):
+            if not isinstance(value, str):
+                continue
+            replacement = next(
+                (by_source[source_key] for source_key in _texture_reference_keys(value) if source_key in by_source),
+                None,
+            )
+            if replacement is not None:
+                stage[key] = replacement
+    return material
+
+
+def _fallback_texture_correction_material(
+    material_name: str,
+    copied_maps: dict[str, str],
+) -> dict[str, object]:
+    stage: dict[str, object] = {}
+    for key in (
+        "baseColorMap",
+        "normalMap",
+        "roughnessMap",
+        "metallicMap",
+        "ambientOcclusionMap",
+        "opacityMap",
+    ):
+        if key in copied_maps:
+            stage[key] = copied_maps[key]
+    if "metallicMap" in stage:
+        stage.setdefault("metallicFactor", 1)
+    return {
+        "name": material_name,
+        "mapTo": material_name,
+        "class": "Material",
+        "Stages": [stage],
+        "doubleSided": True,
+        "dynamicCubemap": True,
+        "materialTag0": "beamng",
+        "materialTag1": "vehicle",
+        "translucentBlendOp": "None",
+        "version": 1.5,
+    }
+
+
+def _prepare_texture_correction_materials(
+    job_dir: Path,
+    target_dir: Path,
+    output_root: Path,
+) -> dict[str, str]:
+    manifest = job_dir / "rhd_materials.json"
+    if not manifest.is_file():
+        return {}
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    entries = document.get("materials", []) if isinstance(document, dict) else []
+    material_file = target_dir / "beamxp_texture_correction.materials.json"
+    existing: dict[str, object] = {}
+    if material_file.is_file():
+        try:
+            loaded = json.loads(material_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            existing = {}
+
+    alias_to_material: dict[str, str] = {}
+    used_names = {str(key).lower() for key in existing}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        aliases = [str(alias) for alias in entry.get("aliases", []) if str(alias).strip()]
+        maps = entry.get("maps", {})
+        if not aliases or not isinstance(maps, dict):
+            continue
+        material_name = _texture_correction_material_name(aliases[0], used_names)
+        for alias in aliases:
+            alias_to_material.setdefault(_normalise_material_alias(alias), material_name)
+
+        by_source, by_stage = _entry_corrected_texture_outputs(
+            job_dir,
+            target_dir,
+            output_root,
+            material_name,
+            entry,
+        )
+        source_material = _select_source_material(entry)
+        if source_material is not None:
+            existing[material_name] = _retarget_material_document(
+                source_material,
+                material_name,
+                by_source,
+                by_stage,
+            )
+        else:
+            existing[material_name] = _fallback_texture_correction_material(
+                material_name,
+                by_stage,
+            )
+
+    if alias_to_material:
+        material_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    return alias_to_material
+
+
+def _retarget_collada_materials(root: ET.Element, alias_to_material: dict[str, str]) -> None:
+    if not alias_to_material:
+        return
+    for primitive in root.findall(".//*[@material]", NS):
+        material = primitive.get("material") or ""
+        replacement = alias_to_material.get(_normalise_material_alias(material))
+        if replacement:
+            primitive.set("material", replacement)
+    for binding in root.findall(".//c:instance_material", NS):
+        aliases = [
+            binding.get("symbol") or "",
+            (binding.get("target") or "").lstrip("#"),
+        ]
+        replacement = next(
+            (
+                alias_to_material[_normalise_material_alias(alias)]
+                for alias in aliases
+                if _normalise_material_alias(alias) in alias_to_material
+            ),
+            None,
+        )
+        if replacement:
+            binding.set("symbol", replacement)
+            binding.set("target", f"#{replacement}-material")
+
+
+def _collada_child(root: ET.Element, name: str) -> ET.Element | None:
+    return root.find(f"./c:{name}", NS)
+
+
+def _ensure_collada_library(root: ET.Element, name: str) -> ET.Element:
+    existing = _collada_child(root, name)
+    if existing is not None:
+        return existing
+    library = ET.Element(_collada_q(name))
+    children = list(root)
+    insert_at = next(
+        (
+            index
+            for index, child in enumerate(children)
+            if child.tag in {
+                _collada_q("library_effects"),
+                _collada_q("library_materials"),
+                _collada_q("library_geometries"),
+                _collada_q("library_visual_scenes"),
+            }
+        ),
+        len(children),
+    )
+    root.insert(insert_at, library)
+    return library
+
+
+def _collada_material_aliases(material: ET.Element) -> set[str]:
+    aliases = {
+        material.get("id") or "",
+        material.get("name") or "",
+    }
+    return {_normalise_material_alias(alias) for alias in aliases if alias}
+
+
+def _clone_collada_library_entry(
+    source_root: ET.Element,
+    target_root: ET.Element,
+    library_name: str,
+    entry_id: str,
+) -> None:
+    target_library = _ensure_collada_library(target_root, library_name)
+    if any(child.get("id") == entry_id for child in list(target_library)):
+        return
+    source_library = _collada_child(source_root, library_name)
+    if source_library is None:
+        return
+    for source_entry in list(source_library):
+        if source_entry.get("id") == entry_id:
+            target_library.append(copy.deepcopy(source_entry))
+            return
+
+
+def _ensure_retargeted_collada_materials(
+    target_root: ET.Element,
+    source_root: ET.Element,
+    alias_to_material: dict[str, str],
+) -> None:
+    if not alias_to_material:
+        return
+    target_materials = _ensure_collada_library(target_root, "library_materials")
+    existing_ids = {
+        material.get("id") or ""
+        for material in target_materials.findall("c:material", NS)
+    }
+    source_materials = source_root.findall("./c:library_materials/c:material", NS)
+    for source_material in source_materials:
+        replacement = next(
+            (
+                alias_to_material[alias]
+                for alias in _collada_material_aliases(source_material)
+                if alias in alias_to_material
+            ),
+            None,
+        )
+        if not replacement:
+            continue
+        material_id = f"{replacement}-material"
+        if material_id in existing_ids:
+            continue
+        material = copy.deepcopy(source_material)
+        material.set("id", material_id)
+        material.set("name", replacement)
+        target_materials.append(material)
+        existing_ids.add(material_id)
+
+        instance_effect = material.find("c:instance_effect", NS)
+        effect_url = instance_effect.get("url", "") if instance_effect is not None else ""
+        if effect_url.startswith("#"):
+            _clone_collada_library_entry(
+                source_root,
+                target_root,
+                "library_effects",
+                effect_url.lstrip("#"),
+            )
+
+
+def _append_texture_correction_dae(
+    target_dae: Path,
+    source_dae: Path,
+    node_ids: set[str],
+    alias_to_material: dict[str, str],
+) -> list[str]:
+    if not node_ids:
+        return []
+    target_tree = ET.parse(target_dae)
+    target_root = target_tree.getroot()
+    target_geometries = target_root.find(".//c:library_geometries", NS)
+    target_scene = target_root.find(".//c:library_visual_scenes/c:visual_scene", NS)
+    if target_geometries is None or target_scene is None:
+        raise RuntimeError(f"{target_dae} is missing library_geometries or visual_scene")
+
+    source_tree = ET.parse(source_dae)
+    source_root = source_tree.getroot()
+    _ensure_retargeted_collada_materials(target_root, source_root, alias_to_material)
+    _retarget_collada_materials(source_root, alias_to_material)
+    parents = _collada_parent_map(source_root)
+    source_geometries = {
+        geometry.get("id"): geometry
+        for geometry in source_root.findall(".//c:geometry", NS)
+        if geometry.get("id")
+    }
+
+    appended_nodes: list[ET.Element] = []
+    appended_geometries: list[ET.Element] = []
+    appended_geometry_ids: set[str] = set()
+    for source_node in source_root.findall(".//c:node", NS):
+        node_id = source_node.get("id") or ""
+        if node_id not in node_ids:
+            continue
+        node_matrix = _collada_world_matrix(source_node, parents)
+        node = copy.deepcopy(source_node)
+        _set_identity_node_transform(node)
+        appended_nodes.append(node)
+
+        for instance in source_node.findall(".//c:instance_geometry", NS):
+            geometry_id = (instance.get("url") or "").lstrip("#")
+            if not geometry_id or geometry_id in appended_geometry_ids:
+                continue
+            source_geometry = source_geometries.get(geometry_id)
+            if source_geometry is None:
+                continue
+            geometry = copy.deepcopy(source_geometry)
+            _bake_geometry_transform(geometry, node_matrix)
+            appended_geometries.append(geometry)
+            appended_geometry_ids.add(geometry_id)
+
+    if not appended_nodes:
+        return []
+
+    appended_node_ids = {node.get("id") for node in appended_nodes}
+    for child in list(target_scene):
+        if child.get("id") in appended_node_ids:
+            target_scene.remove(child)
+    for child in list(target_geometries):
+        if child.get("id") in appended_geometry_ids:
+            target_geometries.remove(child)
+    for geometry in appended_geometries:
+        target_geometries.append(geometry)
+    for node in appended_nodes:
+        target_scene.append(node)
+    write_xml_tree(target_tree, target_dae)
+    return [str(node.get("id") or "") for node in appended_nodes]
+
+
+def _replace_first_flexbody_mesh(row: str, mesh: str) -> str:
+    return re.sub(
+        r'(\[\s*)"((?:[^"\\]|\\.)*)"',
+        rf'\1"{mesh}"',
+        row,
+        count=1,
+    )
+
+
+def _expand_texture_correction_flexbody_array(
+    array_text: str,
+    replacements: dict[str, list[str]],
+) -> tuple[str, int]:
+    spans: list[tuple[int, int, str]] = []
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] == "[":
+            end = transform_helpers.find_matching(array_text, idx, "[", "]")
+            spans.append((idx, end, array_text[idx:end]))
+            idx = end
+            continue
+        idx += 1
+    if not spans:
+        return array_text, 0
+
+    out: list[str] = []
+    cursor = 0
+    changed = 0
+    for start, end, row in spans:
+        out.append(array_text[cursor:start])
+        mesh = flexbody_row_mesh(row)
+        split_meshes = replacements.get(mesh or "")
+        if split_meshes:
+            line_joiner = ",\n" if "\n" in array_text else ", "
+            out.append(line_joiner.join(_replace_first_flexbody_mesh(row, split) for split in split_meshes))
+            changed += 1
+        else:
+            out.append(row)
+        cursor = end
+    out.append(array_text[cursor:])
+    return "".join(out), changed
+
+
+def _patch_texture_correction_jbeams(
+    output_vehicle_dir: Path,
+    replacements: dict[str, list[str]],
+) -> dict[str, object]:
+    patched_files: list[str] = []
+    replaced_rows = 0
+    if not replacements:
+        return {"files": patched_files, "replacedRows": replaced_rows}
+    for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
+        original = path.read_text(encoding="utf-8")
+        file_replacements = 0
+
+        def replace_array(array_text: str) -> tuple[str, int]:
+            nonlocal file_replacements
+            new_text, changed = _expand_texture_correction_flexbody_array(array_text, replacements)
+            file_replacements += changed
+            return new_text, changed
+
+        updated = _replace_all_jbeam_array_regions(original, "flexbodies", replace_array)
+        if updated == original:
+            continue
+        path.write_text(updated, encoding="utf-8")
+        patched_files.append(str(path))
+        replaced_rows += file_replacements
+    return {"files": patched_files, "replacedRows": replaced_rows}
+
+
+def _replace_all_jbeam_array_regions(text: str, key: str, transform) -> str:
+    pattern = re.compile(rf'"{re.escape(key)}"\s*:[\s,]*\[')
+    out: list[str] = []
+    cursor = 0
+    search_at = 0
+    while True:
+        match = pattern.search(text, search_at)
+        if match is None:
+            break
+        bracket = text.rfind("[", match.start(), match.end())
+        try:
+            end = transform_helpers.find_matching(text, bracket, "[", "]")
+        except Exception:
+            search_at = match.end()
+            continue
+        old = text[bracket:end]
+        new, _changed = transform(old)
+        out.append(text[cursor:bracket])
+        out.append(new)
+        cursor = end
+        search_at = end
+    if not out:
+        return text
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def integrate_texture_correction_artifacts(
+    context: VehicleContext,
+    output_root: Path,
+    output_vehicle_dir: Path,
+    texture_correction_report: dict[str, object],
+    target_hands: Iterable[str],
+) -> dict[str, object]:
+    jobs = texture_correction_report.get("jobs", [])
+    if not isinstance(jobs, list) or not jobs:
+        return {"enabled": False, "daePatches": [], "jbeamPatch": {"files": [], "replacedRows": 0}}
+
+    dae_patches: list[dict[str, object]] = []
+    row_replacements: dict[str, list[str]] = {}
+    hands = sorted(set(target_hands))
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        dae_member = str(job.get("dae") or "")
+        output_directory = Path(str(job.get("outputDirectory") or ""))
+        report_path = Path(str(job.get("reportPath") or ""))
+        if not dae_member or not output_directory.is_dir() or not report_path.is_file():
+            continue
+        target_dae = generated_dae_output_path(output_root, output_vehicle_dir, context, dae_member)
+        if not target_dae.is_file():
+            dae_patches.append({"dae": dae_member, "target": str(target_dae), "error": "generated DAE not found"})
+            continue
+        alias_to_material = _prepare_texture_correction_materials(
+            output_directory,
+            target_dae.parent,
+            output_root,
+        )
+        detail = json.loads(report_path.read_text(encoding="utf-8"))
+        for dae_export in detail.get("dae_exports", []):
+            if not isinstance(dae_export, dict):
+                continue
+            source_part = dae_export.get("source_part")
+            if not isinstance(source_part, dict):
+                continue
+            source_mesh = str(source_part.get("key") or source_part.get("node_id") or "")
+            rows = dae_export.get("generated_flexbody_rows", [])
+            split_nodes = [
+                str(row.get("node_id") or "")
+                for row in rows
+                if isinstance(row, dict) and row.get("node_id")
+            ]
+            source_dae = Path(str(dae_export.get("dae_path") or ""))
+            appended = _append_texture_correction_dae(
+                target_dae,
+                source_dae,
+                set(split_nodes),
+                alias_to_material,
+            )
+            if source_mesh and appended:
+                for hand in hands:
+                    row_replacements[generated_mesh_name(source_mesh, hand)] = appended
+            dae_patches.append(
+                {
+                    "sourceMesh": source_mesh,
+                    "sourceDae": str(source_dae),
+                    "targetDae": str(target_dae),
+                    "appendedNodes": appended,
+                    "materialAliases": sorted(alias_to_material),
+                }
+            )
+
+    jbeam_patch = _patch_texture_correction_jbeams(output_vehicle_dir, row_replacements)
+    return {
+        "enabled": True,
+        "daePatches": dae_patches,
+        "jbeamPatch": jbeam_patch,
+        "rowReplacements": row_replacements,
+    }
+
+
 def build_batch(
     context: VehicleContext,
     conversion: dict[str, object],
@@ -230,7 +1247,13 @@ def build_batch(
     write_zip: bool = True,
     install: bool = False,
     mods_folder: Path | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> BuildResult:
+    def emit_progress(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    emit_progress("Preparing build plan...")
     output_plans, skipped = selected_output_plans(context, conversion)
     if not output_plans:
         raise RuntimeError("No trim outputs are selected")
@@ -270,6 +1293,7 @@ def build_batch(
     translated_flexbody_meshes: set[str] = set()
     translate_magnitudes: dict[str, float] = {}
     texture_flip_ids: set[str] = set()
+    texture_correction_ids: set[str] = set()
     if generated_variant_targets:
         object_modes = active_part_modes(conversion)
         # A vehicle whose every converted trim is fully covered by an authored
@@ -288,6 +1312,9 @@ def build_batch(
         )
         if mesh_scope:
             object_modes = {mesh: mode for mesh, mode in object_modes.items() if mesh in mesh_scope}
+            texture_correction_ids = active_texture_correction_mesh_ids(conversion) & mesh_scope
+        else:
+            texture_correction_ids = active_texture_correction_mesh_ids(conversion)
         for mesh in relocation_meshes(context, slot_pair_plans):
             object_modes[mesh] = MODE_MIRROR
         if not object_modes and not swap_driven:
@@ -344,6 +1371,7 @@ def build_batch(
 
     output_root = context.project_dir / "unpacked_output"
     build_dir = context.project_dir / "build"
+    emit_progress("Preparing build output...")
     clean_dir(output_root)
     build_dir.mkdir(parents=True, exist_ok=True)
     output_vehicle_dir = output_root / context.vehicle_path
@@ -351,7 +1379,15 @@ def build_batch(
     baked_shared_specs: list[BakedMeshSpec] = []
     generated_configs: list[str] = []
     generated_daes: list[Path] = []
+    texture_correction_report: dict[str, object] = {
+        "enabled": False,
+        "requestedMeshes": sorted(texture_correction_ids),
+        "jobs": [],
+        "missing": [],
+        "failures": [],
+    }
     if variant_targets:
+        emit_progress("Writing generated JBeam and config files...")
         generated_configs.extend(write_generated_jbeam_and_configs(
             context,
             output_vehicle_dir,
@@ -372,6 +1408,7 @@ def build_batch(
             slot_pair_plans,
         ))
     if generated_variant_targets and object_modes:
+        emit_progress("Generating transformed vehicle meshes...")
         generated_daes = generate_daes(
             context,
             output_root,
@@ -386,6 +1423,29 @@ def build_batch(
             baked_shared_specs,
             texture_flip_ids,
         )
+    if generated_variant_targets and texture_correction_ids:
+        emit_progress(f"Running texture correction for {len(texture_correction_ids)} mesh(es)...")
+        texture_correction_report = export_texture_correction_artifacts(
+            context,
+            output_root,
+            texture_correction_ids,
+            progress=emit_progress,
+        )
+        emit_progress("Integrating texture-corrected meshes...")
+        texture_correction_report["integration"] = integrate_texture_correction_artifacts(
+            context,
+            output_root,
+            output_vehicle_dir,
+            texture_correction_report,
+            set(generated_variant_targets.values()),
+        )
+        report_path = texture_correction_report.get("reportPath")
+        if isinstance(report_path, str) and report_path:
+            Path(report_path).write_text(
+                json.dumps(texture_correction_report, indent=2) + "\n",
+                encoding="utf-8",
+            )
+    emit_progress("Writing original config outputs...")
     generated_configs.extend(write_original_plate_configs(
         context,
         output_vehicle_dir,
@@ -397,6 +1457,7 @@ def build_batch(
     # Licence plates are generated as a separate pass over the written output
     # so plate logic stays fully decoupled from the handedness transforms.
     try:
+        emit_progress("Applying licence plate settings...")
         plate_summary = plate_generator.apply_to_build(
             context,
             conversion,
@@ -424,6 +1485,8 @@ def build_batch(
         "translateMagnitudes": translate_magnitudes,
         "mirroredPropMeshes": sorted(mirrored_prop_meshes),
         "textureFlipMeshes": sorted(texture_flip_ids),
+        "textureCorrectionMeshes": sorted(texture_correction_ids),
+        "textureCorrection": texture_correction_report,
         "structuralMirrorSources": structural_sources,
         "structuralPropMeshes": sorted(structural_prop_meshes),
         "bakedSharedMeshCount": len(baked_shared_specs),
@@ -436,6 +1499,7 @@ def build_batch(
     installed_zip = None
     installed_plates_zip = None
     if write_zip:
+        emit_progress("Packaging XP conversion zip...")
         package_zip = build_dir / package_name_for_context(context)
         make_zip(output_root, package_zip)
     if install:
@@ -444,8 +1508,9 @@ def build_batch(
         if mods_folder is None:
             raise RuntimeError("Install requested without a mods folder")
         mods_folder.mkdir(parents=True, exist_ok=True)
+        emit_progress("Installing XP conversion zip...")
         installed_zip = mods_folder / package_zip.name
-        shutil.copy2(package_zip, installed_zip)
+        _atomic_copy_file(package_zip, installed_zip)
         # Refresh the universal plates mod alongside the vehicle so every
         # library design stays selectable on any vehicle, not just the sets
         # bound to this build. A broken library set must not fail the build.
@@ -457,10 +1522,11 @@ def build_batch(
             if plates_mod is not None:
                 plates_zip = Path(plates_mod["zip"])
                 installed_plates_zip = mods_folder / plates_zip.name
-                shutil.copy2(plates_zip, installed_plates_zip)
+                _atomic_copy_file(plates_zip, installed_plates_zip)
                 plate_summary["libraryModDesigns"] = plates_mod["designs"]
 
     save_conversion(context, conversion)
+    emit_progress("Build complete.")
     return BuildResult(
         unpacked_dir=output_root,
         package_zip=package_zip,
@@ -470,6 +1536,7 @@ def build_batch(
         skipped_variants=skipped,
         plate_summary=plate_summary,
         installed_plates_zip=installed_plates_zip,
+        texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'package_name_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'package_name_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'integrate_texture_correction_artifacts', 'build_batch']

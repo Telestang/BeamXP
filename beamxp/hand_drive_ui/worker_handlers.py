@@ -37,6 +37,9 @@ class WorkerHandlersMixin:
         if kind == "variant_hands_done":
             self._handle_variant_hands_done(payload)
             return
+        if kind == "status":
+            self.status_var.set(str(payload))
+            return
 
         self._set_busy(False)
         if kind == "build_success":

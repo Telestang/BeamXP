@@ -51,6 +51,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -3042,6 +3043,31 @@ def rebuild_companion_map(
     )
 
 
+def _source_material_reports_for_aliases(
+    archive: VehicleArchive,
+    aliases: tuple[str, ...],
+) -> list[dict[str, object]]:
+    wanted = {_normalise_material_alias(alias) for alias in aliases}
+    reports: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for record in archive.materials:
+        if not any(_normalise_material_alias(alias) in wanted for alias in record.aliases):
+            continue
+        key = (record.materials_member, record.key)
+        if key in seen:
+            continue
+        seen.add(key)
+        reports.append(
+            {
+                "key": record.key,
+                "aliases": list(record.aliases),
+                "materialsMember": record.materials_member,
+                "material": copy.deepcopy(record.source_material),
+            }
+        )
+    return reports
+
+
 def _texture_stem(member: str) -> str:
     """The output name for a texture member, without its image extension."""
     stem = PurePosixPath(member).name
@@ -3623,6 +3649,10 @@ def build_rhd_texture(
             if value
         )
     )
+    source_materials = _source_material_reports_for_aliases(
+        archive,
+        material_aliases,
+    )
     texture_report: dict[str, object] = {
         "texture": texture_member,
         "size": [width, height],
@@ -3640,6 +3670,7 @@ def build_rhd_texture(
             for part, binding in candidates
         ],
         "material_aliases": list(material_aliases),
+        "source_materials": source_materials,
         "collada_symbols": sorted(symbols),
         "parts_analysed": analysed,
         "mirror_coverage": round(float(mirror_mask.mean()), 6),
@@ -3974,12 +4005,34 @@ def write_blender_preview(
         if not result.material_aliases or result.png_path is None:
             continue
         maps: dict[str, str] = {"baseColorMap": result.png_path.name}
+        output_maps: list[dict[str, object]] = [
+            {
+                "stageKey": "baseColorMap",
+                "member": result.texture_member,
+                "png": result.png_path.name,
+                "dds": result.dds_path.name if result.dds_path is not None else None,
+            }
+        ]
         for companion in result.companions:
             path = companion.preview_path or companion.png_path
             if path is not None:
                 maps.setdefault(companion.stage_key, path.name)
+            output_maps.append(
+                {
+                    "stageKey": companion.stage_key,
+                    "member": companion.member,
+                    "png": companion.png_path.name if companion.png_path is not None else None,
+                    "dds": companion.dds_path.name if companion.dds_path is not None else None,
+                    "preview": companion.preview_path.name if companion.preview_path is not None else None,
+                }
+            )
         materials.append(
-            {"aliases": list(result.material_aliases), "maps": maps}
+            {
+                "aliases": list(result.material_aliases),
+                "maps": maps,
+                "outputMaps": output_maps,
+                "sourceMaterials": result.report.get("source_materials", []),
+            }
         )
     if not materials:
         return None

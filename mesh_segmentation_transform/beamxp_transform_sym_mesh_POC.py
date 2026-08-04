@@ -169,6 +169,8 @@ class ArchiveMaterialRecord:
     materials_member: str
     base_colour_reference: str
     preview_layers: tuple[ArchiveMaterialPreviewLayer, ...] = ()
+    source_material: dict[str, object] = field(default_factory=dict)
+    archive_index: int = 0
 
     @property
     def aliases(self) -> tuple[str, ...]:
@@ -195,6 +197,9 @@ class VehicleArchive:
     dae_members: tuple[str, ...]
     materials: tuple[ArchiveMaterialRecord, ...]
     workspace: Path
+    member_source_zips: dict[str, Path] = field(default_factory=dict)
+    member_archive_indices: dict[str, int] = field(default_factory=dict)
+    archive_paths: tuple[Path, ...] = ()
     material_errors: tuple[str, ...] = ()
 
 
@@ -469,62 +474,105 @@ def _material_preview_layers(material: dict[str, object]) -> tuple[ArchiveMateri
     return tuple(layers)
 
 
-def scan_vehicle_archive(path: Path, workspace: Path | None = None) -> VehicleArchive:
-    """Index a BeamNG vehicle/mod ZIP without extracting the whole archive."""
-    if not path.is_file():
+def scan_vehicle_archive(
+    path: Path,
+    workspace: Path | None = None,
+    asset_archives: Iterable[Path] = (),
+) -> VehicleArchive:
+    """Index a BeamNG vehicle/mod ZIP plus optional mounted asset archives.
+
+    BeamNG materials and textures are resolved by virtual path, not by the one
+    zip that supplied a DAE. A mod can therefore reference assets from stock
+    vehicle archives. ``path`` is indexed first and wins duplicate virtual
+    paths; dependency archives fill in anything the source zip does not ship.
+    """
+    ordered_paths: list[Path] = []
+    seen_paths: set[str] = set()
+
+    def add_zip(candidate: Path) -> None:
+        candidate = Path(candidate)
+        try:
+            key = str(candidate.resolve(strict=False)).lower()
+        except OSError:
+            return
+        if key in seen_paths:
+            return
+        seen_paths.add(key)
+        if candidate.is_file():
+            ordered_paths.append(candidate)
+
+    add_zip(path)
+    for candidate in asset_archives:
+        add_zip(Path(candidate))
+    if not ordered_paths:
         raise FileNotFoundError(path)
-    if not zipfile.is_zipfile(path):
-        raise ValueError(f"Not a readable ZIP archive: {path}")
+    if not zipfile.is_zipfile(ordered_paths[0]):
+        raise ValueError(f"Not a readable ZIP archive: {ordered_paths[0]}")
 
     workspace = workspace or Path(tempfile.mkdtemp(prefix="beamxp_vehicle_zip_"))
     members: list[str] = []
     sizes: dict[str, int] = {}
     member_by_lower: dict[str, str] = {}
+    member_source_zips: dict[str, Path] = {}
+    member_archive_indices: dict[str, int] = {}
     materials: list[ArchiveMaterialRecord] = []
     errors: list[str] = []
 
-    with zipfile.ZipFile(path, "r") as archive:
-        for info in archive.infolist():
-            if info.is_dir():
-                continue
-            try:
-                member = _normalise_archive_member(info.filename)
-            except ValueError as exc:
-                errors.append(str(exc))
-                continue
-            members.append(member)
-            sizes[member] = int(info.file_size)
-            member_by_lower.setdefault(member.lower(), member)
+    for archive_index, archive_path in enumerate(ordered_paths):
+        if not zipfile.is_zipfile(archive_path):
+            errors.append(f"{archive_path}: not a readable ZIP archive")
+            continue
+        archive_members: list[str] = []
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                try:
+                    member = _normalise_archive_member(info.filename)
+                except ValueError as exc:
+                    errors.append(f"{archive_path.name}: {exc}")
+                    continue
+                archive_members.append(member)
+                key = member.lower()
+                if key in member_by_lower:
+                    continue
+                members.append(member)
+                sizes[member] = int(info.file_size)
+                member_by_lower[key] = member
+                member_source_zips[member] = archive_path
+                member_archive_indices[member] = archive_index
 
-        for member in members:
-            if not member.lower().endswith(".materials.json"):
-                continue
-            try:
-                raw = archive.read(member).decode("utf-8-sig")
-                document = json.loads(raw)
-            except Exception as exc:
-                errors.append(f"{member}: {type(exc).__name__}: {exc}")
-                continue
-            if not isinstance(document, dict):
-                continue
-            for key, value in document.items():
-                if not isinstance(value, dict):
+            for member in archive_members:
+                if not member.lower().endswith(".materials.json"):
                     continue
-                base_colour = _material_base_colour_reference(value)
-                if not base_colour:
+                try:
+                    raw = archive.read(member).decode("utf-8-sig")
+                    document = json.loads(raw)
+                except Exception as exc:
+                    errors.append(f"{archive_path.name}:{member}: {type(exc).__name__}: {exc}")
                     continue
-                name = str(value.get("name") or "").strip()
-                map_to = str(value.get("mapTo") or "").strip()
-                materials.append(
-                    ArchiveMaterialRecord(
-                        key=str(key).strip(),
-                        name=name,
-                        map_to=map_to,
-                        materials_member=member,
-                        base_colour_reference=base_colour,
-                        preview_layers=_material_preview_layers(value),
+                if not isinstance(document, dict):
+                    continue
+                for key, value in document.items():
+                    if not isinstance(value, dict):
+                        continue
+                    base_colour = _material_base_colour_reference(value)
+                    if not base_colour:
+                        continue
+                    name = str(value.get("name") or "").strip()
+                    map_to = str(value.get("mapTo") or "").strip()
+                    materials.append(
+                        ArchiveMaterialRecord(
+                            key=str(key).strip(),
+                            name=name,
+                            map_to=map_to,
+                            materials_member=member,
+                            base_colour_reference=base_colour,
+                            preview_layers=_material_preview_layers(value),
+                            source_material=copy.deepcopy(value),
+                            archive_index=archive_index,
+                        )
                     )
-                )
 
     dae_members = [member for member in members if member.lower().endswith(".dae")]
     dae_members.sort(
@@ -538,13 +586,16 @@ def scan_vehicle_archive(path: Path, workspace: Path | None = None) -> VehicleAr
         raise ValueError("The archive contains no .dae files.")
 
     return VehicleArchive(
-        path=path,
+        path=ordered_paths[0],
         members=tuple(members),
         member_by_lower=member_by_lower,
         member_sizes=sizes,
         dae_members=tuple(dae_members),
         materials=tuple(materials),
         workspace=workspace,
+        member_source_zips=member_source_zips,
+        member_archive_indices=member_archive_indices,
+        archive_paths=tuple(ordered_paths),
         material_errors=tuple(errors),
     )
 
@@ -560,8 +611,9 @@ def extract_archive_member(archive: VehicleArchive, member: str) -> Path:
     if target.is_file() and target.stat().st_size == archive.member_sizes.get(actual, -1):
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
+    source_zip = archive.member_source_zips.get(actual, archive.path)
     with (
-        zipfile.ZipFile(archive.path, "r") as source,
+        zipfile.ZipFile(source_zip, "r") as source,
         source.open(actual, "r") as handle,
         target.open("wb") as output,
     ):
@@ -618,7 +670,14 @@ def resolve_archive_texture_member(
         suffix = "/" + candidate.lower()
         matches = [member for member in archive.members if ("/" + member.lower()).endswith(suffix)]
         if matches:
-            matches.sort(key=lambda value: (value.count("/"), len(value), value.lower()))
+            matches.sort(
+                key=lambda value: (
+                    archive.member_archive_indices.get(value, 1_000_000),
+                    value.count("/"),
+                    len(value),
+                    value.lower(),
+                )
+            )
             return matches[0]
     return None
 
@@ -803,6 +862,7 @@ def archive_texture_choices_for_part(
             records_by_alias.get(normalised_dae_material, ()),
             key=lambda record: (
                 _material_alias_match_rank(record, normalised_dae_material),
+                record.archive_index,
                 0 if _normalise_material_alias(record.map_to) == normalised_dae_material else 1,
                 record.materials_member.count("/"),
                 record.materials_member.lower(),

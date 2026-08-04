@@ -166,3 +166,4 @@ class BuildResult:
     skipped_variants: dict[str, str]
     plate_summary: dict[str, object] = field(default_factory=dict)
     installed_plates_zip: Path | None = None
+    texture_correction: dict[str, object] = field(default_factory=dict)

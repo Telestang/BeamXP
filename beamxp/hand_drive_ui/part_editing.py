@@ -51,6 +51,9 @@ class PartEditingMixin:
                 disabled_message="Replace Source needs another part that fits this slot",
             )
             return "break"
+        if name == "textureCorrection":
+            self._toggle_texture_correction(object_id)
+            return "break"
         if name == "source":
             mode = self._get_part_setting(object_id, "mode", core.MODE_SKIP)
             if mode == core.MODE_MIRROR_STRUCTURAL:
@@ -429,6 +432,25 @@ class PartEditingMixin:
                 self.part_tree.set(row_id, "visible", yn_label(settings.get("viewerVisible", True)))
                 self.part_tree.set(row_id, "solo", yn_label(settings.get("viewerSolo")))
 
+    def _refresh_part_texture_correction_cells(
+        self,
+        object_ids: list[str] | tuple[str, ...] | set[str],
+    ) -> None:
+        parts = self.conversion.get("parts", {})
+        if not isinstance(parts, dict):
+            return
+        for object_id in object_ids:
+            mesh_id = self._part_row_mesh_id(object_id)
+            row_ids = [
+                row_id
+                for row_id in self.part_tree.get_children()
+                if row_id == object_id or self._part_row_mesh_id(row_id) == mesh_id
+            ]
+            settings = parts.get(mesh_id)
+            enabled = bool(settings.get(core.PART_TEXTURE_CORRECTION_KEY)) if isinstance(settings, dict) else False
+            for row_id in row_ids:
+                self.part_tree.set(row_id, "textureCorrection", yn_label(enabled))
+
     def _toggle_part_bool(self, object_id: str, key: str, *, default: bool = False) -> None:
         object_id = self._part_row_mesh_id(object_id)
         parts = self.conversion.setdefault("parts", {})
@@ -445,6 +467,18 @@ class PartEditingMixin:
         self._refresh_parts()
         self._refresh_delta_label()
         self._update_detail()
+
+    def _toggle_texture_correction(self, object_id: str) -> None:
+        object_id = self._part_row_mesh_id(object_id)
+        settings = self._part_settings(object_id)
+        enabled = not bool(settings.get(core.PART_TEXTURE_CORRECTION_KEY))
+        settings[core.PART_TEXTURE_CORRECTION_KEY] = enabled
+        self._refresh_part_texture_correction_cells([object_id])
+        self._refresh_derived_output_summary()
+        self._update_detail()
+        self.status_var.set(
+            f"{self._part_display_name(object_id)} texture correction {'enabled' if enabled else 'disabled'}"
+        )
 
     def _toggle_include_children(self, object_id: str) -> None:
         object_id = self._part_row_mesh_id(object_id)
@@ -653,15 +687,7 @@ class PartEditingMixin:
         parts = self.conversion.setdefault("parts", {})
         settings = parts.setdefault(
             object_id,
-            {
-                "mode": core.MODE_SKIP,
-                "mirrorSource": None,
-                "translateOffset": None,
-                "steeringRef": False,
-                "includeChildren": False,
-                "viewerVisible": True,
-                "viewerSolo": False,
-            },
+            core.default_part_setting(object_id),
         )
         if not isinstance(settings, dict):
             settings = {}

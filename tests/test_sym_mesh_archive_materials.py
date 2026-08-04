@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from xml.etree import ElementTree as ET
+import zipfile
 
 import numpy as np
 
@@ -17,10 +18,99 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
     VehicleArchive,
     _blend_archive_preview_texture,
     archive_texture_choices_for_part,
+    extract_archive_member,
+    scan_vehicle_archive,
 )
 
 
 class SymMeshArchiveMaterialTests(unittest.TestCase):
+    def test_materials_and_textures_resolve_from_dependency_archives(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_zip = root / "source.zip"
+            common_zip = root / "common.zip"
+            with zipfile.ZipFile(source_zip, "w") as archive:
+                archive.writestr(
+                    "vehicles/mod/mod.dae",
+                    """<COLLADA>
+                      <library_materials>
+                        <material id="Generic_racing_interior-material" name="Generic_racing_interior"/>
+                      </library_materials>
+                      <library_visual_scenes>
+                        <visual_scene>
+                          <node id="mod_switches" name="mod_switches">
+                            <instance_geometry url="#Mesh_001-mesh">
+                              <bind_material>
+                                <technique_common>
+                                  <instance_material
+                                    symbol="Generic_racing_interior-material"
+                                    target="#Generic_racing_interior-material"/>
+                                </technique_common>
+                              </bind_material>
+                            </instance_geometry>
+                          </node>
+                        </visual_scene>
+                      </library_visual_scenes>
+                    </COLLADA>""",
+                )
+            with zipfile.ZipFile(common_zip, "w") as archive:
+                archive.writestr(
+                    "vehicles/common/racinginterior/main.materials.json",
+                    """{
+                      "Generic_racing_interior": {
+                        "name": "Generic_racing_interior",
+                        "mapTo": "Generic_racing_interior",
+                        "Stages": [
+                          {
+                            "baseColorMap": "/vehicles/common/racinginterior/generic_racing_interior_b.color.png"
+                          }
+                        ]
+                      }
+                    }""",
+                )
+                archive.writestr(
+                    "vehicles/common/racinginterior/generic_racing_interior_b.color.dds",
+                    b"dds bytes",
+                )
+
+            tree = ET.ElementTree(
+                ET.fromstring(
+                    zipfile.ZipFile(source_zip).read("vehicles/mod/mod.dae")
+                )
+            )
+            loaded = LoadedDae(
+                path=Path("vehicles/mod/mod.dae"),
+                tree=tree,
+                namespace="",
+                unit_scale=1.0,
+                parts=[],
+                geometries={},
+            )
+            part = DaePart(
+                key="mod_switches",
+                label="mod_switches",
+                node_id="mod_switches",
+                node_name="mod_switches",
+                matrix=np.eye(4),
+                instances=(GeometryInstance("Mesh_001-mesh"),),
+            )
+            archive = scan_vehicle_archive(
+                source_zip,
+                root / "workspace",
+                asset_archives=[common_zip],
+            )
+
+            choices = archive_texture_choices_for_part(archive, loaded, part)
+
+            self.assertEqual(len(choices), 1)
+            self.assertEqual(choices[0].material_key, "Generic_racing_interior")
+            self.assertEqual(
+                choices[0].texture_member,
+                "vehicles/common/racinginterior/generic_racing_interior_b.color.dds",
+            )
+            extracted = extract_archive_member(archive, choices[0].texture_member)
+            self.assertEqual(extracted.read_bytes(), b"dds bytes")
+
     def test_skin_material_variants_match_base_dae_material(self) -> None:
         tree = ET.ElementTree(
             ET.fromstring(

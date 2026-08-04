@@ -350,8 +350,8 @@ class LayoutMixin:
         frame.rowconfigure(0, weight=1)
 
         columns = (
-            "parttype", "visible", "solo", "active", "mode", "source", "children", "offset",
-            "steering", "x", "y", "z",
+            "parttype", "visible", "solo", "active", "mode", "textureCorrection",
+            "source", "children", "offset", "steering", "x", "y", "z",
         )
         self.part_tree = ttk.Treeview(frame, columns=columns, show=("tree", "headings"), selectmode="extended")
         self.part_tree.heading("#0", text="Mesh", anchor="w")
@@ -369,10 +369,12 @@ class LayoutMixin:
             "x": "X",
             "y": "Y",
             "z": "Z",
+            "textureCorrection": "Texture Fix",
         }
         widths = {
             "parttype": 112,
             "mode": 118,
+            "textureCorrection": 88,
             "source": 170,
             "children": 76,
             "offset": 82,
@@ -395,7 +397,7 @@ class LayoutMixin:
                 width=widths[col],
                 minwidth=50,
                 stretch=False,
-                anchor="center" if col in {"steering", "visible", "solo", "active", "children"} else "w",
+                anchor="center" if col in {"steering", "visible", "solo", "active", "children", "textureCorrection"} else "w",
             )
         self._register_tree_headings(self.part_tree, {"#0": "Mesh", **headings})
         yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.part_tree.yview)
@@ -497,3 +499,6 @@ class LayoutMixin:
         self.install_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.blender_button = ttk.Button(buttons, text="Blender Preview", command=self._start_blender_preview)
         self.blender_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.busy_progress = ttk.Progressbar(buttons, mode="indeterminate")
+        self.busy_progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.busy_progress.grid_remove()

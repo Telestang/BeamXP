@@ -152,6 +152,7 @@ class HandDriveToolApp(
         self.part_row_side_refs: dict[str, str] = {}
         self.part_row_positions: dict[str, tuple[tuple[float, float, float], bool]] = {}
         self.part_instance_rows: dict[str, dict[str, object]] = {}
+        self.part_row_labels: dict[str, str] = {}
         self.part_child_overrides: dict[str, dict[str, str]] = {}
         self.mesh_instance_numbering_key: tuple[object, str] | None = None
         self.mesh_instance_numbering_cache: dict[str, dict[str, int]] = {}

@@ -88,6 +88,13 @@ class BuildAndPreviewMixin:
         state = "disabled" if busy else "normal"
         self.install_button.configure(state=state)
         self.blender_button.configure(state=state)
+        if hasattr(self, "busy_progress"):
+            if busy:
+                self.busy_progress.grid()
+                self.busy_progress.start(12)
+            else:
+                self.busy_progress.stop()
+                self.busy_progress.grid_remove()
         if hasattr(self, "preview_output_combo"):
             if busy or not self.preview_output_to_config:
                 self.preview_output_combo.configure(state="disabled")
@@ -117,6 +124,7 @@ class BuildAndPreviewMixin:
                 write_zip=True,
                 install=install,
                 mods_folder=Path(self.mods_folder_var.get()) if install else None,
+                progress=lambda message: self.worker_queue.put(("status", message)),
             )
             self.worker_queue.put(("build_success", result))
         except Exception as exc:
@@ -291,14 +299,15 @@ class BuildAndPreviewMixin:
                 self._schedule_pending_mesh_scene()
                 return
             assert self.viewer is not None
-            self.viewer.show_scene(scene, reset_view=self.mesh_scene_reset_pending)
+            reset_view = self.mesh_scene_reset_pending
+            self.viewer.show_scene(scene, reset_view=False, apply_filters=False)
             self.mesh_scene_reset_pending = False
             # Replacement-source children can render as meshes that belong to the
             # replacement part rather than the original child row. Once the GPU
-            # scene has its pick-to-row map, rebuild the table so green preview
-            # children and table rows agree about their inherited transform.
-            self._refresh_parts()
-            self._refresh_active_cells()
+            # scene has its pick-to-row map, update only the preview-dependent
+            # cells. A full parts-table rebuild here blocks Tk for large cars.
+            self._refresh_preview_dependent_part_cells()
+            self._refresh_viewer(reset=reset_view)
             self._schedule_pending_mesh_scene()
 
     def _schedule_pending_mesh_scene(self) -> None:

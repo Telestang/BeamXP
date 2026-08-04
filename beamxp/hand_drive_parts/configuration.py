@@ -32,6 +32,7 @@ from beamxp.core.constants import (
     MODE_TRANSLATE,
     NS,
     NUMBER_RE,
+    PART_TEXTURE_CORRECTION_KEY,
     PREVIEW_FAR_LIMIT,
     PROJECTS_DIR,
     SOURCE_ROOT_DIR,
@@ -75,18 +76,24 @@ from beamxp.core.models import (
 )
 from beamxp.plates import generator as plate_generator
 
+
+def default_part_setting(object_id: str, obj: object | None = None) -> dict[str, object]:
+    return {
+        "mode": MODE_SKIP,
+        "mirrorSource": None,
+        "translateOffset": None,
+        "steeringRef": is_default_steering_ref(object_id, obj) if obj is not None else False,
+        "includeChildren": False,
+        PART_TEXTURE_CORRECTION_KEY: False,
+        "viewerVisible": True,
+        "viewerSolo": False,
+    }
+
+
 def default_part_settings(context: VehicleContext) -> dict[str, dict[str, object]]:
     settings: dict[str, dict[str, object]] = {}
     for object_id, obj in sorted(context.objects.items()):
-        settings[object_id] = {
-            "mode": MODE_SKIP,
-            "mirrorSource": None,
-            "translateOffset": None,
-            "steeringRef": is_default_steering_ref(object_id, obj),
-            "includeChildren": False,
-            "viewerVisible": True,
-            "viewerSolo": False,
-        }
+        settings[object_id] = default_part_setting(object_id, obj)
     # Vehicles often index several confident candidates (steering wheel
     # variants, columns, ...); auto-detect must flag only the best one.
     keep_single_steering_ref(context, settings)
@@ -337,6 +344,7 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
                             "translateOffset",
                             "steeringRef",
                             "includeChildren",
+                            PART_TEXTURE_CORRECTION_KEY,
                             "viewerVisible",
                             "viewerSolo",
                         )
@@ -433,6 +441,7 @@ def import_matching_conversion(
                             "translateOffset",
                             "steeringRef",
                             "includeChildren",
+                            PART_TEXTURE_CORRECTION_KEY,
                             "viewerVisible",
                             "viewerSolo",
                         )
@@ -553,4 +562,4 @@ def set_slot_pair(conversion: dict[str, object], slot_type: str, partner: str) -
     conversion["slotPairs"] = normalized_slot_pairs(pairs)
 
 
-__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
+__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']

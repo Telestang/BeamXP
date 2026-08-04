@@ -64,6 +64,7 @@ from beamxp.core.constants import (
     MODE_TRANSLATE,
     NS,
     NUMBER_RE,
+    PART_TEXTURE_CORRECTION_KEY,
     PREVIEW_FAR_LIMIT,
     PROJECTS_DIR,
     SOURCE_ROOT_DIR,

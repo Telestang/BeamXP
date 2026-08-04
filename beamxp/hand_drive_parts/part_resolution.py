@@ -48,6 +48,7 @@ from beamxp.core.constants import (
     MODE_TRANSLATE,
     NS,
     NUMBER_RE,
+    PART_TEXTURE_CORRECTION_KEY,
     PREVIEW_FAR_LIMIT,
     PROJECTS_DIR,
     SOURCE_ROOT_DIR,
@@ -1559,6 +1560,29 @@ def active_part_modes(conversion: dict[str, object]) -> dict[str, str]:
     return modes
 
 
+def active_texture_correction_mesh_ids(
+    conversion: dict[str, object],
+    *,
+    object_modes: dict[str, str] | None = None,
+) -> set[str]:
+    """Meshes the user explicitly marked for the expensive atlas correction.
+
+    This is independent of transform mode: the column is an extra opt-in for
+    dashboard/console-style texture work, not another transform state.
+    """
+    parts = conversion.get("parts", {})
+    if not isinstance(parts, dict):
+        return set()
+    scope = set(object_modes) if object_modes is not None else None
+    return {
+        str(object_id)
+        for object_id, settings in parts.items()
+        if isinstance(settings, dict)
+        and settings.get(PART_TEXTURE_CORRECTION_KEY)
+        and (scope is None or str(object_id) in scope)
+    }
+
+
 def texture_flip_mesh_ids(
     context: VehicleContext,
     object_modes: dict[str, str],
@@ -1660,4 +1684,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']

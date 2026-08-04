@@ -1199,13 +1199,20 @@ class MeshPreview:
         self.canvas.itemconfigure(self._message_item, text=text if self.scene is None else "")
 
     # --- scene management -------------------------------------------------
-    def show_scene(self, scene: SceneData, *, reset_view: bool = False) -> None:
+    def show_scene(
+        self,
+        scene: SceneData,
+        *,
+        reset_view: bool = False,
+        apply_filters: bool = True,
+    ) -> None:
         with _timed_ui("MeshPreview.show_scene"):
             self.scene = scene
             self.renderer.upload_scene(scene)
-            self.renderer.set_visible(self.visible_ids)
-            self.renderer.set_selection(self.selected_ids)
-            self.renderer.set_dimmed(self.dimmed_ids)
+            if apply_filters:
+                self.renderer.set_visible(self.visible_ids)
+                self.renderer.set_selection(self.selected_ids)
+                self.renderer.set_dimmed(self.dimmed_ids)
             parts = len(scene.base_groups or scene.groups)
             self.status_var.set(
                 f"{scene.label}: {parts} mesh(es), {scene.triangle_count:,} tris"
