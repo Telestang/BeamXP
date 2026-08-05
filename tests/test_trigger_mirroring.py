@@ -211,19 +211,21 @@ class TriggerRewriteTest(unittest.TestCase):
         # rotation, rotation, translation all stay zero; only baseTranslation moves
         self.assertEqual(row.count('{"x":0, "y":0, "z":0}'), 3)
 
-    def test_non_zero_rotation_on_unmirrorable_nodes_is_flagged(self):
+    def test_rotation_is_kept_when_the_frame_does_not_reflect(self):
+        """The stalk cage exists on one side only, so its frame is unchanged and
+        the box keeps pointing the way it was authored. That is what the part
+        does: BeamXP copies a mirrored prop's rotation across untouched and moves
+        it with baseTranslationGlobal, because the mirroring is in the DAE."""
         text = section(
             '        ["headlights", "int_strw","int_stalk","dshr", "box", {"x":0.03, "y":0.03, "z":0.03},'
             ' {"x":30, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
             ' {"x":0.2, "y":0, "z":0}],'
         )
         out = mirror(text, ARDENTE_NODES)
-        self.assertIn("//BeamXP: headlights", out)
-        self.assertIn("baseRotation", out.split("//BeamXP:")[1].split("\n")[0])
-        # the authored rotation is left exactly as it was rather than guessed at
         self.assertIn('{"x":30, "y":0, "z":0}', out)
+        self.assertNotIn("//BeamXP:", out)
 
-    def test_manual_review_reports_the_approximated_trigger(self):
+    def test_nothing_needs_manual_review_on_a_resolvable_part(self):
         body = '{"triggers2":' + section(
             '        ["headlights", "int_strw","int_stalk","dshr", "box", {"x":0.03, "y":0.03, "z":0.03},'
             ' {"x":30, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
@@ -232,7 +234,18 @@ class TriggerRewriteTest(unittest.TestCase):
         findings = triggers_needing_manual_review(
             body, ARDENTE_NODES, build_node_mirror_map(ARDENTE_NODES)
         )
-        self.assertEqual([name for name, _reason in findings], ["headlights"])
+        self.assertEqual(findings, [])
+
+    def test_rotation_x_negates_when_the_frame_reflects(self):
+        """Fitted from vanilla: across etk800, bx and covet the authored x always
+        negates while y is always kept."""
+        text = section(
+            '        ["door_R_int", "d7r","d8r","d4r", "box", {"x":0.19, "y":0.03, "z":0.06},'
+            ' {"x":-13, "y":1, "z":1}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.51, "y":0.062, "z":0.085}],'
+        )
+        out = mirror(text, ETK_DOOR_NODES)
+        self.assertIn('{"x":13, "y":1, "z":1}', out)
 
 
 if __name__ == "__main__":

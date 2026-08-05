@@ -1114,7 +1114,8 @@ def _rewrite_slot_default_row(
 #
 # Reflecting the three nodes across the y-z plane gives x' = Mx, y' = My and
 # z' = -Mz: the frame flips in z alone. So a mirrored trigger keeps its x/y
-# offsets and negates z, while its euler columns negate x and y and keep z.
+# offsets and negates z. Its euler columns are a separate matter -- see
+# _mirror_euler -- because they are applied about world axes, not the frame.
 # Vanilla confirms both halves -- etk800's door_FR_int -> door_FL_int is exactly
 # baseTranslation.z 0.085 -> -0.085 and baseRotation.x -12 -> 12, and bx's
 # interior_lhd -> interior_rhd repoints every ref triple the same way.
@@ -1189,6 +1190,20 @@ def mirror_trigger_offset(
         sum(delta[i] * axis[i] for i in range(3))
         for axis in (target_x, target_y, target_z)
     )
+
+
+def _mirror_euler(values: Vec3) -> Vec3:
+    """Mirror a trigger's euler triple across a reflected ref frame.
+
+    Fitted to the three stock LHD/RHD trigger pairs rather than derived: the
+    columns are applied about world axes, so there is no clean analytic answer.
+    Across etk800, bx and covet the authored x always negates (-12/12, -13/12.5,
+    -4/4) and y is always kept (bx and covet both author 1 on each side). z is
+    the one vanilla disagrees with itself about -- bx flips 1 to -1 while covet
+    keeps 2 and etk800 keeps -0.2 -- so the majority reading wins and z is kept.
+    Every disputed value is under 2 degrees on a box a few centimetres across.
+    """
+    return (-values[0], values[1], values[2])
 
 
 def _frames_differ_by_z_flip(
@@ -1444,36 +1459,29 @@ def _mirror_trigger_row(
         if updated is not None:
             edits.append((start, end, updated))
 
-    # Negating euler .x/.y is only exact while the target frame is the source
-    # frame reflected, which repointing guarantees and the world-space fallback
-    # does not. Rotations are usually all-zero, so say so rather than guess.
-    exact_rotation = _frames_differ_by_z_flip(source_frame, target_frame)
-    approximated: list[str] = []
-    for column in _TRIGGER_ROTATION_COLUMNS:
-        position = index_of.get(column)
-        if position is None or position >= len(spans):
-            continue
-        start, end = spans[position]
-        values = _parse_vector(row[start:end])
-        if values is None:
-            continue
-        if not any(abs(value) > 1e-9 for value in values):
-            continue
-        if not exact_rotation:
-            approximated.append(column)
-            continue
-        updated = _replace_vector_numbers(row[start:end], (-values[0], -values[1], values[2]))
-        if updated is not None:
-            edits.append((start, end, updated))
+    # Rotations only change when the frame itself reflects, which is exactly
+    # when the triple could be repointed. On a one-sided cage the frame is
+    # unchanged and the rotation stays as authored -- not a punt, but what the
+    # part does: BeamXP relocates a mirrored prop on those same nodes with
+    # baseTranslationGlobal and copies its rotation across untouched (the
+    # Ardente steering wheel keeps {"x":90,"y":90,"z":180} into RHD), because
+    # the mirroring lives in the DAE rather than in the euler columns.
+    if _frames_differ_by_z_flip(source_frame, target_frame):
+        for column in _TRIGGER_ROTATION_COLUMNS:
+            position = index_of.get(column)
+            if position is None or position >= len(spans):
+                continue
+            start, end = spans[position]
+            values = _parse_vector(row[start:end])
+            if values is None:
+                continue
+            updated = _replace_vector_numbers(row[start:end], _mirror_euler(values))
+            if updated is not None:
+                edits.append((start, end, updated))
 
     out = row
     for start, end, replacement in sorted(edits, reverse=True):
         out = out[:start] + replacement + out[end:]
-    if approximated:
-        return out, (
-            f"position mirrored in place on unmirrored ref nodes; "
-            f"{'/'.join(approximated)} left as authored and may need a manual pass"
-        )
     return out, None
 
 
