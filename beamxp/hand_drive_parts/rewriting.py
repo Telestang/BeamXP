@@ -1100,6 +1100,378 @@ def _rewrite_slot_default_row(
     return row
 
 
+# ---------------------------------------------------------------------------
+# Interaction triggers ("triggers2" / "triggers")
+#
+# A trigger box is not placed in vehicle space. Its idRef/idX/idY columns name
+# three nodes that build a local frame and the translation columns are metres
+# along that frame -- the same scheme props use. BeamNG builds the frame as
+# (lua/ge/extensions/core/vehicle/triggerLabelPlacement.lua, computeTriggerBasis):
+#
+#     x = norm(pX - pRef)
+#     z = norm((pY - pRef) x (pX - pRef))
+#     y = norm(-(z x x))
+#
+# Reflecting the three nodes across the y-z plane gives x' = Mx, y' = My and
+# z' = -Mz: the frame flips in z alone. So a mirrored trigger keeps its x/y
+# offsets and negates z, while its euler columns negate x and y and keep z.
+# Vanilla confirms both halves -- etk800's door_FR_int -> door_FL_int is exactly
+# baseTranslation.z 0.085 -> -0.085 and baseRotation.x -12 -> 12, and bx's
+# interior_lhd -> interior_rhd repoints every ref triple the same way.
+#
+# Which triggers move is not decided here. A trigger is declared inside a part,
+# so it inherits that part's fate: door handles stay put because the door part
+# is never cloned, the dash cluster mirrors because the dash part is.
+# ---------------------------------------------------------------------------
+
+TRIGGER_SECTIONS = ("triggers2", "triggers")
+_TRIGGER_NODE_COLUMNS = ("idRef", "idX", "idY")
+_TRIGGER_TRANSLATION_COLUMNS = ("baseTranslation", "translation")
+_TRIGGER_ROTATION_COLUMNS = ("baseRotation", "rotation")
+_BARE_VECTOR_RE = re.compile(
+    rf'\{{\s*"x"\s*:\s*(?P<x>{NUMBER_RE})\s*,'
+    rf'\s*"y"\s*:\s*(?P<y>{NUMBER_RE})\s*,'
+    rf'\s*"z"\s*:\s*(?P<z>{NUMBER_RE})\s*\}}'
+)
+
+Vec3 = tuple[float, float, float]
+
+
+def _vec_cross(a: Vec3, b: Vec3) -> Vec3:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _vec_normalized(v: Vec3) -> Vec3 | None:
+    length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+    if length < 1e-9:
+        return None
+    return (v[0] / length, v[1] / length, v[2] / length)
+
+
+def trigger_frame(p_ref: Vec3, p_x: Vec3, p_y: Vec3) -> tuple[Vec3, Vec3, Vec3, Vec3] | None:
+    """The orthonormal frame BeamNG derives from a trigger's three ref nodes."""
+    nx = tuple(p_x[i] - p_ref[i] for i in range(3))
+    ny = tuple(p_y[i] - p_ref[i] for i in range(3))
+    x_axis = _vec_normalized(nx)
+    z_axis = _vec_normalized(_vec_cross(ny, nx))
+    if x_axis is None or z_axis is None:
+        return None
+    y_axis = _vec_normalized(tuple(-c for c in _vec_cross(z_axis, x_axis)))
+    if y_axis is None:
+        return None
+    return (p_ref, x_axis, y_axis, z_axis)
+
+
+def mirror_trigger_offset(
+    values: Vec3,
+    source_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    target_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+) -> Vec3:
+    """Re-express a ref-frame offset so it lands on the mirrored world point.
+
+    Going through world space rather than just negating z matters when the two
+    node triples are not perfect mirrors of each other: the mesh is mirrored
+    exactly, so the box has to follow the geometry, not the node asymmetry.
+    """
+    origin, x_axis, y_axis, z_axis = source_frame
+    world = tuple(
+        origin[i] + values[0] * x_axis[i] + values[1] * y_axis[i] + values[2] * z_axis[i]
+        for i in range(3)
+    )
+    mirrored = (-world[0], world[1], world[2])
+    target_origin, target_x, target_y, target_z = target_frame
+    delta = tuple(mirrored[i] - target_origin[i] for i in range(3))
+    return tuple(
+        sum(delta[i] * axis[i] for i in range(3))
+        for axis in (target_x, target_y, target_z)
+    )
+
+
+def _row_element_spans(row_text: str) -> list[tuple[int, int]]:
+    """Top-level element spans inside one ``[...]`` jbeam row."""
+    masked = transform_helpers.mask_comments_preserve_offsets(row_text)
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    in_string = False
+    escape = False
+    start: int | None = None
+    for idx, ch in enumerate(masked):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            if start is None:
+                start = idx
+            continue
+        if ch in "[{":
+            depth += 1
+            if depth == 1:
+                continue
+            if start is None:
+                start = idx
+            continue
+        if ch in "]}":
+            depth -= 1
+            if depth == 0:
+                if start is not None:
+                    spans.append((start, idx))
+                start = None
+                break
+            continue
+        if depth == 1 and ch == ",":
+            if start is not None:
+                spans.append((start, idx))
+            start = None
+            continue
+        if depth >= 1 and start is None and not ch.isspace():
+            start = idx
+    return [(s, e) for s, e in spans if row_text[s:e].strip()]
+
+
+def _row_spans(array_text: str) -> list[tuple[int, int]]:
+    """Spans of each ``[...]`` row inside a section body, outermost bracket included."""
+    masked = transform_helpers.mask_comments_preserve_offsets(array_text)
+    rows: list[tuple[int, int]] = []
+    idx = 1  # array_text[0] is the section's opening bracket
+    depth = 0
+    in_string = False
+    escape = False
+    while idx < len(masked):
+        ch = masked[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            if depth == 0:
+                end = transform_helpers.find_matching(array_text, idx, "[", "]")
+                rows.append((idx, end))
+                idx = end
+                continue
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        idx += 1
+    return rows
+
+
+def _row_string_value(text: str) -> str | None:
+    match = re.fullmatch(r'\s*"((?:[^"\\]|\\.)*)"\s*', text)
+    return match.group(1) if match else None
+
+
+def trigger_column_names(array_text: str) -> list[str] | None:
+    """Column names from a trigger section's header row, ``:`` markers stripped."""
+    for start, end in _row_spans(array_text):
+        row = array_text[start:end]
+        names = [_row_string_value(row[s:e]) for s, e in _row_element_spans(row)]
+        if names and names[0] == "id":
+            return [name.rstrip(":") if name else "" for name in names]
+        return None
+    return None
+
+
+def _mirrored_node_id(
+    node_id: str,
+    node_mirror_map: dict[str, str],
+    node_positions: dict[str, Vec3],
+) -> str | None:
+    mapped = node_mirror_map.get(node_id)
+    if mapped and mapped in node_positions:
+        return mapped
+    swapped = mirror_lateral_node_id(node_id)
+    if swapped != node_id and swapped in node_positions:
+        return swapped
+    return None
+
+
+def _replace_vector_numbers(text: str, values: Vec3) -> str | None:
+    """Rewrite an inline ``{"x":..,"y":..,"z":..}`` in place, keeping its layout."""
+    match = _BARE_VECTOR_RE.search(text)
+    if match is None:
+        return None
+    out = text
+    for name, value in zip(("z", "y", "x"), (values[2], values[1], values[0])):
+        rounded = round(value, 6)
+        if abs(rounded) < 1e-9:
+            rounded = 0.0
+        out = out[: match.start(name)] + transform_helpers.format_num(rounded) + out[match.end(name) :]
+    return out
+
+
+def _parse_vector(text: str) -> Vec3 | None:
+    match = _BARE_VECTOR_RE.search(text)
+    if match is None:
+        return None
+    return (float(match.group("x")), float(match.group("y")), float(match.group("z")))
+
+
+def _mirror_trigger_row(
+    row: str,
+    columns: list[str],
+    node_positions: dict[str, Vec3],
+    node_mirror_map: dict[str, str],
+) -> tuple[str, str | None]:
+    """Mirror one trigger row. Returns the row and a reason when left untouched."""
+    spans = _row_element_spans(row)
+    if len(spans) < len(_TRIGGER_NODE_COLUMNS) + 1:
+        return row, None
+    index_of = {name: idx for idx, name in enumerate(columns) if name}
+
+    source_ids: list[str] = []
+    for column in _TRIGGER_NODE_COLUMNS:
+        position = index_of.get(column)
+        if position is None or position >= len(spans):
+            return row, None
+        start, end = spans[position]
+        node_id = _row_string_value(row[start:end])
+        if node_id is None:
+            return row, None
+        source_ids.append(node_id)
+
+    target_ids: list[str] = []
+    for node_id in source_ids:
+        mirrored = _mirrored_node_id(node_id, node_mirror_map, node_positions)
+        if mirrored is None:
+            return row, f'ref node "{node_id}" has no mirrored counterpart'
+        target_ids.append(mirrored)
+
+    if any(node_id not in node_positions for node_id in source_ids):
+        return row, "ref node positions unknown"
+
+    source_frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
+    target_frame = trigger_frame(*(node_positions[node_id] for node_id in target_ids))
+    if source_frame is None or target_frame is None:
+        return row, "ref nodes are collinear"
+
+    edits: list[tuple[int, int, str]] = []
+    for column, node_id in zip(_TRIGGER_NODE_COLUMNS, target_ids):
+        start, end = spans[index_of[column]]
+        edits.append((start, end, re.sub(r'"(?:[^"\\]|\\.)*"', f'"{node_id}"', row[start:end], count=1)))
+
+    for column in _TRIGGER_TRANSLATION_COLUMNS:
+        position = index_of.get(column)
+        if position is None or position >= len(spans):
+            continue
+        start, end = spans[position]
+        values = _parse_vector(row[start:end])
+        if values is None:
+            continue
+        updated = _replace_vector_numbers(
+            row[start:end], mirror_trigger_offset(values, source_frame, target_frame)
+        )
+        if updated is not None:
+            edits.append((start, end, updated))
+
+    for column in _TRIGGER_ROTATION_COLUMNS:
+        position = index_of.get(column)
+        if position is None or position >= len(spans):
+            continue
+        start, end = spans[position]
+        values = _parse_vector(row[start:end])
+        if values is None:
+            continue
+        updated = _replace_vector_numbers(row[start:end], (-values[0], -values[1], values[2]))
+        if updated is not None:
+            edits.append((start, end, updated))
+
+    out = row
+    for start, end, replacement in sorted(edits, reverse=True):
+        out = out[:start] + replacement + out[end:]
+    return out, None
+
+
+def rewrite_triggers(
+    array_text: str,
+    node_positions: dict[str, Vec3],
+    node_mirror_map: dict[str, str],
+) -> str:
+    columns = trigger_column_names(array_text)
+    if not columns:
+        return array_text
+
+    rows = _row_spans(array_text)
+    ids: list[str | None] = []
+    for start, end in rows:
+        row = array_text[start:end]
+        spans = _row_element_spans(row)
+        ids.append(_row_string_value(row[spans[0][0] : spans[0][1]]) if spans else None)
+    # A twinned pair already covers both sides and each half is bolted to its own
+    # side's nodes, so mirroring them would put two triggers on one door and none
+    # on the other. Vanilla keeps such pairs in their own part, so this guard is
+    # belt and braces -- but a modded part that mixes them would otherwise break.
+    known_ids = {trigger_id for trigger_id in ids if trigger_id}
+    twinned = {
+        trigger_id
+        for trigger_id in known_ids
+        if (swapped := mirror_lateral_node_id(trigger_id)) != trigger_id and swapped in known_ids
+    }
+
+    newline = "\r\n" if "\r\n" in array_text else "\n"
+    out = array_text
+    for (start, end), trigger_id in reversed(list(zip(rows, ids))):
+        if trigger_id is None or trigger_id == "id" or trigger_id in twinned:
+            continue
+        row = array_text[start:end]
+        mirrored, reason = _mirror_trigger_row(row, columns, node_positions, node_mirror_map)
+        if reason is not None:
+            indent = re.match(r"[ \t]*", array_text[array_text.rfind("\n", 0, start) + 1 : start])
+            note = f"//BeamXP: {trigger_id} left unmirrored, {reason}{newline}{indent.group(0) if indent else ''}"
+            out = out[:start] + note + out[start:]
+            continue
+        out = out[:start] + mirrored + out[end:]
+    return out
+
+
+def triggers_needing_manual_review(
+    part_body: str,
+    node_positions: dict[str, Vec3],
+    node_mirror_map: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Trigger ids in this part that cannot be mirrored, with the reason why."""
+    findings: list[tuple[str, str]] = []
+    for section in TRIGGER_SECTIONS:
+        array_text = transform_helpers.extract_named_array(part_body, section)
+        if not array_text:
+            continue
+        columns = trigger_column_names(array_text)
+        if not columns:
+            continue
+        for start, end in _row_spans(array_text):
+            row = array_text[start:end]
+            spans = _row_element_spans(row)
+            if not spans:
+                continue
+            trigger_id = _row_string_value(row[spans[0][0] : spans[0][1]])
+            if trigger_id is None or trigger_id == "id":
+                continue
+            _mirrored, reason = _mirror_trigger_row(row, columns, node_positions, node_mirror_map)
+            if reason is not None:
+                findings.append((trigger_id, reason))
+    return findings
+
+
 def rewrite_light_pattern_for_target(part_body: str, target_hand: str) -> str:
     pattern = "RHD" if target_hand == HAND_RHD else "LHD"
     return re.sub(
@@ -1157,6 +1529,15 @@ def clone_part_for_target(
         "camerasInternal",
         lambda text: rewrite_internal_cameras(text, node_mirror_map, target_hand),
     )
+    # Only cloned parts reach here, which is the whole of the "which triggers
+    # move" decision: a trigger lives inside a part, so an untouched part keeps
+    # its triggers exactly where they were.
+    for trigger_section in TRIGGER_SECTIONS:
+        out = transform_helpers.replace_array_region(
+            out,
+            trigger_section,
+            lambda text: rewrite_triggers(text, node_positions, node_mirror_map),
+        )
     out = transform_helpers.replace_array_region(
         out,
         "slots",
@@ -1181,4 +1562,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
