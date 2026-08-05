@@ -12,6 +12,7 @@ from beamxp.hand_drive_parts.rewriting import (
     rewrite_triggers,
     trigger_column_names,
     trigger_frame,
+    local_to_world,
     triggers_needing_manual_review,
 )
 
@@ -52,8 +53,13 @@ def section(*rows: str) -> str:
     return "[\n" + HEADER + "\n" + "\n".join(rows) + "\n    "
 
 
-def mirror(text: str, nodes: dict) -> str:
-    return rewrite_triggers(text, nodes, build_node_mirror_map(nodes))
+# A trigger inherits the verdict of the geometry it is mounted on, so every
+# case has to say what the config did. Owners are (prop rest pivots, anchor
+# node -> transform); the default here puts every node on mirrored geometry.
+def mirror(text: str, nodes: dict, owners: tuple | None = None) -> str:
+    if owners is None:
+        owners = ([], {node: ("mirror", 0.0) for node in nodes}, [])
+    return rewrite_triggers(text, nodes, build_node_mirror_map(nodes), owners)
 
 
 class TriggerFrameTest(unittest.TestCase):
@@ -235,6 +241,85 @@ class TriggerRewriteTest(unittest.TestCase):
             body, ARDENTE_NODES, build_node_mirror_map(ARDENTE_NODES)
         )
         self.assertEqual(findings, [])
+
+    def test_trigger_on_a_translated_mesh_slides_instead_of_mirroring(self):
+        """The Ardente's indicator stalk is mode translate: it slides across by
+        the steering offset without being reflected. Mirroring its headlight
+        trigger instead of sliding it lands the box 12.7 cm out."""
+        text = section(
+            '        ["headlights", "int_strw","int_stalk","dshr", "sphere", 0.025,'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.2, "y":0, "z":0}],'
+        )
+        # ardente_signalstalk sits at x=+0.4186 and moves by the steering offset
+        owners = ([((0.4186, -0.4588, 0.7969), "translate", -0.71)], {}, [])
+        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr")))
+        before = local_to_world(frame, (0.2, 0.0, 0.0))
+
+        out = mirror(text, ARDENTE_NODES, owners)
+        # the anchor and the rotations are untouched by a pure slide
+        self.assertIn('"int_strw","int_stalk","dshr"', out)
+        row = [line for line in out.splitlines() if "headlights" in line][0]
+        values = tuple(
+            float(part.split(":")[1])
+            for part in row.rsplit("{", 1)[1].rstrip("}],").replace('"', "").split(",")
+        )
+        after = local_to_world(frame, values)
+        self.assertAlmostEqual(after[0], before[0] - 0.71, places=6)
+        self.assertAlmostEqual(after[1], before[1], places=6)
+        self.assertAlmostEqual(after[2], before[2], places=6)
+
+    def test_trigger_on_a_skipped_mesh_stays_put(self):
+        text = section(
+            '        ["headlights", "int_strw","int_stalk","dshr", "sphere", 0.025,'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.2, "y":0, "z":0}],'
+        )
+        owners = ([((0.4186, -0.4588, 0.7969), "skip", 0.0)], {}, [])
+        out = mirror(text, ARDENTE_NODES, owners)
+        self.assertEqual(out, text)
+
+    def test_nearest_mesh_wins_the_association(self):
+        """Steering wheel, wiper stalk and indicator stalk all sit within 15 cm
+        of the headlight trigger; only the indicator stalk should claim it."""
+        text = section(
+            '        ["headlights", "int_strw","int_stalk","dshr", "sphere", 0.025,'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.2, "y":0, "z":0}],'
+        )
+        owners = (
+            [
+                ((0.4186, -0.4588, 0.7969), "translate", -0.71),
+                ((0.2960, -0.4588, 0.7969), "skip", 0.0),
+                ((0.3550, -0.4397, 0.8037), "mirror", 0.0),
+            ],
+            {},
+            [],
+        )
+        out = mirror(text, ARDENTE_NODES, owners)
+        self.assertNotEqual(out, text)  # not the skipped wiper stalk
+        self.assertIn('"int_strw","int_stalk","dshr"', out)  # not the mirrored wheel
+        row = [line for line in out.splitlines() if "headlights" in line][0]
+        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr")))
+        values = tuple(
+            float(part.split(":")[1])
+            for part in row.rsplit("{", 1)[1].rstrip("}],").replace('"', "").split(",")
+        )
+        self.assertAlmostEqual(
+            local_to_world(frame, values)[0],
+            local_to_world(frame, (0.2, 0.0, 0.0))[0] - 0.71,
+            places=6,
+        )
+
+    def test_a_mesh_with_no_verdict_leaves_the_trigger_alone(self):
+        """There is no default transform. If the config says nothing about the
+        geometry, the box stays exactly where it was authored."""
+        text = section(
+            '        ["hazard", "dsh2l","dsh2r","dshl", "box", {"x":0.03, "y":0.025, "z":0.015},'
+            ' {"x":45, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.34, "y":-0.04, "z":-0.09}],'
+        )
+        self.assertEqual(mirror(text, ARDENTE_NODES, ([], {}, [])), text)
 
     def test_rotation_x_negates_when_the_frame_reflects(self):
         """Fitted from vanilla: across etk800, bx and covet the authored x always

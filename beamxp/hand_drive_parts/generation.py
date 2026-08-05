@@ -571,6 +571,150 @@ def apply_authored_group_suffixed_slot_updates(
     pc["parts"] = parts
 
 
+# How each conversion verdict moves geometry in world space. Interaction
+# triggers carry no transform of their own -- they inherit whichever of these
+# applied to the mesh they label -- so this table is the single place the
+# mapping lives rather than being restated per section.
+_MESH_ACTION_FOR_MODE = {
+    MODE_TRANSLATE: "translate",
+    MODE_MIRROR: "mirror",
+    MODE_MIRROR_STRUCTURAL: "mirror",
+    MODE_REPLACE_SOURCE: "mirror",
+    MODE_MIRROR_POSITION: "mirrorPosition",
+    MODE_SKIP: "skip",
+}
+
+
+def _mesh_world_transform(
+    mesh: str,
+    object_modes: dict[str, str],
+    translate_magnitudes: dict[str, float],
+    target_hand: str,
+) -> tuple[str, float] | None:
+    action = _MESH_ACTION_FOR_MODE.get(object_modes.get(mesh, ""))
+    if action is None:
+        return None
+    delta = (
+        signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0))
+        if action == "translate"
+        else 0.0
+    )
+    return action, delta
+
+
+def _node_group_membership(context: VehicleContext) -> dict[str, set[str]]:
+    """Which node groups each node belongs to, across the whole vehicle.
+
+    Vehicle-wide because a trigger's anchor node is routinely declared in a
+    different part from the one carrying the trigger.
+    """
+    membership: dict[str, set[str]] = {}
+    for part_id in context.part_body_index:
+        nodes_array = part_named_array_for_context(context, part_id, "nodes")
+        if not nodes_array:
+            continue
+        for row in iter_jbeam_table_rows(nodes_array):
+            node_id = row.get("id")
+            if not isinstance(node_id, str) or node_id in {"id", "type", "mesh", "func"}:
+                continue
+            groups = jbeam_group_names(row.get("group"))
+            if groups:
+                membership.setdefault(node_id, set()).update(groups)
+    return membership
+
+
+def trigger_owners_for_part(
+    context: VehicleContext,
+    part_body: str,
+    object_modes: dict[str, str],
+    translate_magnitudes: dict[str, float],
+    target_hand: str,
+    node_positions: dict[str, tuple[float, float, float]],
+) -> TriggerOwners:
+    """The two exact signals for attributing a trigger to its geometry.
+
+    Props give a rest pivot -- an exact world position for a discrete control,
+    unlike a mesh's cross-trim representative point, which for a big flexbody
+    sits nowhere near its surface. Flexbodies give the node groups they deform
+    with, which is the authored link between a trigger's anchor node and the
+    panel it is set into. A node whose groups are claimed by flexbodies that
+    disagree is left out rather than resolved arbitrarily.
+    """
+    prop_anchors: list[tuple[tuple[float, float, float], str, float]] = []
+    props = transform_helpers.extract_named_array(part_body, "props")
+    for row in iter_top_level_rows(props or "[]"):
+        mesh = prop_row_mesh(row)
+        if not mesh:
+            continue
+        transform = _mesh_world_transform(
+            mesh, object_modes, translate_magnitudes, target_hand
+        )
+        if transform is None:
+            continue
+        pivot = prop_row_pivot_position(row, node_positions, context.mesh_pivots.get(mesh))
+        if pivot is not None:
+            prop_anchors.append((pivot, transform[0], transform[1]))
+
+    group_transforms: dict[str, set[tuple[str, float]]] = {}
+    flexbody_meshes: list[str] = []
+    flexbodies = transform_helpers.extract_named_array(part_body, "flexbodies")
+    for row in iter_top_level_rows(flexbodies or "[]"):
+        mesh = flexbody_row_mesh(row)
+        if not mesh or mesh == "mesh":
+            continue
+        flexbody_meshes.append(mesh)
+        transform = _mesh_world_transform(
+            mesh, object_modes, translate_magnitudes, target_hand
+        )
+        if transform is None:
+            continue
+        # The groups live in the row's own "[group]:" column, which is a nested
+        # array rather than a named key, so read it positionally the way
+        # mirror_flexbody_group_lists does.
+        group_start = row.find("[", 1)
+        if group_start == -1:
+            continue
+        try:
+            group_end = transform_helpers.find_matching(row, group_start, "[", "]")
+        except ValueError:
+            continue
+        for group in re.findall(r'"([^"]*)"', row[group_start:group_end]):
+            if group:
+                group_transforms.setdefault(group, set()).add(transform)
+
+    node_transforms: dict[str, tuple[str, float]] = {}
+    if group_transforms:
+        membership = _node_group_membership(context)
+        for node_id, groups in membership.items():
+            candidates = set()
+            for group in groups:
+                candidates.update(group_transforms.get(group, ()))
+            if len(candidates) == 1:
+                node_transforms[node_id] = next(iter(candidates))
+
+    # Node groups cannot separate a dashboard from a steering column -- on the
+    # Ardente five flexbodies share "ardente_dash" across two different verdicts
+    # -- so fall back to the geometry itself and ask which mesh the box is
+    # actually inside. Clouds are cached on the context and each DAE is parsed
+    # once, against files the build already opens to mirror them.
+    flex_bounds: list[tuple[tuple[float, float, float], tuple[float, float, float], str, float]] = []
+    flex_meshes = {
+        mesh: transform
+        for mesh in flexbody_meshes
+        if (transform := _mesh_world_transform(mesh, object_modes, translate_magnitudes, target_hand))
+    }
+    if flex_meshes:
+        clouds = full_vertex_clouds_for_ids(context, flex_meshes)
+        for mesh, (action, delta) in flex_meshes.items():
+            cloud = clouds.get(mesh)
+            if cloud is None or len(cloud) == 0:
+                continue
+            low = tuple(float(v) for v in cloud.min(axis=0))
+            high = tuple(float(v) for v in cloud.max(axis=0))
+            flex_bounds.append((low, high, action, delta))
+    return prop_anchors, node_transforms, flex_bounds
+
+
 def _relocation_rewrite_context(context: VehicleContext) -> dict[str, object]:
     """The vehicle-wide name maps a relocation clone rewrites against.
 
@@ -657,6 +801,14 @@ def _relocation_clone_body(
     # A relocated part always mirrors: it is moving to the other side of the
     # car, whatever mode its individual meshes were left on.
     row_transforms = {mesh: ("mirror", 0.0) for mesh in meshes}
+    relocation_trigger_owners = trigger_owners_for_part(
+        context,
+        part_body,
+        {mesh: MODE_MIRROR for mesh in meshes},
+        {},
+        target_hand,
+        prop_node_positions,
+    )
     prop_globals = {
         mesh: mirrored_object_position(context, mesh, config_name)
         for mesh in meshes
@@ -687,6 +839,8 @@ def _relocation_clone_body(
         inherited_options,
         shared_bake,
         context.mesh_pivots,
+        None,
+        relocation_trigger_owners,
     )
     return relocate_part_for_slot(
         body,
@@ -1017,6 +1171,19 @@ def write_generated_jbeam_and_configs(
                 translate_magnitudes=translate_magnitudes,
                 baked_specs=baked_shared_specs,
             )
+            # Interaction triggers follow the geometry they label, so they need
+            # to know what actually happened to each mesh in this part -- a
+            # translated indicator stalk slides its trigger across rather than
+            # reflecting it.
+            trigger_owners = trigger_owners_for_part(
+                context,
+                part_body,
+                object_modes,
+                translate_magnitudes,
+                target_hand,
+                prop_node_positions,
+            )
+
             cloned_bodies.append(
                 clone_part_for_target(
                     part_body,
@@ -1033,6 +1200,7 @@ def write_generated_jbeam_and_configs(
                     shared_bake,
                     context.mesh_pivots,
                     generated_parts_for_source,
+                    trigger_owners,
                 )
             )
 

@@ -1136,6 +1136,14 @@ _BARE_VECTOR_RE = re.compile(
 )
 
 Vec3 = tuple[float, float, float]
+# What a trigger can be attributed to, in order of precision: prop rest
+# pivots, anchor node -> transform via flexbody node groups, and flexbody
+# world bounds for the panels a box is set into.
+TriggerOwners = tuple[
+    list[tuple[Vec3, str, float]],
+    dict[str, tuple[str, float]],
+    list[tuple[Vec3, Vec3, str, float]],
+]
 
 
 def _vec_cross(a: Vec3, b: Vec3) -> Vec3:
@@ -1190,6 +1198,116 @@ def mirror_trigger_offset(
         sum(delta[i] * axis[i] for i in range(3))
         for axis in (target_x, target_y, target_z)
     )
+
+
+def local_to_world(frame: tuple[Vec3, Vec3, Vec3, Vec3], values: Vec3) -> Vec3:
+    origin, x_axis, y_axis, z_axis = frame
+    return tuple(
+        origin[i] + values[0] * x_axis[i] + values[1] * y_axis[i] + values[2] * z_axis[i]
+        for i in range(3)
+    )
+
+
+def world_to_local(frame: tuple[Vec3, Vec3, Vec3, Vec3], point: Vec3) -> Vec3:
+    origin, x_axis, y_axis, z_axis = frame
+    delta = tuple(point[i] - origin[i] for i in range(3))
+    return tuple(
+        sum(delta[i] * axis[i] for i in range(3)) for axis in (x_axis, y_axis, z_axis)
+    )
+
+
+# Mesh verdicts that reflect the geometry across the y-z plane rather than
+# sliding it. These are the only ones that change the frame a trigger's columns
+# are expressed in; everything else is a rigid x offset.
+_REFLECTING_ACTIONS = frozenset({"mirror", "mirrorPosition"})
+
+
+# How close a trigger has to sit to a prop's rest pivot to be counted as
+# mounted on it. Props are hand-sized controls -- stalks, levers, switches --
+# so a box further out than this is on the surrounding panel, not the control.
+# On the Ardente the headlight trigger is 0.139 m from the indicator stalk it
+# belongs to, while the two dash-mounted boxes are 0.268 m and 0.285 m from the
+# nearest prop of any kind.
+PROP_MOUNT_REACH = 0.2
+
+
+def _owning_transform(
+    centre: Vec3,
+    ref_node: str,
+    owners: TriggerOwners,
+) -> tuple[str, float] | None:
+    """What happened to the geometry this trigger is mounted on.
+
+    Two exact signals, in order: the prop whose rest pivot the box sits on, and
+    failing that the flexbody that claims the box's anchor node. Returns None
+    when neither resolves -- there is deliberately no default, because guessing
+    moves a box onto geometry that never went anywhere.
+    """
+    prop_anchors, node_transforms, flex_bounds = owners
+    best: tuple[float, str, float] | None = None
+    for position, action, delta in prop_anchors:
+        distance = sum((centre[i] - position[i]) ** 2 for i in range(3)) ** 0.5
+        if distance <= PROP_MOUNT_REACH and (best is None or distance < best[0]):
+            best = (distance, action, delta)
+    if best is not None:
+        return best[1], best[2]
+
+    node_hit = node_transforms.get(ref_node)
+    if node_hit is not None:
+        return node_hit
+
+    # Whose geometry is the box actually inside? Smallest enclosing mesh wins,
+    # so a switch panel set into a dashboard beats the dashboard itself.
+    enclosing: tuple[float, str, float] | None = None
+    for low, high, action, delta in flex_bounds:
+        if any(centre[i] < low[i] or centre[i] > high[i] for i in range(3)):
+            continue
+        volume = 1.0
+        for i in range(3):
+            volume *= max(high[i] - low[i], 1e-6)
+        if enclosing is None or volume < enclosing[0]:
+            enclosing = (volume, action, delta)
+    if enclosing is not None:
+        return enclosing[1], enclosing[2]
+    return None
+
+
+def _slide_trigger_row(
+    row: str,
+    spans: list[tuple[int, int]],
+    index_of: dict[str, int],
+    frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    delta: float,
+) -> str:
+    """Slide the box along x by the same amount its mesh slid.
+
+    The ref triple, the rotations and the free-vector offset all stay: a
+    non-reflecting transform leaves the box's orientation alone and its anchor
+    cage is still the right one. A zero delta is the identity, which is what a
+    skipped mesh gets.
+    """
+    edits: list[tuple[int, int, str]] = []
+    carries_origin = True
+    for column in _TRIGGER_TRANSLATION_COLUMNS:
+        position = index_of.get(column)
+        if position is None or position >= len(spans):
+            continue
+        start, end = spans[position]
+        values = _parse_vector(row[start:end])
+        if values is None:
+            continue
+        if not carries_origin:
+            continue  # a free vector is unchanged by a pure translation
+        carries_origin = False
+        centre = local_to_world(frame, values)
+        moved = (centre[0] + delta, centre[1], centre[2])
+        updated = _replace_vector_numbers(row[start:end], world_to_local(frame, moved))
+        if updated is not None:
+            edits.append((start, end, updated))
+    out = row
+    for start, end, replacement in sorted(edits, reverse=True):
+        out = out[:start] + replacement + out[end:]
+    return out
 
 
 def _mirror_euler(values: Vec3) -> Vec3:
@@ -1394,6 +1512,7 @@ def _mirror_trigger_row(
     columns: list[str],
     node_positions: dict[str, Vec3],
     node_mirror_map: dict[str, str],
+    owners: TriggerOwners | None = None,
 ) -> tuple[str, str | None]:
     """Mirror one trigger row. Returns the row and a reason when left untouched."""
     spans = _row_element_spans(row)
@@ -1414,6 +1533,33 @@ def _mirror_trigger_row(
 
     if any(node_id not in node_positions for node_id in source_ids):
         return row, "ref node positions unknown"
+
+    authored_frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
+    if authored_frame is None:
+        return row, "ref nodes are collinear"
+
+    # A trigger has no transform of its own: it takes whatever the config
+    # applied to the mesh it labels. There is no default -- a mesh with no
+    # verdict leaves the box exactly where it was authored.
+    base_column = index_of.get("baseTranslation")
+    if base_column is None or base_column >= len(spans):
+        base_column = index_of.get("translation")
+    if not owners or base_column is None or base_column >= len(spans):
+        return row, None
+    start, end = spans[base_column]
+    authored_offset = _parse_vector(row[start:end]) or (0.0, 0.0, 0.0)
+    owner = _owning_transform(
+        local_to_world(authored_frame, authored_offset), source_ids[0], owners
+    )
+    if owner is None:
+        return row, None
+    owner_action, owner_delta = owner
+
+    # Only a reflection changes the frame the box is expressed in, so only a
+    # reflection repoints the ref triple and touches the euler columns. Anything
+    # else is a rigid slide along x and leaves both alone.
+    if owner_action not in _REFLECTING_ACTIONS:
+        return _slide_trigger_row(row, spans, index_of, authored_frame, owner_delta), None
 
     # Prefer repointing the triple at the mirrored nodes: that is what vanilla
     # does and it keeps the offsets small and readable. When the cage has no
@@ -1489,6 +1635,7 @@ def rewrite_triggers(
     array_text: str,
     node_positions: dict[str, Vec3],
     node_mirror_map: dict[str, str],
+    owners: TriggerOwners | None = None,
 ) -> str:
     columns = trigger_column_names(array_text)
     if not columns:
@@ -1517,7 +1664,9 @@ def rewrite_triggers(
         if trigger_id is None or trigger_id == "id" or trigger_id in twinned:
             continue
         row = array_text[start:end]
-        mirrored, reason = _mirror_trigger_row(row, columns, node_positions, node_mirror_map)
+        mirrored, reason = _mirror_trigger_row(
+            row, columns, node_positions, node_mirror_map, owners
+        )
         out = out[:start] + mirrored + out[end:]
         if reason is not None:
             indent = re.match(r"[ \t]*", array_text[array_text.rfind("\n", 0, start) + 1 : start])
@@ -1533,6 +1682,7 @@ def triggers_needing_manual_review(
     part_body: str,
     node_positions: dict[str, Vec3],
     node_mirror_map: dict[str, str],
+    owners: TriggerOwners | None = None,
 ) -> list[tuple[str, str]]:
     """Trigger ids in this part that cannot be mirrored, with the reason why."""
     findings: list[tuple[str, str]] = []
@@ -1551,7 +1701,9 @@ def triggers_needing_manual_review(
             trigger_id = _row_string_value(row[spans[0][0] : spans[0][1]])
             if trigger_id is None or trigger_id == "id":
                 continue
-            _mirrored, reason = _mirror_trigger_row(row, columns, node_positions, node_mirror_map)
+            _mirrored, reason = _mirror_trigger_row(
+            row, columns, node_positions, node_mirror_map, owners
+        )
             if reason is not None:
                 findings.append((trigger_id, reason))
     return findings
@@ -1581,6 +1733,7 @@ def clone_part_for_target(
     shared_bake: SharedBakeContext | None = None,
     mesh_pivots: dict[str, tuple[float, float, float]] | None = None,
     child_part_map: dict[str, str] | None = None,
+    owners: TriggerOwners | None = None,
 ) -> str:
     new_part_id = new_part_id or generated_part_name(source_part_id, target_hand)
     out = transform_helpers.replace_first(part_body, f'"{source_part_id}"', f'"{new_part_id}"')
@@ -1621,7 +1774,9 @@ def clone_part_for_target(
         out = transform_helpers.replace_array_region(
             out,
             trigger_section,
-            lambda text: rewrite_triggers(text, node_positions, node_mirror_map),
+            lambda text: rewrite_triggers(
+                text, node_positions, node_mirror_map, owners
+            ),
         )
     out = transform_helpers.replace_array_region(
         out,
@@ -1647,4 +1802,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
