@@ -133,13 +133,50 @@ class SourceDefaultTests(unittest.TestCase):
         self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_rotated_bounds_filter)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.bounds_shape, SHAPE_ROTATED)
         self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_edge_aligned_rotation)
-        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.rotation_edge_search_px, 100)
+        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.rotation_edge_search_px, 50)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_region_relief, 30.0)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.final_max_aspect, 20.0)
 
     def test_normal_relief_render_defaults_match_the_cached_normal_source(self) -> None:
         self.assertEqual(DEFAULT_RELIEF_CONFIG.mode, "slope")
         self.assertTrue(DEFAULT_RELIEF_CONFIG.invert)
+
+    def test_partial_saved_source_values_do_not_inherit_the_other_source(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_tuning_app import TuningApp
+
+        app = object.__new__(TuningApp)
+        app.parameter_vars = {
+            "delta": object(),
+            "edge_operator": object(),
+            "enable_blob_shape_filter": object(),
+            "min_blob_region_area_px": object(),
+        }
+        app.symmetry_parameter_vars = {}
+        app.relief_parameter_vars = {}
+        app.rhd_parameter_vars = {}
+        app.mode_parameters = {
+            SOURCE_COLOUR: {
+                "mser:enable_blob_shape_filter": True,
+                "mser:min_blob_region_area_px": "99",
+            },
+            SOURCE_RELIEF: {
+                "mser:delta": "7",
+            },
+        }
+
+        values = app._parameters_for_source(SOURCE_RELIEF)
+        config = app._mser_config_from_values(values, SOURCE_RELIEF)
+
+        self.assertEqual(config.delta, 7)
+        self.assertEqual(config.edge_operator, "laplacian")
+        self.assertEqual(
+            config.enable_blob_shape_filter,
+            DEFAULT_RELIEF_DETECTION_CONFIG.enable_blob_shape_filter,
+        )
+        self.assertEqual(
+            config.min_blob_region_area_px,
+            DEFAULT_RELIEF_DETECTION_CONFIG.min_blob_region_area_px,
+        )
 
 
 class ParameterSectionTests(unittest.TestCase):
@@ -171,7 +208,12 @@ class ParameterSectionTests(unittest.TestCase):
 
     def test_shared_stages_apply_to_both_sources(self) -> None:
         by_title = {title: mode for title, _names, mode in PARAMETER_SECTIONS}
-        for title in ("2. Stroke width", "3. Box filtering", "4. Initial grouping"):
+        for title in (
+            "2. Stroke width",
+            "3. Box filtering",
+            "4. Overlap grouping",
+            "5. Initial grouping",
+        ):
             self.assertIsNone(by_title[title], title)
 
 

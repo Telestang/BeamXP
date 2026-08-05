@@ -30,6 +30,111 @@ def part(key: str) -> DaePart:
     )
 
 
+class SurfaceFlipAxisTests(unittest.TestCase):
+    def test_side_surface_horizontal_flip_when_image_vertical_plane_matches_z(self) -> None:
+        uv = np.asarray([[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]])
+        xyz = np.asarray(
+            [
+                [
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ]
+            ]
+        )
+
+        axes = rhd.surface_flip_axes(uv, xyz, width=100, height=100)
+
+        self.assertEqual(axes.tolist(), [rhd.AXIS_HORIZONTAL])
+
+    def test_side_surface_vertical_flip_when_image_horizontal_plane_matches_z(self) -> None:
+        uv = np.asarray([[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]])
+        xyz = np.asarray(
+            [
+                [
+                    (0.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                    (1.0, 0.0, 0.0),
+                ]
+            ]
+        )
+
+        axes = rhd.surface_flip_axes(uv, xyz, width=100, height=100)
+
+        self.assertEqual(axes.tolist(), [rhd.AXIS_VERTICAL])
+
+    def test_horizontal_surface_horizontal_flip_when_image_vertical_plane_is_yz(self) -> None:
+        uv = np.asarray([[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]])
+        xyz = np.asarray(
+            [
+                [
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                ]
+            ]
+        )
+
+        axes = rhd.surface_flip_axes(uv, xyz, width=100, height=100)
+
+        self.assertEqual(axes.tolist(), [rhd.AXIS_HORIZONTAL])
+
+    def test_horizontal_surface_vertical_flip_when_image_horizontal_plane_is_yz(self) -> None:
+        uv = np.asarray([[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]])
+        xyz = np.asarray(
+            [
+                [
+                    (0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                ]
+            ]
+        )
+
+        axes = rhd.surface_flip_axes(uv, xyz, width=100, height=100)
+
+        self.assertEqual(axes.tolist(), [rhd.AXIS_VERTICAL])
+
+    def test_skew_delta_flags_texture_reflection_that_is_not_a_flat_flip(self) -> None:
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (-50.0, -100.0, 0.0),
+                ]
+            ),
+        )
+        config = replace(rhd.DEFAULT_RHD_CONFIG, skewed_region_min_delta=0.01)
+
+        delta = rhd.skew_delta_for_region(
+            uv, xyz, (20, 20, 30, 30), "horizontal", 100, 100, config
+        )
+
+        self.assertIsNotNone(delta)
+        self.assertGreater(delta, config.skewed_region_min_delta)
+
+    def test_skew_delta_ignores_axis_aligned_texture_reflection(self) -> None:
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (0.0, -100.0, 0.0),
+                ]
+            ),
+        )
+
+        delta = rhd.skew_delta_for_region(
+            uv, xyz, (20, 20, 30, 30), "horizontal", 100, 100,
+            rhd.DEFAULT_RHD_CONFIG,
+        )
+
+        self.assertIsNone(delta)
+
+
 class CroppedDetectionTests(unittest.TestCase):
     def test_cropped_detection_reports_full_atlas_coordinates(self) -> None:
         bgr = np.zeros((100, 120, 3), dtype=np.uint8)

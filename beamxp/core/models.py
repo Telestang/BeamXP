@@ -146,7 +146,11 @@ class VehicleContext:
     node_groups_cache: dict[str, set[str]] = field(default_factory=dict)
     selected_node_positions_cache: dict[str, dict[str, tuple[float, float, float]]] = field(default_factory=dict)
     part_array_cache: dict[tuple[str, str], str | None] = field(default_factory=dict)
+    part_mesh_names_cache: dict[str, set[str]] = field(default_factory=dict)
+    part_slot_defs_cache: dict[str, list[SlotDef]] = field(default_factory=dict)
     variant_hands_cache: dict[str, dict[str, str]] = field(default_factory=dict)
+    pc_cache: dict[str, dict[str, object]] = field(default_factory=dict)
+    info_cache: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property
     def source_vehicle_id(self) -> str:

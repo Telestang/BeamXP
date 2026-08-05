@@ -71,6 +71,11 @@ def in_letter_band(boxes) -> list:
 EDGE_CONFIG = replace(
     DEFAULT_CONFIG, box_source="edge", edge_local_window_px=64, edge_local_k=1.6
 )
+RING_CONFIG = replace(
+    DEFAULT_CONFIG,
+    ring_smoothness_width_px=12,
+    ring_smoothness_percentile=75.0,
+)
 
 
 class EdgeResponseTests(unittest.TestCase):
@@ -192,6 +197,495 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(second.resumed_from, 0)
 
 
+class ConservativeGroupingTests(unittest.TestCase):
+    def test_diagonal_neighbours_do_not_group(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((80, 80, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 8, 8),
+                (34, 34, 8, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=18,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config)
+
+        self.assertEqual(
+            [group.bounds for group in groups],
+            [(20, 20, 8, 8), (34, 34, 8, 8)],
+        )
+
+    def test_corner_touching_neighbours_do_not_group(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((80, 80, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 8, 8),
+                (28, 28, 8, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=18,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config)
+
+        self.assertEqual(
+            [group.bounds for group in groups],
+            [(20, 20, 8, 8), (28, 28, 8, 8)],
+        )
+
+    def test_vertical_neighbours_still_group(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((80, 80, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 8, 8),
+                (20, 34, 8, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=18,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config)
+
+        self.assertEqual([group.bounds for group in groups], [(20, 20, 8, 22)])
+
+    def test_significant_overlap_groups_before_proximity(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            overlap_region_group_candidates,
+        )
+
+        image = np.full((80, 80, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 28, 28),
+                (30, 30, 8, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=0,
+            min_group_union_region_px=10_000,
+            min_group_overlap_ratio=0.75,
+            enable_circular_groups=False,
+        )
+
+        groups = overlap_region_group_candidates(boxes, image, config)
+
+        self.assertEqual([group.bounds for group in groups], [(20, 20, 28, 28)])
+
+    def test_overlap_threshold_can_leave_nested_boxes_separate(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            overlap_region_group_candidates,
+        )
+
+        image = np.full((80, 80, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 28, 28),
+                (30, 30, 8, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=0,
+            min_group_union_region_px=10_000,
+            min_group_overlap_ratio=1.01,
+            enable_circular_groups=False,
+        )
+
+        groups = overlap_region_group_candidates(boxes, image, config)
+
+        self.assertEqual(
+            [group.bounds for group in groups],
+            [(20, 20, 28, 28), (30, 30, 8, 8)],
+        )
+
+    def test_overlap_grouping_runs_before_initial_grouping(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import STEP_INDEX
+
+        self.assertLess(STEP_INDEX["box_filter"], STEP_INDEX["overlap_box_group"])
+        self.assertLess(STEP_INDEX["overlap_box_group"], STEP_INDEX["grouped"])
+
+    def test_initial_grouping_continues_from_overlap_candidates(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            _step_grouped,
+            _step_overlap_box_group,
+            DetectionState,
+        )
+
+        image = np.full((96, 96, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 28, 28),
+                (30, 30, 8, 8),
+                (58, 20, 8, 28),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=18,
+            min_group_overlap_ratio=0.75,
+            enable_circular_groups=False,
+        )
+
+        overlap_state, overlap_stage = _step_overlap_box_group(
+            image,
+            None,
+            config,
+            DetectionState(boxes, []),
+        )
+        grouped_state, grouped_stage = _step_grouped(
+            image, None, config, overlap_state
+        )
+
+        self.assertEqual(overlap_stage.kept, ((20, 20, 28, 28), (58, 20, 8, 28)))
+        self.assertEqual(overlap_stage.adjusted, 1)
+        self.assertEqual(grouped_stage.kept, ((20, 20, 46, 28),))
+        self.assertEqual(
+            grouped_state.candidates[0].members,
+            ((20, 20, 28, 28), (30, 30, 8, 8), (58, 20, 8, 28)),
+        )
+        self.assertEqual(
+            grouped_state.candidates[0].units,
+            ((20, 20, 28, 28), (58, 20, 8, 28)),
+        )
+
+    def test_domain_recovery_splits_failed_initial_groups_to_overlap_groups(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_grouped,
+            _step_overlap_box_group,
+            _step_region_domain,
+        )
+
+        image = np.full((96, 96, 3), 128, dtype=np.uint8)
+        uv = np.zeros((96, 96), dtype=bool)
+        uv[10:30, 10:30] = True
+        uv[10:30, 42:62] = True
+        uv[19:20, 30:42] = True
+        boxes = np.asarray(
+            [
+                (10, 10, 20, 20),
+                (14, 14, 7, 7),
+                (42, 10, 20, 20),
+                (46, 14, 7, 7),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=12,
+            min_box_uv_coverage=0.75,
+            min_region_uv_coverage=1.0,
+            min_group_overlap_ratio=0.75,
+            enable_circular_groups=False,
+        )
+
+        overlap_state, _overlap_stage = _step_overlap_box_group(
+            image,
+            uv,
+            config,
+            DetectionState(boxes, []),
+        )
+        grouped_state, grouped_stage = _step_grouped(
+            image, uv, config, overlap_state
+        )
+        recovered_state, recovered_stage = _step_region_domain(
+            image, uv, config, grouped_state
+        )
+
+        self.assertEqual(overlap_state.groups, [(10, 10, 20, 20), (42, 10, 20, 20)])
+        self.assertEqual(grouped_stage.kept, ((10, 10, 52, 20),))
+        self.assertEqual(
+            recovered_state.groups,
+            [(10, 10, 20, 20), (42, 10, 20, 20)],
+        )
+        self.assertEqual(recovered_stage.rejected[0], (10, 10, 52, 20))
+        self.assertIn("2 strict recovery groups kept", recovered_stage.detail)
+        self.assertIn("0 broad rebuilds", recovered_stage.detail)
+
+    def test_domain_recovery_regroups_overlap_units_until_coverage_would_break(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_grouped,
+            _step_overlap_box_group,
+            _step_region_domain,
+        )
+
+        image = np.full((104, 104, 3), 128, dtype=np.uint8)
+        uv = np.zeros((104, 104), dtype=bool)
+        uv[10:30, 10:54] = True
+        uv[10:30, 66:86] = True
+        uv[19:20, 54:66] = True
+        boxes = np.asarray(
+            [
+                (10, 10, 20, 20),
+                (34, 10, 20, 20),
+                (66, 10, 20, 20),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=12,
+            min_box_uv_coverage=0.75,
+            min_region_uv_coverage=1.0,
+            enable_circular_groups=False,
+        )
+
+        overlap_state, _overlap_stage = _step_overlap_box_group(
+            image, uv, config, DetectionState(boxes, [])
+        )
+        grouped_state, grouped_stage = _step_grouped(
+            image, uv, config, overlap_state
+        )
+        recovered_state, recovered_stage = _step_region_domain(
+            image, uv, config, grouped_state
+        )
+
+        self.assertEqual(
+            overlap_state.groups,
+            [(10, 10, 20, 20), (34, 10, 20, 20), (66, 10, 20, 20)],
+        )
+        self.assertEqual(grouped_stage.kept, ((10, 10, 76, 20),))
+        self.assertEqual(
+            recovered_state.groups,
+            [(10, 10, 44, 20), (66, 10, 20, 20)],
+        )
+        self.assertIn("2 strict recovery groups kept", recovered_stage.detail)
+
+    def test_weakly_overlapping_vertical_neighbours_do_not_group(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((90, 90, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 30, 8),
+                (45, 34, 30, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=18,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config)
+
+        self.assertEqual(
+            [group.bounds for group in groups],
+            [(20, 20, 30, 8), (45, 34, 30, 8)],
+        )
+
+    def test_weakly_overlapping_horizontal_neighbours_do_not_group(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((90, 90, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 8, 30),
+                (34, 45, 8, 30),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=18,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config)
+
+        self.assertEqual(
+            [group.bounds for group in groups],
+            [(20, 20, 8, 30), (34, 45, 8, 30)],
+        )
+
+    def test_accumulated_row_or_column_group_gets_follow_up_merge(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((128, 160, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            [
+                (20, 20, 100, 8),
+                (25, 40, 8, 30),
+                (107, 40, 8, 30),
+                (65, 85, 20, 12),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=20,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config)
+
+        self.assertEqual([group.bounds for group in groups], [(20, 20, 100, 77)])
+
+    def test_box_uv_coverage_uses_one_island_not_the_total_domain(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            box_uv_coverage,
+            build_uv_domain_index,
+        )
+
+        uv = np.zeros((80, 100), dtype=bool)
+        uv[20:40, 10:30] = True
+        uv[20:40, 50:70] = True
+        domain = build_uv_domain_index(uv)
+
+        coverage = box_uv_coverage(uv, (10, 20, 60, 20), uv.shape, domain)
+
+        self.assertAlmostEqual(coverage, 400 / 1200)
+
+    def test_box_coverage_gate_cannot_sum_multiple_uv_islands(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((80, 100, 3), 128, dtype=np.uint8)
+        uv = np.zeros((80, 100), dtype=bool)
+        uv[20:40, 10:30] = True
+        uv[20:40, 50:70] = True
+        boxes = np.asarray(
+            [
+                (12, 24, 10, 8),
+                (56, 24, 10, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=24,
+            min_box_uv_coverage=0.75,
+            enable_island_bounded_grouping=False,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config, uv)
+
+        self.assertEqual([group.bounds for group in groups], [(12, 24, 10, 8), (56, 24, 10, 8)])
+
+    def test_domain_breaking_merge_keeps_the_smaller_valid_groups(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((96, 96, 3), 128, dtype=np.uint8)
+        uv_pixels = np.zeros((96, 96), dtype=np.uint8)
+        uv_pixels[10:32, 10:34] = 255
+        uv_pixels[42:64, 42:66] = 255
+        cv2.line(uv_pixels, (33, 31), (42, 42), 255, 1)
+        uv = uv_pixels > 0
+        boxes = np.asarray(
+            [
+                (13, 14, 7, 8),
+                (24, 14, 7, 8),
+                (45, 46, 7, 8),
+                (56, 46, 7, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=24,
+            enable_circular_groups=False,
+            min_region_uv_coverage=1.0,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config, uv)
+
+        self.assertEqual(
+            [group.bounds for group in groups],
+            [(13, 14, 18, 8), (45, 46, 18, 8)],
+        )
+
+    def test_grouping_uses_box_coverage_before_strict_domain_recovery(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_region_domain,
+            build_uv_domain_index,
+            union_region_group_candidates,
+        )
+
+        image = np.full((96, 96, 3), 128, dtype=np.uint8)
+        uv = np.zeros((96, 96), dtype=bool)
+        uv[20:28, 20:28] = True
+        uv[20:21, 28:48] = True
+        uv[20:28, 48:56] = True
+        boxes = np.asarray(
+            [
+                (20, 20, 8, 8),
+                (48, 20, 8, 8),
+            ],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=20,
+            min_box_uv_coverage=0.4,
+            min_region_uv_coverage=1.0,
+            enable_circular_groups=False,
+        )
+        domain = build_uv_domain_index(uv)
+
+        candidates = union_region_group_candidates(boxes, image, config, uv, domain)
+        self.assertEqual(
+            [candidate.bounds for candidate in candidates],
+            [(20, 20, 36, 8)],
+        )
+
+        state, stage = _step_region_domain(
+            image,
+            uv,
+            config,
+            DetectionState(
+                boxes,
+                [candidate.bounds for candidate in candidates],
+                candidates,
+                domain,
+            ),
+        )
+
+        self.assertEqual(state.groups, [(20, 20, 8, 8), (48, 20, 8, 8)])
+        self.assertEqual(stage.rejected[0], (20, 20, 36, 8))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -305,26 +799,26 @@ class RingSmoothnessTests(unittest.TestCase):
             edge_response, ring_roughness,
         )
         image = self._mark_on_plain_trim()
-        response = edge_response(image, DEFAULT_CONFIG)
+        response = edge_response(image, RING_CONFIG)
         roughness = ring_roughness(
-            response, None, (88, 108, 96, 40), DEFAULT_CONFIG,
-            self._reference(image, DEFAULT_CONFIG),
+            response, None, (88, 108, 96, 40), RING_CONFIG,
+            self._reference(image, RING_CONFIG),
         )
         self.assertIsNotNone(roughness)
-        self.assertLess(roughness, DEFAULT_CONFIG.max_ring_roughness)
+        self.assertLess(roughness, RING_CONFIG.max_ring_roughness)
 
     def test_a_grille_reads_rough_around_any_part_of_itself(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
             edge_response, ring_roughness,
         )
         image = self._patch_of_grille()
-        response = edge_response(image, DEFAULT_CONFIG)
+        response = edge_response(image, RING_CONFIG)
         roughness = ring_roughness(
-            response, None, (88, 108, 96, 40), DEFAULT_CONFIG,
-            self._reference(image, DEFAULT_CONFIG),
+            response, None, (88, 108, 96, 40), RING_CONFIG,
+            self._reference(image, RING_CONFIG),
         )
         self.assertIsNotNone(roughness)
-        self.assertGreater(roughness, DEFAULT_CONFIG.max_ring_roughness)
+        self.assertGreater(roughness, RING_CONFIG.max_ring_roughness)
 
     def test_a_ring_with_too_little_domain_concludes_nothing(self) -> None:
         # Nothing measured, nothing concluded: a region at an island edge is
@@ -333,11 +827,11 @@ class RingSmoothnessTests(unittest.TestCase):
             edge_response, ring_roughness,
         )
         image = self._mark_on_plain_trim()
-        response = edge_response(image, DEFAULT_CONFIG)
+        response = edge_response(image, RING_CONFIG)
         domain = np.zeros(image.shape, dtype=bool)
         domain[100:140, 100:140] = True
         self.assertIsNone(
-            ring_roughness(response, domain, (100, 100, 40, 40), DEFAULT_CONFIG, 1.0)
+            ring_roughness(response, domain, (100, 100, 40, 40), RING_CONFIG, 1.0)
         )
 
     def test_the_margin_keeps_the_mark_out_of_its_own_ring(self) -> None:
@@ -347,14 +841,47 @@ class RingSmoothnessTests(unittest.TestCase):
             edge_response, ring_roughness,
         )
         image = self._mark_on_plain_trim()
-        response = edge_response(image, DEFAULT_CONFIG)
-        reference = self._reference(image, DEFAULT_CONFIG)
-        tight = replace(DEFAULT_CONFIG, ring_smoothness_margin_px=0)
+        response = edge_response(image, RING_CONFIG)
+        reference = self._reference(image, RING_CONFIG)
+        tight = replace(RING_CONFIG, ring_smoothness_margin_px=0)
         bounds = (92, 112, 88, 32)
         self.assertLessEqual(
-            ring_roughness(response, None, bounds, DEFAULT_CONFIG, reference),
+            ring_roughness(response, None, bounds, RING_CONFIG, reference),
             ring_roughness(response, None, bounds, tight, reference),
         )
+
+    def test_a_hull_ring_measures_the_material_near_the_feature(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            RegionFeatureHull,
+            edge_response,
+            ring_roughness,
+        )
+
+        image = np.full((160, 160), 128, dtype=np.uint8)
+        cv2.rectangle(image, (50, 76), (110, 82), 168, -1)
+        for x in range(48, 113, 6):
+            cv2.line(image, (x, 62), (x + 4, 72), 168, 2)
+        response = edge_response(image, RING_CONFIG)
+        config = replace(
+            RING_CONFIG,
+            ring_smoothness_margin_px=2,
+            ring_smoothness_width_px=12,
+        )
+        reference = self._reference(image, RING_CONFIG)
+        bounds = (38, 54, 84, 48)
+        hull = RegionFeatureHull(
+            points=((50, 76), (110, 76), (110, 82), (50, 82)),
+            feature_area_px=427,
+            hull_area_px=360.0,
+            colour_variation=0.0,
+        )
+
+        rectangular = ring_roughness(response, None, bounds, config, reference)
+        hull_based = ring_roughness(response, None, bounds, config, reference, hull)
+
+        self.assertIsNotNone(rectangular)
+        self.assertIsNotNone(hull_based)
+        self.assertGreater(hull_based, rectangular)
 
     def test_the_stage_is_a_no_op_until_enabled(self) -> None:
         run = run_detection(embossed_text(), None, EDGE_CONFIG)
@@ -362,10 +889,245 @@ class RingSmoothnessTests(unittest.TestCase):
         self.assertEqual(stage.detail, "disabled")
         self.assertEqual(len(stage.rejected), 0)
 
-    def test_it_runs_after_grouping_and_before_final_size(self) -> None:
+    def test_it_runs_after_blob_shape_and_before_final_size(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import STEP_INDEX
         self.assertLess(STEP_INDEX["grouped"], STEP_INDEX["ring_smoothness"])
+        self.assertLess(STEP_INDEX["blob_shape"], STEP_INDEX["ring_smoothness"])
         self.assertLess(STEP_INDEX["ring_smoothness"], STEP_INDEX["size"])
+
+
+class MagicFeatureFilterTests(unittest.TestCase):
+    def _image(self) -> np.ndarray:
+        return np.full((128, 128, 3), 160, dtype=np.uint8)
+
+    def test_a_filled_mark_reads_as_a_blob(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import blob_hull_fill
+
+        image = self._image()
+        cv2.circle(image, (64, 64), 18, (30, 30, 30), -1)
+
+        fill = blob_hull_fill(image, None, (46, 46, 36, 36), DEFAULT_CONFIG)
+
+        self.assertIsNotNone(fill)
+        self.assertGreater(fill, DEFAULT_CONFIG.max_blob_hull_fill)
+
+    def test_a_blob_with_internal_detail_is_not_flat(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            blob_shape_measures,
+        )
+
+        image = self._image()
+        cv2.circle(image, (64, 64), 22, (20, 20, 20), -1)
+        cv2.putText(image, "23", (45, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 3)
+
+        measures = blob_shape_measures(image, None, (40, 40, 48, 48), DEFAULT_CONFIG)
+
+        self.assertIsNotNone(measures)
+        fill, colour_variation = measures
+        self.assertGreater(fill, DEFAULT_CONFIG.max_blob_hull_fill)
+        self.assertGreater(
+            colour_variation,
+            DEFAULT_CONFIG.min_blob_internal_colour_variation,
+        )
+
+    def test_a_distinctive_shape_leaves_empty_hull_space(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import blob_hull_fill
+
+        image = self._image()
+        cv2.line(image, (42, 64), (86, 64), (30, 30, 30), 6)
+        cv2.line(image, (64, 42), (64, 86), (30, 30, 30), 6)
+
+        fill = blob_hull_fill(image, None, (38, 38, 52, 52), DEFAULT_CONFIG)
+
+        self.assertIsNotNone(fill)
+        self.assertLess(fill, DEFAULT_CONFIG.max_blob_hull_fill)
+
+    def test_connected_feature_extension_is_measured(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_extension_measure,
+        )
+
+        image = self._image()
+        cv2.line(image, (20, 64), (108, 64), (30, 30, 30), 6)
+        config = replace(DEFAULT_CONFIG, feature_extension_context_px=28)
+
+        measure = feature_extension_measure(image, None, (50, 59, 28, 12), config)
+
+        self.assertIsNotNone(measure)
+        self.assertGreater(measure.extension_area_px, measure.feature_area_px)
+        self.assertGreater(
+            measure.extension_ratio,
+            config.feature_extension_min_ratio,
+        )
+
+    def test_isolated_feature_has_no_extension(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_extension_measure,
+        )
+
+        image = self._image()
+        cv2.rectangle(image, (55, 58), (73, 70), (30, 30, 30), -1)
+        config = replace(DEFAULT_CONFIG, feature_extension_context_px=28)
+
+        measure = feature_extension_measure(image, None, (50, 52, 30, 28), config)
+
+        self.assertIsNotNone(measure)
+        self.assertEqual(measure.extension_area_px, 0)
+        self.assertEqual(measure.extension_ratio, 0.0)
+
+    def test_blob_stage_rejects_only_blob_like_regions(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_blob_shape,
+        )
+
+        image = self._image()
+        cv2.circle(image, (36, 64), 14, (30, 30, 30), -1)
+        cv2.line(image, (78, 64), (114, 64), (30, 30, 30), 5)
+        cv2.line(image, (96, 46), (96, 82), (30, 30, 30), 5)
+        groups = [(22, 50, 28, 28), (74, 42, 44, 44)]
+        config = replace(DEFAULT_CONFIG, enable_blob_shape_filter=True)
+
+        _state, stage = _step_blob_shape(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), groups)
+        )
+
+        self.assertEqual(stage.rejected, (groups[0],))
+        self.assertEqual(stage.kept, (groups[1],))
+
+    def test_blob_stage_keeps_blob_like_regions_with_internal_detail(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_blob_shape,
+        )
+
+        image = self._image()
+        cv2.circle(image, (64, 64), 22, (20, 20, 20), -1)
+        cv2.putText(image, "23", (45, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 3)
+        group = (40, 40, 48, 48)
+        config = replace(DEFAULT_CONFIG, enable_blob_shape_filter=True)
+
+        _state, stage = _step_blob_shape(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), [group])
+        )
+
+        self.assertEqual(stage.rejected, ())
+        self.assertEqual(stage.kept, (group,))
+
+    def test_blob_stage_skips_regions_below_the_area_floor(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_blob_shape,
+        )
+
+        image = self._image()
+        cv2.circle(image, (64, 64), 8, (30, 30, 30), -1)
+        group = (56, 56, 16, 16)
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_blob_shape_filter=True,
+            min_blob_region_area_px=512,
+        )
+
+        _state, stage = _step_blob_shape(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), [group])
+        )
+
+        self.assertEqual(stage.rejected, ())
+        self.assertEqual(stage.kept, (group,))
+
+    def test_blob_stage_caches_feature_hulls_for_ring_smoothness(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_blob_shape,
+        )
+
+        image = self._image()
+        cv2.rectangle(image, (44, 60), (84, 68), (30, 30, 30), -1)
+        group = (36, 50, 60, 28)
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_blob_shape_filter=False,
+            enable_ring_smoothness_filter=True,
+        )
+
+        state, stage = _step_blob_shape(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), [group])
+        )
+
+        self.assertEqual(stage.kept, (group,))
+        self.assertEqual(len(state.feature_hulls), 1)
+        self.assertIsNotNone(state.feature_hulls[0])
+
+    def test_feature_extension_stage_rejects_partial_larger_features(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_feature_extension,
+        )
+
+        image = self._image()
+        cv2.line(image, (12, 42), (80, 42), (30, 30, 30), 6)
+        cv2.rectangle(image, (86, 78), (106, 94), (30, 30, 30), -1)
+        groups = [(34, 36, 22, 14), (82, 72, 30, 28)]
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_feature_extension_filter=True,
+            feature_extension_context_px=28,
+            feature_extension_min_ratio=0.25,
+        )
+
+        _state, stage = _step_feature_extension(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), groups)
+        )
+
+        self.assertEqual(stage.rejected, (groups[0],))
+        self.assertEqual(stage.kept, (groups[1],))
+
+    def test_feature_extension_stage_keeps_small_raw_extensions_on_large_features(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_feature_extension,
+        )
+
+        image = self._image()
+        cv2.rectangle(image, (35, 40), (85, 88), (30, 30, 30), -1)
+        cv2.rectangle(image, (86, 60), (94, 68), (30, 30, 30), -1)
+        group = (34, 39, 52, 50)
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_feature_extension_filter=True,
+            feature_extension_context_px=16,
+            feature_extension_min_ratio=0.25,
+        )
+
+        _state, stage = _step_feature_extension(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), [group])
+        )
+
+        self.assertEqual(stage.rejected, ())
+        self.assertEqual(stage.kept, (group,))
+
+    def test_the_stages_are_no_ops_until_enabled(self) -> None:
+        config = replace(
+            EDGE_CONFIG,
+            enable_blob_shape_filter=False,
+            enable_feature_extension_filter=False,
+        )
+        run = run_detection(embossed_text(), None, config)
+        blob = next(s for s in run.stages if s.key == "blob_shape")
+        extension = next(s for s in run.stages if s.key == "feature_extension")
+        self.assertEqual(blob.detail, "disabled")
+        self.assertEqual(extension.detail, "disabled")
+        self.assertEqual(len(blob.rejected), 0)
+        self.assertEqual(len(extension.rejected), 0)
+
+    def test_they_run_before_ring_smoothness_and_text_lines(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import STEP_INDEX
+
+        self.assertLess(STEP_INDEX["blob_shape"], STEP_INDEX["feature_extension"])
+        self.assertLess(STEP_INDEX["blob_shape"], STEP_INDEX["ring_smoothness"])
+        self.assertLess(STEP_INDEX["ring_smoothness"], STEP_INDEX["feature_extension"])
+        self.assertLess(STEP_INDEX["feature_extension"], STEP_INDEX["text_line"])
 
 
 class RegionFlatnessTests(unittest.TestCase):
@@ -471,7 +1233,8 @@ class RegionFlatnessTests(unittest.TestCase):
     def test_the_two_region_filters_run_in_order(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import STEP_INDEX
         self.assertLess(STEP_INDEX["pattern_group"], STEP_INDEX["region_flatness"])
-        self.assertLess(STEP_INDEX["region_flatness"], STEP_INDEX["ring_smoothness"])
+        self.assertLess(STEP_INDEX["region_flatness"], STEP_INDEX["blob_shape"])
+        self.assertLess(STEP_INDEX["blob_shape"], STEP_INDEX["ring_smoothness"])
         self.assertLess(STEP_INDEX["ring_smoothness"], STEP_INDEX["size"])
 
     def test_the_default_floor_is_reachable(self) -> None:
@@ -519,6 +1282,40 @@ class RotatedBoundsTests(unittest.TestCase):
         )
         self.assertGreater(fill, 0.8)
         self.assertLess(aspect, 1.3)
+
+    def test_circular_regions_keep_their_circle_instead_of_a_rotated_outline(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_rotated_bounds,
+            inscribed_circle_radius,
+        )
+
+        image = np.full((96, 96, 3), 128, dtype=np.uint8)
+        cv2.circle(image, (48, 48), 24, (220, 220, 220), -1)
+        group = (22, 22, 52, 52)
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_circular_groups=True,
+            circular_group_padding_px=0,
+            enable_rotated_bounds_filter=True,
+            rotated_bounds_min_points=8,
+            min_rotated_fill=0.0,
+            max_rotated_aspect=10.0,
+            min_feature_tightness=0.0,
+            min_rotated_elongation=0.0,
+        )
+
+        self.assertIsNotNone(inscribed_circle_radius(image, None, group, config))
+
+        _state, stage = _step_rotated_bounds(
+            image,
+            None,
+            config,
+            DetectionState(np.empty((0, 4), np.int32), [group]),
+        )
+
+        self.assertEqual(stage.kept, (group,))
+        self.assertEqual(stage.rotations, (None,))
 
     def test_too_few_points_fits_nothing(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
@@ -770,6 +1567,8 @@ def separated_marks(size: int = 512) -> np.ndarray:
 MARKS_CONFIG = replace(
     DEFAULT_CONFIG, box_source="edge", edge_local_window_px=64, edge_local_k=1.6,
     enable_box_feature_filter=False, enable_rotated_bounds_filter=True,
+    enable_blob_shape_filter=False, enable_feature_extension_filter=False,
+    merge_distance_px=18,
 )
 
 
@@ -788,9 +1587,9 @@ class RotatedBoundsPersistenceTests(unittest.TestCase):
     def test_outlines_reach_the_final_stage(self) -> None:
         run = self._run()
         after = [s for s in run.stages
-                 if s.key in ("region_flatness", "ring_smoothness", "size",
-                              "final_padding")]
-        self.assertEqual(len(after), 4)
+                 if s.key in ("region_flatness", "blob_shape",
+                              "ring_smoothness", "size", "final_padding")]
+        self.assertEqual(len(after), 5)
         for stage in after:
             self.assertGreater(len(stage.kept), 0, f"{stage.title} kept nothing")
             self.assertEqual(len(stage.rotations), len(stage.kept), stage.title)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from beamxp import hand_drive_core as core
@@ -53,6 +55,34 @@ def context_with_parts(
     )
     context.selected_parts_cache["trim"] = selected
     return context
+
+
+def write_structural_doorpanel_output(
+    context: core.VehicleContext,
+    output_vehicle_dir: Path,
+) -> None:
+    source_zip = output_vehicle_dir.parent / "source.zip"
+    source_zip.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(source_zip, "w"):
+        pass
+    context.source_zip = source_zip
+    generation_impl.write_generated_jbeam_and_configs(
+        context,
+        output_vehicle_dir,
+        {"parts": {"doorpanel_FL": {"mode": core.MODE_MIRROR_STRUCTURAL, "mirrorSource": "doorpanel_FR"}}},
+        {"doorpanel_FL": core.MODE_MIRROR_STRUCTURAL},
+        {"doorpanel_FL": "doorpanel_FR"},
+        {},
+        {"trim": core.HAND_RHD},
+        {},
+        set(),
+        set(),
+        set(),
+        set(),
+        set(),
+        set(),
+        [],
+    )
 
 
 class GeneratedPartIdentityTests(unittest.TestCase):
@@ -311,6 +341,105 @@ class ReplaceSourceConfigOutputTests(unittest.TestCase):
         self.assertEqual(pc["parts"]["mirror_L"], "mirror_L")
         self.assertEqual(pc["parts"]["/mirror_L/"], "mirror_L")
         self.assertEqual(pc["parts"]["mirror_L_xp_lhd"], "mirror_L")
+
+
+class StructuralFlexbodyOutputTests(unittest.TestCase):
+    def test_structural_leaf_swap_does_not_clone_physical_parent_door(self) -> None:
+        car = part("car", "main", "Car", (("door_FL", "door_FL"),))
+        door = part("door_FL", "door_FL", "Front Left Door", (("doorpanel_FL", "doorpanel_FL"),))
+        panel = (
+            '"doorpanel_FL": {\n'
+            '"information": {"name": "Front Left Door Panel"},\n'
+            '"slotType": "doorpanel_FL",\n'
+            '"flexbodies": [\n'
+            '    ["mesh", "[group]:"],\n'
+            '    ["doorpanel_FL", ["door_FL"]]\n'
+            "]\n"
+            "}"
+        )
+        selected = {
+            "parts": {"car", "door_FL", "doorpanel_FL"},
+            "main_part": "car",
+            "part_instances": [
+                {
+                    "instance_id": "/car",
+                    "part_id": "car",
+                    "slot_id": "main",
+                    "slot_path": "/",
+                },
+                {
+                    "instance_id": "/door_FL/door_FL",
+                    "part_id": "door_FL",
+                    "slot_id": "door_FL",
+                    "slot_path": "/door_FL/",
+                    "parent_instance_id": "/car",
+                },
+                {
+                    "instance_id": "/door_FL/doorpanel_FL/doorpanel_FL",
+                    "part_id": "doorpanel_FL",
+                    "slot_id": "doorpanel_FL",
+                    "slot_path": "/door_FL/doorpanel_FL/",
+                    "parent_instance_id": "/door_FL/door_FL",
+                },
+            ],
+            "selected_by_slot": {
+                "main": "car",
+                "door_FL": "door_FL",
+                "doorpanel_FL": "doorpanel_FL",
+            },
+            "selected_by_path": {
+                "/": "car",
+                "/door_FL/": "door_FL",
+                "/door_FL/doorpanel_FL/": "doorpanel_FL",
+            },
+        }
+        context = context_with_parts(
+            {
+                "car": (car, "car.jbeam"),
+                "door_FL": (door, "door.jbeam"),
+                "doorpanel_FL": (panel, "panel.jbeam"),
+            },
+            selected,
+        )
+        context.objects = {
+            "doorpanel_FL": core.DaeObject(
+                "doorpanel_FL",
+                "doorpanel_FL",
+                "vehicles/acme/acme.dae",
+                1.0,
+                0.0,
+                0.0,
+                (),
+            ),
+            "doorpanel_FR": core.DaeObject(
+                "doorpanel_FR",
+                "doorpanel_FR",
+                "vehicles/acme/acme.dae",
+                -1.0,
+                0.0,
+                0.0,
+                (),
+            ),
+        }
+        context.pc_cache["trim.pc"] = {
+            "parts": {
+                "door_FL": "door_FL",
+                "doorpanel_FL": "doorpanel_FL",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_vehicle_dir = Path(tmp) / context.vehicle_path
+            write_structural_doorpanel_output(context, output_vehicle_dir)
+            generated_jbeam = (output_vehicle_dir / "jbeam" / "handdrive_visual_conversion.jbeam").read_text(
+                encoding="utf-8"
+            )
+            generated_pc = core.read_json_file(output_vehicle_dir / "trim_rhd.pc")
+
+        self.assertNotIn('"door_FL_xp_rhd"', generated_jbeam)
+        self.assertIn('"doorpanel_FL_xp_rhd"', generated_jbeam)
+        self.assertEqual(generated_pc["parts"]["door_FL"], "door_FL")
+        self.assertEqual(generated_pc["parts"]["doorpanel_FL"], "doorpanel_FL_xp_rhd")
 
 
 class GeneratedConfigMetadataTests(unittest.TestCase):

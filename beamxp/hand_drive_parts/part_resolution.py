@@ -6,6 +6,7 @@ Original source lines 3521-4068. Import the public orchestration module
 
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -103,6 +104,113 @@ def part_named_array_for_context(context: VehicleContext, part_id: str, array_ke
     array_text = transform_helpers.extract_named_array(found[0], array_key)
     context.part_array_cache[cache_key] = array_text
     return array_text
+
+
+def part_mesh_names_for_context(context: VehicleContext, part_id: str) -> set[str]:
+    cached = context.part_mesh_names_cache.get(part_id)
+    if cached is not None:
+        return set(cached)
+    found = part_body_for_context(context, part_id)
+    meshes = transform_helpers.extract_part_mesh_names(found[0]) if found is not None else set()
+    context.part_mesh_names_cache[part_id] = set(meshes)
+    return set(meshes)
+
+
+def part_slot_defs_for_context(context: VehicleContext, part_id: str) -> list[SlotDef]:
+    cached = context.part_slot_defs_cache.get(part_id)
+    if cached is not None:
+        return list(cached)
+    found = part_body_for_context(context, part_id)
+    slot_defs = extract_slot_defs(found[0]) if found is not None else []
+    context.part_slot_defs_cache[part_id] = list(slot_defs)
+    return list(slot_defs)
+
+
+_SLOT_TYPE_INDEX_ATTR = "_slot_type_part_index"
+
+
+def _slot_type_part_index(
+    context: VehicleContext,
+) -> tuple[dict[str, tuple[str, ...]], dict[str, frozenset[str]]]:
+    """Parts grouped by the slotTypes they declare, plus the reverse map.
+
+    The counterpart searches below used to walk every part in the vehicle for
+    each (part, slot) pair they considered -- 9.5M candidate bodies re-parsed on
+    a stock etk800 build, virtually all of them thrown away by ``part_fits_slot``.
+    That filter only admits a part whose declared slotTypes meet the slot's allow
+    set, so the same candidates come out of an index keyed on those slotTypes,
+    at roughly four per slot instead of two and a half thousand.
+
+    Kept as a plain attribute rather than a ``VehicleContext`` field on purpose:
+    the context cache fingerprint covers the field names, so adding one would
+    invalidate every user's cached vehicle and force a cold rebuild for a value
+    that is cheap to derive. ``dataclasses.replace`` drops it too, so a derived
+    context carrying a different part index (generated output parts, preview
+    overlays) builds its own rather than inheriting a stale one.
+    """
+    part_index = context.part_body_index
+    cached = getattr(context, _SLOT_TYPE_INDEX_ATTR, None)
+    if cached is not None and cached[0] is part_index and cached[1] == len(part_index):
+        return cached[2], cached[3]
+
+    grouped: dict[str, list[str]] = {}
+    types_by_part: dict[str, frozenset[str]] = {}
+    for part_id, (part_body, _filename) in part_index.items():
+        slot_types = frozenset(transform_helpers.extract_part_slot_types(part_body))
+        if not slot_types:
+            # part_fits_slot rejects a part that declares no slotType, so one
+            # that is absent from the index is already the right answer.
+            continue
+        types_by_part[part_id] = slot_types
+        for slot_type in slot_types:
+            grouped.setdefault(slot_type, []).append(part_id)
+
+    by_slot_type = {slot_type: tuple(ids) for slot_type, ids in grouped.items()}
+    setattr(
+        context,
+        _SLOT_TYPE_INDEX_ATTR,
+        (part_index, len(part_index), by_slot_type, types_by_part),
+    )
+    return by_slot_type, types_by_part
+
+
+def parts_fitting_slot(context: VehicleContext, slot: SlotDef) -> list[str]:
+    """Ids of the parts that may fill ``slot``, mirroring ``part_fits_slot``.
+
+    Allow types admit (defaulting to the slot's own type), deny types reject.
+    Callers still rank the survivors themselves; this only replaces the scan
+    that found them.
+    """
+    by_slot_type, types_by_part = _slot_type_part_index(context)
+    allow = set(slot.allow_types) or {slot.slot_type}
+    candidates: dict[str, None] = {}
+    for allow_type in sorted(allow):
+        for part_id in by_slot_type.get(allow_type, ()):
+            candidates.setdefault(part_id, None)
+    if not slot.deny_types:
+        return list(candidates)
+    deny = set(slot.deny_types)
+    return [
+        part_id
+        for part_id in candidates
+        if deny.isdisjoint(types_by_part[part_id])
+    ]
+
+
+def load_context_pc(context: VehicleContext, pc_path: str) -> dict[str, object]:
+    cached = context.pc_cache.get(pc_path)
+    if cached is None:
+        cached = load_pc(context.source_zip, pc_path)
+        context.pc_cache[pc_path] = cached
+    return copy.deepcopy(cached)
+
+
+def load_context_info(context: VehicleContext, info_path: str) -> dict[str, object]:
+    cached = context.info_cache.get(info_path)
+    if cached is None:
+        cached = load_info(context.source_zip, info_path)
+        context.info_cache[info_path] = cached
+    return copy.deepcopy(cached)
 
 
 def vehicle_namespace_main_part(
@@ -277,7 +385,7 @@ def selected_parts_for_config(context: VehicleContext, config_name: str) -> dict
     if cached is not None:
         return cached
     variant = context.variants[config_name]
-    pc = load_pc(context.source_zip, variant.pc_path)
+    pc = load_context_pc(context, variant.pc_path)
     selected = resolve_selected_parts(
         pc,
         context.jbeam_texts,
@@ -388,12 +496,10 @@ def _hand_authored_counterpart(
         return None
 
     ranked: list[tuple[tuple[int, int, int, int], str]] = []
-    for candidate_id, (candidate_body, _candidate_file) in context.part_body_index.items():
+    for candidate_id in parts_fitting_slot(context, target_slot):
         if candidate_id == source_part_id:
             continue
-        candidate_slot_types = transform_helpers.extract_part_slot_types(candidate_body)
-        if not part_fits_slot(candidate_slot_types, target_slot):
-            continue
+        candidate_body = context.part_body_index[candidate_id][0]
 
         candidate_hint = _part_hand_hint(candidate_id, candidate_body)
         if candidate_hint not in {target_hand, HAND_UNKNOWN}:
@@ -445,12 +551,10 @@ def _sideless_counterpart(
     source_body = found[0]
 
     ranked: list[tuple[tuple[int, int], str]] = []
-    for candidate_id, (candidate_body, _candidate_file) in context.part_body_index.items():
+    for candidate_id in parts_fitting_slot(context, target_slot):
         if candidate_id == source_part_id:
             continue
-        candidate_slot_types = transform_helpers.extract_part_slot_types(candidate_body)
-        if not part_fits_slot(candidate_slot_types, target_slot):
-            continue
+        candidate_body = context.part_body_index[candidate_id][0]
         identity_score = _part_identity_score(
             source_part_id,
             source_body,
@@ -1684,4 +1788,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']

@@ -101,6 +101,7 @@ from mesh_segmentation_transform.relief_from_normals import (  # noqa: E402
 )
 from mesh_segmentation_transform.mirror_texture_for_rhd import (  # noqa: E402
     DEFAULT_RHD_CONFIG,
+    RhdTextureConfig,
     companion_maps_for_binding,
     export_part_preview,
 )
@@ -295,7 +296,12 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "4. Initial grouping",
+        "4. Overlap grouping",
+        ("min_group_overlap_ratio",),
+        None,
+    ),
+    (
+        "5. Initial grouping",
         (
             "merge_distance_px",
             "min_group_union_region_px",
@@ -309,17 +315,17 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "5. Domain recovery",
+        "6. Domain recovery",
         ("enable_region_domain_filter", "min_region_uv_coverage"),
         None,
     ),
     (
-        "6. Post-circle forced merge",
+        "7. Post-circle forced merge",
         ("enable_overlap_group_merge",),
         None,
     ),
     (
-        "7. Repeating pattern",
+        "8. Repeating pattern",
         (
             "enable_pattern_group_filter",
             "max_pattern_autocorrelation",
@@ -331,7 +337,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "8. Rotated bounds",
+        "9. Rotated bounds",
         (
             "enable_rotated_bounds_filter",
             "rotated_bounds_min_points",
@@ -351,7 +357,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "9. Region flatness",
+        "10. Region flatness",
         (
             "enable_region_flatness_filter",
             "region_flatness_percentile",
@@ -361,7 +367,23 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "10. Ring smoothness",
+        "11. Blob shape",
+        (
+            "enable_blob_shape_filter",
+            "min_blob_region_area_px",
+            "max_blob_hull_fill",
+            "min_blob_internal_colour_variation",
+            "region_feature_ring_margin_px",
+            "region_feature_ring_width_px",
+            "region_feature_colour_tolerance",
+            "region_feature_variance_scale",
+            "region_feature_min_domain_px",
+            "region_feature_min_px",
+        ),
+        None,
+    ),
+    (
+        "12. Ring smoothness",
         (
             "enable_ring_smoothness_filter",
             "ring_smoothness_width_px",
@@ -373,7 +395,16 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "11. Text lines",
+        "13. Feature extension",
+        (
+            "enable_feature_extension_filter",
+            "feature_extension_context_px",
+            "feature_extension_min_ratio",
+        ),
+        None,
+    ),
+    (
+        "14. Text lines",
         (
             "enable_text_line_filter",
             "text_min_component_px",
@@ -383,7 +414,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "12. Final size",
+        "15. Final size",
         (
             "enable_final_size_filter",
             "final_min_width_px",
@@ -395,7 +426,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "13. Final padding",
+        "16. Final padding",
         ("final_region_padding_px",),
         None,
     ),
@@ -447,6 +478,11 @@ RELIEF_PARAMETER_ORDER: tuple[str, ...] = (
     "slope_saturation_levels",
 )
 
+RHD_PARAMETER_ORDER: tuple[str, ...] = (
+    "enable_skewed_region_filter",
+    "skewed_region_min_delta",
+    "skewed_region_max_condition",
+)
 
 # ---------------------------------------------------------------------------
 # Detection run
@@ -934,6 +970,7 @@ class TuningApp(tk.Tk):
         self.parameter_vars: dict[str, tk.Variable] = {}
         self.symmetry_parameter_vars: dict[str, tk.Variable] = {}
         self.relief_parameter_vars: dict[str, tk.Variable] = {}
+        self.rhd_parameter_vars: dict[str, tk.Variable] = {}
         self.section_widgets: dict[str, list[tk.Widget]] = {}
         self.section_source: dict[str, str | None] = {}
         self.session = load_session()
@@ -1338,9 +1375,30 @@ class TuningApp(tk.Tk):
             )
             row += 1
 
-        remembered = self.mode_parameters.get(self.active_source)
-        if remembered:
-            self._apply_parameters(remembered)
+        owned, row = self._begin_section(
+            parent, "Texture correction export", None, row
+        )
+        note = ttk.Label(
+            parent,
+            text="Post-detection filters used when exporting the corrected preview.",
+            wraplength=320,
+            justify="left",
+            foreground="#777777",
+        )
+        note.grid(row=row, column=0, columnspan=2, sticky="w", padx=4)
+        owned.append(note)
+        row += 1
+        rhd_fields = {field.name: field for field in fields(RhdTextureConfig)}
+        for name in RHD_PARAMETER_ORDER:
+            if name not in rhd_fields:
+                continue
+            self._parameter_row(
+                parent, name, getattr(DEFAULT_RHD_CONFIG, name),
+                None, row, owned, self.rhd_parameter_vars,
+            )
+            row += 1
+
+        self._apply_parameters(self._parameters_for_source(self.active_source))
         self._apply_parameter_visibility()
 
     # -- per-source parameter sets ---------------------------------------
@@ -1356,6 +1414,7 @@ class TuningApp(tk.Tk):
             ("mser", self.parameter_vars),
             ("uv", self.symmetry_parameter_vars),
             ("relief", self.relief_parameter_vars),
+            ("rhd", self.rhd_parameter_vars),
         )
 
     def _capture_parameters(self) -> dict[str, object]:
@@ -1375,12 +1434,19 @@ class TuningApp(tk.Tk):
             "mser": self._mser_default_for_source(source),
             "uv": DEFAULT_UV_ISLAND_SYMMETRY_CONFIG,
             "relief": DEFAULT_RELIEF_CONFIG,
+            "rhd": DEFAULT_RHD_CONFIG,
         }
         return {
             f"{prefix}:{name}": getattr(defaults[prefix], name)
             for prefix, store in self._parameter_stores()
             for name in store
         }
+
+    def _parameters_for_source(self, source: str) -> dict[str, object]:
+        """Return source defaults overlaid with its remembered widget values."""
+        values = self._default_parameters(source)
+        values.update(self.mode_parameters.get(source) or {})
+        return values
 
     def _apply_parameters(self, values: dict[str, object]) -> None:
         for prefix, store in self._parameter_stores():
@@ -1407,9 +1473,7 @@ class TuningApp(tk.Tk):
         if incoming == self.active_source:
             return
         self._remember_parameters()
-        self._apply_parameters(
-            self.mode_parameters.get(incoming) or self._default_parameters(incoming)
-        )
+        self._apply_parameters(self._parameters_for_source(incoming))
         self.active_source = incoming
 
     def _apply_parameter_visibility(self) -> None:
@@ -1433,11 +1497,19 @@ class TuningApp(tk.Tk):
             DetectionStage(key=key, title=title, kept=())
             for key, title in (
                 ("mser", "MSER boxes"),
+                ("stroke_width", "Stroke width"),
                 ("box_filter", "Box filtering"),
+                ("overlap_box_group", "Overlap grouping"),
                 ("grouped", "Initial grouping"),
                 ("region_domain", "Domain recovery"),
                 ("overlap_group", "Post-circle forced merge"),
                 ("pattern_group", "Repeating pattern"),
+                ("rotated_bounds", "Rotated bounds"),
+                ("region_flatness", "Region flatness"),
+                ("blob_shape", "Blob shape"),
+                ("ring_smoothness", "Ring smoothness"),
+                ("feature_extension", "Feature extension"),
+                ("text_line", "Text lines"),
                 ("size", "Final size"),
                 ("final_padding", "Final padding"),
             )
@@ -1515,7 +1587,7 @@ class TuningApp(tk.Tk):
         overrides["box_source"] = BOX_SOURCE_FOR_SOURCE.get(
             self.detect_source_var.get(), "mser"
         )
-        return replace(DEFAULT_CONFIG, **overrides)
+        return replace(self._mser_default_for_source(), **overrides)
 
     def current_uv_symmetry_config(self) -> UvIslandSymmetryConfig:
         """Build the independent UV symmetry configuration from its widgets."""
@@ -1573,6 +1645,19 @@ class TuningApp(tk.Tk):
                 raise ValueError(f"{field.name}: {text!r} is not a valid number") from exc
         return replace(DEFAULT_RELIEF_CONFIG, **overrides)
 
+    def current_rhd_config(self) -> RhdTextureConfig:
+        """Build export/correction settings from their widgets."""
+        overrides: dict[str, object] = {}
+        for field in fields(RhdTextureConfig):
+            variable = self.rhd_parameter_vars.get(field.name)
+            if variable is None:
+                continue
+            default = getattr(DEFAULT_RHD_CONFIG, field.name)
+            overrides[field.name] = self._coerce_config_value(
+                field.name, default, variable.get()
+            )
+        return replace(DEFAULT_RHD_CONFIG, **overrides)
+
     def _reset_parameters(self) -> None:
         for name, variable in self.parameter_vars.items():
             default = getattr(self._mser_default_for_source(), name)
@@ -1582,6 +1667,9 @@ class TuningApp(tk.Tk):
             variable.set(default if isinstance(default, bool) else str(default))
         for name, variable in self.relief_parameter_vars.items():
             default = getattr(DEFAULT_RELIEF_CONFIG, name)
+            variable.set(default if isinstance(default, bool) else str(default))
+        for name, variable in self.rhd_parameter_vars.items():
+            default = getattr(DEFAULT_RHD_CONFIG, name)
             variable.set(default if isinstance(default, bool) else str(default))
         # Only the source on screen: the other one's tuning is not being
         # looked at and must not be thrown away from behind a hidden panel.
@@ -1596,6 +1684,7 @@ class TuningApp(tk.Tk):
             config = self.current_config()
             symmetry_config = self.current_uv_symmetry_config()
             relief_config = self.current_relief_config()
+            rhd_config = self.current_rhd_config()
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -1632,6 +1721,19 @@ class TuningApp(tk.Tk):
                 lines.append("")
             lines.append("# ReliefConfig (relief_from_normals.py)")
             lines.extend(relief_lines)
+        rhd_lines = [
+            f"    {field.name}: {'bool' if isinstance(getattr(rhd_config, field.name), bool) else type(getattr(rhd_config, field.name)).__name__} = "
+            f"{getattr(rhd_config, field.name)!r}"
+            for field in fields(RhdTextureConfig)
+            if field.name in self.rhd_parameter_vars
+            and getattr(rhd_config, field.name)
+            != getattr(DEFAULT_RHD_CONFIG, field.name)
+        ]
+        if rhd_lines:
+            if lines:
+                lines.append("")
+            lines.append("# RhdTextureConfig (mirror_texture_for_rhd.py)")
+            lines.extend(rhd_lines)
         if not lines:
             self.status_var.set("No parameters differ from the module defaults.")
             return
@@ -1864,21 +1966,20 @@ class TuningApp(tk.Tk):
         try:
             active_mser_config = self.current_config()
             relief_config = self.current_relief_config()
+            export_config = self.current_rhd_config()
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
         if self.detect_source_var.get() == SOURCE_RELIEF:
             colour_mser_config = self._mser_config_from_values(
-                self.mode_parameters.get(SOURCE_COLOUR)
-                or self._default_parameters(SOURCE_COLOUR),
+                self._parameters_for_source(SOURCE_COLOUR),
                 SOURCE_COLOUR,
             )
             relief_mser_config = active_mser_config
         else:
             colour_mser_config = active_mser_config
             relief_mser_config = self._mser_config_from_values(
-                self.mode_parameters.get(SOURCE_RELIEF)
-                or self._default_parameters(SOURCE_RELIEF),
+                self._parameters_for_source(SOURCE_RELIEF),
                 SOURCE_RELIEF,
             )
 
@@ -1895,7 +1996,7 @@ class TuningApp(tk.Tk):
         # Relief detection is switched on only when that is the source being
         # tuned; exporting from the colour side must reproduce a colour run.
         rhd_config = replace(
-            DEFAULT_RHD_CONFIG,
+            export_config,
             relief=relief_config,
             detect_on_normal_map=self.detect_source_var.get() == SOURCE_RELIEF,
         )
@@ -2099,8 +2200,8 @@ class TuningApp(tk.Tk):
         reused = (
             "full run"
             if resumed == 0
-            else f"resumed at {result.stages[resumed].title}"
-            if resumed < len(result.stages)
+            else f"resumed at {result.run.stages[resumed].title}"
+            if resumed < len(result.run.stages)
             else "nothing to redo"
         )
         # Name the front-end that produced what is on screen.  Without it there

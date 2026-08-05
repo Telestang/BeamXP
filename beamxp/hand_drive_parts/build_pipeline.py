@@ -112,31 +112,47 @@ def selected_variant_targets(
     context: VehicleContext,
     conversion: dict[str, object],
 ) -> tuple[dict[str, str], dict[str, str]]:
+    targets, skipped, _source_hands = _selected_variant_targets_and_source_hands(context, conversion)
+    return targets, skipped
+
+
+def _selected_variant_targets_and_source_hands(
+    context: VehicleContext,
+    conversion: dict[str, object],
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     targets: dict[str, str] = {}
     skipped: dict[str, str] = {}
+    source_hands: dict[str, str] = {}
     variants = conversion.get("variants", {})
     if not isinstance(variants, dict):
-        return targets, skipped
+        return targets, skipped, source_hands
     for config_name, settings in variants.items():
         if config_name not in context.variants or not isinstance(settings, dict):
             continue
         if variant_build_mode(settings) not in {BUILD_CONVERTED, BUILD_BOTH}:
             continue
         source_hand = effective_source_hand(context, conversion, config_name)
+        source_hands[config_name] = source_hand
         target = target_hand_for(source_hand, ACTION_OPPOSITE)
         if target is None:
             skipped[config_name] = f"No opposite target for source hand {source_hand}"
         else:
             targets[config_name] = target
-    return targets, skipped
+    return targets, skipped, source_hands
 
 
 def selected_output_plans(
     context: VehicleContext,
     conversion: dict[str, object],
+    *,
+    variant_targets: dict[str, str] | None = None,
+    target_skipped: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, str]]:
     """Expand each trim row into zero, one, or two generated configs."""
-    targets, skipped = selected_variant_targets(context, conversion)
+    targets = variant_targets
+    skipped = dict(target_skipped or {})
+    if targets is None:
+        targets, skipped = selected_variant_targets(context, conversion)
     plans: list[dict[str, object]] = []
     variants = conversion.get("variants", {})
     if not isinstance(variants, dict):
@@ -167,6 +183,7 @@ def split_authored_hand_drive_targets(
     context: VehicleContext,
     conversion: dict[str, object],
     variant_targets: dict[str, str],
+    source_hands: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
     """Resolve authored LHD/RHD swaps, keeping every variant in the build.
 
@@ -177,8 +194,11 @@ def split_authored_hand_drive_targets(
     """
     generated: dict[str, str] = dict(variant_targets)
     authored: dict[str, dict[str, object]] = {}
+    source_hands = source_hands or {}
     for config_name, target_hand in sorted(variant_targets.items()):
-        source_hand = effective_source_hand(context, conversion, config_name)
+        source_hand = source_hands.get(config_name)
+        if source_hand is None:
+            source_hand = effective_source_hand(context, conversion, config_name)
         group = find_hand_authored_opposite_group(
             context,
             config_name,
@@ -226,7 +246,7 @@ def relocation_meshes(
         for relocation in slot_pair_plan_relocations(plan):
             found = part_body_for_context(context, str(relocation.get("partId") or ""))
             if found is not None:
-                meshes.update(transform_helpers.extract_part_mesh_names(found[0]))
+                meshes.update(part_mesh_names_for_context(context, str(relocation.get("partId") or "")))
     return {mesh for mesh in meshes if mesh in context.objects}
 
 
@@ -380,91 +400,94 @@ def export_texture_correction_artifacts(
                 progress(f"Texture correction failed loading {Path(dae_member).name}")
             continue
 
-        for source_mesh in sorted(source_meshes):
-            job_stem = _texture_correction_output_stem(source_zip, dae_member)
-            mesh_stem = safe_project_segment(source_mesh) or "mesh"
-            job_dir = output_dir / job_stem / mesh_stem
-            clean_dir(job_dir)
-            job_dir.mkdir(parents=True, exist_ok=True)
-            log_lines: list[str] = []
+        # Keep meshes from one DAE in one export so shared atlases are corrected
+        # once with the full selected UV scope.
+        wanted_meshes = sorted(source_meshes)
+        job_dir = output_dir / _texture_correction_output_stem(source_zip, dae_member)
+        clean_dir(job_dir)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        log_lines: list[str] = []
+
+        def log(line: object = "") -> None:
+            log_lines.append(str(line))
+
+        parts, missing = _matching_loaded_dae_parts(loaded, wanted_meshes)
+        if missing:
+            report["missing"].append(
+                {
+                    "sourceZip": str(source_zip),
+                    "dae": dae_member,
+                    "meshes": missing,
+                }
+            )
+        if not parts:
+            continue
+        matched_meshes = [mesh for mesh in wanted_meshes if mesh not in set(missing)]
+        if progress is not None:
+            progress(
+                "Texture correction: "
+                f"{len(parts)} mesh(es) from {Path(dae_member).name}..."
+            )
+
+        try:
+            preview = export_parts_preview(
+                archive,
+                loaded,
+                parts,
+                job_dir,
+                texture_config,
+                DEFAULT_MSER_CONFIG,
+                bake=False,
+                relief_mser_config=DEFAULT_RELIEF_DETECTION_CONFIG,
+                log=log,
+            )
+            (job_dir / "texture_correction.log").write_text(
+                "\n".join(log_lines) + ("\n" if log_lines else ""),
+                encoding="utf-8",
+            )
+            report["jobs"].append(
+                {
+                    "sourceZip": str(source_zip),
+                    "dae": dae_member,
+                    "meshes": matched_meshes,
+                    "selectedParts": [
+                        {
+                            "key": str(getattr(part, "key", "") or ""),
+                            "nodeId": str(getattr(part, "node_id", "") or ""),
+                            "nodeName": str(getattr(part, "node_name", "") or ""),
+                        }
+                        for part in parts
+                    ],
+                    "outputDirectory": str(job_dir),
+                    "reportPath": str(preview.report_path) if preview.report_path is not None else None,
+                    "daePaths": [str(path) for path in preview.dae_paths],
+                    "textureCount": len(preview.textures),
+                    "seconds": round(float(preview.seconds), 6),
+                }
+            )
             if progress is not None:
                 progress(
-                    "Texture correction: "
-                    f"{source_mesh} from {Path(dae_member).name}..."
+                    f"Texture correction finished {len(parts)} mesh(es) "
+                    f"in {float(preview.seconds):.1f}s"
                 )
-
-            def log(line: object = "") -> None:
-                log_lines.append(str(line))
-
-            parts, missing = _matching_loaded_dae_parts(loaded, [source_mesh])
-            if missing:
-                report["missing"].append(
-                    {
-                        "sourceZip": str(source_zip),
-                        "dae": dae_member,
-                        "meshes": missing,
-                    }
-                )
-            if not parts:
-                continue
-
-            try:
-                preview = export_parts_preview(
-                    archive,
-                    loaded,
-                    parts,
-                    job_dir,
-                    texture_config,
-                    DEFAULT_MSER_CONFIG,
-                    bake=False,
-                    relief_mser_config=DEFAULT_RELIEF_DETECTION_CONFIG,
-                    log=log,
-                )
+        except Exception as exc:
+            if log_lines:
                 (job_dir / "texture_correction.log").write_text(
-                    "\n".join(log_lines) + ("\n" if log_lines else ""),
+                    "\n".join(log_lines) + "\n",
                     encoding="utf-8",
                 )
-                report["jobs"].append(
-                    {
-                        "sourceZip": str(source_zip),
-                        "dae": dae_member,
-                        "meshes": [source_mesh],
-                        "selectedParts": [
-                            {
-                                "key": str(getattr(part, "key", "") or ""),
-                                "nodeId": str(getattr(part, "node_id", "") or ""),
-                                "nodeName": str(getattr(part, "node_name", "") or ""),
-                            }
-                            for part in parts
-                        ],
-                        "outputDirectory": str(job_dir),
-                        "reportPath": str(preview.report_path) if preview.report_path is not None else None,
-                        "daePaths": [str(path) for path in preview.dae_paths],
-                        "textureCount": len(preview.textures),
-                        "seconds": round(float(preview.seconds), 6),
-                    }
+            report["failures"].append(
+                {
+                    "sourceZip": str(source_zip),
+                    "dae": dae_member,
+                    "meshes": matched_meshes,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            if progress is not None:
+                progress(
+                    f"Texture correction failed for {Path(dae_member).name}"
                 )
-                if progress is not None:
-                    progress(
-                        "Texture correction finished "
-                        f"{source_mesh} in {float(preview.seconds):.1f}s"
-                    )
-            except Exception as exc:
-                if log_lines:
-                    (job_dir / "texture_correction.log").write_text(
-                        "\n".join(log_lines) + "\n",
-                        encoding="utf-8",
-                    )
-                report["failures"].append(
-                    {
-                        "sourceZip": str(source_zip),
-                        "dae": dae_member,
-                        "meshes": [source_mesh],
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-                if progress is not None:
-                    progress(f"Texture correction failed for {source_mesh}")
 
     if report["failures"] and not report["jobs"]:
         first = report["failures"][0]
@@ -1069,6 +1092,42 @@ def _append_texture_correction_dae(
     return [str(node.get("id") or "") for node in appended_nodes]
 
 
+def _retarget_texture_correction_generated_nodes(
+    target_dae: Path,
+    source_dae: Path,
+    node_ids: set[str],
+    alias_to_material: dict[str, str],
+) -> list[str]:
+    if not node_ids or not alias_to_material:
+        return []
+    target_tree = ET.parse(target_dae)
+    target_root = target_tree.getroot()
+    source_root = ET.parse(source_dae).getroot()
+    _ensure_retargeted_collada_materials(target_root, source_root, alias_to_material)
+
+    geometries = {
+        geometry.get("id"): geometry
+        for geometry in target_root.findall(".//c:geometry", NS)
+        if geometry.get("id")
+    }
+    retargeted: list[str] = []
+    for node in target_root.findall(".//c:node", NS):
+        node_id = node.get("id") or ""
+        if node_id not in node_ids:
+            continue
+        _retarget_collada_materials(node, alias_to_material)
+        for instance in node.findall(".//c:instance_geometry", NS):
+            geometry_id = (instance.get("url") or "").lstrip("#")
+            geometry = geometries.get(geometry_id)
+            if geometry is not None:
+                _retarget_collada_materials(geometry, alias_to_material)
+        retargeted.append(node_id)
+
+    if retargeted:
+        write_xml_tree(target_tree, target_dae)
+    return retargeted
+
+
 def _replace_first_flexbody_mesh(row: str, mesh: str) -> str:
     return re.sub(
         r'(\[\s*)"((?:[^"\\]|\\.)*)"',
@@ -1172,6 +1231,9 @@ def integrate_texture_correction_artifacts(
     output_vehicle_dir: Path,
     texture_correction_report: dict[str, object],
     target_hands: Iterable[str],
+    *,
+    texture_correction_targets: dict[str, set[str]] | None = None,
+    structural_sources: dict[str, str] | None = None,
 ) -> dict[str, object]:
     jobs = texture_correction_report.get("jobs", [])
     if not isinstance(jobs, list) or not jobs:
@@ -1180,6 +1242,8 @@ def integrate_texture_correction_artifacts(
     dae_patches: list[dict[str, object]] = []
     row_replacements: dict[str, list[str]] = {}
     hands = sorted(set(target_hands))
+    texture_correction_targets = texture_correction_targets or {}
+    structural_sources = structural_sources or {}
     for job in jobs:
         if not isinstance(job, dict):
             continue
@@ -1212,21 +1276,48 @@ def integrate_texture_correction_artifacts(
                 if isinstance(row, dict) and row.get("node_id")
             ]
             source_dae = Path(str(dae_export.get("dae_path") or ""))
-            appended = _append_texture_correction_dae(
-                target_dae,
-                source_dae,
-                set(split_nodes),
-                alias_to_material,
-            )
-            if source_mesh and appended:
-                for hand in hands:
-                    row_replacements[generated_mesh_name(source_mesh, hand)] = appended
+            target_meshes = sorted(texture_correction_targets.get(source_mesh, {source_mesh}))
+            structural_target_meshes = [
+                target_mesh
+                for target_mesh in target_meshes
+                if structural_sources.get(target_mesh) == source_mesh
+            ]
+            row_target_meshes = [
+                target_mesh
+                for target_mesh in target_meshes
+                if target_mesh not in structural_target_meshes
+            ]
+            appended: list[str] = []
+            if row_target_meshes:
+                appended = _append_texture_correction_dae(
+                    target_dae,
+                    source_dae,
+                    set(split_nodes),
+                    alias_to_material,
+                )
+                if appended:
+                    for target_mesh in row_target_meshes:
+                        for hand in hands:
+                            row_replacements[generated_mesh_name(target_mesh, hand)] = appended
+            retargeted: list[str] = []
+            if structural_target_meshes:
+                retargeted = _retarget_texture_correction_generated_nodes(
+                    target_dae,
+                    source_dae,
+                    {
+                        generated_mesh_name(target_mesh, hand)
+                        for target_mesh in structural_target_meshes
+                        for hand in hands
+                    },
+                    alias_to_material,
+                )
             dae_patches.append(
                 {
                     "sourceMesh": source_mesh,
                     "sourceDae": str(source_dae),
                     "targetDae": str(target_dae),
                     "appendedNodes": appended,
+                    "retargetedNodes": retargeted,
                     "materialAliases": sorted(alias_to_material),
                 }
             )
@@ -1254,12 +1345,19 @@ def build_batch(
             progress(message)
 
     emit_progress("Preparing build plan...")
-    output_plans, skipped = selected_output_plans(context, conversion)
+    variant_targets, skipped, source_hands = _selected_variant_targets_and_source_hands(
+        context, conversion
+    )
+    output_plans, skipped = selected_output_plans(
+        context,
+        conversion,
+        variant_targets=variant_targets,
+        target_skipped=skipped,
+    )
     if not output_plans:
         raise RuntimeError("No trim outputs are selected")
-    variant_targets, skipped = selected_variant_targets(context, conversion)
     generated_variant_targets, authored_groups = split_authored_hand_drive_targets(
-        context, conversion, variant_targets
+        context, conversion, variant_targets, source_hands
     )
     slot_pair_plans = slot_pair_plans_for_variants(
         context, conversion, sorted(variant_targets)
@@ -1294,6 +1392,8 @@ def build_batch(
     translate_magnitudes: dict[str, float] = {}
     texture_flip_ids: set[str] = set()
     texture_correction_ids: set[str] = set()
+    texture_correction_targets: dict[str, set[str]] = {}
+    texture_correction_source_ids: set[str] = set()
     if generated_variant_targets:
         object_modes = active_part_modes(conversion)
         # A vehicle whose every converted trim is fully covered by an authored
@@ -1330,6 +1430,10 @@ def build_batch(
             selected_configs=selected_configs,
         )
         structural_sources = structural_mirror_sources(context, conversion, object_modes)
+        for mesh in sorted(texture_correction_ids):
+            source_mesh = structural_sources.get(mesh, mesh)
+            texture_correction_targets.setdefault(source_mesh, set()).add(mesh)
+        texture_correction_source_ids = set(texture_correction_targets)
         node_mirror_map = build_node_mirror_map(context.node_positions)
         translated_prop_meshes = {
             mesh for mesh, mode in object_modes.items() if mode == MODE_TRANSLATE and mesh in prop_meshes
@@ -1428,7 +1532,7 @@ def build_batch(
         texture_correction_report = export_texture_correction_artifacts(
             context,
             output_root,
-            texture_correction_ids,
+            texture_correction_source_ids,
             progress=emit_progress,
         )
         emit_progress("Integrating texture-corrected meshes...")
@@ -1438,6 +1542,8 @@ def build_batch(
             output_vehicle_dir,
             texture_correction_report,
             set(generated_variant_targets.values()),
+            texture_correction_targets=texture_correction_targets,
+            structural_sources=structural_sources,
         )
         report_path = texture_correction_report.get("reportPath")
         if isinstance(report_path, str) and report_path:

@@ -71,7 +71,15 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 {"scintilla_dashboard"},
             )
 
-    def test_export_artifacts_isolates_marked_mesh_material_jobs(self) -> None:
+    def test_export_artifacts_batches_marked_meshes_per_dae(self) -> None:
+        """Every marked mesh out of one DAE goes through a single export call.
+
+        export_parts_preview groups its texture work by atlas across the parts
+        it is given, so meshes sharing an atlas have their UV domains unioned
+        and corrected once. Exporting them one at a time discards that grouping
+        (its sweep/mask/companion caches are per call) and rebuilds a shared
+        atlas once per mesh, shipping competing corrected copies of it.
+        """
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             context = minimal_context(tmp)
@@ -84,14 +92,11 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             )
             previews = [
                 SimpleNamespace(
-                    report_path=tmp / "controls_rhd_preview.report.json",
-                    dae_paths=(tmp / "scintilla_dash_controls_rhd.dae",),
-                    textures=[object()],
-                    seconds=1.25,
-                ),
-                SimpleNamespace(
-                    report_path=tmp / "dashboard_rhd_preview.report.json",
-                    dae_paths=(tmp / "scintilla_dashboard_rhd.dae",),
+                    report_path=tmp / "scintilla_rhd_preview.report.json",
+                    dae_paths=(
+                        tmp / "scintilla_dash_controls_rhd.dae",
+                        tmp / "scintilla_dashboard_rhd.dae",
+                    ),
                     textures=[object()],
                     seconds=1.5,
                 ),
@@ -113,18 +118,20 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
 
             scan.assert_called_once()
             load.assert_called_once()
-            self.assertEqual(export.call_count, 2)
-            selected_parts = [call.args[2][0].key for call in export.call_args_list]
+            export.assert_called_once()
+            # Both marked meshes reach the one call; the unmarked race dashboard
+            # sharing the DAE must not be dragged in with them.
             self.assertEqual(
-                selected_parts,
+                [part.key for part in export.call_args.args[2]],
+                ["scintilla_dashboard", "scintilla_dash_controls"],
+            )
+            self.assertTrue(export.call_args.args[4].detect_on_normal_map)
+            self.assertEqual(len(report["jobs"]), 1)
+            self.assertEqual(
+                report["jobs"][0]["meshes"],
                 ["scintilla_dash_controls", "scintilla_dashboard"],
             )
-            self.assertTrue(all(call.args[4].detect_on_normal_map for call in export.call_args_list))
-            self.assertEqual(len(report["jobs"]), 2)
-            self.assertEqual(
-                [job["meshes"] for job in report["jobs"]],
-                [["scintilla_dash_controls"], ["scintilla_dashboard"]],
-            )
+            self.assertEqual(report["missing"], [])
             self.assertTrue(any("Texture correction:" in message for message in progress_messages))
             self.assertTrue(any("finished" in message for message in progress_messages))
 
@@ -163,6 +170,121 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertNotIn('"scintilla_controls_xp_rhd"', updated)
         self.assertIn('"scintilla_dashboard__beamxp_rigid_001"', updated)
         self.assertIn('"scintilla_controls__beamxp_mirrored_carrier"', updated)
+
+    def test_structural_texture_correction_retargets_generated_node_without_row_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            context = minimal_context(tmp)
+            output_root = tmp / "unpacked_output"
+            output_vehicle_dir = output_root / context.vehicle_path
+            output_vehicle_dir.mkdir(parents=True)
+            target_dae = output_vehicle_dir / "scintilla_handdrive.dae"
+            target_dae.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="door_mat-material" name="door_mat"/></library_materials><library_geometries>
+<geometry id="geom_generated"><mesh><triangles material="door_mat-material" count="0"/></mesh></geometry>
+</library_geometries><library_visual_scenes><visual_scene id="Scene">
+<node id="doorpanel_FL_xp_rhd" name="doorpanel_FL_xp_rhd"><matrix>1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1</matrix>
+<instance_geometry url="#geom_generated"><bind_material><technique_common>
+<instance_material symbol="door_mat-material" target="#door_mat-material"/>
+</technique_common></bind_material></instance_geometry></node>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            jbeam_dir = output_vehicle_dir / "jbeam"
+            jbeam_dir.mkdir()
+            (jbeam_dir / "handdrive_visual_conversion.jbeam").write_text(
+                '{"doorpanel_FL_xp_rhd":{"flexbodies":[["mesh", "[group]:"],'
+                '["doorpanel_FL_xp_rhd", ["door_FL"]]]}}',
+                encoding="utf-8",
+            )
+            job = tmp / "texture_job"
+            job.mkdir()
+            source_dae = job / "doorpanel_FR_rhd.dae"
+            source_dae.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="door_mat-material" name="door_mat"/></library_materials><library_geometries/>
+<library_visual_scenes><visual_scene id="Scene">
+<node id="doorpanel_FR__beamxp_mirrored_carrier" name="doorpanel_FR__beamxp_mirrored_carrier"/>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {
+                                "aliases": ["door_mat", "door_mat-material"],
+                                "maps": {},
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            detail_path = job / "texture.report.json"
+            detail_path.write_text(
+                json.dumps(
+                    {
+                        "dae_exports": [
+                            {
+                                "source_part": {"key": "doorpanel_FR"},
+                                "generated_flexbody_rows": [
+                                    {"node_id": "doorpanel_FR__beamxp_mirrored_carrier"}
+                                ],
+                                "dae_path": str(source_dae),
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = build_pipeline.integrate_texture_correction_artifacts(
+                context,
+                output_root,
+                output_vehicle_dir,
+                {
+                    "jobs": [
+                        {
+                            "dae": "vehicles/scintilla/scintilla.dae",
+                            "outputDirectory": str(job),
+                            "reportPath": str(detail_path),
+                        }
+                    ]
+                },
+                {core.HAND_RHD},
+                texture_correction_targets={"doorpanel_FR": {"doorpanel_FL"}},
+                structural_sources={"doorpanel_FL": "doorpanel_FR"},
+            )
+
+            jbeam = (jbeam_dir / "handdrive_visual_conversion.jbeam").read_text(encoding="utf-8")
+            root = ET.parse(target_dae).getroot()
+
+        self.assertEqual(result["rowReplacements"], {})
+        self.assertEqual(result["jbeamPatch"], {"files": [], "replacedRows": 0})
+        self.assertEqual(result["daePatches"][0]["appendedNodes"], [])
+        self.assertEqual(result["daePatches"][0]["retargetedNodes"], ["doorpanel_FL_xp_rhd"])
+        self.assertIn('"doorpanel_FL_xp_rhd", ["door_FL"]', jbeam)
+        self.assertNotIn("doorpanel_FR__beamxp_mirrored_carrier", jbeam)
+
+        binding = root.find(".//c:node[@id='doorpanel_FL_xp_rhd']//c:instance_material", core.NS)
+        triangle = root.find(".//c:geometry[@id='geom_generated']//c:triangles", core.NS)
+        appended = root.find(".//c:node[@id='doorpanel_FR__beamxp_mirrored_carrier']", core.NS)
+        material = root.find(".//c:material[@id='door_mat_beamxp_tc-material']", core.NS)
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.get("symbol"), "door_mat_beamxp_tc")
+        self.assertEqual(binding.get("target"), "#door_mat_beamxp_tc-material")
+        self.assertIsNotNone(triangle)
+        assert triangle is not None
+        self.assertEqual(triangle.get("material"), "door_mat_beamxp_tc")
+        self.assertIsNone(appended)
+        self.assertIsNotNone(material)
 
     def test_append_texture_correction_dae_bakes_transform_and_material(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

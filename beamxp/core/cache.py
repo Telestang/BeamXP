@@ -133,6 +133,8 @@ def load_cached_part_ids(context: VehicleContext, selected: Iterable[str]) -> li
     ids = selections.get(selection_cache_key(selected))
     if not isinstance(ids, list):
         return None
+    if selected and not ids:
+        return None
     return [str(part_id) for part_id in ids]
 
 

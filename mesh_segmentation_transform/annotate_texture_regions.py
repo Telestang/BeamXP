@@ -71,7 +71,7 @@ class MserConfig:
     box_source:    str   = "mser"  # default: "mser"  ("mser" or "edge")
 
     # MSER detector
-    delta:         int   = 12  # default: 5
+    delta:         int   = 10  # default: 10
     min_area:      int   = 10  # default: 30
     max_area:      int   = 10000  # default: 1_024
     max_variation: float = 1.0  # default: 0.25
@@ -218,11 +218,11 @@ class MserConfig:
     min_region_relief:           float = 10.0  # default: 10.0
 
     enable_ring_smoothness_filter: bool = False  # default: False
-    ring_smoothness_width_px:      int = 12  # default: 12 (how thick a ring)
+    ring_smoothness_width_px:      int = 2  # default: 2 (how thick a ring)
     # Held off the region so the mark's own outer edge is not counted as
     # surrounding busyness; without it every real mark measures rough.
     ring_smoothness_margin_px:     int = 3  # default: 3
-    ring_smoothness_percentile:  float = 75.0  # default: 75.0 (ring's own level)
+    ring_smoothness_percentile:  float = 1.0  # default: 1.0 (ring's own level)
     ring_smoothness_min_domain_px: int = 48  # default: 48 (else nothing is concluded)
     # As a multiple of the atlas's typical gradient, so it travels between
     # vehicles.  Measured on the ardente interior: AIRBAG's ring reads 1.01 and
@@ -231,6 +231,29 @@ class MserConfig:
     # regions and raising it again costs none -- so it buys ARDENTE a margin
     # for nothing.
     max_ring_roughness:          float = 3.0  # default: 3.0
+
+    # Late colour-region feature filters.  These run after ring smoothness,
+    # using a background colour estimated from an offset ring around the region.
+    # They are deliberately off by default while the thresholds are tuned.
+    region_feature_ring_margin_px:     int = 3  # default: 3
+    region_feature_ring_width_px:      int = 8  # default: 8
+    region_feature_colour_tolerance:   int = 16  # default: 16
+    region_feature_variance_scale:     float = 2.0  # default: 2.0
+    region_feature_min_domain_px:      int = 24  # default: 24
+    region_feature_min_px:             int = 12  # default: 12
+
+    # A filled pill, rectangle or dot has feature/hull fill close to one; text
+    # and symbols leave more empty hull space.  Reject blobs, keep the rest.
+    enable_blob_shape_filter:          bool = True  # default: True
+    min_blob_region_area_px:           int = 512  # default: 512
+    max_blob_hull_fill:                float = 0.95  # default: 0.95
+    min_blob_internal_colour_variation: float = 48.0  # default: 48.0
+
+    # If the same magic-wand feature continues outside the detected bounds, the
+    # box is probably a slice of a larger motif/material run rather than a mark.
+    enable_feature_extension_filter:   bool = True  # default: True
+    feature_extension_context_px:      int = 12  # default: 12
+    feature_extension_min_ratio:       float = 0.25  # default: 0.25 (outside / inside)
 
     # Post-detection filtering.  MSER's own max_area already caps a region far
     # below any sane fraction of the atlas, so no image-fraction test is applied
@@ -248,9 +271,9 @@ class MserConfig:
     min_box_width_px:            int   = 3  # default: 3
     min_box_height_px:           int   = 3  # default: 3
     box_feature_colour_tolerance: int  = 16  # default: 16 (magic-wand sensitivity)
-    box_feature_min_domain_px:   int   = 8  # default: 8
+    box_feature_min_domain_px:   int   = 10  # default: 10
     box_feature_context_px:      int   = 3  # default: 3 (an MSER box alone is always flat)
-    min_box_uv_coverage:         float = 0.75  # default: 0.75 (share of the box inside the UV domain)
+    min_box_uv_coverage:         float = 0.75  # default: 0.75 (share of the box inside one UV island)
     box_min_feature_px:          int   = 24  # default: 24 (largest non-background blob)
     # Repeating-pattern rejection, applied to assembled groups.  A group covers
     # a whole panel, so the statistic sees several periods; the same test on a
@@ -269,12 +292,17 @@ class MserConfig:
     # minimum union-area test.  This replaces the old additive
     # merge_distance_px + group_dilate_px pair.
     #
-    # No size or area cap is applied while candidates are assembled.  A group
-    # that comes out too broad still owns its exact member boxes, and domain
-    # recovery below can split it back down; dropping it here would throw those
-    # members away, which is the one case recovery exists to handle.
-    merge_distance_px:              int  = 18  # default: 18
+    # Candidate joins first collapse boxes that significantly overlap, which
+    # keeps nested MSER fragments attached to their containing symbol.  Remaining
+    # joins are attempted closest-first, but only along rows or columns.  A
+    # diagonal group has no useful near-symmetry once flipped, so boxes separated
+    # on both axes are left as separate regions.  When the domain filter is
+    # active, a merge that would make the accumulated group fail the loose
+    # rectangular UV coverage test is refused, leaving the already-valid smaller
+    # groups alive.
+    merge_distance_px:              int  = 150  # default: 150
     min_group_union_region_px:      int  = 1  # default: 1 (any overlap merges)
+    min_group_overlap_ratio:        float = 1.0  # default: 1.0 (intersection / smaller box)
     enable_island_bounded_grouping: bool = True  # default: True
     enable_overlap_group_merge:     bool = True  # default: True
 
@@ -296,10 +324,11 @@ class MserConfig:
     enable_final_aspect_filter:            bool  = True  # default: True
     final_max_aspect:                      float = 12.0  # default: 12.0 (long side / short)
 
-    # Two-pass shaped-domain recovery.  An initial group is tested after circle
-    # inference.  A failing group is split back into its exact source boxes,
-    # invalid boxes are removed and survivors are regrouped.  A broad rebuilt
-    # group that still fails is retried once at half the merge distance.
+    # Two-pass shaped-domain recovery.  Grouping uses min_box_uv_coverage as a
+    # loose rectangular gate so a circular candidate can form before its shape
+    # is known.  This pass then applies the stricter shaped-domain test by
+    # splitting any failed group into exact source boxes, removing invalid boxes
+    # and regrouping survivors, with one half-distance retry.
     enable_region_domain_filter:           bool  = True  # default: True
     min_region_uv_coverage:                float = 1.0  # default: 0.98
 
@@ -328,22 +357,25 @@ DEFAULT_COLOUR_CONFIG = MserConfig()
 DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     DEFAULT_COLOUR_CONFIG,
     box_source="edge",
+    delta=12,
     edge_operator="laplacian",
     swt_polarity="both",
     enable_rotated_bounds_filter=True,
     min_rotated_fill=0.01,
     bounds_shape=SHAPE_ROTATED,
     enable_edge_aligned_rotation=True,
-    rotation_edge_search_px=100,
+    rotation_edge_search_px=50,
     min_feature_tightness=0.01,
     enable_region_flatness_filter=True,
     min_region_relief=30.0,
     enable_ring_smoothness_filter=True,
-    ring_smoothness_width_px=1,
-    ring_smoothness_percentile=60.0,
+    ring_smoothness_margin_px=4,
+    ring_smoothness_percentile=20.0,
     min_box_width_px=15,
     min_box_height_px=15,
+    box_feature_min_domain_px=8,
     box_min_feature_px=15,
+    merge_distance_px=18,
     final_max_aspect=20.0,
 )
 DEFAULT_CONFIG = DEFAULT_COLOUR_CONFIG
@@ -789,6 +821,38 @@ class FeatureShape:
 
 
 @dataclass(frozen=True, slots=True)
+class RegionMagicFeature:
+    """Magic-wand feature mask extracted around one detected region."""
+
+    bounds: tuple[int, int, int, int]
+    inner: tuple[int, int, int, int]
+    feature: np.ndarray
+    tolerance: int
+
+
+@dataclass(frozen=True, slots=True)
+class RegionFeatureHull:
+    """Convex hull of a magic-wand feature, in absolute texture coordinates."""
+
+    points: tuple[tuple[int, int], ...]
+    feature_area_px: int
+    hull_area_px: float
+    colour_variation: float
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureExtensionMeasure:
+    """Connected feature continuation measured around a detected region."""
+
+    feature_area_px: int
+    extension_area_px: int
+
+    @property
+    def extension_ratio(self) -> float:
+        return float(self.extension_area_px) / max(float(self.feature_area_px), 1.0)
+
+
+@dataclass(frozen=True, slots=True)
 class EdgeAlignment:
     """A feature rectangle whose side is parallel to a nearby UV edge."""
 
@@ -1225,6 +1289,7 @@ def ring_roughness(
     bounds: tuple[int, int, int, int],
     config: MserConfig,
     reference: float,
+    feature_hull: RegionFeatureHull | None = None,
 ) -> float | None:
     """How busy the material immediately around a region is.
 
@@ -1246,8 +1311,35 @@ def ring_roughness(
     ``None`` when too little of the ring is inside the UV domain to judge --
     a region at an island edge is measuring the void, not the material.
     """
+    ring_result = feature_hull_ring(
+        response.shape, feature_hull, config
+    ) if feature_hull is not None else None
+    if ring_result is None:
+        ring_result = rectangular_region_ring(response.shape, bounds, config)
+    if ring_result is None:
+        return None
+    (ox0, oy0, ox1, oy1), ring = ring_result
+
+    if uv_mask is not None:
+        ring &= uv_mask[oy0:oy1, ox0:ox1]
+    if int(ring.sum()) < max(config.ring_smoothness_min_domain_px, 1):
+        return None
+
+    values = response[oy0:oy1, ox0:ox1][ring]
+    busy = float(
+        np.percentile(values, min(max(config.ring_smoothness_percentile, 0.0), 100.0))
+    )
+    return busy / max(reference, 1e-6)
+
+
+def rectangular_region_ring(
+    image_shape: tuple[int, ...],
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+    """Return the legacy rectangular offset ring for a region."""
     x, y, w, h = bounds
-    height, width = response.shape[:2]
+    height, width = image_shape[:2]
     margin = max(int(config.ring_smoothness_margin_px), 0)
     band = max(int(config.ring_smoothness_width_px), 1)
     outer = margin + band
@@ -1262,16 +1354,45 @@ def ring_roughness(
         max(y - margin, 0) - oy0 : min(y + h + margin, height) - oy0,
         max(x - margin, 0) - ox0 : min(x + w + margin, width) - ox0,
     ] = False
-    if uv_mask is not None:
-        ring &= uv_mask[oy0:oy1, ox0:ox1]
-    if int(ring.sum()) < max(config.ring_smoothness_min_domain_px, 1):
+    return (ox0, oy0, ox1, oy1), ring
+
+
+def feature_hull_ring(
+    image_shape: tuple[int, ...],
+    hull: RegionFeatureHull | None,
+    config: MserConfig,
+) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+    """Return an offset ring around a feature's convex hull."""
+    if hull is None or len(hull.points) < 3:
+        return None
+    height, width = image_shape[:2]
+    margin = max(int(config.ring_smoothness_margin_px), 0)
+    band = max(int(config.ring_smoothness_width_px), 1)
+    outer = margin + band
+    points = np.asarray(hull.points, dtype=np.int32)
+    x0 = max(int(points[:, 0].min()) - outer, 0)
+    y0 = max(int(points[:, 1].min()) - outer, 0)
+    x1 = min(int(points[:, 0].max()) + outer + 1, width)
+    y1 = min(int(points[:, 1].max()) + outer + 1, height)
+    if x1 <= x0 or y1 <= y0:
         return None
 
-    values = response[oy0:oy1, ox0:ox1][ring]
-    busy = float(
-        np.percentile(values, min(max(config.ring_smoothness_percentile, 0.0), 100.0))
+    local = points - np.asarray((x0, y0), dtype=np.int32)
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, local, 255)
+
+    outer_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (outer * 2 + 1, outer * 2 + 1)
     )
-    return busy / max(reference, 1e-6)
+    outer_mask = cv2.dilate(mask, outer_kernel) > 0
+    if margin:
+        inner_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1)
+        )
+        inner_mask = cv2.dilate(mask, inner_kernel) > 0
+    else:
+        inner_mask = mask > 0
+    return (x0, y0, x1, y1), outer_mask & ~inner_mask
 
 
 def stroke_width_transform(
@@ -1487,8 +1608,9 @@ def box_uv_coverage(
     uv_mask: np.ndarray | None,
     box: tuple[int, int, int, int],
     image_shape: tuple[int, ...],
+    domain: UvDomainIndex | None = None,
 ) -> float:
-    """Return the share of a box's area that lies inside the UV domain."""
+    """Return the share of a box covered by its single largest UV island."""
     if uv_mask is None:
         return 1.0
     clamped = clamp_group(box, image_shape)
@@ -1497,7 +1619,17 @@ def box_uv_coverage(
     x, y, w, h = clamped
     _bx, _by, bw, bh = box
     area = max(bw * bh, 1)
-    return float(uv_mask[y : y + h, x : x + w].sum()) / float(area)
+    if domain is not None:
+        labels = domain.island_labels
+    else:
+        _count, labels = cv2.connectedComponents(
+            uv_mask.astype(np.uint8), connectivity=8
+        )
+    within = labels[y : y + h, x : x + w]
+    within = within[within > 0]
+    if within.size == 0:
+        return 0.0
+    return float(np.bincount(within).max()) / float(area)
 
 
 def box_feature_blob_px(
@@ -1566,11 +1698,228 @@ def box_feature_blob_px(
     )
 
 
+def _local_inner_rect(
+    outer: tuple[int, int, int, int],
+    inner: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    ox, oy, ow, oh = outer
+    x, y, w, h = inner
+    x0 = max(x - ox, 0)
+    y0 = max(y - oy, 0)
+    x1 = min(x + w - ox, ow)
+    y1 = min(y + h - oy, oh)
+    return (x0, y0, max(x1 - x0, 0), max(y1 - y0, 0))
+
+
+def _region_background_ring(
+    image_shape: tuple[int, ...],
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+    x, y, w, h = group
+    margin = max(int(config.region_feature_ring_margin_px), 0)
+    band = max(int(config.region_feature_ring_width_px), 1)
+    outer = margin + band
+    clamped = clamp_group(context_box(group, outer), image_shape)
+    if clamped is None:
+        return None
+    ox, oy, ow, oh = clamped
+    ring = np.ones((oh, ow), dtype=bool)
+    ring[
+        max(y - margin, 0) - oy : min(y + h + margin, image_shape[0]) - oy,
+        max(x - margin, 0) - ox : min(x + w + margin, image_shape[1]) - ox,
+    ] = False
+    return clamped, ring
+
+
+def region_magic_feature(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+    *,
+    context_px: int = 0,
+) -> RegionMagicFeature | None:
+    """Extract non-background pixels using a background ring around a region."""
+    ring_result = _region_background_ring(image.shape, group, config)
+    if ring_result is None:
+        return None
+    ring_bounds, ring = ring_result
+    rx, ry, rw, rh = ring_bounds
+    ring_crop = image[ry : ry + rh, rx : rx + rw]
+    ring_domain = (
+        uv_mask[ry : ry + rh, rx : rx + rw]
+        if uv_mask is not None
+        else np.ones((rh, rw), dtype=bool)
+    )
+    if uv_mask is not None:
+        ring_domain = dominant_island_component(
+            ring_domain, _local_inner_rect(ring_bounds, group)
+        )
+    ring &= ring_domain
+    if int(ring.sum()) < max(config.region_feature_min_domain_px, 1):
+        return None
+
+    base_tolerance = max(int(config.region_feature_colour_tolerance), 0)
+    background = estimate_background_colour(ring_crop, ring, max(base_tolerance, 1))
+    if background is None:
+        return None
+    ring_pixels = ring_crop[ring].astype(np.float32)
+    variance_tolerance = int(
+        math.ceil(float(ring_pixels.std(axis=0).max()) * config.region_feature_variance_scale)
+    )
+    tolerance = max(base_tolerance, variance_tolerance)
+
+    feature_bounds = clamp_group(
+        context_box(group, max(int(context_px), 0)), image.shape
+    )
+    if feature_bounds is None:
+        return None
+    fx, fy, fw, fh = feature_bounds
+    crop = image[fy : fy + fh, fx : fx + fw]
+    domain = (
+        uv_mask[fy : fy + fh, fx : fx + fw]
+        if uv_mask is not None
+        else np.ones((fh, fw), dtype=bool)
+    )
+    if uv_mask is not None:
+        domain = dominant_island_component(
+            domain, _local_inner_rect(feature_bounds, group)
+        )
+    feature = domain & ~channel_colour_mask(crop, domain, background, tolerance)
+    return RegionMagicFeature(
+        bounds=feature_bounds,
+        inner=_local_inner_rect(feature_bounds, group),
+        feature=feature,
+        tolerance=tolerance,
+    )
+
+
+def blob_hull_fill(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+) -> float | None:
+    """Return feature area over convex-hull area for a detected region."""
+    measures = blob_shape_measures(image, uv_mask, group, config)
+    return measures[0] if measures is not None else None
+
+
+def region_feature_hull(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+) -> RegionFeatureHull | None:
+    """Return the convex hull and colour spread of a region's extracted feature."""
+    extracted = region_magic_feature(image, uv_mask, group, config)
+    if extracted is None:
+        return None
+    x, y, w, h = extracted.inner
+    if w <= 0 or h <= 0:
+        return None
+    feature = extracted.feature[y : y + h, x : x + w]
+    points = cv2.findNonZero(feature.astype(np.uint8))
+    if points is None or len(points) < max(config.region_feature_min_px, 3):
+        return None
+    hull = cv2.convexHull(points)
+    feature_pixels = image[
+        extracted.bounds[1] + y : extracted.bounds[1] + y + h,
+        extracted.bounds[0] + x : extracted.bounds[0] + x + w,
+    ][feature]
+    if feature_pixels.size == 0:
+        return None
+    pixels = feature_pixels.astype(np.float32)
+    lo = np.percentile(pixels, 5.0, axis=0)
+    hi = np.percentile(pixels, 95.0, axis=0)
+    offset = np.asarray(
+        (extracted.bounds[0] + x, extracted.bounds[1] + y),
+        dtype=np.int32,
+    )
+    absolute = hull.reshape(-1, 2) + offset
+    return RegionFeatureHull(
+        points=tuple((int(px), int(py)) for px, py in absolute),
+        feature_area_px=int(len(points)),
+        hull_area_px=float(cv2.contourArea(hull)),
+        colour_variation=float((hi - lo).max()),
+    )
+
+
+def blob_shape_measures(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[float, float] | None:
+    """Return hull fill and internal colour variation for a blob candidate."""
+    hull = region_feature_hull(image, uv_mask, group, config)
+    if hull is None:
+        return None
+    return (
+        float(hull.feature_area_px) / max(hull.hull_area_px, 1e-6),
+        hull.colour_variation,
+    )
+
+
+def feature_extension_measure(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+) -> FeatureExtensionMeasure | None:
+    """Return connected feature area inside and outside the detected region."""
+    extracted = region_magic_feature(
+        image,
+        uv_mask,
+        group,
+        config,
+        context_px=config.feature_extension_context_px,
+    )
+    if extracted is None:
+        return None
+    x, y, w, h = extracted.inner
+    if w <= 0 or h <= 0:
+        return None
+    inside = np.zeros(extracted.feature.shape, dtype=bool)
+    inside[y : y + h, x : x + w] = True
+    feature_area_px = int((extracted.feature & inside).sum())
+    if feature_area_px < max(config.region_feature_min_px, 1):
+        return None
+
+    count, labels = cv2.connectedComponents(
+        extracted.feature.astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return FeatureExtensionMeasure(feature_area_px, 0)
+    inner_labels = labels[inside & extracted.feature]
+    inner_labels = inner_labels[inner_labels > 0]
+    if inner_labels.size == 0:
+        return None
+    connected = np.isin(labels, np.unique(inner_labels))
+    return FeatureExtensionMeasure(
+        feature_area_px,
+        int((connected & extracted.feature & ~inside).sum()),
+    )
+
+
+def feature_extension_px(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+) -> int | None:
+    """Return connected feature pixels that continue outside the region."""
+    measure = feature_extension_measure(image, uv_mask, group, config)
+    return measure.extension_area_px if measure is not None else None
+
+
 def filter_boxes_by_feature(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
     boxes: np.ndarray,
     config: MserConfig,
+    domain: UvDomainIndex | None = None,
 ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
     """Drop undersized, featureless, or out-of-domain MSER boxes.
 
@@ -1594,7 +1943,10 @@ def filter_boxes_by_feature(
         if not config.enable_box_feature_filter:
             kept.append(box)
             continue
-        if box_uv_coverage(uv_mask, box, image.shape) < config.min_box_uv_coverage:
+        if (
+            box_uv_coverage(uv_mask, box, image.shape, domain)
+            < config.min_box_uv_coverage
+        ):
             rejected.append(box)
             continue
         feature_px = box_feature_blob_px(image, uv_mask, box, config)
@@ -1707,8 +2059,9 @@ def circle_uv_coverage(
     uv_mask: np.ndarray | None,
     centre: tuple[float, float],
     radius: float,
+    domain: UvDomainIndex | None = None,
 ) -> float:
-    """Return the share of a disc that lies inside the UV domain."""
+    """Return the share of a disc covered by its single largest UV island."""
     if uv_mask is None:
         return 1.0
     height, width = uv_mask.shape[:2]
@@ -1725,7 +2078,17 @@ def circle_uv_coverage(
     area = int(disc.sum())
     if area == 0:
         return 0.0
-    return float((uv_mask[y0:y1, x0:x1] & disc).sum()) / float(area)
+    if domain is not None:
+        labels = domain.island_labels
+    else:
+        _count, labels = cv2.connectedComponents(
+            uv_mask.astype(np.uint8), connectivity=8
+        )
+    within = labels[y0:y1, x0:x1][disc]
+    within = within[within > 0]
+    if within.size == 0:
+        return 0.0
+    return float(np.bincount(within).max()) / float(area)
 
 
 def inscribed_circle_radius(
@@ -1808,6 +2171,7 @@ def _circle_keeps_uv_coverage(
     group: tuple[int, int, int, int],
     radius: float,
     config: MserConfig,
+    domain: UvDomainIndex | None = None,
 ) -> bool:
     """Hold the circle to the same UV-domain rule that gates group merges.
 
@@ -1816,7 +2180,7 @@ def _circle_keeps_uv_coverage(
     """
     x, y, w, h = group
     return (
-        circle_uv_coverage(uv_mask, (x + w / 2.0, y + h / 2.0), radius)
+        circle_uv_coverage(uv_mask, (x + w / 2.0, y + h / 2.0), radius, domain)
         >= config.min_box_uv_coverage
     )
 
@@ -1896,6 +2260,11 @@ class GroupCandidate:
 
     bounds: tuple[int, int, int, int]
     members: tuple[tuple[int, int, int, int], ...]
+    units: tuple[tuple[int, int, int, int], ...] = ()
+
+    def recovery_units(self) -> tuple[tuple[int, int, int, int], ...]:
+        """Return the grouping level Domain recovery should split back to."""
+        return self.units or self.members
 
 
 @dataclass(frozen=True, slots=True)
@@ -1929,23 +2298,107 @@ def union_region_group_candidates(
     uv_mask: np.ndarray | None = None,
     domain: UvDomainIndex | None = None,
 ) -> list[GroupCandidate]:
-    """Group boxes by proximity and retain exact membership for later recovery.
+    """Group boxes by overlap/proximity and retain exact membership."""
+    candidates = [
+        GroupCandidate(
+            bounds=tuple(int(value) for value in box),
+            members=(tuple(int(value) for value in box),),
+        )
+        for box in boxes
+    ]
+    return _merge_region_group_candidates(
+        candidates,
+        image,
+        config,
+        uv_mask,
+        domain,
+        include_overlap=True,
+        include_proximity=True,
+    )
 
-    Deliberately permissive, and deliberately without any cap on the result: a
-    group that comes out too broad is handed to domain recovery, which can
-    split it back into the boxes it was built from.  Discarding it here would
-    discard those boxes with it.
+
+def strict_region_recovery_candidates(
+    units: list[tuple[int, int, int, int]],
+    image: np.ndarray,
+    config: MserConfig,
+    uv_mask: np.ndarray | None = None,
+    domain: UvDomainIndex | None = None,
+) -> list[GroupCandidate]:
+    """Regroup valid recovery units without ever growing outside the domain."""
+    candidates = [
+        GroupCandidate(bounds=unit, members=(unit,))
+        for unit in units
+    ]
+    return _merge_region_group_candidates(
+        candidates,
+        image,
+        config,
+        uv_mask,
+        domain,
+        include_overlap=False,
+        include_proximity=True,
+        enforce_region_coverage=True,
+    )
+
+
+def overlap_region_group_candidates(
+    boxes: np.ndarray,
+    image: np.ndarray,
+    config: MserConfig,
+    uv_mask: np.ndarray | None = None,
+    domain: UvDomainIndex | None = None,
+) -> list[GroupCandidate]:
+    """Collapse significantly overlapping boxes before distance grouping."""
+    candidates = [
+        GroupCandidate(
+            bounds=tuple(int(value) for value in box),
+            members=(tuple(int(value) for value in box),),
+        )
+        for box in boxes
+    ]
+    return _merge_region_group_candidates(
+        candidates,
+        image,
+        config,
+        uv_mask,
+        domain,
+        include_overlap=True,
+        include_proximity=False,
+    )
+
+
+def _merge_region_group_candidates(
+    seed_candidates: list[GroupCandidate],
+    image: np.ndarray,
+    config: MserConfig,
+    uv_mask: np.ndarray | None,
+    domain: UvDomainIndex | None,
+    *,
+    include_overlap: bool,
+    include_proximity: bool,
+    enforce_region_coverage: bool = False,
+) -> list[GroupCandidate]:
+    """Merge candidate bounds while preserving each candidate's source boxes.
+
+    Candidate joins are attempted conservatively: significantly overlapping
+    boxes merge first, then touching and closest boxes, then progressively more
+    distant pairs.  When the UV-domain filter is active, a join whose
+    accumulated rectangular bounds would fail the loose box-domain test is
+    refused while the already-formed smaller groups are kept.  The stricter
+    shaped-domain test waits for Domain recovery, after circular groups have had
+    a chance to form.
 
     ``domain`` is the shared island labelling; it is built on demand when the
     caller has none.
     """
-    if len(boxes) == 0:
+    if not seed_candidates:
         return []
 
     height, width = image.shape[:2]
     distance = max(0, config.merge_distance_px)
     min_union_area = max(1, config.min_group_union_region_px)
-    box_tuples = [tuple(int(value) for value in box) for box in boxes]
+    min_overlap_ratio = max(0.0, config.min_group_overlap_ratio)
+    box_tuples = [candidate.bounds for candidate in seed_candidates]
     expanded_boxes = [expanded_box(box, distance) for box in box_tuples]
     cell_size = max(distance + int(np.sqrt(min_union_area)), 16)
     parent = list(range(len(box_tuples)))
@@ -1972,23 +2425,111 @@ def union_region_group_candidates(
             index = parent[index]
         return index
 
-    def merge(root: int, other_root: int) -> None:
-        """Attach one resolved root to another, growing the surviving bounds."""
+    def merged_bounds(root: int, other_root: int) -> tuple[int, int, int, int]:
         first = bounds[root]
         second = bounds[other_root]
-        parent[other_root] = root
-        bounds[root] = (
+        return (
             min(first[0], second[0]),
             min(first[1], second[1]),
             max(first[2], second[2]),
             max(first[3], second[3]),
         )
 
+    def merged_pre_domain_ok(rect: tuple[int, int, int, int]) -> bool:
+        if (
+            uv_mask is None
+            or not config.enable_region_domain_filter
+            or config.min_box_uv_coverage <= 0.0
+        ):
+            return True
+        x0, y0, x1, y1 = rect
+        group = (x0, y0, x1 - x0, y1 - y0)
+        return (
+            box_uv_coverage(uv_mask, group, image.shape, domain)
+            >= config.min_box_uv_coverage
+        )
+
+    def merged_strict_region_ok(rect: tuple[int, int, int, int]) -> bool:
+        if not enforce_region_coverage or uv_mask is None:
+            return True
+        x0, y0, x1, y1 = rect
+        _radius, coverage = _region_shape_and_coverage(
+            image, uv_mask, (x0, y0, x1 - x0, y1 - y0), config, domain
+        )
+        return coverage >= config.min_region_uv_coverage
+
+    def merge(root: int, other_root: int, rect: tuple[int, int, int, int]) -> None:
+        """Attach one resolved root to another, growing the surviving bounds."""
+        parent[other_root] = root
+        bounds[root] = rect
+
+    def root_box(root: int) -> tuple[int, int, int, int]:
+        x0, y0, x1, y1 = bounds[root]
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    def pair_priority(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+        left: int,
+        right: int,
+    ) -> tuple[float, int, int, int, int]:
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        ax1, ay1 = ax + aw, ay + ah
+        bx1, by1 = bx + bw, by + bh
+        gap_x = max(bx - ax1, ax - bx1, 0)
+        gap_y = max(by - ay1, ay - by1, 0)
+        gap = math.hypot(gap_x, gap_y)
+        overlap = intersection_area(first, second)
+        union_area = (max(ax1, bx1) - min(ax, bx)) * (max(ay1, by1) - min(ay, by))
+        return (gap, -overlap, union_area, min(left, right), max(left, right))
+
+    def overlap_priority(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+        left: int,
+        right: int,
+    ) -> tuple[float, int, int, int, int]:
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        ax1, ay1 = ax + aw, ay + ah
+        bx1, by1 = bx + bw, by + bh
+        overlap = intersection_area(first, second)
+        smaller_area = max(min(aw * ah, bw * bh), 1)
+        ratio = float(overlap) / float(smaller_area)
+        union_area = (max(ax1, bx1) - min(ax, bx)) * (max(ay1, by1) - min(ay, by))
+        return (-ratio, -overlap, union_area, min(left, right), max(left, right))
+
+    def axis_aligned_grouping_link(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        """Only let grouping grow along well-aligned rows or columns."""
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        ax1, ay1 = ax + aw, ay + ah
+        bx1, by1 = bx + bw, by + bh
+        overlap_x = max(min(ax1, bx1) - max(ax, bx), 0)
+        overlap_y = max(min(ay1, by1) - max(ay, by), 0)
+        separated_x = overlap_x <= 0
+        separated_y = overlap_y <= 0
+        if separated_x and separated_y:
+            return False
+        min_axis_overlap = 0.5
+        if separated_x:
+            return overlap_y >= min(ah, bh) * min_axis_overlap
+        if separated_y:
+            return overlap_x >= min(aw, bw) * min_axis_overlap
+        return True
+
     # Neighbour search over a uniform grid whose cell is the merge distance, so
-    # two expanded boxes that overlap always share at least one cell.  Each box
-    # is inserted only after it has been compared with the boxes already there,
-    # which is what keeps every pair from being considered twice.
+    # two expanded boxes that overlap always share at least one cell.  Pairs are
+    # collected first and then replayed nearest-first; that prevents a distant
+    # transitive chain from growing a group before closer local detail has had a
+    # chance to settle.
     grid: dict[tuple[int, int], list[int]] = {}
+    overlap_edges: list[tuple[tuple[float, int, int, int, int], int, int]] = []
+    merge_edges: list[tuple[tuple[float, int, int, int, int], int, int]] = []
     for index, expanded in enumerate(expanded_boxes):
         checked: set[int] = set()
         cells = grid_cells_for_box(expanded, cell_size)
@@ -1997,19 +2538,92 @@ def union_region_group_candidates(
                 if other in checked:
                     continue
                 checked.add(other)
-                # Resolve membership before measuring any overlap.  Dense glyph
-                # clusters put a box in a cell with hundreds of others, nearly
-                # all of which it has already been merged with transitively --
-                # 98% of pairs on the busiest atlas -- and a pair that cannot
-                # merge does not need its overlap computed at all.
-                root = find(index)
-                other_root = find(other)
-                if root == other_root or island[root] != island[other_root]:
+                if island[index] != island[other]:
                     continue
-                if intersection_area(expanded, expanded_boxes[other]) >= min_union_area:
-                    merge(root, other_root)
+                if include_overlap and min_overlap_ratio > 0.0:
+                    overlap = intersection_area(box_tuples[index], box_tuples[other])
+                    smaller_area = max(
+                        min(
+                            box_tuples[index][2] * box_tuples[index][3],
+                            box_tuples[other][2] * box_tuples[other][3],
+                        ),
+                        1,
+                    )
+                    if float(overlap) / float(smaller_area) >= min_overlap_ratio:
+                        priority = overlap_priority(
+                            box_tuples[index], box_tuples[other], index, other
+                        )
+                        overlap_edges.append((priority, index, other))
+                if include_proximity:
+                    if not axis_aligned_grouping_link(
+                        box_tuples[index], box_tuples[other]
+                    ):
+                        continue
+                    if intersection_area(expanded, expanded_boxes[other]) >= min_union_area:
+                        priority = pair_priority(
+                            box_tuples[index], box_tuples[other], index, other
+                        )
+                        merge_edges.append((priority, index, other))
         for cell in cells:
             grid.setdefault(cell, []).append(index)
+
+    for _priority, index, other in sorted(overlap_edges):
+        root = find(index)
+        other_root = find(other)
+        if root == other_root or island[root] != island[other_root]:
+            continue
+        rect = merged_bounds(root, other_root)
+        if not merged_pre_domain_ok(rect) or not merged_strict_region_ok(rect):
+            continue
+        merge(root, other_root, rect)
+
+    for _priority, index, other in sorted(merge_edges):
+        root = find(index)
+        other_root = find(other)
+        if root == other_root or island[root] != island[other_root]:
+            continue
+        rect = merged_bounds(root, other_root)
+        if not merged_pre_domain_ok(rect) or not merged_strict_region_ok(rect):
+            continue
+        merge(root, other_root, rect)
+
+    if include_proximity:
+        while True:
+            roots = sorted({find(index) for index in range(len(box_tuples))})
+            group_edges: list[
+                tuple[tuple[float, int, int, int, int], int, int]
+            ] = []
+            for left_pos, root in enumerate(roots):
+                first = root_box(root)
+                first_expanded = expanded_box(first, distance)
+                for other_root in roots[left_pos + 1:]:
+                    if island[root] != island[other_root]:
+                        continue
+                    second = root_box(other_root)
+                    if not axis_aligned_grouping_link(first, second):
+                        continue
+                    if (
+                        intersection_area(
+                            first_expanded, expanded_box(second, distance)
+                        )
+                        < min_union_area
+                    ):
+                        continue
+                    group_edges.append((pair_priority(first, second, root, other_root), root, other_root))
+
+            merged_any = False
+            for _priority, root, other_root in sorted(group_edges):
+                root = find(root)
+                other_root = find(other_root)
+                if root == other_root or island[root] != island[other_root]:
+                    continue
+                rect = merged_bounds(root, other_root)
+                if not merged_pre_domain_ok(rect) or not merged_strict_region_ok(rect):
+                    continue
+                merge(root, other_root, rect)
+                merged_any = True
+            if not merged_any:
+                break
 
     members: dict[int, list[int]] = {}
     for index in range(len(box_tuples)):
@@ -2024,10 +2638,22 @@ def union_region_group_candidates(
         y1 = min(rect[3], height)
         if x1 <= x0 or y1 <= y0:
             continue
+        candidate_bounds = (x0, y0, x1 - x0, y1 - y0)
+        if include_overlap and not include_proximity:
+            recovery_units = (candidate_bounds,)
+        elif any(seed_candidates[index].units for index in indices):
+            recovery_units = tuple(seed_candidates[index].bounds for index in indices)
+        else:
+            recovery_units = ()
         candidates.append(
             GroupCandidate(
-                bounds=(x0, y0, x1 - x0, y1 - y0),
-                members=tuple(box_tuples[index] for index in indices),
+                bounds=candidate_bounds,
+                members=tuple(
+                    member
+                    for index in indices
+                    for member in seed_candidates[index].members
+                ),
+                units=recovery_units,
             )
         )
 
@@ -2202,6 +2828,7 @@ class DetectionState:
     rotations: list[tuple[tuple[float, float], ...] | None] = field(
         default_factory=list
     )
+    feature_hulls: list[RegionFeatureHull | None] = field(default_factory=list)
 
     def copy(self) -> "DetectionState":
         return DetectionState(
@@ -2210,6 +2837,7 @@ class DetectionState:
             candidates=list(self.candidates),
             domain=self.domain,
             rotations=list(self.rotations),
+            feature_hulls=list(self.feature_hulls),
         )
 
 
@@ -2299,8 +2927,11 @@ def _step_box_filter(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
-    boxes, rejected = filter_boxes_by_feature(image, uv_mask, state.boxes, config)
-    return DetectionState(boxes, []), DetectionStage(
+    domain = build_uv_domain_index(uv_mask)
+    boxes, rejected = filter_boxes_by_feature(
+        image, uv_mask, state.boxes, config, domain
+    )
+    return DetectionState(boxes, [], domain=domain), DetectionStage(
         key="box_filter",
         title="Box filtering",
         kept=tuple(tuple(int(v) for v in box) for box in boxes),  # type: ignore[misc]
@@ -2309,12 +2940,38 @@ def _step_box_filter(
             f"minimum {max(config.min_box_width_px, 1)}x"
             f"{max(config.min_box_height_px, 1)} px; "
             + (
-                f"need >= {config.min_box_uv_coverage:.0%} of the box inside the UV "
-                f"domain and a non-background blob of >= {config.box_min_feature_px} px "
-                f"within {config.box_feature_colour_tolerance} of one colour"
+                f"need >= {config.min_box_uv_coverage:.0%} of the box inside one UV "
+                f"island and a non-background blob of >= {config.box_min_feature_px} "
+                f"px within {config.box_feature_colour_tolerance} of one colour"
                 if config.enable_box_feature_filter
                 else "feature and UV-domain checks disabled"
             )
+        ),
+    )
+
+
+def _step_overlap_box_group(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Collapse nested or highly overlapping boxes before proximity grouping."""
+    domain = state.domain or build_uv_domain_index(uv_mask)
+    candidates = overlap_region_group_candidates(
+        state.boxes, image, config, uv_mask, domain
+    )
+    groups = [candidate.bounds for candidate in candidates]
+    absorbed = sum(max(len(candidate.members) - 1, 0) for candidate in candidates)
+    return DetectionState(state.boxes, groups, candidates, domain), DetectionStage(
+        key="overlap_box_group",
+        title="Overlap grouping",
+        kept=tuple(groups),
+        adjusted=absorbed,
+        detail=(
+            f"actual overlap >= {config.min_group_overlap_ratio:.0%} of the smaller "
+            f"box is collapsed first; {absorbed} nested/overlapping box"
+            f"{'es' if absorbed != 1 else ''} absorbed"
         ),
     )
 
@@ -2325,10 +2982,23 @@ def _step_grouped(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
-    """Create permissive initial groups and retain their exact members."""
-    domain = build_uv_domain_index(uv_mask)
-    candidates = union_region_group_candidates(
-        state.boxes, image, config, uv_mask, domain
+    """Create nearest-first groups and retain their exact members."""
+    domain = state.domain or build_uv_domain_index(uv_mask)
+    seed_candidates = state.candidates or [
+        GroupCandidate(
+            bounds=tuple(int(value) for value in box),
+            members=(tuple(int(value) for value in box),),
+        )
+        for box in state.boxes
+    ]
+    candidates = _merge_region_group_candidates(
+        seed_candidates,
+        image,
+        config,
+        uv_mask,
+        domain,
+        include_overlap=False,
+        include_proximity=True,
     )
     groups = [candidate.bounds for candidate in candidates]
     return DetectionState(state.boxes, groups, candidates, domain), DetectionStage(
@@ -2337,8 +3007,9 @@ def _step_grouped(
         kept=tuple(groups),
         detail=(
             f"boxes expanded by {config.merge_distance_px} px per side; "
-            "no size cap here -- membership is retained so an over-broad group "
-            "can be split by domain recovery"
+            "nearest horizontal/vertical joins with >= 50% shared-axis overlap "
+            "are accepted, then rechecked as groups grow; diagonal, weak-overlap "
+            "and UV-domain-breaking joins are left as smaller groups"
         ),
     )
 
@@ -2422,6 +3093,10 @@ def _step_rotated_bounds(
     edge_unadopted = 0
     edge_adopted = 0
     for group in state.groups:
+        if inscribed_circle_radius(image, uv_mask, group, config) is not None:
+            kept.append(group)
+            rotations.append(None)
+            continue
         shape = feature_shape(mask, group, config)
         if shape is None:
             # Nothing was fitted, so nothing is concluded.
@@ -2582,7 +3257,12 @@ def _step_ring_smoothness(
     unjudged = 0
     for index, group in enumerate(state.groups):
         outline = state.rotations[index] if index < len(state.rotations) else None
-        roughness = ring_roughness(response, uv_mask, group, config, reference)
+        hull = (
+            state.feature_hulls[index]
+            if index < len(state.feature_hulls)
+            else None
+        )
+        roughness = ring_roughness(response, uv_mask, group, config, reference, hull)
         if roughness is None:
             # Nothing was measured, so nothing is concluded.
             unjudged += 1
@@ -2603,8 +3283,156 @@ def _step_ring_smoothness(
         detail=(
             f"reject above {config.max_ring_roughness:g}x the atlas's median "
             f"gradient, measured over a {config.ring_smoothness_width_px} px ring "
-            f"held {config.ring_smoothness_margin_px} px off the region"
+            f"held {config.ring_smoothness_margin_px} px off the feature hull "
+            "when available, otherwise the region"
             + (f"; {unjudged} had too little domain to judge" if unjudged else "")
+        ),
+    )
+
+
+def _step_blob_shape(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Reject solid blob-like regions with little distinctive shape."""
+    if (
+        not config.enable_blob_shape_filter
+        and not config.enable_ring_smoothness_filter
+    ) or not state.groups:
+        return state, DetectionStage(
+            key="blob_shape",
+            title="Blob shape",
+            kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
+            detail=(
+                "disabled"
+                if not config.enable_blob_shape_filter
+                else "no regions to test"
+            ),
+        )
+
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    hulls: list[RegionFeatureHull | None] = []
+    unjudged = 0
+    skipped_small = 0
+    detailed = 0
+    for index, group in enumerate(state.groups):
+        outline = state.rotations[index] if index < len(state.rotations) else None
+        area = max(group[2] * group[3], 0)
+        hull = region_feature_hull(image, uv_mask, group, config)
+        if not config.enable_blob_shape_filter:
+            kept.append(group)
+            rotations.append(outline)
+            hulls.append(hull)
+            continue
+        if area < max(config.min_blob_region_area_px, 0):
+            skipped_small += 1
+            kept.append(group)
+            rotations.append(outline)
+            hulls.append(hull)
+            continue
+        if hull is None:
+            unjudged += 1
+            kept.append(group)
+            rotations.append(outline)
+            hulls.append(None)
+            continue
+        fill = float(hull.feature_area_px) / max(hull.hull_area_px, 1e-6)
+        colour_variation = hull.colour_variation
+        if (
+            fill >= config.max_blob_hull_fill
+            and colour_variation < config.min_blob_internal_colour_variation
+        ):
+            rejected.append(group)
+        elif fill >= config.max_blob_hull_fill:
+            detailed += 1
+            kept.append(group)
+            rotations.append(outline)
+            hulls.append(hull)
+        else:
+            kept.append(group)
+            rotations.append(outline)
+            hulls.append(hull)
+
+    detail = (
+        "disabled; feature hulls cached for ring smoothness"
+        if not config.enable_blob_shape_filter
+        else (
+            f"for regions >= {config.min_blob_region_area_px} px^2, reject "
+            f"feature/hull fill >= {config.max_blob_hull_fill:.0%} only when "
+            f"internal colour range < {config.min_blob_internal_colour_variation:g}; "
+            f"background from a {config.region_feature_ring_width_px} px ring "
+            f"held {config.region_feature_ring_margin_px} px off the region"
+            + (f"; {detailed} blob-like region{'s' if detailed != 1 else ''} kept for internal detail" if detailed else "")
+            + (f"; {skipped_small} smaller region{'s' if skipped_small != 1 else ''} skipped" if skipped_small else "")
+            + (f"; {unjudged} had too little feature/ring domain to judge" if unjudged else "")
+        )
+    )
+
+    return DetectionState(
+        state.boxes, kept, rotations=rotations, feature_hulls=hulls
+    ), DetectionStage(
+        key="blob_shape",
+        title="Blob shape",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        rotations=tuple(rotations),
+        detail=detail,
+    )
+
+
+def _step_feature_extension(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Reject regions that are only a slice of a larger connected feature."""
+    if not config.enable_feature_extension_filter or not state.groups:
+        return state, DetectionStage(
+            key="feature_extension",
+            title="Feature extension",
+            kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
+            detail=(
+                "disabled"
+                if not config.enable_feature_extension_filter
+                else "no regions to test"
+            ),
+        )
+
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    unjudged = 0
+    threshold = max(float(config.feature_extension_min_ratio), 0.0)
+    for index, group in enumerate(state.groups):
+        outline = state.rotations[index] if index < len(state.rotations) else None
+        measure = feature_extension_measure(image, uv_mask, group, config)
+        if measure is None:
+            unjudged += 1
+            kept.append(group)
+            rotations.append(outline)
+        elif measure.extension_ratio >= threshold:
+            rejected.append(group)
+        else:
+            kept.append(group)
+            rotations.append(outline)
+
+    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+        key="feature_extension",
+        title="Feature extension",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        rotations=tuple(rotations),
+        detail=(
+            "reject connected feature continuation where outside/inside "
+            f">= {threshold:.0%}, searched {config.feature_extension_context_px} px past it"
+            + (f"; {unjudged} had too little feature/ring domain to judge" if unjudged else "")
         ),
     )
 
@@ -2692,6 +3520,7 @@ def _region_shape_and_coverage(
     uv_mask: np.ndarray | None,
     group: tuple[int, int, int, int],
     config: MserConfig,
+    domain: UvDomainIndex | None = None,
 ) -> tuple[int | None, float]:
     """Infer a region's circle, then measure that circle or its rectangle."""
     radius = inscribed_circle_radius(image, uv_mask, group, config)
@@ -2701,8 +3530,9 @@ def _region_shape_and_coverage(
             uv_mask,
             (x + w / 2.0, y + h / 2.0),
             float(radius),
+            domain,
         )
-    return None, box_uv_coverage(uv_mask, group, image.shape)
+    return None, box_uv_coverage(uv_mask, group, image.shape, domain)
 
 
 def _step_region_domain(
@@ -2714,11 +3544,13 @@ def _step_region_domain(
     """Recover failed groups with a full-distance pass and a half-distance retry.
 
     Every initial group first gets its circle decision and shaped-domain test.
-    A passing group remains intact.  A failing group is split back into the
-    exact MSER boxes that formed it; boxes failing the same shaped-domain test
-    are removed and the survivors are regrouped at the configured merge
-    distance.  If a rebuilt group still fails, its already-valid members are
-    regrouped once more at half the merge distance before any final rejection.
+    A passing group remains intact.  A failing group is split back into its
+    recovery units: after overlap grouping, those are the overlap-group boxes
+    rather than the raw nested MSER fragments.  Units failing the same shaped
+    domain test are removed.  If the failed group came from overlap grouping,
+    survivors are regrouped closest-first while enforcing the shaped domain
+    threshold on every growth step.  Older raw-member recovery still uses the
+    full-distance rebuild plus one half-distance retry before final rejection.
     """
     candidates = state.candidates or [
         GroupCandidate(bounds=group, members=(group,)) for group in state.groups
@@ -2735,9 +3567,10 @@ def _step_region_domain(
     kept_candidates: list[GroupCandidate] = []
     rejected: list[tuple[int, int, int, int]] = []
     failed_initial = 0
-    removed_members = 0
+    removed_units = 0
     half_distance_attempts = 0
     half_distance_rescued = 0
+    strict_recovery_groups = 0
     final_rejected = 0
     half_merge_distance = max(config.merge_distance_px // 2, 0)
     half_distance_config = replace(
@@ -2747,7 +3580,7 @@ def _step_region_domain(
 
     for candidate in candidates:
         _radius, initial_coverage = _region_shape_and_coverage(
-            image, uv_mask, candidate.bounds, config
+            image, uv_mask, candidate.bounds, config, domain
         )
         if initial_coverage >= config.min_region_uv_coverage:
             kept_candidates.append(candidate)
@@ -2756,22 +3589,34 @@ def _step_region_domain(
         failed_initial += 1
         rejected.append(candidate.bounds)
 
-        valid_members: list[tuple[int, int, int, int]] = []
-        for member in candidate.members:
-            _member_radius, member_coverage = _region_shape_and_coverage(
-                image, uv_mask, member, config
+        valid_units: list[tuple[int, int, int, int]] = []
+        for unit in candidate.recovery_units():
+            _unit_radius, unit_coverage = _region_shape_and_coverage(
+                image, uv_mask, unit, config, domain
             )
-            if member_coverage < config.min_region_uv_coverage:
-                rejected.append(member)
-                removed_members += 1
+            if unit_coverage < config.min_region_uv_coverage:
+                rejected.append(unit)
+                removed_units += 1
             else:
-                valid_members.append(member)
+                valid_units.append(unit)
 
-        if not valid_members:
+        if not valid_units:
+            continue
+
+        if candidate.units:
+            recovered = strict_region_recovery_candidates(
+                valid_units,
+                image,
+                config,
+                uv_mask,
+                domain,
+            )
+            kept_candidates.extend(recovered)
+            strict_recovery_groups += len(recovered)
             continue
 
         rebuilt = union_region_group_candidates(
-            np.asarray(valid_members, dtype=np.int32),
+            np.asarray(valid_units, dtype=np.int32),
             image,
             config,
             uv_mask,
@@ -2779,7 +3624,7 @@ def _step_region_domain(
         )
         for rebuilt_candidate in rebuilt:
             _rebuilt_radius, rebuilt_coverage = _region_shape_and_coverage(
-                image, uv_mask, rebuilt_candidate.bounds, config
+                image, uv_mask, rebuilt_candidate.bounds, config, domain
             )
             if rebuilt_coverage >= config.min_region_uv_coverage:
                 kept_candidates.append(rebuilt_candidate)
@@ -2791,7 +3636,7 @@ def _step_region_domain(
             rejected.append(rebuilt_candidate.bounds)
             half_distance_attempts += 1
             retry_candidates = union_region_group_candidates(
-                np.asarray(rebuilt_candidate.members, dtype=np.int32),
+                np.asarray(rebuilt_candidate.recovery_units(), dtype=np.int32),
                 image,
                 half_distance_config,
                 uv_mask,
@@ -2800,7 +3645,7 @@ def _step_region_domain(
             rescued_here = 0
             for retry_candidate in retry_candidates:
                 _retry_radius, retry_coverage = _region_shape_and_coverage(
-                    image, uv_mask, retry_candidate.bounds, config
+                    image, uv_mask, retry_candidate.bounds, config, domain
                 )
                 if retry_coverage < config.min_region_uv_coverage:
                     rejected.append(retry_candidate.bounds)
@@ -2820,7 +3665,9 @@ def _step_region_domain(
         detail=(
             f"first shaped test >= {config.min_region_uv_coverage:.0%}; "
             f"{failed_initial} initial group{'s' if failed_initial != 1 else ''} split, "
-            f"{removed_members} invalid member{'s' if removed_members != 1 else ''} removed; "
+            f"{removed_units} invalid recovery unit{'s' if removed_units != 1 else ''} removed; "
+            f"{strict_recovery_groups} strict recovery group"
+            f"{'s' if strict_recovery_groups != 1 else ''} kept; "
             f"{half_distance_attempts} broad rebuild"
             f"{'s' if half_distance_attempts != 1 else ''} retried at "
             f"{half_merge_distance} px, {half_distance_rescued} retry group"
@@ -2901,6 +3748,7 @@ def _shaped_region_uv_coverage(
     uv_mask: np.ndarray | None,
     group: tuple[int, int, int, int],
     radius: int | None,
+    domain: UvDomainIndex | None = None,
 ) -> float:
     """Return UV-domain coverage for one already-shaped region."""
     if uv_mask is None:
@@ -2911,8 +3759,9 @@ def _shaped_region_uv_coverage(
             uv_mask,
             (x + w / 2.0, y + h / 2.0),
             float(radius),
+            domain,
         )
-    return box_uv_coverage(uv_mask, group, image.shape)
+    return box_uv_coverage(uv_mask, group, image.shape, domain)
 
 
 def _step_overlap_group(
@@ -2923,9 +3772,10 @@ def _step_overlap_group(
 ) -> tuple[DetectionState, DetectionStage]:
     """Force positive-area shaped overlaps, then validate each merged result."""
     groups = list(state.groups)
+    domain = state.domain or build_uv_domain_index(uv_mask)
 
     if not config.enable_overlap_group_merge or len(groups) < 2:
-        return DetectionState(state.boxes, groups), DetectionStage(
+        return DetectionState(state.boxes, groups, domain=domain), DetectionStage(
             key="overlap_group",
             title="Post-circle forced merge",
             kept=tuple(groups),
@@ -2988,7 +3838,7 @@ def _step_overlap_group(
 
         if config.enable_region_domain_filter and uv_mask is not None:
             _radius, coverage = _region_shape_and_coverage(
-                image, uv_mask, result, config
+                image, uv_mask, result, config, domain
             )
             if coverage < config.min_region_uv_coverage:
                 rejected.append(result)
@@ -3001,7 +3851,7 @@ def _step_overlap_group(
         f"{len(rejected)} merged group{'s' if len(rejected) != 1 else ''} "
         "failed the final shaped-domain test"
     )
-    return DetectionState(state.boxes, merged), DetectionStage(
+    return DetectionState(state.boxes, merged, domain=domain), DetectionStage(
         key="overlap_group",
         title="Post-circle forced merge",
         kept=tuple(merged),
@@ -3091,20 +3941,34 @@ def _step_final_padding(
 # Stages holding assembled regions rather than raw MSER boxes; only these are
 # worth shaping, and only these are few enough for it to be cheap.
 GROUP_STAGE_KEYS = frozenset(
-    {"grouped", "region_domain", "overlap_group", "pattern_group", "size"}
+    {
+        "overlap_box_group",
+        "grouped",
+        "region_domain",
+        "overlap_group",
+        "pattern_group",
+        "rotated_bounds",
+        "blob_shape",
+        "ring_smoothness",
+        "size",
+        "feature_extension",
+    }
 )
 
 PIPELINE_STEPS = (
     _step_mser,
     _step_stroke_width,
     _step_box_filter,
+    _step_overlap_box_group,
     _step_grouped,
     _step_region_domain,
     _step_overlap_group,
     _step_pattern_group,
     _step_rotated_bounds,
     _step_region_flatness,
+    _step_blob_shape,
     _step_ring_smoothness,
+    _step_feature_extension,
     _step_text_line,
     _step_size,
     _step_final_padding,
@@ -3121,13 +3985,16 @@ STEP_INDEX = {
             "boxes",
             "stroke_width",
             "box_filter",
+            "overlap_box_group",
             "grouped",
             "region_domain",
             "overlap_group",
             "pattern_group",
             "rotated_bounds",
             "region_flatness",
+            "blob_shape",
             "ring_smoothness",
+            "feature_extension",
             "text_line",
             "size",
             "final_padding",
@@ -3175,6 +4042,7 @@ PARAMETER_STEP = {
     "box_feature_context_px": STEP_INDEX["box_filter"],
     "min_box_uv_coverage": STEP_INDEX["box_filter"],
     "box_min_feature_px": STEP_INDEX["box_filter"],
+    "min_group_overlap_ratio": STEP_INDEX["overlap_box_group"],
     "merge_distance_px": STEP_INDEX["grouped"],
     "min_group_union_region_px": STEP_INDEX["grouped"],
     "enable_island_bounded_grouping": STEP_INDEX["grouped"],
@@ -3183,7 +4051,7 @@ PARAMETER_STEP = {
     "circular_group_padding_px": STEP_INDEX["grouped"],
     "circular_group_colour_tolerance": STEP_INDEX["grouped"],
     "circular_group_max_corner_content": STEP_INDEX["grouped"],
-    "enable_region_domain_filter": STEP_INDEX["region_domain"],
+    "enable_region_domain_filter": STEP_INDEX["grouped"],
     "min_region_uv_coverage": STEP_INDEX["region_domain"],
     "enable_overlap_group_merge": STEP_INDEX["overlap_group"],
     "enable_pattern_group_filter": STEP_INDEX["pattern_group"],
@@ -3216,6 +4084,19 @@ PARAMETER_STEP = {
     "ring_smoothness_percentile": STEP_INDEX["ring_smoothness"],
     "ring_smoothness_min_domain_px": STEP_INDEX["ring_smoothness"],
     "max_ring_roughness": STEP_INDEX["ring_smoothness"],
+    "region_feature_ring_margin_px": STEP_INDEX["blob_shape"],
+    "region_feature_ring_width_px": STEP_INDEX["blob_shape"],
+    "region_feature_colour_tolerance": STEP_INDEX["blob_shape"],
+    "region_feature_variance_scale": STEP_INDEX["blob_shape"],
+    "region_feature_min_domain_px": STEP_INDEX["blob_shape"],
+    "region_feature_min_px": STEP_INDEX["blob_shape"],
+    "enable_blob_shape_filter": STEP_INDEX["blob_shape"],
+    "min_blob_region_area_px": STEP_INDEX["blob_shape"],
+    "max_blob_hull_fill": STEP_INDEX["blob_shape"],
+    "min_blob_internal_colour_variation": STEP_INDEX["blob_shape"],
+    "enable_feature_extension_filter": STEP_INDEX["feature_extension"],
+    "feature_extension_context_px": STEP_INDEX["feature_extension"],
+    "feature_extension_min_ratio": STEP_INDEX["feature_extension"],
     "enable_text_line_filter": STEP_INDEX["text_line"],
     "text_min_component_px": STEP_INDEX["text_line"],
     "text_min_characters": STEP_INDEX["text_line"],

@@ -19,13 +19,13 @@ The correction happens in three passes, each narrower than the last:
     region overrunning its UV island cannot come out perfect, and is flipped
     anyway and reported rather than left reliably backwards.
 
-Which way to flip is read off the surface, not guessed from the texture.  The
-exporter reflects about world X, so the correct flip is along whichever image
-axis world X runs in, and that is the x row of the UV-to-surface Jacobian of
-the triangles under the glyph.  The island's own outline only decides whether
-the whole island may be turned over on that axis, or whether its glyphs have to
-be done individually.  Off-axis mirrors, where world X runs diagonally across
-the UV, are resolved to the nearer axis and not otherwise corrected.
+Which way to flip is read off the surface, not guessed from the texture.  Text
+on side-facing surfaces is turned over about the image plane that best follows
+world Z.  Text on horizontal surfaces is turned over about the image plane most
+parallel to world YZ, because a Z-up test cannot distinguish the two candidates
+there.  The island's own outline only decides whether the whole island may be
+turned over on that axis, or whether its glyphs have to be done individually.
+Off-axis cases are resolved to the nearer axis and not otherwise corrected.
 
 The plan is then replayed onto the material's other maps, which are registered
 to the same UV layout: normal, roughness, metallic, AO and palette masks.  A
@@ -60,6 +60,7 @@ import struct
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -154,6 +155,13 @@ class RhdTextureConfig:
     # sampler is for genuinely angled text; using it for a 0.8 degree AIRBAG
     # box loses detail for no useful geometric gain.
     rotated_axis_snap_degrees: float = 2.0
+    # Some atlas marks are skewed in texture space but become upright only when
+    # mapped onto the mesh.  Skewing and mirroring do not commute, and the flat
+    # texture often lacks enough detail to repair honestly, so materially
+    # skewed in-place glyph regions are treated as unsafe and left unchanged.
+    enable_skewed_region_filter: bool = True
+    skewed_region_min_delta: float = 0.08
+    skewed_region_max_condition: float = 50.0
     # Blend only the outside edge of in-place glyph writes, in pixels.  This is
     # deliberately tiny: it hides UV/mask joins without softening the mark body.
     region_boundary_blend_px: float = 1.5
@@ -804,47 +812,108 @@ def split_mirrored_and_rigid(
 AXIS_UNKNOWN, AXIS_HORIZONTAL, AXIS_VERTICAL = 0, 1, 2
 
 
+def _surface_pixel_frame(
+    uv: np.ndarray,
+    xyz: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return per-triangle surface derivatives for image x/y and usability."""
+    d1 = uv[:, 1] - uv[:, 0]
+    d2 = uv[:, 2] - uv[:, 0]
+    determinant = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    usable = np.abs(determinant) > 1e-12
+    safe = np.where(usable, determinant, 1.0)
+
+    surface_1 = xyz[:, 1] - xyz[:, 0]
+    surface_2 = xyz[:, 2] - xyz[:, 0]
+    dxyz_du = (
+        surface_1 * d2[:, 1, None] - surface_2 * d1[:, 1, None]
+    ) / safe[:, None]
+    dxyz_dv = (
+        -surface_1 * d2[:, 0, None] + surface_2 * d1[:, 0, None]
+    ) / safe[:, None]
+
+    image_x = dxyz_du / max(width, 1)
+    image_y = -dxyz_dv / max(height, 1)
+    normal = np.cross(image_x, image_y)
+    return image_x, image_y, normal, usable
+
+
 def surface_flip_axes(
     uv: np.ndarray,
     xyz: np.ndarray,
     width: int,
     height: int,
 ) -> np.ndarray:
-    """Per triangle, which image axis the mirrored world axis runs along.
+    """Per triangle, which image flip uses the surface-correct mirror plane.
 
-    The exporter reflects the husk about world X, so a glyph is undone by
-    flipping the texture along whichever image direction world X travels in.
-    Over one triangle the surface is affine in UV, so that direction is read
-    straight off the Jacobian: solve J [W1-W0, W2-W0] = [P1-P0, P2-P0] for the
-    x row alone, giving dx/du and dx/dv.
+    A horizontal image flip (left-right) reflects about an image-vertical plane.
+    A vertical image flip (top-bottom) reflects about an image-horizontal plane.
+    On a side-facing surface, where the mesh normal is closer to the XY plane,
+    choose whichever candidate plane best contains world Z.  On a horizontal
+    surface, where the mesh normal is closer to the Z axis, choose whichever
+    candidate plane is most parallel to world YZ.
 
-    The two are compared per texel rather than per unit UV -- a unit of u spans
-    ``width`` texels and a unit of v spans ``height`` -- so the test stays
-    correct on a non-square atlas.  Only which axis wins matters, so the v flip
-    the rasteriser applies is irrelevant: it negates the derivative without
-    moving it to the other axis.
-
-    Off-axis cases, where world X runs diagonally across the UV, are decided by
-    the larger component and not otherwise corrected.
+    Over one triangle the surface is affine in UV, so both texture directions
+    come straight from the Jacobian.  They are measured per texel -- a unit of u
+    spans ``width`` texels and a unit of v spans ``height``.  The rasteriser's v
+    inversion only negates a vector, so it cannot change which plane wins.
     """
     if len(uv) == 0:
         return np.empty(0, dtype=np.uint8)
 
-    d1 = uv[:, 1] - uv[:, 0]
-    d2 = uv[:, 2] - uv[:, 0]
-    determinant = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    image_x, image_y, normal, usable = _surface_pixel_frame(uv, xyz, width, height)
+    x_length = np.linalg.norm(image_x, axis=1)
+    y_length = np.linalg.norm(image_y, axis=1)
 
-    first_x = xyz[:, 1, 0] - xyz[:, 0, 0]
-    second_x = xyz[:, 2, 0] - xyz[:, 0, 0]
+    normal_length = np.linalg.norm(normal, axis=1)
+    unit_normal = np.divide(
+        normal,
+        normal_length[:, None],
+        out=np.zeros_like(normal),
+        where=normal_length[:, None] > 1e-12,
+    )
 
-    usable = np.abs(determinant) > 1e-12
-    safe = np.where(usable, determinant, 1.0)
-    dx_du = (first_x * d2[:, 1] - second_x * d1[:, 1]) / safe
-    dx_dv = (-first_x * d2[:, 0] + second_x * d1[:, 0]) / safe
+    horizontal_plane_normal = np.cross(unit_normal, image_y)
+    vertical_plane_normal = np.cross(unit_normal, image_x)
+    horizontal_plane_length = np.linalg.norm(horizontal_plane_normal, axis=1)
+    vertical_plane_length = np.linalg.norm(vertical_plane_normal, axis=1)
+    horizontal_plane_normal = np.divide(
+        horizontal_plane_normal,
+        horizontal_plane_length[:, None],
+        out=np.zeros_like(horizontal_plane_normal),
+        where=horizontal_plane_length[:, None] > 1e-12,
+    )
+    vertical_plane_normal = np.divide(
+        vertical_plane_normal,
+        vertical_plane_length[:, None],
+        out=np.zeros_like(vertical_plane_normal),
+        where=vertical_plane_length[:, None] > 1e-12,
+    )
 
-    horizontal = np.abs(dx_du) / max(width, 1) >= np.abs(dx_dv) / max(height, 1)
+    horizontal_z_score = np.sqrt(
+        np.clip(1.0 - horizontal_plane_normal[:, 2] ** 2, 0.0, 1.0)
+    )
+    vertical_z_score = np.sqrt(
+        np.clip(1.0 - vertical_plane_normal[:, 2] ** 2, 0.0, 1.0)
+    )
+    horizontal_yz_score = np.abs(horizontal_plane_normal[:, 0])
+    vertical_yz_score = np.abs(vertical_plane_normal[:, 0])
+
+    normal_is_z_parallel = np.abs(unit_normal[:, 2]) >= math.sqrt(0.5)
+    horizontal = np.where(
+        normal_is_z_parallel,
+        horizontal_yz_score >= vertical_yz_score,
+        horizontal_z_score >= vertical_z_score,
+    )
     axes = np.where(horizontal, AXIS_HORIZONTAL, AXIS_VERTICAL).astype(np.uint8)
-    axes[~usable] = AXIS_UNKNOWN  # a triangle with no UV area says nothing
+    axes[
+        ~usable
+        | (normal_length <= 1e-12)
+        | ((x_length <= 1e-12) & (y_length <= 1e-12))
+        | ((horizontal_plane_length <= 1e-12) & (vertical_plane_length <= 1e-12))
+    ] = AXIS_UNKNOWN
     return axes
 
 
@@ -882,6 +951,126 @@ def rasterise_axis_map(
                     continue
                 cv2.fillPoly(axis_map, [points], int(axis), lineType=cv2.LINE_8)
     return axis_map
+
+
+def _triangle_pixel_points(
+    triangle: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    points = np.empty((len(triangle), 2), dtype=np.float32)
+    points[:, 0] = triangle[:, 0] * max(width - 1, 1)
+    points[:, 1] = (1.0 - triangle[:, 1]) * max(height - 1, 1)
+    return points
+
+
+def _box_overlap_area(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    ax0, ay0, ax1, ay1 = first
+    bx0, by0, bx1, by1 = second
+    return max(min(ax1, bx1) - max(ax0, bx0), 0.0) * max(
+        min(ay1, by1) - max(ay0, by0), 0.0
+    )
+
+
+def skew_delta_for_region(
+    triangles: tuple[np.ndarray, ...],
+    surfaces: tuple[np.ndarray, ...],
+    bounds: tuple[int, int, int, int],
+    axis: str,
+    width: int,
+    height: int,
+    config: RhdTextureConfig,
+) -> float | None:
+    """Return how far the mesh-derived reflection differs from a flat flip.
+
+    Skewed atlas regions can map upright onto the mesh, but skew and mirroring
+    do not commute.  When the local mesh reflection differs materially from the
+    flat texture-space flip, the region is treated as unsafe and left unchanged.
+    """
+    if not triangles or len(triangles) != len(surfaces):
+        return None
+
+    x, y, w, h = bounds
+    region_box = (float(x), float(y), float(x + w), float(y + h))
+    weighted_x = np.zeros(3, dtype=np.float64)
+    weighted_y = np.zeros(3, dtype=np.float64)
+    total_weight = 0.0
+
+    for triangle, surface in zip(triangles, surfaces):
+        min_u, min_v = triangle.min(axis=0)
+        max_u, max_v = triangle.max(axis=0)
+        for shift_u in range(math.floor(min_u), math.floor(max_u) + 1):
+            for shift_v in range(math.floor(min_v), math.floor(max_v) + 1):
+                shifted = triangle - (shift_u, shift_v)
+                clipped = clip_to_unit_tile(shifted)
+                if len(clipped) < 3:
+                    continue
+                points = _triangle_pixel_points(clipped, width, height)
+                tri_box = (
+                    float(points[:, 0].min()),
+                    float(points[:, 1].min()),
+                    float(points[:, 0].max() + 1.0),
+                    float(points[:, 1].max() + 1.0),
+                )
+                weight = _box_overlap_area(region_box, tri_box)
+                if weight <= 0.0:
+                    continue
+                image_x, image_y, _normal, usable = _surface_pixel_frame(
+                    np.asarray([shifted], dtype=float),
+                    np.asarray([surface], dtype=float),
+                    width,
+                    height,
+                )
+                if not bool(usable[0]):
+                    continue
+                weighted_x += image_x[0] * weight
+                weighted_y += image_y[0] * weight
+                total_weight += weight
+
+    if total_weight <= 0.0:
+        return None
+
+    surface_x = weighted_x / total_weight
+    surface_y = weighted_y / total_weight
+    basis = np.stack([surface_x, surface_y], axis=1)
+    metric = basis.T @ basis
+    try:
+        condition = float(np.linalg.cond(metric))
+    except np.linalg.LinAlgError:
+        return None
+    if not math.isfinite(condition) or condition > config.skewed_region_max_condition:
+        return None
+
+    normal = np.cross(surface_x, surface_y)
+    normal_length = float(np.linalg.norm(normal))
+    if normal_length <= 1e-12:
+        return None
+    normal /= normal_length
+
+    mirror_line = surface_y if axis == "horizontal" else surface_x
+    plane_normal = np.cross(normal, mirror_line)
+    plane_normal_length = float(np.linalg.norm(plane_normal))
+    if plane_normal_length <= 1e-12:
+        return None
+    plane_normal /= plane_normal_length
+
+    reflected = np.eye(3) - 2.0 * np.outer(plane_normal, plane_normal)
+    try:
+        texture_reflection = np.linalg.solve(metric, basis.T @ reflected @ basis)
+    except np.linalg.LinAlgError:
+        return None
+    simple = (
+        np.asarray(((-1.0, 0.0), (0.0, 1.0)), dtype=np.float64)
+        if axis == "horizontal"
+        else np.asarray(((1.0, 0.0), (0.0, -1.0)), dtype=np.float64)
+    )
+    delta = float(np.max(np.abs(texture_reflection - simple)))
+    if delta < config.skewed_region_min_delta:
+        return None
+    return delta
 
 
 def region_flip_axis(
@@ -924,6 +1113,8 @@ class DomainMasks:
     rigid_triangles: int
     parts_analysed: int
     axis_map: np.ndarray | None = None
+    mirrored_uv: tuple[np.ndarray, ...] = ()
+    mirrored_xyz: tuple[np.ndarray, ...] = ()
 
 
 def build_domain_masks(
@@ -983,7 +1174,7 @@ def build_domain_masks(
         horizontal = int((painted == AXIS_HORIZONTAL).sum())
         vertical = int((painted == AXIS_VERTICAL).sum())
         total = max(horizontal + vertical, 1)
-        log(f"  mirrored world X runs along the image's horizontal axis over "
+        log(f"  surface flip plane chooses horizontal over "
             f"{horizontal / total:.1%} of the domain, vertical over "
             f"{vertical / total:.1%}")
 
@@ -995,6 +1186,8 @@ def build_domain_masks(
         rigid_triangles=len(rigid_triangles),
         parts_analysed=analysed,
         axis_map=axis_map,
+        mirrored_uv=tuple(mirrored_triangles),
+        mirrored_xyz=tuple(mirrored_surfaces),
     )
 
 
@@ -1193,8 +1386,9 @@ def plan_island_flips(
     """Choose which whole islands to turn over, and on which axis.
 
     Direction and permission are two separate questions.  The surface decides
-    the direction: whichever image axis the mirrored world axis runs along is
-    the one that undoes the mirror, and ``axis_map`` carries that per texel.
+    the direction: on side-facing triangles this is whichever image flip plane
+    best aligns with world Z; on horizontal triangles it is whichever plane is
+    most parallel to world YZ. ``axis_map`` carries that decision per texel.
     The island's own outline decides permission: flipping along that axis is
     only safe if the island matches its reflection in it, or the content lands
     outside the silhouette and bleeds onto neighbouring geometry.
@@ -2105,6 +2299,67 @@ def mip_chain(rgba: np.ndarray) -> list[np.ndarray]:
     return levels
 
 
+# A block-compressed surface is stored as rows of 4x4 blocks, so cutting it at
+# a multiple of 4 rows and concatenating the pieces in order reproduces the
+# serial byte stream exactly. ispc_texcomp releases the GIL, so the pieces
+# encode in parallel: BC7 at the alpha_basic profile runs about 25s for a
+# single 4096x2048 level, which was over 80% of a texture-correction build.
+# Bands are kept well above the worker count so an expensive strip of atlas
+# cannot leave the other threads idle at the end.
+#
+# Only the BC7 encoder is worth splitting. BC4 and BC5 encode a 4096-square in
+# well under a second, and banding those cost more in dispatch than it saved:
+# the companion maps (which are all BC4/BC5) went from 10.2s to 15.6s per build
+# before this was restricted. Named as the complement rather than as {"bc7"} so
+# it tracks the encode branch below -- every codec that is not BC4 or BC5 goes
+# to compress_blocks_bc7, including the bc7_srgb the colour atlases actually use.
+_DDS_SERIAL_CODECS = frozenset({"bc4", "bc5"})
+_DDS_MIN_BANDED_ROWS = 256
+_DDS_BANDS_PER_WORKER = 4
+
+
+def _dds_encode_workers() -> int:
+    return max(1, min(32, os.cpu_count() or 1))
+
+
+def _compress_level_blocks(
+    level: np.ndarray,
+    encode: Callable[[np.ndarray], bytes],
+    block_bytes: int,
+    executor: ThreadPoolExecutor | None,
+    workers: int,
+) -> bytes:
+    """Block-compress one mip level, in parallel row bands when it is worth it."""
+    height, width = level.shape[:2]
+    blocks_wide = (width + 3) // 4
+
+    def padded(piece: np.ndarray) -> bytes:
+        piece_height = piece.shape[0]
+        expected = blocks_wide * ((piece_height + 3) // 4) * block_bytes
+        encoded = encode(piece)
+        if len(encoded) < expected:
+            return encoded + b"\0" * (expected - len(encoded))
+        if len(encoded) > expected:
+            raise ValueError(
+                f"encoder returned {len(encoded)} bytes for "
+                f"{width}x{piece_height}; expected {expected}"
+            )
+        return encoded
+
+    if executor is None or workers < 2 or height < _DDS_MIN_BANDED_ROWS:
+        return padded(level)
+
+    # Every band but the last is a whole number of block rows, so no block
+    # straddles a cut and the last band handles the partial row exactly as the
+    # whole surface would have.
+    block_rows = (height + 3) // 4
+    rows_per_band = max(1, math.ceil(block_rows / (workers * _DDS_BANDS_PER_WORKER))) * 4
+    bands = [level[top : top + rows_per_band] for top in range(0, height, rows_per_band)]
+    if len(bands) < 2:
+        return padded(level)
+    return b"".join(executor.map(padded, bands))
+
+
 def write_dds(
     path: Path,
     rgba: np.ndarray,
@@ -2117,6 +2372,9 @@ def write_dds(
     BC7 carries a DX10 extended header because that is the only way to say
     which of its two colour spaces is meant; the rest name themselves in the
     legacy FourCC, exactly as the shipped textures do.
+
+    Large levels are encoded in parallel row bands; the output is byte-for-byte
+    what the serial encoder produced.
     """
     import ispc_texcomp
 
@@ -2128,35 +2386,36 @@ def write_dds(
     # the interleave -- it encodes without complaint and decodes to noise.
     channels = {"bc4": 1, "bc5": 2}.get(format.name, 4)
 
-    blocks: list[bytes] = []
-    levels = mip_chain(rgba)
-    for level in levels:
-        level_height, level_width = level.shape[:2]
+    def encode(piece: np.ndarray) -> bytes:
+        piece_height, piece_width = piece.shape[:2]
         surface = ispc_texcomp.RGBASurface(
-            np.ascontiguousarray(level[:, :, :channels]),
-            level_width,
-            level_height,
-            level_width * channels,
+            np.ascontiguousarray(piece[:, :, :channels]),
+            piece_width,
+            piece_height,
+            piece_width * channels,
         )
         if format.name == "bc4":
-            block = ispc_texcomp.compress_blocks_bc4(surface)
-        elif format.name == "bc5":
-            block = ispc_texcomp.compress_blocks_bc5(surface)
-        else:
-            block = ispc_texcomp.compress_blocks_bc7(surface, settings)
-        expected = (
-            ((level_width + 3) // 4)
-            * ((level_height + 3) // 4)
-            * format.block_bytes
-        )
-        if len(block) < expected:
-            block += b"\0" * (expected - len(block))
-        elif len(block) > expected:
-            raise ValueError(
-                f"{format.name} encoder returned {len(block)} bytes for "
-                f"{level_width}x{level_height}; expected {expected}"
-            )
-        blocks.append(block)
+            return ispc_texcomp.compress_blocks_bc4(surface)
+        if format.name == "bc5":
+            return ispc_texcomp.compress_blocks_bc5(surface)
+        return ispc_texcomp.compress_blocks_bc7(surface, settings)
+
+    levels = mip_chain(rgba)
+    workers = _dds_encode_workers()
+    banded = (
+        format.name not in _DDS_SERIAL_CODECS
+        and workers > 1
+        and any(level.shape[0] >= _DDS_MIN_BANDED_ROWS for level in levels)
+    )
+    executor = ThreadPoolExecutor(max_workers=workers) if banded else None
+    try:
+        blocks = [
+            _compress_level_blocks(level, encode, format.block_bytes, executor, workers)
+            for level in levels
+        ]
+    finally:
+        if executor is not None:
+            executor.shutdown()
 
     height, width = rgba.shape[:2]
     linear_size = ((width + 3) // 4) * ((height + 3) // 4) * format.block_bytes
@@ -3409,6 +3668,7 @@ def build_rhd_texture(
     in_place_stencils: list[str] = []
     in_place_shares: list[float] = []
     imperfect: list[tuple[int, int, int, int, str, float]] = []
+    skewed: list[tuple[int, int, int, int, str, float]] = []
     expanded = 0
     skipped = 0
     marginal = 0
@@ -3441,24 +3701,44 @@ def build_rhd_texture(
             ):
                 rotation = None
                 rotated_axis = None
+        if config.enable_skewed_region_filter:
+            delta = skew_delta_for_region(
+                masks.mirrored_uv,
+                masks.mirrored_xyz,
+                (x, y, w, h),
+                axis,
+                width,
+                height,
+                config,
+            )
+            if delta is not None:
+                skipped += 1
+                skewed.append((x, y, w, h, axis, delta))
+                log(f"    ~ ({x},{y}) {w}x{h}: texture-space skew "
+                    f"{delta:.3f}; left unchanged")
+                continue
         # Where the region overruns its UV island some texels have no partner
         # and keep their original content.  Measured on both axes so the
         # report says whether the other one would have fared better; the
         # surface still decides which is applied.
-        exchangeable = (
-            rotated_exchangeable_share(mirror_mask, rotation, rotated_axis)
-            if rotation is not None and rotated_axis is not None
-            else exchangeable_share(mirror_mask, (x, y, w, h), axis)
-        )
+        if rotation is not None and rotated_axis is not None:
+            exchangeable = rotated_exchangeable_share(
+                mirror_mask, rotation, rotated_axis
+            )
+        else:
+            exchangeable = exchangeable_share(mirror_mask, (x, y, w, h), axis)
         stencil = STENCIL_MIRROR
         if exchangeable < config.min_region_exchangeable:
             other = "vertical" if axis == "horizontal" else "horizontal"
             alternative = exchangeable_share(mirror_mask, (x, y, w, h), other)
-            domain_exchangeable = (
-                rotated_exchangeable_share(domain_mask, rotation, rotated_axis)
-                if rotation is not None and rotated_axis is not None
-                else exchangeable_share(domain_mask, (x, y, w, h), axis)
-            )
+            if rotation is not None and rotated_axis is not None:
+                domain_exchangeable = rotated_exchangeable_share(
+                    domain_mask, rotation, rotated_axis
+                )
+            else:
+                domain_exchangeable = exchangeable_share(
+                    domain_mask, (x, y, w, h), axis
+                )
             if domain_exchangeable >= config.min_region_exchangeable:
                 expanded += 1
                 stencil = STENCIL_DOMAIN
@@ -3473,7 +3753,16 @@ def build_rhd_texture(
                     f"{axis} ({alternative:.0%} on {other}, "
                     f"{domain_exchangeable:.0%} in material domain); left unchanged")
                 continue
-        steps.append(FlipStep((x, y, w, h), axis, None, rotation, rotated_axis, stencil))
+        steps.append(
+            FlipStep(
+                (x, y, w, h),
+                axis,
+                None,
+                rotation,
+                rotated_axis,
+                stencil,
+            )
+        )
         in_place.append((x, y, w, h))
         in_place_axes.append(axis)
         in_place_rotated_axes.append(rotated_axis)
@@ -3684,6 +3973,9 @@ def build_rhd_texture(
         "correct_flipped_normal_background": (
             config.correct_flipped_normal_background
         ),
+        "enable_skewed_region_filter": config.enable_skewed_region_filter,
+        "skewed_region_min_delta": config.skewed_region_min_delta,
+        "skewed_region_max_condition": config.skewed_region_max_condition,
         "regions_detected": detected_total,
         "mirrored_regions": len(mirrored_regions),
         "relief_regions_added": relief_added,
@@ -3752,6 +4044,11 @@ def build_rhd_texture(
                 in_place_stencils,
                 in_place_shares,
             )
+        ],
+        "skewed_regions": [
+            {"x": x, "y": y, "w": w, "h": h, "axis": axis,
+             "affine_delta": round(delta, 6)}
+            for x, y, w, h, axis, delta in skewed
         ],
         "blob_regions": [
             {"x": x, "y": y, "w": w, "h": h, "solidity": round(v, 3)}

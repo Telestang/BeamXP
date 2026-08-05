@@ -2052,7 +2052,7 @@ def _plate_slots_by_side_for_config(context, config_name: str) -> dict[str, list
         cache[config_name] = result
         return result
 
-    pc = core.load_pc(context.source_zip, variant.pc_path)
+    pc = core.load_context_pc(context, variant.pc_path)
     explicit = {
         str(slot_type): str(part_id or "")
         for slot_type, part_id in dict(pc.get("parts", {})).items()
@@ -2534,7 +2534,7 @@ def preview_pc_with_plate_parts(
     from beamxp import hand_drive_core as core
 
     variant = context.variants[config_name]
-    pc = core.load_pc(context.source_zip, variant.pc_path)
+    pc = core.load_context_pc(context, variant.pc_path)
     parts = dict(pc.get("parts", {}))
     variants = conversion.get("variants", {})
     settings = variants.get(config_name, {}) if isinstance(variants, dict) else {}

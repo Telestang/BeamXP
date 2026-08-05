@@ -819,11 +819,14 @@ class PartsWorkflowMixin:
         context = self.context
         cached_ids = core.load_cached_part_ids(context, selected)
         if cached_ids is not None:
-            self.resolved_part_ids = [part_id for part_id in cached_ids if part_id in context.objects]
-            self._refresh_parts(reset_view=reset_view)
-            self._update_detail()
-            self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed (parts cache)")
-            return
+            resolved = [part_id for part_id in cached_ids if part_id in context.objects]
+            if resolved:
+                self.resolved_part_ids = resolved
+                self._refresh_parts(reset_view=reset_view)
+                self._update_detail()
+                self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed (parts cache)")
+                return
+            core.clear_parts_cache(context)
         self.status_var.set(f"Resolving used parts for {len(selected)} trim(s)...")
         self.part_refresh_running = True
         future = self.part_resolver.submit(self._resolve_part_ids_worker, context, selected)

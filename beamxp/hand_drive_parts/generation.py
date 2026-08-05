@@ -22,8 +22,6 @@ from beamxp.core.beam_json import (
     display_name_for,
     info_path_for_config,
     json_line_needs_comma,
-    load_info,
-    load_pc,
     parse_beamng_json,
     strip_json_comments,
     zip_json_by_name as _zip_json_by_name,
@@ -126,6 +124,7 @@ from beamxp.core.models import (
 )
 from beamxp.hand_drive_parts.spatial_analysis import display_texture_flip_scope
 from beamxp.plates import generator as plate_generator
+
 
 def generate_daes(
     context: VehicleContext,
@@ -457,7 +456,7 @@ def write_converted_config(
     info: dict[str, object] = {}
     if variant.info_path:
         try:
-            info = load_info(context.source_zip, variant.info_path)
+            info = load_context_info(context, variant.info_path)
         except Exception:
             info = {}
     existing_name = generated_info_display_name(info, variant)
@@ -582,7 +581,7 @@ def _relocation_rewrite_context(context: VehicleContext) -> dict[str, object]:
     slots = {
         slot_def.slot_type
         for part_id in context.part_body_index
-        for slot_def in extract_slot_defs(context.part_body_index[part_id][0])
+        for slot_def in part_slot_defs_for_context(context, part_id)
     }
     return {
         "node_mirror_map": build_node_mirror_map(context.node_positions),
@@ -649,7 +648,7 @@ def _relocation_clone_body(
 
     part_body = found[0]
     suffix = suffix_for_hand(target_hand)
-    meshes = sorted(transform_helpers.extract_part_mesh_names(part_body))
+    meshes = sorted(part_mesh_names_for_context(context, source_part_id))
     mesh_map = {
         mesh: f"{mesh}{suffix}"
         for mesh in meshes
@@ -731,11 +730,22 @@ def _part_needs_generated_clone(
     part_body: str,
     object_modes: dict[str, str],
     node_mirror_map: dict[str, str],
+    part_meshes: set[str] | None = None,
 ) -> bool:
-    part_meshes = transform_helpers.extract_part_mesh_names(part_body)
+    part_meshes = part_meshes if part_meshes is not None else part_mesh_names_for_context(context, source_part_id)
     return (
         any(mesh in object_modes for mesh in part_meshes)
         or part_has_transformable_internal_camera(part_body, node_mirror_map)
+        or _part_has_handed_light_slots(part_body)
+    )
+
+
+def _part_needs_generated_ancestors(
+    part_body: str,
+    node_mirror_map: dict[str, str],
+) -> bool:
+    return (
+        part_has_transformable_internal_camera(part_body, node_mirror_map)
         or _part_has_handed_light_slots(part_body)
     )
 
@@ -757,6 +767,7 @@ def _generated_clone_plan(
     carries its handed child-slot namespace down to those leaves.
     """
     generated_parts: dict[str, str] = {}
+    bridge_required_parts: set[str] = set()
     parts_with_child_slots: set[str] = set()
     part_children: dict[str, set[str]] = {}
     selected_part_ids = {str(part_id) for part_id in selected["parts"]}
@@ -792,7 +803,7 @@ def _generated_clone_plan(
         part_body, _filename = found
         if _generated_clone_excluded(source_part_id, part_body):
             continue
-        slot_defs = extract_slot_defs(part_body)
+        slot_defs = part_slot_defs_for_context(context, source_part_id)
         if slot_defs:
             parts_with_child_slots.add(source_part_id)
             for slot_def in slot_defs:
@@ -803,11 +814,18 @@ def _generated_clone_plan(
                 if default_part not in inspected_part_ids:
                     pending_part_ids.add(default_part)
         if _part_needs_generated_clone(
-            context, source_part_id, part_body, object_modes, node_mirror_map
+            context,
+            source_part_id,
+            part_body,
+            object_modes,
+            node_mirror_map,
+            part_mesh_names_for_context(context, source_part_id),
         ):
             generated_parts[source_part_id] = generated_variant_part_name(
                 source_part_id, target_hand, config_name
             )
+            if _part_needs_generated_ancestors(part_body, node_mirror_map):
+                bridge_required_parts.add(source_part_id)
 
     changed = True
     while changed:
@@ -818,12 +836,13 @@ def _generated_clone_plan(
             if source_part_id == selected.get("main_part"):
                 continue
             if any(
-                child_part_id in generated_parts
+                child_part_id in bridge_required_parts
                 for child_part_id in part_children.get(source_part_id, ())
             ):
                 generated_parts[source_part_id] = generated_variant_part_name(
                     source_part_id, target_hand, config_name
                 )
+                bridge_required_parts.add(source_part_id)
                 changed = True
     return generated_parts
 
@@ -858,7 +877,7 @@ def write_generated_jbeam_and_configs(
 
     for config_name, target_hand in sorted(variant_targets.items()):
         variant = context.variants[config_name]
-        pc = load_pc(context.source_zip, variant.pc_path)
+        pc = load_context_pc(context, variant.pc_path)
         authored_group = authored_groups.get(config_name)
         slot_plan = slot_pair_plans.get(config_name)
         # Parts an authored swap or a slot pair resolves are already correct
@@ -897,9 +916,8 @@ def write_generated_jbeam_and_configs(
             part_body, _filename = found
             if _generated_clone_excluded(str(source_part_id), part_body):
                 continue
-            part_meshes = transform_helpers.extract_part_mesh_names(part_body)
+            part_meshes = part_mesh_names_for_context(context, str(source_part_id))
             mesh_hits = sorted(mesh for mesh in part_meshes if mesh in object_modes)
-            camera_hit = part_has_transformable_internal_camera(part_body, node_mirror_map)
             new_part_id = generated_parts_for_source.get(str(source_part_id))
             if not new_part_id:
                 continue
@@ -938,10 +956,10 @@ def write_generated_jbeam_and_configs(
                 elif object_modes.get(mesh) == MODE_MIRROR_POSITION and mesh in mirror_position_flexbody_meshes:
                     flexbody_row_transforms[mesh] = ("mirrorPosition", 0.0)
                 elif object_modes.get(mesh) in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
-                    # Structural rows must carry the mirror in the jbeam pos/rot
-                    # like plain mirror rows: the engine drops the DAE node
-                    # translation for flexbodies, so a side-swap baked into the
-                    # copy's node matrix never reaches the screen.
+                    # Mirrored flexbodies must carry the mirror in the jbeam
+                    # pos/rot: the engine drops the DAE node translation, so a
+                    # side-swap baked into the copy's node matrix never reaches
+                    # the screen.
                     flexbody_row_transforms[mesh] = ("mirror", 0.0)
             prop_row_transforms: dict[str, tuple[str, float]] = {}
             for mesh in mesh_hits:
@@ -1092,14 +1110,14 @@ def write_original_plate_configs(
     output_vehicle_dir.mkdir(parents=True, exist_ok=True)
     for config_name in sorted(set(config_names)):
         variant = context.variants[config_name]
-        pc = load_pc(context.source_zip, variant.pc_path)
+        pc = load_context_pc(context, variant.pc_path)
         output_config = original_plate_output_name(config_name)
         write_text_file(output_vehicle_dir / f"{output_config}.pc", json.dumps(pc, indent=2), encoding="utf-8")
 
         info: dict[str, object] = {}
         if variant.info_path:
             try:
-                info = load_info(context.source_zip, variant.info_path)
+                info = load_context_info(context, variant.info_path)
             except Exception:
                 info = {}
         existing_name = generated_info_display_name(info, variant)

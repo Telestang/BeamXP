@@ -553,13 +553,25 @@ def zip_member_path(value: str) -> Path:
     return Path(*[part for part in value.replace("\\", "/").split("/") if part])
 
 
-def make_zip(src: Path, target: Path) -> None:
-    if os.path.exists(fs_path(target)):
-        os.remove(fs_path(target))
+def make_zip(src: Path, target: Path, *, compresslevel: int | None = 1) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    if os.path.exists(fs_path(temporary)):
+        os.remove(fs_path(temporary))
     src_path = fs_path(src)
-    with zipfile.ZipFile(fs_path(target), "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _dirs, files in os.walk(src_path):
-            for filename in files:
-                file_path = os.path.join(root, filename)
-                archive_name = os.path.relpath(file_path, src_path).replace(os.sep, "/")
-                zf.write(file_path, archive_name)
+    try:
+        with zipfile.ZipFile(
+            fs_path(temporary),
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=compresslevel,
+        ) as zf:
+            for root, _dirs, files in os.walk(src_path):
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    archive_name = os.path.relpath(file_path, src_path).replace(os.sep, "/")
+                    zf.write(file_path, archive_name)
+        os.replace(fs_path(temporary), fs_path(target))
+    finally:
+        if os.path.exists(fs_path(temporary)):
+            os.remove(fs_path(temporary))
