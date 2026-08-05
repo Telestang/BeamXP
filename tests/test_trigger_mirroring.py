@@ -165,7 +165,11 @@ class TriggerRewriteTest(unittest.TestCase):
         }
         self.assertEqual(mirror(text, nodes), text)
 
-    def test_unmappable_ref_node_leaves_the_row_and_flags_it(self):
+    def test_unmirrorable_ref_nodes_keep_the_anchor_and_move_the_box(self):
+        """A steering stalk exists on one side only, so there is nothing to
+        repoint at. BeamXP relocates a mirrored prop on such nodes with
+        baseTranslationGlobal and leaves its ref nodes alone; the trigger has to
+        follow suit or it parts company with the geometry it labels."""
         text = section(
             '        ["headlights", "int_strw","int_stalk","dshr", "sphere", 0.025,'
             ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
@@ -173,13 +177,56 @@ class TriggerRewriteTest(unittest.TestCase):
         )
         out = mirror(text, ARDENTE_NODES)
         self.assertIn('"int_strw","int_stalk","dshr"', out)
-        self.assertIn("//BeamXP: headlights left unmirrored", out)
-        self.assertIn("int_stalk", out.split("//BeamXP:")[1].split("\n")[0])
+        # all-zero rotations need no approximation, so nothing is flagged
+        self.assertNotIn("//BeamXP:", out)
 
-    def test_manual_review_reports_the_unmappable_trigger(self):
-        body = '{"triggers2":' + section(
+        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr")))
+        before = [
+            frame[0][i] + sum((0.2, 0.0, 0.0)[a] * frame[a + 1][i] for a in range(3))
+            for i in range(3)
+        ]
+        row = [line for line in out.splitlines() if "headlights" in line][0]
+        values = [
+            float(part.split(":")[1])
+            for part in row.rsplit("{", 1)[1].rstrip("}],").replace('"', "").split(",")
+        ]
+        after = [
+            frame[0][i] + sum(values[a] * frame[a + 1][i] for a in range(3)) for i in range(3)
+        ]
+        self.assertAlmostEqual(after[0], -before[0], places=6)
+        self.assertAlmostEqual(after[1], before[1], places=6)
+        self.assertAlmostEqual(after[2], before[2], places=6)
+
+    def test_translation_column_is_reflected_as_a_free_vector(self):
+        """baseTranslation positions the box so it carries the frame origin;
+        translation stacks on top of it. Reflecting the origin twice only shows
+        up once the anchor cannot be repointed, so pin it on the stalk case."""
+        text = section(
             '        ["headlights", "int_strw","int_stalk","dshr", "sphere", 0.025,'
             ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.2, "y":0, "z":0}],'
+        )
+        out = mirror(text, ARDENTE_NODES)
+        row = [line for line in out.splitlines() if "headlights" in line][0]
+        # rotation, rotation, translation all stay zero; only baseTranslation moves
+        self.assertEqual(row.count('{"x":0, "y":0, "z":0}'), 3)
+
+    def test_non_zero_rotation_on_unmirrorable_nodes_is_flagged(self):
+        text = section(
+            '        ["headlights", "int_strw","int_stalk","dshr", "box", {"x":0.03, "y":0.03, "z":0.03},'
+            ' {"x":30, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.2, "y":0, "z":0}],'
+        )
+        out = mirror(text, ARDENTE_NODES)
+        self.assertIn("//BeamXP: headlights", out)
+        self.assertIn("baseRotation", out.split("//BeamXP:")[1].split("\n")[0])
+        # the authored rotation is left exactly as it was rather than guessed at
+        self.assertIn('{"x":30, "y":0, "z":0}', out)
+
+    def test_manual_review_reports_the_approximated_trigger(self):
+        body = '{"triggers2":' + section(
+            '        ["headlights", "int_strw","int_stalk","dshr", "box", {"x":0.03, "y":0.03, "z":0.03},'
+            ' {"x":30, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
             ' {"x":0.2, "y":0, "z":0}],'
         ) + "]}"
         findings = triggers_needing_manual_review(

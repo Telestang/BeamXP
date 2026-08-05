@@ -1191,6 +1191,53 @@ def mirror_trigger_offset(
     )
 
 
+def _frames_differ_by_z_flip(
+    source_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    target_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+) -> bool:
+    """True when reflecting the source frame yields the target frame flipped in z.
+
+    Holds whenever the target triple is the source triple mirrored -- including
+    ref nodes that sit on the centreline and mirror to themselves -- and is what
+    makes negating euler .x/.y the exact answer.
+    """
+    expected = (1.0, 1.0, -1.0)
+    for axis in range(3):
+        source_axis = source_frame[axis + 1]
+        reflected = (-source_axis[0], source_axis[1], source_axis[2])
+        for other in range(3):
+            target_axis = target_frame[other + 1]
+            dot = sum(reflected[i] * target_axis[i] for i in range(3))
+            want = expected[axis] if axis == other else 0.0
+            if abs(dot - want) > 1e-6:
+                return False
+    return True
+
+
+def mirror_trigger_vector(
+    values: Vec3,
+    source_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    target_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+) -> Vec3:
+    """Reflect a free vector between two ref frames, ignoring their origins.
+
+    ``baseTranslation`` positions the box and so carries the frame origin, but
+    ``translation`` is an extra offset added on top of it. Passing that through
+    the point transform too would reflect the origin twice, which shows up the
+    moment the target frame is not the source frame moved -- exactly the case
+    when a one-sided node cage forces the anchor to stay put.
+    """
+    _origin, x_axis, y_axis, z_axis = source_frame
+    world = tuple(
+        values[0] * x_axis[i] + values[1] * y_axis[i] + values[2] * z_axis[i] for i in range(3)
+    )
+    mirrored = (-world[0], world[1], world[2])
+    return tuple(
+        sum(mirrored[i] * axis[i] for i in range(3))
+        for axis in (target_frame[1], target_frame[2], target_frame[3])
+    )
+
+
 def _row_element_spans(row_text: str) -> list[tuple[int, int]]:
     """Top-level element spans inside one ``[...]`` jbeam row."""
     masked = transform_helpers.mask_comments_preserve_offsets(row_text)
@@ -1350,15 +1397,20 @@ def _mirror_trigger_row(
             return row, None
         source_ids.append(node_id)
 
-    target_ids: list[str] = []
-    for node_id in source_ids:
-        mirrored = _mirrored_node_id(node_id, node_mirror_map, node_positions)
-        if mirrored is None:
-            return row, f'ref node "{node_id}" has no mirrored counterpart'
-        target_ids.append(mirrored)
-
     if any(node_id not in node_positions for node_id in source_ids):
         return row, "ref node positions unknown"
+
+    # Prefer repointing the triple at the mirrored nodes: that is what vanilla
+    # does and it keeps the offsets small and readable. When the cage has no
+    # mirrored counterpart -- a steering column exists on one side only -- keep
+    # the original anchor and move the box through world space instead. That
+    # matches how a mirrored prop is relocated (baseTranslationGlobal, ref nodes
+    # untouched), so the box goes on deforming with the geometry it labels.
+    mirrored_ids = [
+        _mirrored_node_id(node_id, node_mirror_map, node_positions) for node_id in source_ids
+    ]
+    repointed = all(node_id is not None for node_id in mirrored_ids)
+    target_ids = [str(node_id) for node_id in mirrored_ids] if repointed else list(source_ids)
 
     source_frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
     target_frame = trigger_frame(*(node_positions[node_id] for node_id in target_ids))
@@ -1366,10 +1418,16 @@ def _mirror_trigger_row(
         return row, "ref nodes are collinear"
 
     edits: list[tuple[int, int, str]] = []
-    for column, node_id in zip(_TRIGGER_NODE_COLUMNS, target_ids):
-        start, end = spans[index_of[column]]
-        edits.append((start, end, re.sub(r'"(?:[^"\\]|\\.)*"', f'"{node_id}"', row[start:end], count=1)))
+    if repointed:
+        for column, node_id in zip(_TRIGGER_NODE_COLUMNS, target_ids):
+            start, end = spans[index_of[column]]
+            edits.append(
+                (start, end, re.sub(r'"(?:[^"\\]|\\.)*"', f'"{node_id}"', row[start:end], count=1))
+            )
 
+    # Exactly one column carries the frame origin -- the one that positions the
+    # box. Everything stacked on top of it is a free vector.
+    carries_origin = True
     for column in _TRIGGER_TRANSLATION_COLUMNS:
         position = index_of.get(column)
         if position is None or position >= len(spans):
@@ -1378,12 +1436,19 @@ def _mirror_trigger_row(
         values = _parse_vector(row[start:end])
         if values is None:
             continue
+        transform = mirror_trigger_offset if carries_origin else mirror_trigger_vector
+        carries_origin = False
         updated = _replace_vector_numbers(
-            row[start:end], mirror_trigger_offset(values, source_frame, target_frame)
+            row[start:end], transform(values, source_frame, target_frame)
         )
         if updated is not None:
             edits.append((start, end, updated))
 
+    # Negating euler .x/.y is only exact while the target frame is the source
+    # frame reflected, which repointing guarantees and the world-space fallback
+    # does not. Rotations are usually all-zero, so say so rather than guess.
+    exact_rotation = _frames_differ_by_z_flip(source_frame, target_frame)
+    approximated: list[str] = []
     for column in _TRIGGER_ROTATION_COLUMNS:
         position = index_of.get(column)
         if position is None or position >= len(spans):
@@ -1392,6 +1457,11 @@ def _mirror_trigger_row(
         values = _parse_vector(row[start:end])
         if values is None:
             continue
+        if not any(abs(value) > 1e-9 for value in values):
+            continue
+        if not exact_rotation:
+            approximated.append(column)
+            continue
         updated = _replace_vector_numbers(row[start:end], (-values[0], -values[1], values[2]))
         if updated is not None:
             edits.append((start, end, updated))
@@ -1399,6 +1469,11 @@ def _mirror_trigger_row(
     out = row
     for start, end, replacement in sorted(edits, reverse=True):
         out = out[:start] + replacement + out[end:]
+    if approximated:
+        return out, (
+            f"position mirrored in place on unmirrored ref nodes; "
+            f"{'/'.join(approximated)} left as authored and may need a manual pass"
+        )
     return out, None
 
 
@@ -1435,12 +1510,14 @@ def rewrite_triggers(
             continue
         row = array_text[start:end]
         mirrored, reason = _mirror_trigger_row(row, columns, node_positions, node_mirror_map)
+        out = out[:start] + mirrored + out[end:]
         if reason is not None:
             indent = re.match(r"[ \t]*", array_text[array_text.rfind("\n", 0, start) + 1 : start])
-            note = f"//BeamXP: {trigger_id} left unmirrored, {reason}{newline}{indent.group(0) if indent else ''}"
+            note = (
+                f"//BeamXP: {trigger_id} -- {reason}"
+                f"{newline}{indent.group(0) if indent else ''}"
+            )
             out = out[:start] + note + out[start:]
-            continue
-        out = out[:start] + mirrored + out[end:]
     return out
 
 
@@ -1562,4 +1639,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
