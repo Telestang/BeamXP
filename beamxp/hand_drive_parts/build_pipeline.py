@@ -347,11 +347,20 @@ def texture_correction_asset_archives(context: VehicleContext) -> list[Path]:
 
 def export_texture_correction_artifacts(
     context: VehicleContext,
-    output_root: Path,
+    artifact_root: Path,
     mesh_ids: Iterable[str],
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    """Run the standalone atlas-correction exporter for marked meshes."""
+    """Run the standalone atlas-correction exporter for marked meshes.
+
+    ``artifact_root`` is a working directory, not part of the shipped mod. The
+    exporter emits a full audit trail per job -- the corrected DDS, the PNG it
+    was encoded from, debug and preview renders, the plan JSON, a per-mesh DAE
+    and a Blender script -- and only the DDS is a game asset. Those are copied
+    into the vehicle folder by _prepare_texture_correction_materials, so the
+    rest has no business in the package: on the Ardente it was 1.01 GB of a
+    1.20 GB zip, 842 MB of that in PNGs nothing loads.
+    """
     selected = sorted({str(mesh_id) for mesh_id in mesh_ids if str(mesh_id) in context.objects})
     report: dict[str, object] = {
         "enabled": bool(selected),
@@ -392,7 +401,7 @@ def export_texture_correction_artifacts(
         source_zip = obj.dae_source_zip or context.source_zip
         by_source.setdefault((source_zip, obj.dae_path), []).append(mesh_id)
 
-    output_dir = output_root / "handedness_conversion" / "texture_correction"
+    output_dir = artifact_root
     workspace_root = context.project_dir / "build" / "texture_correction_workspace"
     clean_dir(workspace_root)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -867,6 +876,86 @@ def _fallback_texture_correction_material(
         "materialTag1": "vehicle",
         "translucentBlendOp": "None",
         "version": 1.5,
+    }
+
+
+_DAE_MATERIAL_SYMBOL_RE = re.compile(r'<instance_material[^>]*\bsymbol="([^"]+)"')
+_DAE_MATERIAL_ID_RE = re.compile(r'<material[^>]*\bid="([^"]+)"')
+
+
+def _materials_bound_by_generated_meshes(output_vehicle_dir: Path) -> set[str]:
+    """Every material name the generated COLLADA actually binds."""
+    bound: set[str] = set()
+    for path in output_vehicle_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() != ".dae":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        bound.update(_DAE_MATERIAL_SYMBOL_RE.findall(text))
+        for value in _DAE_MATERIAL_ID_RE.findall(text):
+            bound.add(value)
+            if value.endswith("-material"):
+                bound.add(value[: -len("-material")])
+    return bound
+
+
+def prune_unused_texture_correction_assets(
+    output_root: Path,
+    output_vehicle_dir: Path,
+) -> dict[str, object]:
+    """Drop corrected materials and textures no generated mesh ended up binding.
+
+    The exporter corrects every material alias it finds in a source DAE, but
+    only the aliases the generated meshes turn out to use get bound into them,
+    and which those are is not known until integration has run. Whatever is
+    left over is a full texture set nothing can ever sample: on the Ardente the
+    racing interior's alcantar and alumin variants are corrected and never
+    bound, which is 69.9 MB of DDS in a 189.6 MB package.
+
+    Runs on the finished output rather than predicting up front, so it cannot
+    be wrong about what is in use, and only ever removes files inside the
+    generated vehicle folder.
+    """
+    bound = _materials_bound_by_generated_meshes(output_vehicle_dir)
+    removed_materials: list[str] = []
+    removed_files: list[str] = []
+    freed = 0
+    for material_file in sorted(output_vehicle_dir.rglob("beamxp_texture_correction.materials.json")):
+        try:
+            document = json.loads(material_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        keep = {name: body for name, body in document.items() if name in bound}
+        drop = {name: body for name, body in document.items() if name not in bound}
+        if not drop:
+            continue
+
+        def texture_paths(entry: object) -> set[str]:
+            return set(re.findall(r'"([^"]*\.(?:dds|png|jpg|jpeg))"', json.dumps(entry)))
+
+        still_used = set().union(*(texture_paths(b) for b in keep.values())) if keep else set()
+        for name, body in drop.items():
+            removed_materials.append(name)
+            for reference in texture_paths(body) - still_used:
+                candidate = output_root / reference.lstrip("/")
+                # never reach outside the folder this build generated
+                if not candidate.is_file() or output_vehicle_dir not in candidate.parents:
+                    continue
+                freed += candidate.stat().st_size
+                removed_files.append(reference)
+                candidate.unlink()
+        if keep:
+            write_text_file(material_file, json.dumps(keep, indent=2), encoding="utf-8")
+        else:
+            material_file.unlink()
+    return {
+        "removedMaterials": sorted(removed_materials),
+        "removedTextures": sorted(removed_files),
+        "bytesFreed": freed,
     }
 
 
@@ -1559,7 +1648,7 @@ def build_batch(
         emit_progress(f"Running texture correction for {len(texture_correction_ids)} mesh(es)...")
         texture_correction_report = export_texture_correction_artifacts(
             context,
-            output_root,
+            context.project_dir / "build" / "texture_correction",
             texture_correction_source_ids,
             progress=emit_progress,
         )
@@ -1572,6 +1661,9 @@ def build_batch(
             set(generated_variant_targets.values()),
             texture_correction_targets=texture_correction_targets,
             structural_sources=structural_sources,
+        )
+        texture_correction_report["pruned"] = prune_unused_texture_correction_assets(
+            output_root, output_vehicle_dir
         )
         report_path = texture_correction_report.get("reportPath")
         if isinstance(report_path, str) and report_path:
@@ -1680,4 +1772,4 @@ def build_batch(
         texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'package_name_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'integrate_texture_correction_artifacts', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'package_name_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'integrate_texture_correction_artifacts', 'build_batch']

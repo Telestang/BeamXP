@@ -560,6 +560,14 @@ def make_zip(
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
 ) -> None:
+    """Pack a directory as a mod zip.
+
+    Stored by default, matching BeamNG's own content zips. Deflating a built
+    package roughly halves it -- the payload is mostly DXT, which gives back
+    about 48% -- so pass ``compression=zipfile.ZIP_DEFLATED`` if size matters
+    more than load-time random access. Every community mod in a stock mods
+    folder is deflated, so the engine is happy either way.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
     if os.path.exists(fs_path(temporary)):
