@@ -1309,6 +1309,24 @@ _REFLECTING_ACTIONS = frozenset({"mirror", "mirrorPosition"})
 PROP_MOUNT_REACH = 0.2
 
 
+def _prop_mounted_transform(
+    centre: Vec3,
+    prop_anchors: list[tuple[Vec3, str, float, TriggerMatrix | None]],
+) -> TriggerOwnerTransform | None:
+    """The prop whose rest pivot this box sits on, or None.
+
+    The most precise of the attribution signals: a prop pivot is an exact world
+    position for one discrete control, so a hit here names the actual thing the
+    box labels rather than the panel it is set into.
+    """
+    best: tuple[float, str, float, TriggerMatrix | None] | None = None
+    for position, action, delta, matrix in prop_anchors:
+        distance = sum((centre[i] - position[i]) ** 2 for i in range(3)) ** 0.5
+        if distance <= PROP_MOUNT_REACH and (best is None or distance < best[0]):
+            best = (distance, action, delta, matrix)
+    return None if best is None else (best[1], best[2], best[3])
+
+
 def _owning_transform(
     centre: Vec3,
     ref_node: str,
@@ -1322,13 +1340,9 @@ def _owning_transform(
     moves a box onto geometry that never went anywhere.
     """
     prop_anchors, node_transforms, flex_bounds = owners
-    best: tuple[float, str, float, TriggerMatrix | None] | None = None
-    for position, action, delta, matrix in prop_anchors:
-        distance = sum((centre[i] - position[i]) ** 2 for i in range(3)) ** 0.5
-        if distance <= PROP_MOUNT_REACH and (best is None or distance < best[0]):
-            best = (distance, action, delta, matrix)
-    if best is not None:
-        return best[1], best[2], best[3]
+    mounted = _prop_mounted_transform(centre, prop_anchors)
+    if mounted is not None:
+        return mounted
 
     node_hit = node_transforms.get(ref_node)
     if node_hit is not None:
@@ -1512,17 +1526,47 @@ def trigger_column_names(array_text: str) -> list[str] | None:
     return None
 
 
+# How far a candidate may sit from the reflected source position before it
+# stops being that node's counterpart. Across every stock trigger ref node,
+# 96.5% of the mirror map's picks land inside 1 mm and the rest split cleanly:
+# authored asymmetries that still carry the lateral name, and picks 8.6 cm or
+# further out that are simply the wrong node.
+_MIRROR_NODE_TOLERANCE = 0.02
+
+
 def _mirrored_node_id(
     node_id: str,
     node_mirror_map: dict[str, str],
     node_positions: dict[str, Vec3],
 ) -> str | None:
-    mapped = node_mirror_map.get(node_id)
-    if mapped and mapped in node_positions:
-        return mapped
+    """The node on the other side of the car, or None if there isn't one.
+
+    The authored lateral name wins. bx's dashboard is asymmetric by design, so
+    its own RHD interior repoints dsh1l -> dsh1r even though that lands 7.8 cm
+    off the reflected position -- position alone cannot tell that apart from a
+    mistake. The geometric map is a fuzzy cage pairer with an 0.18 scoring
+    threshold, which is right for pairing a body shell but picks a dashboard
+    node as the mirror of a steering column (int_strw -> dshr, 12 cm out, on
+    eight stock vehicles) and on the sunburst2 spare holder hands the same node
+    back for two different refs. So it is only trusted when its pick really is
+    the reflected position.
+
+    Checked against the three vehicles that ship authored LHD/RHD trigger pairs
+    -- bx, etk800 and covet -- where it changes nothing.
+    """
     swapped = mirror_lateral_node_id(node_id)
     if swapped != node_id and swapped in node_positions:
         return swapped
+    mapped = node_mirror_map.get(node_id)
+    if not mapped or mapped not in node_positions:
+        return None
+    if mapped == node_id:
+        return mapped  # sits on the centreline and mirrors to itself
+    source = node_positions[node_id]
+    target = node_positions[mapped]
+    reflected = (-source[0], source[1], source[2])
+    if max(abs(target[i] - reflected[i]) for i in range(3)) <= _MIRROR_NODE_TOLERANCE:
+        return mapped
     return None
 
 
@@ -1554,6 +1598,24 @@ def _mirror_box_size(values: Vec3) -> Vec3:
     return (values[0], -values[1], values[2])
 
 
+def _trigger_row_centre(
+    row: str,
+    spans: list[tuple[int, int]],
+    index_of: dict[str, int],
+    authored_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+) -> Vec3 | None:
+    """Where this row's box sits in vehicle space as authored."""
+    base_column = index_of.get("baseTranslation")
+    if base_column is None or base_column >= len(spans):
+        base_column = index_of.get("translation")
+    if base_column is None or base_column >= len(spans):
+        return None
+    start, end = spans[base_column]
+    return local_to_world(
+        authored_frame, _parse_vector(row[start:end]) or (0.0, 0.0, 0.0)
+    )
+
+
 def _trigger_row_owner(
     row: str,
     spans: list[tuple[int, int]],
@@ -1568,16 +1630,10 @@ def _trigger_row_owner(
     to the mesh it labels. There is no default -- a mesh with no verdict leaves
     the box exactly where it was authored.
     """
-    base_column = index_of.get("baseTranslation")
-    if base_column is None or base_column >= len(spans):
-        base_column = index_of.get("translation")
-    if not owners or base_column is None or base_column >= len(spans):
+    centre = _trigger_row_centre(row, spans, index_of, authored_frame)
+    if not owners or centre is None:
         return None
-    start, end = spans[base_column]
-    authored_offset = _parse_vector(row[start:end]) or (0.0, 0.0, 0.0)
-    return _owning_transform(
-        local_to_world(authored_frame, authored_offset), source_ids[0], owners
-    )
+    return _owning_transform(centre, source_ids[0], owners)
 
 
 def _mirror_trigger_row(
@@ -1645,6 +1701,13 @@ def _mirror_trigger_row(
         repointed = all(node_id is not None for node_id in mirrored_ids)
         target_ids = [str(node_id) for node_id in mirrored_ids] if repointed else list(source_ids)
     else:
+        repointed = False
+        target_ids = list(source_ids)
+
+    if repointed and len(set(target_ids)) != len(target_ids):
+        # Two refs landing on one node collapses the frame into a line, which
+        # has no orientation at all. Slide the box on its authored frame
+        # instead -- that is exact for position, which is what the box is for.
         repointed = False
         target_ids = list(source_ids)
 
@@ -1848,6 +1911,13 @@ def triggers_needing_manual_review(
 # and drive them. Each copied row is inserted directly after its source so it
 # inherits that row's scope: node weight, collision flags, beam spring and
 # damping all come from the authored structure rather than being invented.
+#
+# There is never an existing node to point at instead: across all 17 stock
+# animated frames the driven node is int_stalk in idX, and neither it nor the
+# column it hangs off has a counterpart on the other side. So the choice is
+# always generate-or-slide, never generate-or-repoint. Because generating
+# writes physics, it takes the prop-pivot signal specifically and declines on
+# the ladder's coarser rungs.
 # ---------------------------------------------------------------------------
 
 # The only section vanilla uses to animate a trigger's ref frame. Column 0 is
@@ -2004,10 +2074,27 @@ def _requested_frame_twins(
             )
             if authored_frame is None:
                 continue
-            owner = _trigger_row_owner(
-                row, spans, index_of, source_ids, authored_frame, owners
-            )
-            if owner is None or owner[0] not in _FRAME_TRANSFORMING_ACTIONS:
+            centre = _trigger_row_centre(row, spans, index_of, authored_frame)
+            if centre is None or not owners:
+                continue
+            if _owning_transform(centre, source_ids[0], owners) is None:
+                continue
+            # Generating nodes writes physics into the vehicle, so it takes the
+            # exact signal rather than the ladder's coarser rungs: the prop
+            # whose pivot the box sits on. Every stock animated frame is a
+            # stalk, and a stalk is always a prop -- it has to be, because a
+            # prop is what an electrics value can rotate.
+            owner = _prop_mounted_transform(centre, owners[0])
+            if owner is None:
+                notes.append(
+                    (
+                        trigger_id,
+                        "its frame is animated but no prop claims the box, "
+                        "so the box was slid rather than given a frame",
+                    )
+                )
+                continue
+            if owner[0] not in _FRAME_TRANSFORMING_ACTIONS:
                 continue
             conflict = next(
                 (

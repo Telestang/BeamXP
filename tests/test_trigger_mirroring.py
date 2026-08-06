@@ -329,6 +329,75 @@ class TriggerRewriteTest(unittest.TestCase):
         )
         self.assertEqual(mirror(text, ARDENTE_NODES, ([], {}, [])), text)
 
+    def test_the_authored_lateral_name_beats_the_geometric_map(self):
+        """bx's dashboard is asymmetric by design: its own RHD interior repoints
+        dsh1l -> dsh1r even though that is 7.8 cm off the reflected position.
+        Position alone cannot tell that apart from a mistake, so the name wins.
+        """
+        nodes = {
+            "dsh1l": (0.1966, -0.4621, 0.9513),
+            "dsh1r": (-0.1966, -0.4486, 0.8736),
+            "dsh2l": (0.1966, -0.3745, 0.6901),
+            "dsh2r": (-0.1966, -0.3745, 0.6901),
+            "dsh2ll": (0.6483, -0.3745, 0.6901),
+            "dsh2rr": (-0.6483, -0.3745, 0.6901),
+        }
+        text = section(
+            '        ["hazard", "dsh2l","dsh2ll","dsh1l", "box", {"x":-0.03, "y":-0.03, "z":0.03},'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":-0.005, "y":0.08, "z":0}],'
+        )
+        out = mirror(text, nodes)
+        self.assertIn('"dsh2r","dsh2rr","dsh1r"', out)
+
+    def test_a_column_node_is_not_mirrored_onto_a_dashboard_node(self):
+        """The geometric map scores int_strw against dsh2r at 0.172, inside its
+        0.18 threshold, and hands back a dashboard node 13 cm from where the
+        steering column's counterpart would be. Eight stock vehicles hit this.
+        """
+        self.assertEqual(
+            build_node_mirror_map(ARDENTE_NODES).get("int_strw"), "dsh2r"
+        )
+        text = section(
+            '        ["sw_ignition", "int_strw","dshl","dshr", "sphere", 0.02,'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.1, "y":0, "z":0}],'
+        )
+        out = mirror(text, ARDENTE_NODES)
+        self.assertNotIn("dsh2r", out)
+        self.assertIn('"int_strw","dshl","dshr"', out)  # kept, box slid instead
+        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "dshl", "dshr")))
+        row = [line for line in out.splitlines() if "sw_ignition" in line][0]
+        values = tuple(
+            float(part.split(":")[1])
+            for part in row.rsplit("{", 1)[1].rstrip("}],").replace('"', "").split(",")
+        )
+        before = local_to_world(frame, (0.1, 0.0, 0.0))
+        after = local_to_world(frame, values)
+        self.assertAlmostEqual(after[0], -before[0], places=6)
+        self.assertAlmostEqual(after[1], before[1], places=6)
+        self.assertAlmostEqual(after[2], before[2], places=6)
+
+    def test_two_refs_collapsing_onto_one_node_is_refused(self):
+        """The sunburst2 spare holder maps sph2l and sph1l to the same node.
+        A frame with two coincident refs has no orientation at all."""
+        nodes = {
+            "sph1l": (0.30, 0.90, 0.80),
+            "sph2l": (0.30, 1.10, 0.80),
+            "rb2r": (-0.32, 1.00, 0.80),
+            "bbr2ll": (0.60, 1.00, 0.80),
+            "bbr2rr": (-0.60, 1.00, 0.80),
+        }
+        mapped = build_node_mirror_map(nodes)
+        self.assertEqual(mapped.get("sph1l"), mapped.get("sph2l"))
+        text = section(
+            '        ["spareHolder", "sph2l","bbr2rr","sph1l", "box", {"x":0.05, "y":0.05, "z":0.05},'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.05, "y":0, "z":0}],'
+        )
+        out = mirror(text, nodes)
+        self.assertIn('"sph2l","bbr2rr","sph1l"', out)
+
     def test_rotation_x_negates_when_the_frame_reflects(self):
         """Fitted from vanilla: across etk800, bx and covet the authored x always
         negates while y is always kept."""
@@ -613,6 +682,21 @@ class TriggerFrameTwinTest(unittest.TestCase):
         self.assertEqual(len(positions), 2)
         nodes = transform_helpers.extract_named_array(body, "nodes")
         self.assertEqual(nodes.count(f'["{twins["int_stalk"]}"'), 1)
+
+    def test_an_animated_frame_with_no_prop_on_it_is_slid_not_generated(self):
+        """Generating nodes writes physics, so it takes the prop-pivot signal
+        rather than the ladder's coarser rungs. A box the flexbody-containment
+        rung claimed is not evidence enough to bolt a stalk into the cage."""
+        owners = ([], {}, [((-1.0, -1.0, 0.0), (1.0, 1.0, 1.5), "mirror", 0.0)])
+        body, twins, positions, notes = build_twins(owners=owners)
+        self.assertEqual((body, twins, positions), (ARDENTE_STALK_PART, {}, {}))
+        self.assertEqual(
+            [reason for _id, reason in notes],
+            [
+                "its frame is animated but no prop claims the box, "
+                "so the box was slid rather than given a frame"
+            ],
+        )
 
     def test_generated_names_do_not_collide_with_existing_nodes(self):
         nodes = dict(STALK_NODES)

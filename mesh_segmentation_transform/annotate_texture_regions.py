@@ -251,7 +251,7 @@ class MserConfig:
 
     # If the same magic-wand feature continues outside the detected bounds, the
     # box is probably a slice of a larger motif/material run rather than a mark.
-    enable_feature_extension_filter:   bool = True  # default: True
+    enable_feature_extension_filter:   bool = False  # default: True
     feature_extension_context_px:      int = 12  # default: 12
     feature_extension_min_ratio:       float = 0.25  # default: 0.25 (outside / inside)
 
@@ -273,7 +273,7 @@ class MserConfig:
     box_feature_colour_tolerance: int  = 16  # default: 16 (magic-wand sensitivity)
     box_feature_min_domain_px:   int   = 10  # default: 10
     box_feature_context_px:      int   = 3  # default: 3 (an MSER box alone is always flat)
-    min_box_uv_coverage:         float = 0.75  # default: 0.75 (share of the box inside one UV island)
+    min_box_uv_coverage:         float = 0.8  # default: 0.75 (share of the box inside one UV island)
     box_min_feature_px:          int   = 24  # default: 24 (largest non-background blob)
     # Repeating-pattern rejection, applied to assembled groups.  A group covers
     # a whole panel, so the statistic sees several periods; the same test on a
@@ -370,7 +370,7 @@ DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     min_region_relief=30.0,
     enable_ring_smoothness_filter=True,
     ring_smoothness_margin_px=4,
-    ring_smoothness_percentile=20.0,
+    ring_smoothness_percentile=30.0,
     min_box_width_px=15,
     min_box_height_px=15,
     box_feature_min_domain_px=8,
