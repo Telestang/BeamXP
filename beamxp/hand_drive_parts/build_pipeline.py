@@ -1146,7 +1146,16 @@ def _append_texture_correction_dae(
     source_dae: Path,
     node_ids: set[str],
     alias_to_material: dict[str, str],
+    superseded_nodes: set[str] | None = None,
 ) -> list[str]:
+    """Append the per-material split meshes, dropping what they replace.
+
+    ``superseded_nodes`` names the whole-mesh copies whose flexbody rows the
+    caller is about to repoint at these splits. They are removed here, while
+    the tree is open and before it is written, rather than left for a later
+    pass -- a superseded node carries its geometry with it, and geometry is
+    where the bytes are.
+    """
     if not node_ids:
         return []
     target_tree = ET.parse(target_dae)
@@ -1205,6 +1214,20 @@ def _append_texture_correction_dae(
         target_geometries.append(geometry)
     for node in appended_nodes:
         target_scene.append(node)
+
+    if superseded_nodes:
+        for child in list(target_scene):
+            if child.get("id") in superseded_nodes or child.get("name") in superseded_nodes:
+                target_scene.remove(child)
+        # A geometry may be shared, so only drop the ones nothing instances now.
+        still_used = {
+            (instance.get("url") or "").lstrip("#")
+            for instance in target_scene.findall(".//c:instance_geometry", NS)
+        }
+        for child in list(target_geometries):
+            if child.get("id") not in still_used:
+                target_geometries.remove(child)
+
     write_xml_tree(target_tree, target_dae)
     return [str(node.get("id") or "") for node in appended_nodes]
 
@@ -1411,6 +1434,11 @@ def integrate_texture_correction_artifacts(
                     source_dae,
                     set(split_nodes),
                     alias_to_material,
+                    superseded_nodes={
+                        generated_mesh_name(target_mesh, hand)
+                        for target_mesh in row_target_meshes
+                        for hand in hands
+                    },
                 )
                 if appended:
                     for target_mesh in row_target_meshes:

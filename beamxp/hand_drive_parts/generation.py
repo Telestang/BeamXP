@@ -126,6 +126,36 @@ from beamxp.hand_drive_parts.spatial_analysis import display_texture_flip_scope
 from beamxp.plates import generator as plate_generator
 
 
+def meshes_the_generated_jbeam_asks_for(output_vehicle_dir: Path) -> set[str]:
+    """Mesh names the freshly written parts actually reference.
+
+    generate_daes runs after write_generated_jbeam_and_configs, so the parts
+    that will ship already say which meshes they need. A generated mesh missing
+    from this set is one nothing can ever look up -- normally a shared mesh
+    whose every use took a per-instance baked copy instead, which is why the
+    Ardente shipped steer_01a_xp_rhd alongside the three baked variants that
+    superseded it.
+    """
+    wanted: set[str] = set()
+    for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for section, row_mesh in (("flexbodies", flexbody_row_mesh), ("props", prop_row_mesh)):
+            for match in re.finditer(rf'"{section}"\s*:\s*\[', text):
+                start = text.index("[", match.end() - 1)
+                try:
+                    end = transform_helpers.find_matching(text, start, "[", "]")
+                except ValueError:
+                    continue
+                for row in iter_top_level_rows(text[start:end]):
+                    mesh = row_mesh(row)
+                    if mesh and mesh not in {"mesh", "func"}:
+                        wanted.add(mesh)
+    return wanted
+
+
 def generate_daes(
     context: VehicleContext,
     output_root: Path,
@@ -145,6 +175,10 @@ def generate_daes(
     # dedicated screen mesh maps to all its symbols (whole-mesh flip); a shared
     # mesh (nav screen + cluster) maps to only the display islands.
     display_flip_scope = display_texture_flip_scope(context)
+    # Don't build what the parts never ask for. Checked here rather than pruned
+    # afterwards so the geometry is never created either -- that is where the
+    # bytes are, not in the node.
+    wanted_meshes = meshes_the_generated_jbeam_asks_for(output_vehicle_dir)
     generated: list[Path] = []
     objects_by_dae: dict[tuple[Path, str], list[tuple[str, str]]] = {}
     for object_id in object_modes:
@@ -198,6 +232,8 @@ def generate_daes(
                     translate_magnitudes.get(object_id, 0.0),
                 )
                 new_name = generated_mesh_name(object_id, target_hand)
+                if wanted_meshes and new_name not in wanted_meshes:
+                    continue
                 new_node = copy.deepcopy(source_node)
                 new_node.set("id", new_name)
                 new_node.set("name", new_name)
