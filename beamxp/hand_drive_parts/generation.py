@@ -687,32 +687,19 @@ def _node_group_membership(context: VehicleContext) -> dict[str, set[str]]:
     return membership
 
 
-def trigger_owners_for_part(
+def _accumulate_trigger_owner_sources(
     context: VehicleContext,
     part_body: str,
     object_modes: dict[str, str],
     translate_magnitudes: dict[str, float],
     target_hand: str,
     node_positions: dict[str, tuple[float, float, float]],
-    inherited_options: Iterable[str] = (),
-) -> TriggerOwners:
-    """The two exact signals for attributing a trigger to its geometry.
-
-    Props give a rest pivot -- an exact world position for a discrete control,
-    unlike a mesh's cross-trim representative point, which for a big flexbody
-    sits nowhere near its surface. Flexbodies give the node groups they deform
-    with, which is the authored link between a trigger's anchor node and the
-    panel it is set into. A node whose groups are claimed by flexbodies that
-    disagree is left out rather than resolved arbitrarily.
-    """
-    prop_anchors: list[
-        tuple[
-            tuple[float, float, float],
-            str,
-            float,
-            list[list[float]] | None,
-        ]
-    ] = []
+    inherited_options: Iterable[str],
+    prop_anchors: list[tuple[tuple[float, float, float], str, float, list[list[float]] | None]],
+    group_transforms: dict[str, set[tuple[str, float]]],
+    flexbody_meshes: list[str],
+) -> None:
+    """Read one part's props and flexbodies into the shared owner channels."""
     props = transform_helpers.extract_named_array(part_body, "props")
     for row in iter_top_level_rows(props or "[]"):
         mesh = prop_row_mesh(row)
@@ -741,8 +728,6 @@ def trigger_owners_for_part(
         if pivot is not None:
             prop_anchors.append((pivot, transform[0], transform[1], owner_matrix))
 
-    group_transforms: dict[str, set[tuple[str, float]]] = {}
-    flexbody_meshes: list[str] = []
     flexbodies = transform_helpers.extract_named_array(part_body, "flexbodies")
     for row in iter_top_level_rows(flexbodies or "[]"):
         mesh = flexbody_row_mesh(row)
@@ -768,6 +753,16 @@ def trigger_owners_for_part(
             if group:
                 group_transforms.setdefault(group, set()).add(transform)
 
+
+def _finalise_trigger_owners(
+    context: VehicleContext,
+    object_modes: dict[str, str],
+    translate_magnitudes: dict[str, float],
+    target_hand: str,
+    group_transforms: dict[str, set[tuple[str, float]]],
+    flexbody_meshes: list[str],
+    prop_anchors: list[tuple[tuple[float, float, float], str, float, list[list[float]] | None]],
+) -> TriggerOwners:
     node_transforms: dict[str, tuple[str, float]] = {}
     if group_transforms:
         membership = _node_group_membership(context)
@@ -799,6 +794,121 @@ def trigger_owners_for_part(
             high = tuple(float(v) for v in cloud.max(axis=0))
             flex_bounds.append((low, high, action, delta))
     return prop_anchors, node_transforms, flex_bounds
+
+
+def trigger_owners_for_part(
+    context: VehicleContext,
+    part_body: str,
+    object_modes: dict[str, str],
+    translate_magnitudes: dict[str, float],
+    target_hand: str,
+    node_positions: dict[str, tuple[float, float, float]],
+    inherited_options: Iterable[str] = (),
+) -> TriggerOwners:
+    """The exact signals for attributing a trigger to geometry in one part.
+
+    Props give a rest pivot -- an exact world position for a discrete control,
+    unlike a mesh's cross-trim representative point, which for a big flexbody
+    sits nowhere near its surface. Flexbodies give the node groups they deform
+    with, which is the authored link between a trigger's anchor node and the
+    panel it is set into. A node whose groups are claimed by flexbodies that
+    disagree is left out rather than resolved arbitrarily.
+    """
+    prop_anchors: list[tuple[tuple[float, float, float], str, float, list[list[float]] | None]] = []
+    group_transforms: dict[str, set[tuple[str, float]]] = {}
+    flexbody_meshes: list[str] = []
+    _accumulate_trigger_owner_sources(
+        context,
+        part_body,
+        object_modes,
+        translate_magnitudes,
+        target_hand,
+        node_positions,
+        inherited_options,
+        prop_anchors,
+        group_transforms,
+        flexbody_meshes,
+    )
+    return _finalise_trigger_owners(
+        context,
+        object_modes,
+        translate_magnitudes,
+        target_hand,
+        group_transforms,
+        flexbody_meshes,
+        prop_anchors,
+    )
+
+
+def trigger_owners_for_config(
+    context: VehicleContext,
+    selected: dict[str, object],
+    object_modes: dict[str, str],
+    translate_magnitudes: dict[str, float],
+    target_hand: str,
+    node_positions: dict[str, tuple[float, float, float]],
+) -> TriggerOwners:
+    """The precise owner signals, gathered across the whole trim.
+
+    A trigger names a control, not the part it happens to be filed under. Every
+    stock hood release is a box in the driver's footwell declared inside the
+    hood part, whose own geometry is a metre away at the front of the car -- so
+    a part-local lookup can never attribute it to anything.
+
+    Only the precise signals travel: a prop pivot is an exact world position,
+    and a node group is the authored statement that this node deforms with that
+    panel. The enclosing-bounds fallback deliberately does not, and the caller
+    keeps supplying it per part -- it is a bounding-box containment test, so a
+    trim-wide mesh set hands it whole-body boxes that enclose the entire cabin.
+    Letting those answer moved the Ardente's rear door handles to the other
+    side of the car.
+    """
+    part_slot_options = selected.get("part_slot_options", {})
+    if not isinstance(part_slot_options, dict):
+        part_slot_options = {}
+    prop_anchors: list[tuple[tuple[float, float, float], str, float, list[list[float]] | None]] = []
+    group_transforms: dict[str, set[tuple[str, float]]] = {}
+    flexbody_meshes: list[str] = []
+    for part_id in sorted({str(part_id) for part_id in selected.get("parts", ())}):
+        found = part_body_for_context(context, part_id)
+        if found is None:
+            continue
+        raw_options = part_slot_options.get(part_id, ())
+        inherited = (
+            tuple(str(item) for item in raw_options if item)
+            if isinstance(raw_options, (list, tuple))
+            else ()
+        )
+        _accumulate_trigger_owner_sources(
+            context,
+            found[0],
+            object_modes,
+            translate_magnitudes,
+            target_hand,
+            node_positions,
+            inherited,
+            prop_anchors,
+            group_transforms,
+            flexbody_meshes,
+        )
+    prop_anchors_out, node_transforms, _bounds = _finalise_trigger_owners(
+        context,
+        object_modes,
+        translate_magnitudes,
+        target_hand,
+        group_transforms,
+        [],
+        prop_anchors,
+    )
+    return prop_anchors_out, node_transforms, []
+
+
+def trigger_owners_with_local_bounds(
+    config_owners: TriggerOwners,
+    part_owners: TriggerOwners,
+) -> TriggerOwners:
+    """Trim-wide precise signals over the declaring part's own bounds."""
+    return config_owners[0], config_owners[1], part_owners[2]
 
 
 def _relocation_rewrite_context(context: VehicleContext) -> dict[str, object]:
@@ -972,12 +1082,15 @@ def _part_needs_generated_clone(
     object_modes: dict[str, str],
     node_mirror_map: dict[str, str],
     part_meshes: set[str] | None = None,
+    node_positions: dict[str, tuple[float, float, float]] | None = None,
+    owners: TriggerOwners | None = None,
 ) -> bool:
     part_meshes = part_meshes if part_meshes is not None else part_mesh_names_for_context(context, source_part_id)
     return (
         any(mesh in object_modes for mesh in part_meshes)
         or part_has_transformable_internal_camera(part_body, node_mirror_map)
         or _part_has_handed_light_slots(part_body)
+        or part_has_relocatable_trigger(part_body, node_positions or {}, owners)
     )
 
 
@@ -999,6 +1112,8 @@ def _generated_clone_plan(
     object_modes: dict[str, str],
     node_mirror_map: dict[str, str],
     authored_parts: set[str],
+    node_positions: dict[str, tuple[float, float, float]] | None = None,
+    owners: TriggerOwners | None = None,
 ) -> dict[str, str]:
     """Generated source part -> output part id for one config.
 
@@ -1054,6 +1169,12 @@ def _generated_clone_plan(
                 part_children.setdefault(source_part_id, set()).add(default_part)
                 if default_part not in inspected_part_ids:
                     pending_part_ids.add(default_part)
+        # A box can only be attributed against the trim it actually ships in.
+        # The walk above also reaches slot defaults this config never selects --
+        # the Ardente pulls in vivace_dash that way -- and resolving their
+        # triggers against the selected trim's geometry moves them to match a
+        # dashboard that is not installed alongside them.
+        in_trim = source_part_id in selected_part_ids
         if _part_needs_generated_clone(
             context,
             source_part_id,
@@ -1061,6 +1182,8 @@ def _generated_clone_plan(
             object_modes,
             node_mirror_map,
             part_mesh_names_for_context(context, source_part_id),
+            node_positions if in_trim else None,
+            owners if in_trim else None,
         ):
             generated_parts[source_part_id] = generated_variant_part_name(
                 source_part_id, target_hand, config_name
@@ -1137,6 +1260,17 @@ def write_generated_jbeam_and_configs(
         main_update: str | None = None
         suffix = suffix_for_hand(target_hand)
         selected_part_ids = {str(part_id) for part_id in selected["parts"]}
+        # Built once for the whole trim: a trigger names a control, not the part
+        # it happens to be filed under, so attribution has to see every mesh the
+        # config selected rather than only the declaring part's.
+        config_trigger_owners = trigger_owners_for_config(
+            context,
+            selected,
+            object_modes,
+            translate_magnitudes,
+            target_hand,
+            prop_node_positions,
+        )
         generated_parts_for_source = _generated_clone_plan(
             context,
             selected,
@@ -1145,6 +1279,8 @@ def write_generated_jbeam_and_configs(
             object_modes,
             node_mirror_map,
             authored_parts,
+            prop_node_positions,
+            config_trigger_owners,
         )
 
         clone_source_part_ids = selected_part_ids | set(generated_parts_for_source)
@@ -1258,11 +1394,12 @@ def write_generated_jbeam_and_configs(
                 translate_magnitudes=translate_magnitudes,
                 baked_specs=baked_shared_specs,
             )
-            # Interaction triggers follow the geometry they label, so they need
-            # to know what actually happened to each mesh in this part -- a
+            # Interaction triggers follow the geometry they label -- a
             # translated indicator stalk slides its trigger across rather than
-            # reflecting it.
-            trigger_owners = trigger_owners_for_part(
+            # reflecting it. The precise signals come from the whole trim,
+            # because that geometry is routinely in another part; the enclosing
+            # bounds stay this part's own.
+            part_trigger_owners = trigger_owners_for_part(
                 context,
                 part_body,
                 object_modes,
@@ -1270,6 +1407,11 @@ def write_generated_jbeam_and_configs(
                 target_hand,
                 prop_node_positions,
                 inherited_options,
+            )
+            trigger_owners = (
+                trigger_owners_with_local_bounds(config_trigger_owners, part_trigger_owners)
+                if str(source_part_id) in selected_part_ids
+                else part_trigger_owners
             )
 
             cloned_bodies.append(

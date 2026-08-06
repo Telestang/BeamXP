@@ -17,6 +17,7 @@ from beamxp.hand_drive_parts.rewriting import (
     generate_trigger_frame_twins,
     hydro_driven_nodes,
     note_trigger_frames_in_part,
+    part_has_relocatable_trigger,
     mirror_trigger_offset,
     rewrite_triggers,
     trigger_column_names,
@@ -788,6 +789,67 @@ class TriggerRotationGroundTruthTest(unittest.TestCase):
     def test_the_rule_is_its_own_inverse(self):
         for triple in ((45.0, 0.0, -15.0), (-13.0, 1.0, 1.0), (25.0, 0.0, 0.0)):
             self.assertEqual(_mirror_euler(_mirror_euler(triple)), triple)
+
+
+class RelocatableTriggerTest(unittest.TestCase):
+    """Whether a part needs cloning for a trigger it holds.
+
+    ardente_hood declares both hood triggers: the Hood Toggle box on the hood
+    panel, and the Hood Release lever in the driver's footwell. The part's own
+    geometry is the bonnet, a metre away and never converted, so the release
+    can only be attributed to geometry in another part.
+    """
+
+    PART = """"ardente_hood": {
+    "slotType": "ardente_hood",
+    "flexbodies": [
+        ["mesh", "[group]:"],
+        ["ardente_hood", ["ardente_hood"]],
+    ],
+    "triggers2":[
+      ["id", "idRef:", "idX:", "idY:", "type", "size", "baseRotation", "rotation", "translation", "baseTranslation"],
+      ["hood", "h5","h5r","h4", "box", {"x":0.08, "y":0.08, "z":0.08}, {"x":-10, "y":-11, "z":2}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":-0.04, "y":-0.03, "z":-0.05}],
+      ["hood_int", "f5ll","f5l","f6ll", "box", {"x":0.04, "y":0.08, "z":0.08}, {"x":-14, "y":-6, "z":-9}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0.13, "y":0.0, "z":-0.15}],
+    ],
+}"""
+    NODES = {
+        "f5l": (0.316, -0.943, 0.599), "f5ll": (0.8592, -0.883, 0.5209),
+        "f6ll": (0.7539, -0.8056, 0.8997), "f5r": (-0.316, -0.943, 0.599),
+        "f5rr": (-0.8592, -0.883, 0.5209), "f6rr": (-0.7539, -0.8056, 0.8997),
+        "h4": (0.0, -1.9, 0.75), "h5": (0.35, -2.2, 0.66), "h5r": (-0.35, -2.2, 0.66),
+    }
+
+    def test_a_part_whose_own_geometry_never_moves_can_still_need_cloning(self):
+        # the footwell node is claimed by an interior panel the config mirrors
+        owners = ([], {"f5ll": ("mirror", 0.0)}, [])
+        self.assertTrue(part_has_relocatable_trigger(self.PART, self.NODES, owners))
+
+    def test_no_owner_means_no_clone(self):
+        self.assertFalse(part_has_relocatable_trigger(self.PART, self.NODES, ([], {}, [])))
+        self.assertFalse(part_has_relocatable_trigger(self.PART, self.NODES, None))
+
+    def test_a_skipped_owner_does_not_justify_a_clone(self):
+        owners = ([], {"f5ll": ("skip", 0.0)}, [])
+        self.assertFalse(part_has_relocatable_trigger(self.PART, self.NODES, owners))
+
+    def test_the_two_hood_boxes_take_opposite_fates_from_one_part(self):
+        owners = ([], {"f5ll": ("mirror", 0.0)}, [])
+        out = rewrite_triggers(
+            transform_helpers.extract_named_array(self.PART, "triggers2"),
+            self.NODES,
+            build_node_mirror_map(self.NODES),
+            owners,
+        )
+        release = [line for line in out.splitlines() if "hood_int" in line][0]
+        toggle = [line for line in out.splitlines() if '"hood",' in line][0]
+        # the release follows the panel: refs repointed, .x/.z negated, z offset flips
+        self.assertIn('"f5rr","f5r","f6rr"', release)
+        self.assertIn('{"x":14, "y":-6, "z":9}', release)
+        self.assertIn('{"x":0.13, "y":0, "z":0.15}', release)
+        # the toggle sits on the bonnet, which nothing moved
+        self.assertIn('"h5","h5r","h4"', toggle)
+        self.assertIn('{"x":-10, "y":-11, "z":2}', toggle)
+        self.assertIn('{"x":-0.04, "y":-0.03, "z":-0.05}', toggle)
 
 
 class MeshVerdictToTriggerActionTest(unittest.TestCase):

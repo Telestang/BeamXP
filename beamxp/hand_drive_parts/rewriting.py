@@ -2277,6 +2277,67 @@ def note_trigger_frames_in_part(part_body: str, notes: list[tuple[str, str]]) ->
     return part_body
 
 
+def _iter_trigger_rows(part_body: str):
+    """Every trigger row in a part with its column index and element spans."""
+    for section in TRIGGER_SECTIONS:
+        array_text = transform_helpers.extract_named_array(part_body, section)
+        if not array_text:
+            continue
+        columns = trigger_column_names(array_text)
+        if not columns:
+            continue
+        index_of = {name: idx for idx, name in enumerate(columns) if name}
+        for start, end in _row_spans(array_text):
+            row = array_text[start:end]
+            spans = _row_element_spans(row)
+            if len(spans) < len(_TRIGGER_NODE_COLUMNS) + 1:
+                continue
+            trigger_id = _row_string_value(row[spans[0][0] : spans[0][1]])
+            if trigger_id is None or trigger_id == "id":
+                continue
+            source_ids: list[str] = []
+            for column in _TRIGGER_NODE_COLUMNS:
+                position = index_of.get(column)
+                if position is None or position >= len(spans):
+                    break
+                node_id = _row_string_value(row[spans[position][0] : spans[position][1]])
+                if node_id is None:
+                    break
+                source_ids.append(node_id)
+            if len(source_ids) != len(_TRIGGER_NODE_COLUMNS):
+                continue
+            yield trigger_id, row, spans, index_of, source_ids
+
+
+def part_has_relocatable_trigger(
+    part_body: str,
+    node_positions: dict[str, Vec3],
+    owners: TriggerOwners | None,
+) -> bool:
+    """True when a box in this part labels geometry the config is moving.
+
+    A trigger is filed inside whichever part its author found convenient, and
+    for every stock hood release that is the hood -- a panel a hand conversion
+    never touches, whose own geometry sits a metre away at the front of the
+    car. So "does this part hold a box that has to move" is a separate question
+    from "does this part hold geometry that moves", and a part can need cloning
+    for the first reason alone. Resolved through the same ladder the rewrite
+    uses, so the decision to clone and the decision to move cannot disagree.
+    """
+    if not owners:
+        return False
+    for _trigger_id, row, spans, index_of, source_ids in _iter_trigger_rows(part_body):
+        if any(node_id not in node_positions for node_id in source_ids):
+            continue
+        frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
+        if frame is None:
+            continue
+        owner = _trigger_row_owner(row, spans, index_of, source_ids, frame, owners)
+        if owner is not None and owner[0] in _FRAME_TRANSFORMING_ACTIONS:
+            return True
+    return False
+
+
 def rewrite_light_pattern_for_target(part_body: str, target_hand: str) -> str:
     pattern = "RHD" if target_hand == HAND_RHD else "LHD"
     return re.sub(
@@ -2375,4 +2436,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
