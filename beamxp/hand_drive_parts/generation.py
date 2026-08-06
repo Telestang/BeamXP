@@ -575,11 +575,20 @@ def apply_authored_group_suffixed_slot_updates(
 # triggers carry no transform of their own -- they inherit whichever of these
 # applied to the mesh they label -- so this table is the single place the
 # mapping lives rather than being restated per section.
+#
+# Only three verdicts actually move anything. Swap Mesh and Replace Source
+# reskin an object where it stands: the mesh handed to the flexbody or prop is
+# the opposite side's, or another render source, but the nodes it deforms with
+# and the place it occupies are untouched -- which is exactly why those modes
+# exist for slot-locked parts like door cards and wing mirrors, where a .pc
+# swap is impossible. A box labelling such an object must stay where it is, so
+# they map to skip: a positive statement that this geometry did not move,
+# rather than no verdict at all, which would let a coarser rung claim the box.
 _MESH_ACTION_FOR_MODE = {
     MODE_TRANSLATE: "translate",
     MODE_MIRROR: "mirror",
-    MODE_MIRROR_STRUCTURAL: "mirror",
-    MODE_REPLACE_SOURCE: "mirror",
+    MODE_MIRROR_STRUCTURAL: "skip",
+    MODE_REPLACE_SOURCE: "skip",
     MODE_MIRROR_POSITION: "mirrorPosition",
     MODE_SKIP: "skip",
 }

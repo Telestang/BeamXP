@@ -790,5 +790,41 @@ class TriggerRotationGroundTruthTest(unittest.TestCase):
             self.assertEqual(_mirror_euler(_mirror_euler(triple)), triple)
 
 
+class MeshVerdictToTriggerActionTest(unittest.TestCase):
+    """Which conversion verdicts a trigger is allowed to inherit as a move."""
+
+    def test_only_the_three_moving_verdicts_move_a_box(self):
+        from beamxp.core.constants import (
+            MODE_MIRROR,
+            MODE_MIRROR_POSITION,
+            MODE_MIRROR_STRUCTURAL,
+            MODE_REPLACE_SOURCE,
+            MODE_SKIP,
+            MODE_TRANSLATE,
+        )
+        from beamxp.hand_drive_parts.generation import _MESH_ACTION_FOR_MODE
+
+        moving = {MODE_TRANSLATE, MODE_MIRROR, MODE_MIRROR_POSITION}
+        for mode, action in _MESH_ACTION_FOR_MODE.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(action != "skip", mode in moving)
+        # Swap Mesh and Replace Source reskin an object where it stands, so a
+        # box labelling one must not travel with the mesh that replaced it
+        self.assertEqual(_MESH_ACTION_FOR_MODE[MODE_MIRROR_STRUCTURAL], "skip")
+        self.assertEqual(_MESH_ACTION_FOR_MODE[MODE_REPLACE_SOURCE], "skip")
+        self.assertEqual(_MESH_ACTION_FOR_MODE[MODE_SKIP], "skip")
+
+    def test_a_swapped_mesh_pins_its_box_instead_of_mirroring_it(self):
+        """A door card is slot-locked, so it is reskinned rather than moved.
+        Its window switch has to stay on the door it is actually fitted to."""
+        text = section(
+            '        ["window_L", "dsh2l","dsh2r","dshl", "box", {"x":0.03, "y":0.03, "z":0.03},'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x":0.3, "y":0, "z":0}],'
+        )
+        swapped = ([((0.35, -0.57, 0.77), "skip", 0.0, None)], {}, [])
+        self.assertEqual(mirror(text, ARDENTE_NODES, swapped), text)
+
+
 if __name__ == "__main__":
     unittest.main()
