@@ -52,10 +52,11 @@ class WorkerHandlersMixin:
                 if warnings:
                     plate_note += f" ({len(warnings)} plate warning(s), see conversion.json)"
             if result.installed_plates_zip:
-                plate_note += f"; plate library mod refreshed ({plates.get('libraryModDesigns', 0)} design(s))"
+                action = "refreshed" if plates.get("libraryModInstalled", True) else "unchanged"
+                plate_note += f"; plate library mod {action} ({plates.get('libraryModDesigns', 0)} design(s))"
             if result.installed_zip:
                 self.status_var.set(
-                    f"Built {result.package_zip} and installed {result.installed_zip}; "
+                    f"Built and installed {result.installed_zip}; "
                     f"{len(result.generated_configs)} config(s){plate_note}"
                 )
             else:

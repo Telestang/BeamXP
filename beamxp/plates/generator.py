@@ -234,6 +234,94 @@ def default_plate_export_path() -> Path:
     return _user_data_dir() / "plate_exports" / "BeamXP_plates.zip"
 
 
+def _plate_export_fingerprint_path(target_zip: Path) -> Path:
+    return target_zip.with_name(target_zip.name + ".fingerprint.json")
+
+
+def _file_fingerprint(path: Path) -> dict[str, object]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {"path": str(path), "missing": True}
+    return {
+        "path": str(path),
+        "sha1": hashlib.sha1(data).hexdigest(),
+        "size": len(data),
+    }
+
+
+def _plate_config_asset_fingerprints(cfg: dict[str, object]) -> list[dict[str, object]]:
+    assets: list[dict[str, object]] = []
+
+    def add(path_text: object) -> None:
+        text = str(path_text or "")
+        if text:
+            assets.append(_file_fingerprint(Path(text)))
+
+    try:
+        assets.append({"kind": "font", **_file_fingerprint(resolve_font_path(cfg.get("font")))})
+    except PlateError as exc:
+        assets.append({"kind": "font", "error": str(exc)})
+    background = cfg.get("background", {})
+    if isinstance(background, dict):
+        add(background.get("frontImage"))
+        add(background.get("rearImage"))
+    eu = cfg.get("eu", {})
+    if isinstance(eu, dict):
+        add(eu.get("bandFullImage"))
+        add(eu.get("bandImage"))
+    if str(cfg.get("size")) == PLATE_SIZE_JP:
+        jp = cfg.get("jp", {})
+        jp_text = ""
+        if isinstance(jp, dict):
+            jp_text = "".join(str(jp.get(key) or "") for key in ("region", "classification", "kana"))
+        if any(ord(ch) > 0x7F for ch in jp_text):
+            jp_font = resolve_jp_font_path()
+            assets.append(
+                {"kind": "jpFont", **(_file_fingerprint(jp_font) if jp_font is not None else {"missing": True})}
+            )
+    return assets
+
+
+def _plate_export_fingerprint(records: list[dict[str, object]]) -> dict[str, object]:
+    normalized: list[dict[str, object]] = []
+    for record in records:
+        cfg = normalized_plate_config(record.get("config"))
+        cfg["enabled"] = True
+        normalized.append({
+            "id": str(record.get("id") or ""),
+            "name": str(record.get("name") or ""),
+            "config": cfg,
+            "assets": _plate_config_asset_fingerprints(cfg),
+        })
+    payload = {
+        "version": _ASSET_VERSION,
+        "records": sorted(normalized, key=lambda item: (item["id"].casefold(), item["name"].casefold())),
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    return {"version": _ASSET_VERSION, "fingerprint": digest, "payload": payload}
+
+
+def _cached_plate_export(target_zip: Path, fingerprint: dict[str, object]) -> dict[str, object] | None:
+    if not target_zip.is_file():
+        return None
+    try:
+        cached = json.loads(_plate_export_fingerprint_path(target_zip).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if cached.get("fingerprint") != fingerprint.get("fingerprint"):
+        return None
+    payload = fingerprint.get("payload", {})
+    records = payload.get("records") if isinstance(payload, dict) else []
+    records = records if isinstance(records, list) else []
+    return {
+        "zip": target_zip,
+        "setIds": [str(record.get("id") or "") for record in records if isinstance(record, dict)],
+        "designs": len(records),
+        "cached": True,
+    }
+
+
 def _safe_set_id(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower()).strip("-")
     return slug or "plate-set"
@@ -3380,6 +3468,11 @@ def export_plate_sets(records: list[dict[str, object]], target_zip: Path) -> dic
     )
     target_zip.parent.mkdir(parents=True, exist_ok=True)
     core.make_zip(output_root, target_zip)
+    fingerprint = _plate_export_fingerprint(records)
+    _plate_export_fingerprint_path(target_zip).write_text(
+        json.dumps(fingerprint, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     return {"zip": target_zip, "setIds": exported, "designs": len(part_bodies)}
 
 
@@ -3389,7 +3482,12 @@ def export_all_plate_sets(target_zip: Path | None = None) -> dict[str, object] |
     records = plate_set_records()
     if not records:
         return None
-    return export_plate_sets(records, target_zip or default_plate_export_path())
+    resolved_target = target_zip or default_plate_export_path()
+    fingerprint = _plate_export_fingerprint(records)
+    cached = _cached_plate_export(resolved_target, fingerprint)
+    if cached is not None:
+        return cached
+    return export_plate_sets(records, resolved_target)
 
 
 def _clone_rear_parts_for_config(

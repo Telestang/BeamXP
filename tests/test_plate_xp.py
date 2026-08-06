@@ -247,6 +247,8 @@ class PlateXpTests(unittest.TestCase):
         self.assertEqual(generated["parts"]["test_licenseplate_R"], "")
         self.assertEqual(result.generated_configs, ["base_plates"])
         self.assertEqual(result.package_zip.name, "test_XP_conversion.zip")
+        with zipfile.ZipFile(result.package_zip) as archive:
+            self.assertTrue(all(info.compress_type == zipfile.ZIP_STORED for info in archive.infolist()))
         generated_parts = core.parse_beamng_json(
             (generated_path.parent / "jbeam/bhdc_licenseplates.jbeam").read_text(encoding="utf-8"),
             label="bhdc_licenseplates.jbeam",
@@ -339,6 +341,23 @@ class PlateXpTests(unittest.TestCase):
     def test_export_all_plate_sets_is_none_for_empty_library(self) -> None:
         self.assertIsNone(plate_generator.export_all_plate_sets())
 
+    def test_export_all_plate_sets_reuses_unchanged_cached_zip(self) -> None:
+        config = plate_generator.default_plate_config()
+        config["enabled"] = True
+        plate_generator.save_plate_set({"id": "set-one", "name": "Set One", "config": config})
+
+        first = plate_generator.export_all_plate_sets()
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertTrue(Path(first["zip"]).is_file())
+
+        with patch.object(plate_generator, "export_plate_sets", side_effect=AssertionError("unexpected rebuild")):
+            second = plate_generator.export_all_plate_sets()
+
+        self.assertEqual(second["zip"], first["zip"])
+        self.assertTrue(second.get("cached"))
+        self.assertEqual(second["designs"], 1)
+
     def test_install_refreshes_universal_plates_mod_with_all_library_sets(self) -> None:
         for set_id, name in (("set-one", "Set One"), ("set-two", "Set Two")):
             config = plate_generator.default_plate_config()
@@ -361,12 +380,24 @@ class PlateXpTests(unittest.TestCase):
         )
         self.assertEqual(result.installed_plates_zip, mods_folder / "BeamXP_plates.zip")
         self.assertTrue(result.installed_plates_zip.is_file())
+        self.assertEqual(result.package_zip, result.installed_zip)
+        self.assertFalse((context.project_dir / "build" / "test_XP_conversion.zip").exists())
         self.assertEqual(result.plate_summary.get("libraryModDesigns"), 2)
+        self.assertTrue(result.plate_summary.get("libraryModInstalled"))
         with zipfile.ZipFile(result.installed_plates_zip) as archive:
             jbeam = archive.read("vehicles/common/licenseplates/bhdc_plate_sets.jbeam").decode("utf-8")
         parts = core.parse_beamng_json(jbeam, label="bhdc_plate_sets.jbeam")
         self.assertIn("bhdc_plateset_set_one", parts)
         self.assertIn("bhdc_plateset_set_two", parts)
+
+        second = core.build_batch(
+            context,
+            conversion,
+            write_zip=True,
+            install=True,
+            mods_folder=mods_folder,
+        )
+        self.assertFalse(second.plate_summary.get("libraryModInstalled"))
 
 
 class BackgroundImageTests(unittest.TestCase):

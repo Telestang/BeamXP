@@ -553,21 +553,26 @@ def zip_member_path(value: str) -> Path:
     return Path(*[part for part in value.replace("\\", "/").split("/") if part])
 
 
-def make_zip(src: Path, target: Path, *, compresslevel: int | None = 1) -> None:
+def make_zip(
+    src: Path,
+    target: Path,
+    *,
+    compression: int = zipfile.ZIP_STORED,
+    compresslevel: int | None = None,
+) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
     if os.path.exists(fs_path(temporary)):
         os.remove(fs_path(temporary))
     src_path = fs_path(src)
+    zip_kwargs: dict[str, object] = {"compression": compression}
+    if compression != zipfile.ZIP_STORED:
+        zip_kwargs["compresslevel"] = compresslevel
     try:
-        with zipfile.ZipFile(
-            fs_path(temporary),
-            "w",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=compresslevel,
-        ) as zf:
-            for root, _dirs, files in os.walk(src_path):
-                for filename in files:
+        with zipfile.ZipFile(fs_path(temporary), "w", **zip_kwargs) as zf:
+            for root, dirs, files in os.walk(src_path):
+                dirs.sort()
+                for filename in sorted(files):
                     file_path = os.path.join(root, filename)
                     archive_name = os.path.relpath(file_path, src_path).replace(os.sep, "/")
                     zf.write(file_path, archive_name)

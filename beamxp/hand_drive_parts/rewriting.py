@@ -1139,8 +1139,10 @@ Vec3 = tuple[float, float, float]
 # What a trigger can be attributed to, in order of precision: prop rest
 # pivots, anchor node -> transform via flexbody node groups, and flexbody
 # world bounds for the panels a box is set into.
+TriggerMatrix = list[list[float]]
+TriggerOwnerTransform = tuple[str, float, TriggerMatrix | None]
 TriggerOwners = tuple[
-    list[tuple[Vec3, str, float]],
+    list[tuple[Vec3, str, float, TriggerMatrix | None]],
     dict[str, tuple[str, float]],
     list[tuple[Vec3, Vec3, str, float]],
 ]
@@ -1216,6 +1218,82 @@ def world_to_local(frame: tuple[Vec3, Vec3, Vec3, Vec3], point: Vec3) -> Vec3:
     )
 
 
+def _matrix_transform_vector(matrix: TriggerMatrix, vector: Vec3) -> Vec3:
+    x, y, z = vector
+    return (
+        matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z,
+        matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z,
+        matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z,
+    )
+
+
+def _owner_transform_point(
+    point: Vec3,
+    action: str,
+    delta: float,
+    matrix: TriggerMatrix | None = None,
+) -> Vec3:
+    if matrix is not None:
+        return transform_helpers.transform_point(matrix, point)
+    if action in _REFLECTING_ACTIONS:
+        return (-point[0], point[1], point[2])
+    if action == "translate":
+        return (point[0] + delta, point[1], point[2])
+    return point
+
+
+def _owner_transform_vector(
+    vector: Vec3,
+    action: str,
+    matrix: TriggerMatrix | None = None,
+) -> Vec3:
+    if matrix is not None:
+        return _matrix_transform_vector(matrix, vector)
+    if action in _REFLECTING_ACTIONS:
+        return (-vector[0], vector[1], vector[2])
+    return vector
+
+
+def transform_trigger_position(
+    values: Vec3,
+    source_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    target_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    action: str,
+    delta: float,
+    matrix: TriggerMatrix | None = None,
+) -> Vec3:
+    """Apply a mesh-owner transform to a trigger point.
+
+    The authored numbers are in the trigger ref-node frame, while the mesh
+    verdicts are world-space operations. So the same transform used for a prop
+    or flexbody has to be applied between frame conversions.
+    """
+    return world_to_local(
+        target_frame,
+        _owner_transform_point(local_to_world(source_frame, values), action, delta, matrix),
+    )
+
+
+def transform_trigger_vector(
+    values: Vec3,
+    source_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    target_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    action: str,
+    matrix: TriggerMatrix | None = None,
+) -> Vec3:
+    """Apply only the linear part of a mesh-owner transform to a free vector."""
+    _origin, x_axis, y_axis, z_axis = source_frame
+    world = tuple(
+        values[0] * x_axis[i] + values[1] * y_axis[i] + values[2] * z_axis[i]
+        for i in range(3)
+    )
+    transformed = _owner_transform_vector(world, action, matrix)
+    return tuple(
+        sum(transformed[i] * axis[i] for i in range(3))
+        for axis in (target_frame[1], target_frame[2], target_frame[3])
+    )
+
+
 # Mesh verdicts that reflect the geometry across the y-z plane rather than
 # sliding it. These are the only ones that change the frame a trigger's columns
 # are expressed in; everything else is a rigid x offset.
@@ -1235,7 +1313,7 @@ def _owning_transform(
     centre: Vec3,
     ref_node: str,
     owners: TriggerOwners,
-) -> tuple[str, float] | None:
+) -> TriggerOwnerTransform | None:
     """What happened to the geometry this trigger is mounted on.
 
     Two exact signals, in order: the prop whose rest pivot the box sits on, and
@@ -1244,17 +1322,17 @@ def _owning_transform(
     moves a box onto geometry that never went anywhere.
     """
     prop_anchors, node_transforms, flex_bounds = owners
-    best: tuple[float, str, float] | None = None
-    for position, action, delta in prop_anchors:
+    best: tuple[float, str, float, TriggerMatrix | None] | None = None
+    for position, action, delta, matrix in prop_anchors:
         distance = sum((centre[i] - position[i]) ** 2 for i in range(3)) ** 0.5
         if distance <= PROP_MOUNT_REACH and (best is None or distance < best[0]):
-            best = (distance, action, delta)
+            best = (distance, action, delta, matrix)
     if best is not None:
-        return best[1], best[2]
+        return best[1], best[2], best[3]
 
     node_hit = node_transforms.get(ref_node)
     if node_hit is not None:
-        return node_hit
+        return node_hit[0], node_hit[1], None
 
     # Whose geometry is the box actually inside? Smallest enclosing mesh wins,
     # so a switch panel set into a dashboard beats the dashboard itself.
@@ -1268,46 +1346,8 @@ def _owning_transform(
         if enclosing is None or volume < enclosing[0]:
             enclosing = (volume, action, delta)
     if enclosing is not None:
-        return enclosing[1], enclosing[2]
+        return enclosing[1], enclosing[2], None
     return None
-
-
-def _slide_trigger_row(
-    row: str,
-    spans: list[tuple[int, int]],
-    index_of: dict[str, int],
-    frame: tuple[Vec3, Vec3, Vec3, Vec3],
-    delta: float,
-) -> str:
-    """Slide the box along x by the same amount its mesh slid.
-
-    The ref triple, the rotations and the free-vector offset all stay: a
-    non-reflecting transform leaves the box's orientation alone and its anchor
-    cage is still the right one. A zero delta is the identity, which is what a
-    skipped mesh gets.
-    """
-    edits: list[tuple[int, int, str]] = []
-    carries_origin = True
-    for column in _TRIGGER_TRANSLATION_COLUMNS:
-        position = index_of.get(column)
-        if position is None or position >= len(spans):
-            continue
-        start, end = spans[position]
-        values = _parse_vector(row[start:end])
-        if values is None:
-            continue
-        if not carries_origin:
-            continue  # a free vector is unchanged by a pure translation
-        carries_origin = False
-        centre = local_to_world(frame, values)
-        moved = (centre[0] + delta, centre[1], centre[2])
-        updated = _replace_vector_numbers(row[start:end], world_to_local(frame, moved))
-        if updated is not None:
-            edits.append((start, end, updated))
-    out = row
-    for start, end, replacement in sorted(edits, reverse=True):
-        out = out[:start] + replacement + out[end:]
-    return out
 
 
 def _mirror_euler(values: Vec3) -> Vec3:
@@ -1507,6 +1547,13 @@ def _parse_vector(text: str) -> Vec3 | None:
     return (float(match.group("x")), float(match.group("y")), float(match.group("z")))
 
 
+def _mirror_box_size(values: Vec3) -> Vec3:
+    # BeamNG box sizes behave like a signed local corner, not just absolute
+    # extents. The Ardente dash boxes match the mirrored controls when local y
+    # changes sign under the reflected trigger frame.
+    return (values[0], -values[1], values[2])
+
+
 def _mirror_trigger_row(
     row: str,
     columns: list[str],
@@ -1553,25 +1600,23 @@ def _mirror_trigger_row(
     )
     if owner is None:
         return row, None
-    owner_action, owner_delta = owner
+    owner_action, owner_delta, owner_matrix = owner
 
-    # Only a reflection changes the frame the box is expressed in, so only a
-    # reflection repoints the ref triple and touches the euler columns. Anything
-    # else is a rigid slide along x and leaves both alone.
-    if owner_action not in _REFLECTING_ACTIONS:
-        return _slide_trigger_row(row, spans, index_of, authored_frame, owner_delta), None
-
-    # Prefer repointing the triple at the mirrored nodes: that is what vanilla
-    # does and it keeps the offsets small and readable. When the cage has no
-    # mirrored counterpart -- a steering column exists on one side only -- keep
-    # the original anchor and move the box through world space instead. That
-    # matches how a mirrored prop is relocated (baseTranslationGlobal, ref nodes
-    # untouched), so the box goes on deforming with the geometry it labels.
-    mirrored_ids = [
-        _mirrored_node_id(node_id, node_mirror_map, node_positions) for node_id in source_ids
-    ]
-    repointed = all(node_id is not None for node_id in mirrored_ids)
-    target_ids = [str(node_id) for node_id in mirrored_ids] if repointed else list(source_ids)
+    if owner_action in _REFLECTING_ACTIONS:
+        # Prefer repointing the triple at the mirrored nodes: that is what
+        # vanilla does and it keeps the offsets small and readable. When the
+        # cage has no mirrored counterpart -- a steering column exists on one
+        # side only -- keep the original anchor and move the box through world
+        # space instead.
+        mirrored_ids = [
+            _mirrored_node_id(node_id, node_mirror_map, node_positions)
+            for node_id in source_ids
+        ]
+        repointed = all(node_id is not None for node_id in mirrored_ids)
+        target_ids = [str(node_id) for node_id in mirrored_ids] if repointed else list(source_ids)
+    else:
+        repointed = False
+        target_ids = list(source_ids)
 
     source_frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
     target_frame = trigger_frame(*(node_positions[node_id] for node_id in target_ids))
@@ -1586,6 +1631,23 @@ def _mirror_trigger_row(
                 (start, end, re.sub(r'"(?:[^"\\]|\\.)*"', f'"{node_id}"', row[start:end], count=1))
             )
 
+    type_position = index_of.get("type")
+    size_position = index_of.get("size")
+    if (
+        owner_action in _REFLECTING_ACTIONS
+        and type_position is not None
+        and size_position is not None
+        and type_position < len(spans)
+        and size_position < len(spans)
+        and _row_string_value(row[spans[type_position][0] : spans[type_position][1]]) == "box"
+    ):
+        start, end = spans[size_position]
+        values = _parse_vector(row[start:end])
+        if values is not None:
+            updated = _replace_vector_numbers(row[start:end], _mirror_box_size(values))
+            if updated is not None:
+                edits.append((start, end, updated))
+
     # Exactly one column carries the frame origin -- the one that positions the
     # box. Everything stacked on top of it is a free vector.
     carries_origin = True
@@ -1597,11 +1659,20 @@ def _mirror_trigger_row(
         values = _parse_vector(row[start:end])
         if values is None:
             continue
-        transform = mirror_trigger_offset if carries_origin else mirror_trigger_vector
-        carries_origin = False
-        updated = _replace_vector_numbers(
-            row[start:end], transform(values, source_frame, target_frame)
+        replacement_values = (
+            transform_trigger_position(
+                values,
+                source_frame,
+                target_frame,
+                owner_action,
+                owner_delta,
+                owner_matrix,
+            )
+            if carries_origin
+            else transform_trigger_vector(values, source_frame, target_frame, owner_action, owner_matrix)
         )
+        carries_origin = False
+        updated = _replace_vector_numbers(row[start:end], replacement_values)
         if updated is not None:
             edits.append((start, end, updated))
 
@@ -1702,8 +1773,8 @@ def triggers_needing_manual_review(
             if trigger_id is None or trigger_id == "id":
                 continue
             _mirrored, reason = _mirror_trigger_row(
-            row, columns, node_positions, node_mirror_map, owners
-        )
+                row, columns, node_positions, node_mirror_map, owners
+            )
             if reason is not None:
                 findings.append((trigger_id, reason))
     return findings

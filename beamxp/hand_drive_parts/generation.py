@@ -602,6 +602,25 @@ def _mesh_world_transform(
     return action, delta
 
 
+def _owner_transform_matrix(
+    source_matrix: list[list[float]],
+    action: str,
+    delta: float,
+) -> list[list[float]] | None:
+    if action == "translate":
+        target_matrix = multiply_matrix(translation_matrix((delta, 0.0, 0.0)), source_matrix)
+    elif action == "mirrorPosition":
+        target_matrix = multiply_matrix(
+            translation_matrix((-2.0 * source_matrix[0][3], 0.0, 0.0)),
+            source_matrix,
+        )
+    elif action == "mirror":
+        target_matrix = multiply_matrix(mirror_x_matrix4(), source_matrix)
+    else:
+        return None
+    return multiply_matrix(target_matrix, inverse_affine_matrix(source_matrix))
+
+
 def _node_group_membership(context: VehicleContext) -> dict[str, set[str]]:
     """Which node groups each node belongs to, across the whole vehicle.
 
@@ -630,6 +649,7 @@ def trigger_owners_for_part(
     translate_magnitudes: dict[str, float],
     target_hand: str,
     node_positions: dict[str, tuple[float, float, float]],
+    inherited_options: Iterable[str] = (),
 ) -> TriggerOwners:
     """The two exact signals for attributing a trigger to its geometry.
 
@@ -640,7 +660,14 @@ def trigger_owners_for_part(
     panel it is set into. A node whose groups are claimed by flexbodies that
     disagree is left out rather than resolved arbitrarily.
     """
-    prop_anchors: list[tuple[tuple[float, float, float], str, float]] = []
+    prop_anchors: list[
+        tuple[
+            tuple[float, float, float],
+            str,
+            float,
+            list[list[float]] | None,
+        ]
+    ] = []
     props = transform_helpers.extract_named_array(part_body, "props")
     for row in iter_top_level_rows(props or "[]"):
         mesh = prop_row_mesh(row)
@@ -651,9 +678,23 @@ def trigger_owners_for_part(
         )
         if transform is None:
             continue
-        pivot = prop_row_pivot_position(row, node_positions, context.mesh_pivots.get(mesh))
+        pivot = context.mesh_pivots.get(mesh)
+        rotation_override, _source = prop_rest_rotation_override(row, node_positions)
+        source_matrix = prop_row_world_matrix(
+            row,
+            node_positions,
+            pivot,
+            inherited_options,
+            rotation_override,
+        )
+        owner_matrix = (
+            _owner_transform_matrix(source_matrix, transform[0], transform[1])
+            if source_matrix is not None
+            else None
+        )
+        pivot = prop_row_pivot_position(row, node_positions, pivot, inherited_options)
         if pivot is not None:
-            prop_anchors.append((pivot, transform[0], transform[1]))
+            prop_anchors.append((pivot, transform[0], transform[1], owner_matrix))
 
     group_transforms: dict[str, set[tuple[str, float]]] = {}
     flexbody_meshes: list[str] = []
@@ -808,6 +849,7 @@ def _relocation_clone_body(
         {},
         target_hand,
         prop_node_positions,
+        inherited_options,
     )
     prop_globals = {
         mesh: mirrored_object_position(context, mesh, config_name)
@@ -1182,6 +1224,7 @@ def write_generated_jbeam_and_configs(
                 translate_magnitudes,
                 target_hand,
                 prop_node_positions,
+                inherited_options,
             )
 
             cloned_bodies.append(

@@ -257,6 +257,34 @@ def _atomic_copy_file(source: Path, target: Path) -> None:
     temporary.replace(target)
 
 
+def _atomic_move_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    source.replace(temporary)
+    temporary.replace(target)
+
+
+def _same_copied_file(source: Path, target: Path) -> bool:
+    try:
+        source_stat = source.stat()
+        target_stat = target.stat()
+    except OSError:
+        return False
+    return (
+        source_stat.st_size == target_stat.st_size
+        and source_stat.st_mtime_ns == target_stat.st_mtime_ns
+    )
+
+
+def _copy_file_if_changed(source: Path, target: Path) -> bool:
+    if _same_copied_file(source, target):
+        return False
+    _atomic_copy_file(source, target)
+    return True
+
+
 def _texture_correction_output_stem(source_zip: Path, dae_path: str) -> str:
     normalised_dae_path = dae_path.replace("\\", "/")
     stem = f"{source_zip.stem}_{Path(normalised_dae_path).stem}"
@@ -1606,7 +1634,10 @@ def build_batch(
     installed_plates_zip = None
     if write_zip:
         emit_progress("Packaging XP conversion zip...")
-        package_zip = build_dir / package_name_for_context(context)
+        package_name = package_name_for_context(context)
+        package_zip = build_dir / package_name
+        if install:
+            package_zip = build_dir / f"{package_name}.installing"
         make_zip(output_root, package_zip)
     if install:
         if package_zip is None:
@@ -1615,8 +1646,9 @@ def build_batch(
             raise RuntimeError("Install requested without a mods folder")
         mods_folder.mkdir(parents=True, exist_ok=True)
         emit_progress("Installing XP conversion zip...")
-        installed_zip = mods_folder / package_zip.name
-        _atomic_copy_file(package_zip, installed_zip)
+        installed_zip = mods_folder / package_name_for_context(context)
+        _atomic_move_file(package_zip, installed_zip)
+        package_zip = installed_zip
         # Refresh the universal plates mod alongside the vehicle so every
         # library design stays selectable on any vehicle, not just the sets
         # bound to this build. A broken library set must not fail the build.
@@ -1628,7 +1660,10 @@ def build_batch(
             if plates_mod is not None:
                 plates_zip = Path(plates_mod["zip"])
                 installed_plates_zip = mods_folder / plates_zip.name
-                _atomic_copy_file(plates_zip, installed_plates_zip)
+                if _copy_file_if_changed(plates_zip, installed_plates_zip):
+                    plate_summary["libraryModInstalled"] = True
+                else:
+                    plate_summary["libraryModInstalled"] = False
                 plate_summary["libraryModDesigns"] = plates_mod["designs"]
 
     save_conversion(context, conversion)
