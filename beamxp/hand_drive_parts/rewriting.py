@@ -1554,12 +1554,39 @@ def _mirror_box_size(values: Vec3) -> Vec3:
     return (values[0], -values[1], values[2])
 
 
+def _trigger_row_owner(
+    row: str,
+    spans: list[tuple[int, int]],
+    index_of: dict[str, int],
+    source_ids: list[str],
+    authored_frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    owners: TriggerOwners | None,
+) -> TriggerOwnerTransform | None:
+    """The verdict for the geometry this row's box is mounted on, or None.
+
+    A trigger has no transform of its own: it takes whatever the config applied
+    to the mesh it labels. There is no default -- a mesh with no verdict leaves
+    the box exactly where it was authored.
+    """
+    base_column = index_of.get("baseTranslation")
+    if base_column is None or base_column >= len(spans):
+        base_column = index_of.get("translation")
+    if not owners or base_column is None or base_column >= len(spans):
+        return None
+    start, end = spans[base_column]
+    authored_offset = _parse_vector(row[start:end]) or (0.0, 0.0, 0.0)
+    return _owning_transform(
+        local_to_world(authored_frame, authored_offset), source_ids[0], owners
+    )
+
+
 def _mirror_trigger_row(
     row: str,
     columns: list[str],
     node_positions: dict[str, Vec3],
     node_mirror_map: dict[str, str],
     owners: TriggerOwners | None = None,
+    frame_twins: dict[str, str] | None = None,
 ) -> tuple[str, str | None]:
     """Mirror one trigger row. Returns the row and a reason when left untouched."""
     spans = _row_element_spans(row)
@@ -1585,24 +1612,27 @@ def _mirror_trigger_row(
     if authored_frame is None:
         return row, "ref nodes are collinear"
 
-    # A trigger has no transform of its own: it takes whatever the config
-    # applied to the mesh it labels. There is no default -- a mesh with no
-    # verdict leaves the box exactly where it was authored.
-    base_column = index_of.get("baseTranslation")
-    if base_column is None or base_column >= len(spans):
-        base_column = index_of.get("translation")
-    if not owners or base_column is None or base_column >= len(spans):
-        return row, None
-    start, end = spans[base_column]
-    authored_offset = _parse_vector(row[start:end]) or (0.0, 0.0, 0.0)
-    owner = _owning_transform(
-        local_to_world(authored_frame, authored_offset), source_ids[0], owners
-    )
+    owner = _trigger_row_owner(row, spans, index_of, source_ids, authored_frame, owners)
     if owner is None:
         return row, None
     owner_action, owner_delta, owner_matrix = owner
 
-    if owner_action in _REFLECTING_ACTIONS:
+    if frame_twins and any(node_id in frame_twins for node_id in source_ids):
+        # A generated frame is available for this row: the ref nodes that carry
+        # the animation have transformed twins, so point at those and let the
+        # remaining ones mirror if they can. See generate_trigger_frame_twins.
+        target_ids = [
+            frame_twins.get(node_id)
+            or (
+                _mirrored_node_id(node_id, node_mirror_map, node_positions)
+                if owner_action in _REFLECTING_ACTIONS
+                else None
+            )
+            or node_id
+            for node_id in source_ids
+        ]
+        repointed = target_ids != source_ids
+    elif owner_action in _REFLECTING_ACTIONS:
         # Prefer repointing the triple at the mirrored nodes: that is what
         # vanilla does and it keeps the offsets small and readable. When the
         # cage has no mirrored counterpart -- a steering column exists on one
@@ -1707,6 +1737,7 @@ def rewrite_triggers(
     node_positions: dict[str, Vec3],
     node_mirror_map: dict[str, str],
     owners: TriggerOwners | None = None,
+    frame_twins: dict[str, str] | None = None,
 ) -> str:
     columns = trigger_column_names(array_text)
     if not columns:
@@ -1736,7 +1767,7 @@ def rewrite_triggers(
             continue
         row = array_text[start:end]
         mirrored, reason = _mirror_trigger_row(
-            row, columns, node_positions, node_mirror_map, owners
+            row, columns, node_positions, node_mirror_map, owners, frame_twins
         )
         out = out[:start] + mirrored + out[end:]
         if reason is not None:
@@ -1754,9 +1785,13 @@ def triggers_needing_manual_review(
     node_positions: dict[str, Vec3],
     node_mirror_map: dict[str, str],
     owners: TriggerOwners | None = None,
+    target_hand: str = HAND_RHD,
 ) -> list[tuple[str, str]]:
     """Trigger ids in this part that cannot be mirrored, with the reason why."""
-    findings: list[tuple[str, str]] = []
+    part_body, frame_twins, twin_positions, findings = generate_trigger_frame_twins(
+        part_body, node_positions, node_mirror_map, owners, target_hand
+    )
+    node_positions = {**node_positions, **twin_positions}
     for section in TRIGGER_SECTIONS:
         array_text = transform_helpers.extract_named_array(part_body, section)
         if not array_text:
@@ -1773,11 +1808,376 @@ def triggers_needing_manual_review(
             if trigger_id is None or trigger_id == "id":
                 continue
             _mirrored, reason = _mirror_trigger_row(
-                row, columns, node_positions, node_mirror_map, owners
+                row, columns, node_positions, node_mirror_map, owners, frame_twins
             )
             if reason is not None:
                 findings.append((trigger_id, reason))
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Generated trigger reference frames
+#
+# A trigger's box is placed at a constant offset in a frame built from three
+# nodes, so the only thing that can ever move it at runtime is those nodes
+# moving. Vanilla uses that on purpose: every stock indicator-stalk trigger
+# points its idX column at a light helper node that a torsionHydro swings from
+# the vehicle's own input. Ardente:
+#
+#     nodes          ["int_strw", 0.355, -0.4397, 0.8037]   // column
+#                    ["int_stalk", 0.5656, -0.455, 0.8367]  // stalk tip, 0.2 kg
+#     torsionHydros  ["int_stalk","int_strw","dsh2l","dsh2r",
+#                     {"inputSource":"turnsignal","factor":-0.12}]
+#     triggers2      ["headlights", "int_strw","int_stalk","dshr", "sphere",
+#                     0.025, ..., {"x":0.200,"y":0,"z":0}]
+#
+# bx, covet, sunburst2, pessima, sbr, midsize, etki, hopper, dumptruck and
+# wendover all author the same shape. The box sits 0.2 m out along
+# norm(int_stalk - int_strw), so it rides the stalk's arc for free.
+#
+# Relocating such a trigger by rewriting only its offsets keeps the authored
+# frame, which means keeping the authored pivot: the box lands correctly at
+# rest but now hangs half a metre off a node cage on the other side of the
+# cabin, and the stalk swings it through an arc that is both too big and
+# centred on the wrong point. No offset can fix that, because the offset is
+# constant and the pivot is not.
+#
+# So the frame itself has to move. These helpers generate a transformed twin of
+# the ref nodes that carry the animation -- placed with the same owner
+# transform BeamXP already resolved for the box -- and copy the rows that hold
+# and drive them. Each copied row is inserted directly after its source so it
+# inherits that row's scope: node weight, collision flags, beam spring and
+# damping all come from the authored structure rather than being invented.
+# ---------------------------------------------------------------------------
+
+# The only section vanilla uses to animate a trigger's ref frame. Column 0 is
+# the node the row moves; the rest name the axis it turns about.
+_FRAME_DRIVER_SECTIONS = ("torsionHydros",)
+# Sections whose rows are node references only, and so can be copied onto a
+# generated node without dragging authored geometry along with them.
+_FRAME_STRUCTURE_SECTIONS = ("beams", "torsionbars", "torsionHydros")
+# Verdicts that actually move geometry. "skip" and friends leave the box where
+# it was authored, so there is nothing to build a frame for.
+_FRAME_TRANSFORMING_ACTIONS = _REFLECTING_ACTIONS | {"translate"}
+
+
+def hydro_driven_nodes(part_body: str) -> set[str]:
+    """Nodes this part animates -- column 0 of every driver-section row."""
+    driven: set[str] = set()
+    for section in _FRAME_DRIVER_SECTIONS:
+        array_text = transform_helpers.extract_named_array(part_body, section)
+        if not array_text:
+            continue
+        for start, end in _row_spans(array_text):
+            row = array_text[start:end]
+            spans = _row_element_spans(row)
+            if not spans:
+                continue
+            node_id = _row_string_value(row[spans[0][0] : spans[0][1]])
+            if node_id and not node_id.endswith(":"):
+                driven.add(node_id)
+    return driven
+
+
+def _row_node_ids(row: str) -> list[tuple[int, int, str]] | None:
+    """Spans of the bare string elements in a row, or None for a header row.
+
+    Inline option objects and numbers are skipped, so what is left in the
+    sections this is used on is node ids.
+    """
+    ids: list[tuple[int, int, str]] = []
+    for start, end in _row_element_spans(row):
+        value = _row_string_value(row[start:end])
+        if value is None:
+            continue
+        if value.endswith(":"):
+            return None
+        ids.append((start, end, value))
+    return ids or None
+
+
+def _replace_row_string(text: str, value: str) -> str:
+    return re.sub(r'"(?:[^"\\]|\\.)*"', f'"{value}"', text, count=1)
+
+
+def _copy_structure_row(
+    row: str,
+    ids: list[tuple[int, int, str]],
+    remap,
+) -> str | None:
+    """Repoint every node id in a row. None when one of them cannot be mapped."""
+    edits: list[tuple[int, int, str]] = []
+    for start, end, value in ids:
+        target = remap(value)
+        if target is None:
+            return None
+        if target != value:
+            edits.append((start, end, _replace_row_string(row[start:end], target)))
+    if not edits:
+        return None
+    out = row
+    for start, end, replacement in sorted(edits, reverse=True):
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
+def _twin_node_row(row: str, twin_name: str, position: Vec3) -> str | None:
+    """A node row rewritten to declare ``twin_name`` at ``position``."""
+    spans = _row_element_spans(row)
+    if len(spans) < 4:
+        return None
+    edits: list[tuple[int, int, str]] = [
+        (spans[0][0], spans[0][1], _replace_row_string(row[spans[0][0] : spans[0][1]], twin_name))
+    ]
+    for axis in range(3):
+        start, end = spans[axis + 1]
+        try:
+            float(row[start:end].strip())
+        except ValueError:
+            return None  # an expression-valued coordinate is not ours to resolve
+        value = round(position[axis], 6)
+        if abs(value) < 1e-9:
+            value = 0.0
+        edits.append((start, end, transform_helpers.format_num(value)))
+    out = row
+    for start, end, replacement in sorted(edits, reverse=True):
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
+def _row_indent(array_text: str, start: int) -> str:
+    match = re.match(r"[ \t]*", array_text[array_text.rfind("\n", 0, start) + 1 : start])
+    return match.group(0) if match else ""
+
+
+def _generated_row_insert(array_text: str, start: int, row: str, note: str) -> str:
+    newline = "\r\n" if "\r\n" in array_text else "\n"
+    indent = _row_indent(array_text, start)
+    return f",{newline}{indent}//BeamXP: {note}{newline}{indent}{row}"
+
+
+def _requested_frame_twins(
+    part_body: str,
+    node_positions: dict[str, Vec3],
+    owners: TriggerOwners | None,
+    driven: set[str],
+) -> tuple[dict[str, TriggerOwnerTransform], list[tuple[str, str]]]:
+    """Ref nodes whose frame is animated and needs a twin, and why not."""
+    requests: dict[str, TriggerOwnerTransform] = {}
+    notes: list[tuple[str, str]] = []
+    for section in TRIGGER_SECTIONS:
+        array_text = transform_helpers.extract_named_array(part_body, section)
+        if not array_text:
+            continue
+        columns = trigger_column_names(array_text)
+        if not columns:
+            continue
+        index_of = {name: idx for idx, name in enumerate(columns) if name}
+        for start, end in _row_spans(array_text):
+            row = array_text[start:end]
+            spans = _row_element_spans(row)
+            if len(spans) < len(_TRIGGER_NODE_COLUMNS) + 1:
+                continue
+            trigger_id = _row_string_value(row[spans[0][0] : spans[0][1]])
+            if trigger_id is None or trigger_id == "id":
+                continue
+            source_ids: list[str] = []
+            for column in _TRIGGER_NODE_COLUMNS:
+                position = index_of.get(column)
+                if position is None or position >= len(spans):
+                    break
+                node_id = _row_string_value(row[spans[position][0] : spans[position][1]])
+                if node_id is None:
+                    break
+                source_ids.append(node_id)
+            if len(source_ids) != len(_TRIGGER_NODE_COLUMNS):
+                continue
+            # Only the origin and the x node place the box; idY sets the roll
+            # about an axis the authored offsets sit on, so it is left alone.
+            animated = [node_id for node_id in source_ids[:2] if node_id in driven]
+            if not animated:
+                continue
+            if any(node_id not in node_positions for node_id in source_ids):
+                continue
+            authored_frame = trigger_frame(
+                *(node_positions[node_id] for node_id in source_ids)
+            )
+            if authored_frame is None:
+                continue
+            owner = _trigger_row_owner(
+                row, spans, index_of, source_ids, authored_frame, owners
+            )
+            if owner is None or owner[0] not in _FRAME_TRANSFORMING_ACTIONS:
+                continue
+            conflict = next(
+                (
+                    node_id
+                    for node_id in source_ids[:2]
+                    if requests.get(node_id, owner) != owner
+                ),
+                None,
+            )
+            if conflict is not None:
+                notes.append(
+                    (
+                        trigger_id,
+                        f"ref node {conflict} is claimed by two different mesh verdicts",
+                    )
+                )
+                continue
+            for node_id in source_ids[:2]:
+                requests[node_id] = owner
+    return requests, notes
+
+
+def generate_trigger_frame_twins(
+    part_body: str,
+    node_positions: dict[str, Vec3],
+    node_mirror_map: dict[str, str],
+    owners: TriggerOwners | None,
+    target_hand: str,
+) -> tuple[str, dict[str, str], dict[str, Vec3], list[tuple[str, str]]]:
+    """Rebuild animated trigger ref frames on the converted side.
+
+    Returns the part body, the source node -> twin node map for the trigger
+    rewrite, the twin positions to fold into the node index, and any triggers
+    left alone with the reason. Generates nothing at all unless every row that
+    holds or drives the nodes it needs can be repointed: half a frame is worse
+    than none, and there is no guess available to fill the gap.
+    """
+    driven = hydro_driven_nodes(part_body)
+    if not driven or not owners:
+        return part_body, {}, {}, []
+    requests, notes = _requested_frame_twins(part_body, node_positions, owners, driven)
+    if not requests:
+        return part_body, {}, {}, notes
+
+    owner = next(iter(requests.values()))
+    if any(other != owner for other in requests.values()):
+        return part_body, {}, {}, notes
+    action, delta, matrix = owner
+    reflecting = action in _REFLECTING_ACTIONS
+
+    suffix = suffix_for_hand(target_hand)
+    taken = set(node_positions)
+    twin_names: dict[str, str] = {}
+    twin_positions: dict[str, Vec3] = {}
+    for node_id in sorted(requests):
+        name = f"{node_id}{suffix}"
+        counter = 2
+        while name in taken:
+            name = f"{node_id}{suffix}_{counter}"
+            counter += 1
+        taken.add(name)
+        twin_names[node_id] = name
+        twin_positions[name] = _owner_transform_point(
+            node_positions[node_id], action, delta, matrix
+        )
+
+    def remap(value: str) -> str | None:
+        twin = twin_names.get(value)
+        if twin is not None:
+            return twin
+        # A reflected frame wants the mirrored half of the cage, the way bx's
+        # authored RHD interior hangs its column off the right-hand dash nodes.
+        # A slid one keeps the authored anchors, because the prop it follows
+        # keeps its own ref nodes and so its rotation sense too.
+        if reflecting:
+            return _mirrored_node_id(value, node_mirror_map, node_positions)
+        return value
+
+    frame_label = "/".join(sorted(twin_names))
+
+    def abandon(reason: str) -> tuple[str, dict[str, str], dict[str, Vec3], list[tuple[str, str]]]:
+        return part_body, {}, {}, notes + [(frame_label, reason)]
+
+    edits: dict[str, list[tuple[int, str]]] = {}
+
+    nodes_text = transform_helpers.extract_named_array(part_body, "nodes")
+    if nodes_text is None:
+        return abandon("this part declares no nodes")
+    declared: set[str] = set()
+    for start, end in _row_spans(nodes_text):
+        row = nodes_text[start:end]
+        spans = _row_element_spans(row)
+        if not spans:
+            continue
+        node_id = _row_string_value(row[spans[0][0] : spans[0][1]])
+        if node_id is None or node_id not in twin_names:
+            continue
+        twin_name = twin_names[node_id]
+        twin_row = _twin_node_row(row, twin_name, twin_positions[twin_name])
+        if twin_row is None:
+            return abandon(f"node row for {node_id} cannot be restated")
+        declared.add(node_id)
+        edits.setdefault("nodes", []).append(
+            (end, _generated_row_insert(nodes_text, start, twin_row, f"{node_id} frame twin"))
+        )
+    missing = sorted(set(twin_names) - declared)
+    if missing:
+        return abandon(f"ref node {missing[0]} is declared outside this part")
+
+    beamed: set[str] = set()
+    for section in _FRAME_STRUCTURE_SECTIONS:
+        array_text = transform_helpers.extract_named_array(part_body, section)
+        if not array_text:
+            continue
+        for start, end in _row_spans(array_text):
+            row = array_text[start:end]
+            ids = _row_node_ids(row)
+            if ids is None or not any(value in twin_names for _s, _e, value in ids):
+                continue
+            copied = _copy_structure_row(row, ids, remap)
+            if copied is None:
+                return abandon(f"a {section} row on the frame cannot be repointed")
+            if section == "beams":
+                beamed.update(value for _s, _e, value in ids if value in twin_names)
+            edits.setdefault(section, []).append(
+                (end, _generated_row_insert(array_text, start, copied, f"{section} for the frame twin"))
+            )
+    unheld = sorted(set(twin_names) - beamed)
+    if unheld:
+        # A node with no beam is a free particle, so this is not a frame we can
+        # build -- vanilla holds every stalk node with at least two beams.
+        return abandon(f"ref node {unheld[0]} has no beams to copy")
+
+    out = part_body
+    for section, insertions in edits.items():
+        def apply(text: str, insertions=insertions) -> str:
+            for offset, addition in sorted(insertions, reverse=True):
+                text = text[:offset] + addition + text[offset:]
+            return text
+
+        out = transform_helpers.replace_array_region(out, section, apply)
+    return out, twin_names, twin_positions, notes
+
+
+def note_trigger_frames_in_part(part_body: str, notes: list[tuple[str, str]]) -> str:
+    """Record an abandoned frame rebuild in the part it belongs to.
+
+    A trigger left on its authored frame still sits in the right place at rest,
+    so nothing looks wrong in the output until the control moves. The note is
+    the only signal that it will not follow.
+    """
+    if not notes:
+        return part_body
+
+    def annotate(array_text: str) -> str:
+        rows = _row_spans(array_text)
+        if not rows:
+            return array_text
+        newline = "\r\n" if "\r\n" in array_text else "\n"
+        indent = _row_indent(array_text, rows[0][0])
+        lines = "".join(
+            f"{newline}{indent}//BeamXP: trigger frame {label} -- {reason}"
+            for label, reason in notes
+        )
+        return array_text[:1] + lines + array_text[1:]
+
+    for section in TRIGGER_SECTIONS:
+        if transform_helpers.extract_named_array(part_body, section):
+            return transform_helpers.replace_array_region(part_body, section, annotate)
+    return part_body
 
 
 def rewrite_light_pattern_for_target(part_body: str, target_hand: str) -> str:
@@ -1841,12 +2241,17 @@ def clone_part_for_target(
     # Only cloned parts reach here, which is the whole of the "which triggers
     # move" decision: a trigger lives inside a part, so an untouched part keeps
     # its triggers exactly where they were.
+    out, frame_twins, twin_positions, frame_notes = generate_trigger_frame_twins(
+        out, node_positions, node_mirror_map, owners, target_hand
+    )
+    out = note_trigger_frames_in_part(out, frame_notes)
+    trigger_node_positions = {**node_positions, **twin_positions}
     for trigger_section in TRIGGER_SECTIONS:
         out = transform_helpers.replace_array_region(
             out,
             trigger_section,
             lambda text: rewrite_triggers(
-                text, node_positions, node_mirror_map, owners
+                text, trigger_node_positions, node_mirror_map, owners, frame_twins
             ),
         )
     out = transform_helpers.replace_array_region(
@@ -1873,4 +2278,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']

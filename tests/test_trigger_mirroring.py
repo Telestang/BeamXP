@@ -6,8 +6,16 @@ door_FR_int/door_FL_int pair, so mirroring one must reproduce the other.
 
 import unittest
 
+import math
+
+from beamxp import transform_helpers
+from beamxp.core import sjson
+from beamxp.core.constants import HAND_RHD
 from beamxp.hand_drive_parts.rewriting import (
     build_node_mirror_map,
+    generate_trigger_frame_twins,
+    hydro_driven_nodes,
+    note_trigger_frames_in_part,
     mirror_trigger_offset,
     rewrite_triggers,
     trigger_column_names,
@@ -97,8 +105,8 @@ class TriggerRewriteTest(unittest.TestCase):
         # baseRotation.x negates, .z is kept; baseTranslation.z negates
         self.assertIn('{"x":12, "y":0, "z":-0.2}', out)
         self.assertIn('{"x":0.45, "y":-0.02, "z":-0.085}', out)
-        # the box extents are untouched
-        self.assertIn('{"x":0.15, "y":0.05, "z":0.06}', out)
+        # box extents behave like a signed local corner, so y changes sign
+        self.assertIn('{"x":0.15, "y":-0.05, "z":0.06}', out)
 
     def test_header_row_is_not_treated_as_a_trigger(self):
         text = section(
@@ -252,7 +260,7 @@ class TriggerRewriteTest(unittest.TestCase):
             ' {"x":0.2, "y":0, "z":0}],'
         )
         # ardente_signalstalk sits at x=+0.4186 and moves by the steering offset
-        owners = ([((0.4186, -0.4588, 0.7969), "translate", -0.71)], {}, [])
+        owners = ([((0.4186, -0.4588, 0.7969), "translate", -0.71, None)], {}, [])
         frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr")))
         before = local_to_world(frame, (0.2, 0.0, 0.0))
 
@@ -275,7 +283,7 @@ class TriggerRewriteTest(unittest.TestCase):
             ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
             ' {"x":0.2, "y":0, "z":0}],'
         )
-        owners = ([((0.4186, -0.4588, 0.7969), "skip", 0.0)], {}, [])
+        owners = ([((0.4186, -0.4588, 0.7969), "skip", 0.0, None)], {}, [])
         out = mirror(text, ARDENTE_NODES, owners)
         self.assertEqual(out, text)
 
@@ -289,9 +297,9 @@ class TriggerRewriteTest(unittest.TestCase):
         )
         owners = (
             [
-                ((0.4186, -0.4588, 0.7969), "translate", -0.71),
-                ((0.2960, -0.4588, 0.7969), "skip", 0.0),
-                ((0.3550, -0.4397, 0.8037), "mirror", 0.0),
+                ((0.4186, -0.4588, 0.7969), "translate", -0.71, None),
+                ((0.2960, -0.4588, 0.7969), "skip", 0.0, None),
+                ((0.3550, -0.4397, 0.8037), "mirror", 0.0, None),
             ],
             {},
             [],
@@ -331,6 +339,287 @@ class TriggerRewriteTest(unittest.TestCase):
         )
         out = mirror(text, ETK_DOOR_NODES)
         self.assertIn('{"x":13, "y":1, "z":1}', out)
+
+
+# ardente_interior.jbeam, trimmed to the rows the stalk frame is built from.
+# The turn signal stalk hangs off int_strw and a torsionHydro swings int_stalk
+# from the "turnsignal" input; the headlight trigger rides 0.2 m along that
+# axis, which is what makes it follow the stalk.
+ARDENTE_STALK_PART = """"ardente_dash": {
+    "slotType": "ardente_dash",
+    "triggers2":[
+      ["id", "idRef:", "idX:", "idY:", "type", "size", "baseRotation", "rotation", "translation", "baseTranslation"],
+      ["hazard", "dsh2l","dsh2r","dshl","box",{"x":0.030, "y":0.025, "z":0.015},{"x":45,"y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x": 0.340, "y":-0.040, "z":-0.090}],
+      ["headlights", "int_strw","int_stalk","dshr","sphere", 0.025, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x": 0.200, "y": 0.000, "z": 0.000}],
+    ],
+    "nodes": [
+         ["id", "posX", "posY", "posZ"],
+         {"group":["ardente_dash"]},
+         {"nodeWeight":15},
+         ["dshr", -0.355, -0.6203, 0.9431],
+         ["dshl", 0.355, -0.6203, 0.9431],
+         ["dsh2r", -0.355, -0.5735, 0.7659],
+         ["dsh2l", 0.355, -0.5735, 0.7659],
+         {"group":""},
+         {"nodeWeight":1},
+         ["int_strw", 0.355, -0.4397, 0.8037],
+         {"nodeWeight":0.2},
+         ["int_stalk", 0.5656, -0.455, 0.8367],
+    ],
+    "torsionbars":[
+       ["id1:", "id2:", "id3:", "id4:"],
+        {"spring":20000, "damp":10, "deform":18000, "strength":28000},
+        ["int_strw", "dsh2l", "dsh2r", "f5l"],
+    ],
+    "torsionHydros": [
+        ["id1:","id2:","id3:","id4:"],
+        {"spring":100, "damp":1, "deform":"FLT_MAX", "strength":1000},
+        ["int_stalk","int_strw","dsh2l","dsh2r",  {"inputSource":"turnsignal","factor":-0.12}],
+    ],
+    "beams":[
+          ["id1:", "id2:"],
+          {"beamSpring":7001000,"beamDamp":150},
+          ["dsh2r",    "int_strw"],
+          ["dsh2l",    "int_strw"],
+          {"beamSpring":160100,"beamDamp":142.73},
+          ["int_stalk","dsh2l"],
+          ["int_stalk","int_strw"],
+    ],
+}"""
+
+STALK_NODES = dict(ARDENTE_NODES)
+STALK_NODES["f5l"] = (0.33, -0.9, 0.30)
+STALK_NODES["f5r"] = (-0.33, -0.9, 0.30)
+
+# ardente_signalstalk sits at x=+0.4186; the config slides it across by the
+# steering offset rather than reflecting it.
+STALK_OWNERS = ([((0.4186, -0.4588, 0.7969), "translate", -0.71, None)], {}, [])
+
+
+def build_twins(part=ARDENTE_STALK_PART, nodes=STALK_NODES, owners=STALK_OWNERS):
+    return generate_trigger_frame_twins(
+        part, nodes, build_node_mirror_map(nodes), owners, HAND_RHD
+    )
+
+
+def box_world(nodes, ref_ids, offset):
+    return local_to_world(trigger_frame(*(nodes[node] for node in ref_ids)), offset)
+
+
+def box_swing(nodes, ref_ids, offset, pivot, stalk, angle=0.12):
+    """How far and which way the box moves when the stalk swings.
+
+    The torsionHydro turns the stalk node about its column, so yawing that node
+    about the column is a fair stand-in for what the input does at runtime.
+    """
+    origin = nodes[pivot]
+    arm = [nodes[stalk][i] - origin[i] for i in range(3)]
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    swung = dict(nodes)
+    swung[stalk] = (
+        origin[0] + arm[0] * cos_a - arm[1] * sin_a,
+        origin[1] + arm[0] * sin_a + arm[1] * cos_a,
+        origin[2] + arm[2],
+    )
+    at_rest = box_world(nodes, ref_ids, offset)
+    return tuple(box_world(swung, ref_ids, offset)[i] - at_rest[i] for i in range(3))
+
+
+class TriggerFrameTwinTest(unittest.TestCase):
+    """Triggers whose ref frame is animated need the frame itself moved.
+
+    The box offset is a constant, so the only thing that can move a trigger at
+    runtime is its ref nodes moving. Rewriting only the offset therefore keeps
+    the authored pivot and stretches the arc; the frame has to be rebuilt on
+    the converted side for the box to track the stalk it labels.
+    """
+
+    def test_the_driven_node_is_read_from_the_hydro_section(self):
+        self.assertEqual(hydro_driven_nodes(ARDENTE_STALK_PART), {"int_stalk"})
+
+    def test_only_the_animated_frame_gets_twins(self):
+        _body, twins, positions, notes = build_twins()
+        self.assertEqual(set(twins), {"int_strw", "int_stalk"})  # not dsh2l/dshl
+        self.assertEqual(notes, [])
+        # placed by the same transform the box itself is moved with
+        self.assertAlmostEqual(positions[twins["int_strw"]][0], -0.355, places=6)
+        self.assertAlmostEqual(positions[twins["int_stalk"]][0], 0.5656 - 0.71, places=6)
+        for node in ("int_strw", "int_stalk"):
+            for axis in (1, 2):
+                self.assertAlmostEqual(
+                    positions[twins[node]][axis], STALK_NODES[node][axis], places=6
+                )
+
+    def test_the_trigger_is_repointed_and_keeps_its_authored_offset(self):
+        body, twins, positions, _notes = build_twins()
+        nodes = {**STALK_NODES, **positions}
+        out = rewrite_triggers(
+            transform_helpers.extract_named_array(body, "triggers2"),
+            nodes,
+            build_node_mirror_map(STALK_NODES),
+            STALK_OWNERS,
+            twins,
+        )
+        row = [line for line in out.splitlines() if "headlights" in line][0]
+        self.assertIn(f'"{twins["int_strw"]}","{twins["int_stalk"]}","dshr"', row)
+        # the offset is the authored one again, the way vanilla bx keeps 0.2 m
+        # on both hands rather than growing a half-metre lever
+        self.assertIn('{"x": 0.2, "y": 0, "z": 0}', row)
+
+    def test_the_box_lands_where_the_old_slide_put_it(self):
+        """The frame moves under the same transform, so the rest position is
+        unchanged -- only the arc it sweeps is different."""
+        body, twins, positions, _notes = build_twins()
+        nodes = {**STALK_NODES, **positions}
+        before = box_world(STALK_NODES, ("int_strw", "int_stalk", "dshr"), (0.2, 0, 0))
+        after = box_world(
+            nodes, (twins["int_strw"], twins["int_stalk"], "dshr"), (0.2, 0, 0)
+        )
+        self.assertAlmostEqual(after[0], before[0] - 0.71, places=6)
+        self.assertAlmostEqual(after[1], before[1], places=6)
+        self.assertAlmostEqual(after[2], before[2], places=6)
+
+    def test_the_arc_matches_the_authored_one_instead_of_stretching(self):
+        body, twins, positions, _notes = build_twins()
+        nodes = {**STALK_NODES, **positions}
+        authored = box_swing(
+            STALK_NODES, ("int_strw", "int_stalk", "dshr"), (0.2, 0, 0),
+            "int_strw", "int_stalk",
+        )
+        # the offset the shipped vivace conversion carries: authored frame kept,
+        # box slid across, which is a 0.51 m lever on the wrong side's column
+        stretched = box_swing(
+            STALK_NODES, ("int_strw", "int_stalk", "dshr"),
+            (-0.499641, 0.114806, 0.037709),
+            "int_strw", "int_stalk",
+        )
+        rebuilt = box_swing(
+            nodes, (twins["int_strw"], twins["int_stalk"], "dshr"), (0.2, 0, 0),
+            twins["int_strw"], twins["int_stalk"],
+        )
+        # a slide leaves free vectors alone, so a correct frame reproduces the
+        # authored displacement exactly
+        for value, expected in zip(rebuilt, authored):
+            self.assertAlmostEqual(value, expected, places=9)
+        # keeping the authored frame swings the box backwards -- the offset now
+        # points behind the pivot -- and 1.6x further: 37 mm against 23.7 mm
+        self.assertLess(sum(stretched[i] * authored[i] for i in range(3)), 0)
+        self.assertGreater(
+            math.dist(stretched, (0, 0, 0)), math.dist(authored, (0, 0, 0)) * 1.5
+        )
+
+    def test_the_twins_get_the_rows_that_hold_and_drive_them(self):
+        body, twins, _positions, _notes = build_twins()
+        strw, stalk = twins["int_strw"], twins["int_stalk"]
+        nodes = transform_helpers.extract_named_array(body, "nodes")
+        beams = transform_helpers.extract_named_array(body, "beams")
+        hydros = transform_helpers.extract_named_array(body, "torsionHydros")
+        bars = transform_helpers.extract_named_array(body, "torsionbars")
+        # declared right after their source rows, so the 0.2 kg weight and the
+        # empty node group carry over rather than being invented
+        self.assertLess(nodes.index('["int_stalk"'), nodes.index(f'["{stalk}"'))
+        self.assertLess(nodes.index(f'["{strw}"'), nodes.index('["int_stalk"'))
+        for pair in (
+            f'["dsh2r",    "{strw}"]',
+            f'["dsh2l",    "{strw}"]',
+            f'["{stalk}","dsh2l"]',
+            f'["{stalk}","{strw}"]',
+        ):
+            self.assertIn(pair, beams)
+        self.assertIn(f'["{strw}", "dsh2l", "dsh2r", "f5l"]', bars)
+        # the driver is copied with its input and factor untouched: a slid stalk
+        # keeps its prop's ref nodes, so it keeps its rotation sense too
+        self.assertIn(
+            f'["{stalk}","{strw}","dsh2l","dsh2r",'
+            '  {"inputSource":"turnsignal","factor":-0.12}]',
+            hydros,
+        )
+        # the twin rows go in as rows, not as text that happens to look like one
+        part = sjson.decode("{" + body + "}")["ardente_dash"]
+        self.assertIn([strw, -0.355, -0.4397, 0.8037], part["nodes"])
+        self.assertIn([stalk, -0.1444, -0.455, 0.8367], part["nodes"])
+        self.assertIn([stalk, strw], part["beams"])
+        self.assertEqual(
+            part["torsionHydros"][-1],
+            [stalk, strw, "dsh2l", "dsh2r", {"inputSource": "turnsignal", "factor": -0.12}],
+        )
+
+    def test_a_frame_with_no_beams_to_copy_is_left_alone(self):
+        part = ARDENTE_STALK_PART.replace('["dsh2r",    "int_strw"],', "").replace(
+            '["dsh2l",    "int_strw"],', ""
+        ).replace('["int_stalk","int_strw"],', "")
+        body, twins, positions, notes = build_twins(part=part)
+        self.assertEqual(body, part)
+        self.assertEqual(twins, {})
+        self.assertEqual(positions, {})
+        self.assertEqual([reason for _id, reason in notes], ["ref node int_strw has no beams to copy"])
+
+    def test_a_reflected_frame_repoints_its_anchors_at_the_mirrored_cage(self):
+        """bx's authored RHD interior hangs its mirrored column off the
+        right-hand dash nodes, so a reflecting verdict has to do the same."""
+        owners = ([((0.4186, -0.4588, 0.7969), "mirror", 0.0, None)], {}, [])
+        body, twins, positions, notes = build_twins(owners=owners)
+        self.assertEqual(notes, [])
+        self.assertAlmostEqual(positions[twins["int_stalk"]][0], -0.5656, places=6)
+        beams = transform_helpers.extract_named_array(body, "beams")
+        self.assertIn(f'["dsh2l",    "{twins["int_strw"]}"]', beams)
+        self.assertIn(f'["{twins["int_stalk"]}","dsh2r"]', beams)
+        bars = transform_helpers.extract_named_array(body, "torsionbars")
+        self.assertIn(f'["{twins["int_strw"]}", "dsh2r", "dsh2l", "f5r"]', bars)
+
+    def test_a_reflected_frame_with_no_mirrored_anchor_generates_nothing(self):
+        """No guess is available for where an unmirrorable anchor should go, so
+        the trigger keeps today's behaviour and says why."""
+        nodes = {node: pos for node, pos in STALK_NODES.items() if node != "f5r"}
+        owners = ([((0.4186, -0.4588, 0.7969), "mirror", 0.0, None)], {}, [])
+        body, twins, _positions, notes = build_twins(nodes=nodes, owners=owners)
+        self.assertEqual(body, ARDENTE_STALK_PART)
+        self.assertEqual(twins, {})
+        self.assertEqual(
+            [reason for _id, reason in notes],
+            ["a torsionbars row on the frame cannot be repointed"],
+        )
+        annotated = note_trigger_frames_in_part(body, notes)
+        self.assertIn(
+            "//BeamXP: trigger frame int_stalk/int_strw -- "
+            "a torsionbars row on the frame cannot be repointed",
+            annotated,
+        )
+        # the note goes in as a comment, so the part still parses
+        self.assertEqual(
+            sjson.decode("{" + annotated + "}")["ardente_dash"]["triggers2"],
+            sjson.decode("{" + body + "}")["ardente_dash"]["triggers2"],
+        )
+
+    def test_a_still_frame_is_never_rebuilt(self):
+        """Only the animated frame is worth two nodes and a hydro; a trigger on
+        a static cage is already placed correctly by moving its offset."""
+        part = ARDENTE_STALK_PART.replace(
+            '["int_stalk","int_strw","dsh2l","dsh2r",  {"inputSource":"turnsignal","factor":-0.12}],',
+            "",
+        )
+        body, twins, _positions, notes = build_twins(part=part)
+        self.assertEqual((body, twins, notes), (part, {}, []))
+
+    def test_twins_are_shared_by_every_trigger_on_the_same_frame(self):
+        part = ARDENTE_STALK_PART.replace(
+            '["headlights", "int_strw","int_stalk","dshr","sphere", 0.025,',
+            '["foglights", "int_strw","int_stalk","dshr","sphere", 0.025,'
+            ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+            ' {"x": 0.180, "y": 0.000, "z": 0.000}],\n'
+            '      ["headlights", "int_strw","int_stalk","dshr","sphere", 0.025,',
+        )
+        body, twins, positions, _notes = build_twins(part=part)
+        self.assertEqual(len(positions), 2)
+        nodes = transform_helpers.extract_named_array(body, "nodes")
+        self.assertEqual(nodes.count(f'["{twins["int_stalk"]}"'), 1)
+
+    def test_generated_names_do_not_collide_with_existing_nodes(self):
+        nodes = dict(STALK_NODES)
+        nodes["int_stalk_xp_rhd"] = (0.0, 0.0, 0.0)
+        _body, twins, positions, _notes = build_twins(nodes=nodes)
+        self.assertEqual(twins["int_stalk"], "int_stalk_xp_rhd_2")
+        self.assertIn("int_stalk_xp_rhd_2", positions)
 
 
 if __name__ == "__main__":
