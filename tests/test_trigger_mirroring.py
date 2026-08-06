@@ -12,6 +12,7 @@ from beamxp import transform_helpers
 from beamxp.core import sjson
 from beamxp.core.constants import HAND_RHD
 from beamxp.hand_drive_parts.rewriting import (
+    _mirror_euler,
     build_node_mirror_map,
     generate_trigger_frame_twins,
     hydro_driven_nodes,
@@ -102,8 +103,10 @@ class TriggerRewriteTest(unittest.TestCase):
         )
         out = mirror(text, ETK_DOOR_NODES)
         self.assertIn('"d7l","d8l","d4l"', out)
-        # baseRotation.x negates, .z is kept; baseTranslation.z negates
-        self.assertIn('{"x":12, "y":0, "z":-0.2}', out)
+        # baseRotation .x and .z negate; baseTranslation.z negates. etk800
+        # authors -0.2 on both hands where the reflection is +0.2, which is
+        # 0.4 degrees on a door handle -- see TriggerRotationGroundTruthTest.
+        self.assertIn('{"x":12, "y":0, "z":0.2}', out)
         self.assertIn('{"x":0.45, "y":-0.02, "z":-0.085}', out)
         # box extents behave like a signed local corner, so y changes sign
         self.assertIn('{"x":0.15, "y":-0.05, "z":0.06}', out)
@@ -398,16 +401,16 @@ class TriggerRewriteTest(unittest.TestCase):
         out = mirror(text, nodes)
         self.assertIn('"sph2l","bbr2rr","sph1l"', out)
 
-    def test_rotation_x_negates_when_the_frame_reflects(self):
-        """Fitted from vanilla: across etk800, bx and covet the authored x always
-        negates while y is always kept."""
+    def test_rotation_x_and_z_negate_when_the_frame_reflects(self):
+        """.x and .z are the two angles whose axes involve the frame's z, which
+        is the axis a reflected ref triple flips. .y is kept."""
         text = section(
             '        ["door_R_int", "d7r","d8r","d4r", "box", {"x":0.19, "y":0.03, "z":0.06},'
             ' {"x":-13, "y":1, "z":1}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
             ' {"x":0.51, "y":0.062, "z":0.085}],'
         )
         out = mirror(text, ETK_DOOR_NODES)
-        self.assertIn('{"x":13, "y":1, "z":1}', out)
+        self.assertIn('{"x":13, "y":1, "z":-1}', out)
 
 
 # ardente_interior.jbeam, trimmed to the rows the stalk frame is built from.
@@ -704,6 +707,87 @@ class TriggerFrameTwinTest(unittest.TestCase):
         _body, twins, positions, _notes = build_twins(nodes=nodes)
         self.assertEqual(twins["int_stalk"], "int_stalk_xp_rhd_2")
         self.assertIn("int_stalk_xp_rhd_2", positions)
+
+
+# bx_body_hatch.jbeam footwell cage. bx ships hood_int on both hands, so its
+# pair is the only stock evidence for mirroring a box with a real rotation on
+# it -- every other authored pair is either all-zero or under half a degree.
+BX_FOOTWELL = {
+    "f5l": (0.31, -0.82, 0.52),
+    "f5ll": (0.76, -0.7543, 0.5),
+    "f6ll": (0.73, -0.72, 0.83),
+    "f5r": (-0.31, -0.82, 0.52),
+    "f5rr": (-0.76, -0.7543, 0.5),
+    "f6rr": (-0.73, -0.72, 0.83),
+}
+
+
+def _rotate(vector, axis, angle):
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    cross = (
+        axis[1] * vector[2] - axis[2] * vector[1],
+        axis[2] * vector[0] - axis[0] * vector[2],
+        axis[0] * vector[1] - axis[1] * vector[0],
+    )
+    scale = sum(axis[i] * vector[i] for i in range(3)) * (1 - cos_a)
+    return tuple(vector[i] * cos_a + cross[i] * sin_a + axis[i] * scale for i in range(3))
+
+
+def box_axes(refs, base_rotation, nodes):
+    """The box's world axes, per triggerLabelPlacement.applyTriggerRotationsInPlace.
+
+    Rotates the ref frame about its own evolving axes: z by the .y column, then
+    y by -.z, then x by -.x. The lua file states this matches the C++.
+    """
+    p_ref, p_x, p_y = (nodes[node] for node in refs)
+    _origin, x_axis, y_axis, z_axis = trigger_frame(p_ref, p_x, p_y)
+    arm = [p_y[i] - p_ref[i] for i in range(3)]
+    length = math.sqrt(sum(c * c for c in arm))
+    rotated_up = tuple(c / length for c in arm)
+    rot_x, rot_y, rot_z = (math.radians(v) for v in base_rotation)
+    auto_yaw = math.atan2(
+        sum(rotated_up[i] * x_axis[i] for i in range(3)),
+        sum(rotated_up[i] * y_axis[i] for i in range(3)),
+    )
+    for pick, angle in (("z", auto_yaw + rot_y), ("y", -rot_z), ("x", -rot_x)):
+        axis = {"x": x_axis, "y": y_axis, "z": z_axis}[pick]
+        x_axis, y_axis, z_axis = (_rotate(v, axis, angle) for v in (x_axis, y_axis, z_axis))
+    return (x_axis, y_axis, z_axis)
+
+
+class TriggerRotationGroundTruthTest(unittest.TestCase):
+    """The rotation columns against the stock pairs that actually constrain them."""
+
+    def assert_same_box(self, left, right, places=6):
+        # a box is symmetric under negating an axis, so compare axis lines
+        for a, b in zip(left, right):
+            self.assertAlmostEqual(abs(sum(a[i] * b[i] for i in range(3))), 1.0, places=places)
+
+    def test_bx_hood_int_mirrors_onto_the_authored_right_hand_box(self):
+        lhd = box_axes(("f5ll", "f5l", "f6ll"), (45, 0, -15), BX_FOOTWELL)
+        reflected = tuple((-v[0], v[1], v[2]) for v in lhd)
+        authored = box_axes(("f5rr", "f5r", "f6rr"), (45, 0, -165), BX_FOOTWELL)
+        self.assert_same_box(reflected, authored)  # vanilla agrees with itself
+
+        ours = box_axes(("f5rr", "f5r", "f6rr"), _mirror_euler((45, 0, -15)), BX_FOOTWELL)
+        self.assert_same_box(reflected, ours)
+
+    def test_keeping_z_would_put_the_bx_box_thirty_degrees_out(self):
+        lhd = box_axes(("f5ll", "f5l", "f6ll"), (45, 0, -15), BX_FOOTWELL)
+        reflected = tuple((-v[0], v[1], v[2]) for v in lhd)
+        kept_z = box_axes(("f5rr", "f5r", "f6rr"), (-45, 0, -15), BX_FOOTWELL)
+        error = math.degrees(
+            math.acos(min(1.0, abs(sum(reflected[0][i] * kept_z[0][i] for i in range(3)))))
+        )
+        self.assertAlmostEqual(error, 30.0, places=2)
+
+    def test_covet_hood_int_reproduces_the_authored_pair_exactly(self):
+        # covet authors 25 -> -25 with z zero, so the numbers match literally
+        self.assertEqual(_mirror_euler((25.0, 0.0, 0.0)), (-25.0, 0.0, -0.0))
+
+    def test_the_rule_is_its_own_inverse(self):
+        for triple in ((45.0, 0.0, -15.0), (-13.0, 1.0, 1.0), (25.0, 0.0, 0.0)):
+            self.assertEqual(_mirror_euler(_mirror_euler(triple)), triple)
 
 
 if __name__ == "__main__":

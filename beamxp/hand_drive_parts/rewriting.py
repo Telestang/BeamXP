@@ -1367,15 +1367,25 @@ def _owning_transform(
 def _mirror_euler(values: Vec3) -> Vec3:
     """Mirror a trigger's euler triple across a reflected ref frame.
 
-    Fitted to the three stock LHD/RHD trigger pairs rather than derived: the
-    columns are applied about world axes, so there is no clean analytic answer.
-    Across etk800, bx and covet the authored x always negates (-12/12, -13/12.5,
-    -4/4) and y is always kept (bx and covet both author 1 on each side). z is
-    the one vanilla disagrees with itself about -- bx flips 1 to -1 while covet
-    keeps 2 and etk800 keeps -0.2 -- so the majority reading wins and z is kept.
-    Every disputed value is under 2 degrees on a box a few centimetres across.
+    Derived rather than fitted. BeamNG builds the box orientation by rotating
+    the ref frame about its own evolving axes -- z by the .y column, then y by
+    -.z, then x by -.x (triggerLabelPlacement.lua, applyTriggerRotationsInPlace,
+    which the file states matches the C++ asyncUpdate sequence and signs). So
+    the orientation is F * Rz(auto + y) * Ry(-z) * Rx(-x).
+
+    Reflecting the ref triple gives F' = M F diag(1,1,-1), and the automatic
+    yaw is invariant under reflection, so F'^T M F is diag(1,1,-1). Conjugating
+    the product by that flips the sign of the two angles whose axes involve the
+    frame's z, and leaves the third: .x and .z negate, .y is kept.
+
+    Checked against every stock pair that carries a non-zero rotation. covet's
+    hood_int is exact (25 -> -25), and bx's hood_int lands on the same
+    orientation by another route (45/-15 authored as 45/-165, this rule gives
+    -45/15 -- 0.00 degrees apart). The old rule, which kept z, put bx's box 30
+    degrees out. etk800's door pair authors -0.2 on both hands where the true
+    reflection is +0.2, which is 0.4 degrees and is why keeping z looked right.
     """
-    return (-values[0], values[1], values[2])
+    return (-values[0], values[1], -values[2])
 
 
 def _frames_differ_by_z_flip(
