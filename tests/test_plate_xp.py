@@ -471,13 +471,14 @@ class PlateXpTests(unittest.TestCase):
         into format.segments; without it every segment is {0, 0} and skiaTemplate
         resolves both lines to an empty string."""
         font_path = plate_generator.resolve_font_path({"source": "default", "path": ""})
-        _font, metrics = plate_generator._plate_font_metrics(font_path)
+        font, metrics = plate_generator._plate_font_metrics(font_path)
         config = plate_generator.default_plate_config()
-        config["pattern"] = "@@## @@@"
+        # active_pattern() reads the family section, not a top-level "pattern"
+        config["eu"]["pattern"] = "@@@## @@@"
 
-        params = plate_generator._family_text_params(config, "30-15", metrics)
+        params = plate_generator._family_text_params(config, "30-15", metrics, font)
         self.assertEqual(params["layout"], "two-line")
-        self.assertEqual([line["limit"] for line in params["lines"]], [[0, 4], [5, 8]])
+        self.assertEqual([line["limit"] for line in params["lines"]], [[0, 5], [6, 9]])
         # buildPlateRoot() reads placement only from line.pos ([x, y, scale]);
         # the sibling x/y/scale keys alone leave both lines stacked dead centre
         # at full size, so pos must agree with them.
@@ -487,6 +488,44 @@ class PlateXpTests(unittest.TestCase):
         self.assertLess(top["pos"][1], bottom["pos"][1])
         self.assertLess(top["pos"][2], 1.0)
 
+    def test_emitted_scale_keeps_every_registration_inside_the_width_budget(self) -> None:
+        """buildPlateRoot spans a line's node left 0 to right 0, so the game's
+        `fit: "shrink"` only engages past the *full* plate width - it cannot see
+        maxWidth. Unless the emitted font size already respects the budget, the
+        preview is the only thing keeping text off the EU side band."""
+        font_path = plate_generator.resolve_font_path({"source": "default", "path": ""})
+        font, metrics = plate_generator._plate_font_metrics(font_path)
+        width = 512
+        spacing = 0
+
+        def widest_line(pattern: str, band: str) -> tuple[float, float, float]:
+            config = plate_generator.default_plate_config()
+            config["eu"]["pattern"] = pattern
+            config["eu"]["sideBand"] = band
+            params = plate_generator._family_text_params(config, "30-15", metrics, font)
+            worst = plate_generator._widest_registration(pattern, font)
+            drawn = max(
+                plate_generator._rendered_width(
+                    worst[slice(*line["limit"])], font, metrics, spacing, params["scale"]
+                )
+                for line in params["lines"]
+            )
+            return drawn, params["lines"][0]["maxWidth"] * width, params["scale"]
+
+        # Every roll of the pattern has to fit, not just the one the preview drew.
+        for pattern in ("@@## @@@", "@@@## @@@", "@@@@## @@@@", "~~~~~~ ~~~~~~"):
+            drawn, budget, _scale = widest_line(pattern, plate_generator.BAND_EU)
+            self.assertLessEqual(round(drawn, 3), round(budget, 3), pattern)
+
+        # A pattern that already fits keeps its natural size...
+        short, _b, short_scale = widest_line("@@## @@@", plate_generator.BAND_EU)
+        _d, _b2, unclamped = widest_line("@@## @@@", plate_generator.BAND_NONE)
+        self.assertEqual(short_scale, unclamped)
+        # ...and the wider no-band budget shrinks less than the banded one.
+        _d, _b3, banded = widest_line("@@@## @@@", plate_generator.BAND_EU)
+        _d, _b4, unbanded = widest_line("@@@## @@@", plate_generator.BAND_NONE)
+        self.assertLess(banded, unbanded)
+
     def test_letter_spacing_comes_only_from_the_spacing_control(self) -> None:
         """buildPlateRoot gives a `lines` entry letterSpacing (xAdv or 0) + 2.
 
@@ -495,12 +534,12 @@ class PlateXpTests(unittest.TestCase):
         two-line plates differently from every other format.
         """
         font_path = plate_generator.resolve_font_path({"source": "default", "path": ""})
-        _font, metrics = plate_generator._plate_font_metrics(font_path)
+        font, metrics = plate_generator._plate_font_metrics(font_path)
         for spacing in (-10, 0, 12, 30):
             config = plate_generator.default_plate_config()
-            config["pattern"] = "@@## @@@"
+            config["eu"]["pattern"] = "@@## @@@"
             config["eu"]["spacing"] = spacing
-            params = plate_generator._family_text_params(config, "30-15", metrics)
+            params = plate_generator._family_text_params(config, "30-15", metrics, font)
             for line in params["lines"]:
                 self.assertEqual(line["xAdv"] + 2, 0, f"spacing={spacing}")
             atlas = plate_generator.build_font_atlas(font_path, set("AB12"), spacing)
@@ -518,16 +557,16 @@ class PlateXpTests(unittest.TestCase):
         self.assertEqual(registration[0:4], registration.split(" ")[0])
         self.assertEqual(registration[5:8], registration.split(" ")[1])
 
-        wide = plate_generator._family_text_params(config, "52-11", metrics)
+        wide = plate_generator._family_text_params(config, "52-11", metrics, font)
         self.assertNotIn("lines", wide)
 
     def test_eu_horizontal_text_offset_shifts_the_band_aware_centre(self) -> None:
         font_path = plate_generator.resolve_font_path({"source": "default", "path": ""})
-        _font, metrics = plate_generator._plate_font_metrics(font_path)
+        font, metrics = plate_generator._plate_font_metrics(font_path)
 
         def text_x(**eu_overrides):
             cfg = plate_generator.normalized_plate_config({"size": "EU", "eu": eu_overrides})
-            return plate_generator._family_text_params(cfg, "52-11", metrics)["x"]
+            return plate_generator._family_text_params(cfg, "52-11", metrics, font)["x"]
 
         self.assertEqual(text_x(sideBand="none"), 0.5)
         self.assertEqual(text_x(sideBand="none", textX=0.2), 0.7)

@@ -81,7 +81,7 @@ _EU_BLUE = "#003399"
 _ATLAS_WIDTH = 1024
 _ATLAS_PAD = 6
 _CAP_TARGET = 100  # target capital letter height in atlas pixels
-_ASSET_VERSION = 10  # bump to invalidate hashed asset folders
+_ASSET_VERSION = 11  # bump to invalidate hashed asset folders
 EMBOSS_MAX_UI = 2.0  # upper bound of the emboss slider in the UI
 _EMBOSS_BLUR_RADIUS = 1.2
 _EMBOSS_NORMAL_HEIGHT = 10.0
@@ -617,6 +617,64 @@ def _split_two_line_text(text: str) -> tuple[str, str]:
 _LINE_XADV = -2
 
 
+# Decimal places the design JSON's positions and scales are written at.
+_SCALE_DECIMALS = 4
+
+
+def _glyph_advance(ch: str, font, cap_height: float) -> float:
+    """One glyph's pen advance, before the user's extra spacing."""
+    if ch == _CENTER_DOT_CHAR:
+        return max(font.getlength(ch), cap_height * 0.32)
+    return font.getlength(ch)
+
+
+def _rendered_width(text: str, font, metrics: _FontMetrics, spacing: int, scale: float) -> float:
+    return sum((_glyph_advance(ch, font, metrics.cap_height) + spacing) * scale for ch in text)
+
+
+def _widest_registration(pattern: str, font) -> str:
+    """The longest-rendering registration `pattern` can produce.
+
+    A design's font size is fixed but its text is not, so the width budget has
+    to hold for every roll of the pattern, not just the one the preview drew.
+    """
+    widest = {
+        "@": max(_LETTERS, key=font.getlength),
+        "#": max(_DIGITS, key=font.getlength),
+        "~": max(_ALNUM, key=font.getlength),
+    }
+    return "".join(widest.get(ch, ch.upper()) for ch in str(pattern or "").strip())
+
+
+def _scale_within_width(
+    scale: float,
+    lines: list[str],
+    font,
+    metrics: _FontMetrics,
+    spacing: int,
+    canvas_width: int,
+    max_width: float,
+) -> float:
+    """Shrink `scale` until every line fits `max_width` of the plate.
+
+    buildPlateRoot() gives a line an absolute node spanning left 0 to right 0,
+    so the game's `fit: "shrink"` only engages once text passes the *full*
+    plate width - it has no concept of our narrower budget, which exists to
+    keep text off the EU side band. Baking the budget into the emitted font
+    size is the only lever the legacy design format leaves us, and it also
+    keeps the preview's own clamp from being the sole thing enforcing it.
+    """
+    budget = canvas_width * max_width
+    if budget <= 0:
+        return scale
+    widest = max((_rendered_width(line, font, metrics, spacing, scale) for line in lines if line), default=0.0)
+    if widest <= budget or widest <= 0:
+        return scale
+    # Floored to the precision the design JSON is written at, so the value that
+    # actually ships is inside the budget rather than a rounding step past it.
+    return int(scale * budget / widest * 10**_SCALE_DECIMALS) / 10**_SCALE_DECIMALS
+
+
 def _line_pos(x: float, y: float, scale: float) -> list[float]:
     """A rendered line's placement, in the shape the design JSON needs.
 
@@ -801,11 +859,10 @@ def build_font_atlas(font_path: Path, glyphs: set[str], spacing: int = 0, emboss
 
     entries = []
     for ch in sorted(glyphs):
+        advance = _glyph_advance(ch, font, cap_height)
         if ch == _CENTER_DOT_CHAR:
-            advance = max(font.getlength(ch), cap_height * 0.32)
             entries.append({"ch": ch, "w": max(1, round(advance)), "l": 0, "advance": advance, "box": None, "centerDot": True})
             continue
-        advance = font.getlength(ch)
         box = font.getbbox(ch)
         if ch == " " or not box or box[2] <= box[0]:
             entries.append({"ch": ch, "w": 0, "l": 0, "advance": advance, "box": None})
@@ -1225,8 +1282,12 @@ def _text_y_fraction(metrics: _FontMetrics, canvas_h: int, scale: float, center_
     return (target + (lh - base) + lh * 0.5 - (base - cap * 0.5) * scale) / canvas_h
 
 
-def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics) -> dict[str, object]:
-    """text block (x/y/scale/color/limit) for one format of the active family."""
+def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics, font) -> dict[str, object]:
+    """text block (x/y/scale/color/limit) for one format of the active family.
+
+    `font` is the loaded plate font, needed to keep the emitted size inside the
+    format's width budget (see _scale_within_width).
+    """
     size_family = str(cfg.get("size"))
     width, height = _CANVAS[fmt]
     wide = width >= 1024
@@ -1244,12 +1305,23 @@ def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics)
         if not wide:
             # A wide EU registration on a 2:1 plate wraps onto two lines.
             scale = (height * 0.31) / metrics.cap_height
+            max_width = round(0.84 if str(eu.get("sideBand")) == BAND_NONE else 0.78, 4)
+            top_range, bottom_range = _two_line_ranges(active_pattern(cfg))
+            widest = _widest_registration(active_pattern(cfg), font)
+            scale = _scale_within_width(
+                scale,
+                [widest[slice(*top_range)], widest[slice(*bottom_range)]],
+                font,
+                metrics,
+                _active_spacing(cfg),
+                width,
+                max_width,
+            )
             line = {
                 "x": round(tx, 4),
                 "scale": round(scale, 4),
-                "maxWidth": round(0.84 if str(eu.get("sideBand")) == BAND_NONE else 0.78, 4),
+                "maxWidth": max_width,
             }
-            top_range, bottom_range = _two_line_ranges(active_pattern(cfg))
             top_y = round(_text_y_fraction(metrics, height, scale, 0.34), 4)
             bottom_y = round(_text_y_fraction(metrics, height, scale, 0.70), 4)
             return {
@@ -1384,7 +1456,7 @@ def render_plate_preview(
     plate = _render_background_for(cfg, fmt, font_path, rear=rear)
     # Same maths as the generated design JSON, just rendered directly.
     font, metrics = _plate_font_metrics(font_path)
-    params = _family_text_params(cfg, fmt, metrics)
+    params = _family_text_params(cfg, fmt, metrics, font)
     spacing = _active_spacing(cfg)
 
     from PIL import ImageDraw
@@ -1397,14 +1469,15 @@ def render_plate_preview(
         line_scale = float(line_params.get("scale", params.get("scale", 1.0)))
 
         def char_advance(ch: str) -> float:
-            if ch == _CENTER_DOT_CHAR:
-                return max(font.getlength(ch), metrics.cap_height * 0.32)
-            return font.getlength(ch)
+            return _glyph_advance(ch, font, metrics.cap_height)
 
         # No constant of its own: the spacing control is the only source, so the
         # preview matches what the game draws (see _LINE_XADV).
         advances = [(char_advance(ch) + spacing) * line_scale for ch in line]
         total = sum(advances)
+        # The emitted scale already fits the budget for every registration the
+        # pattern can roll (_scale_within_width), so this only catches text the
+        # design did not generate.
         max_width = float(line_params.get("maxWidth", params.get("maxWidth", 0)) or 0)
         if max_width and total > width * max_width and total > 0:
             line_scale *= (width * max_width) / total
@@ -1750,6 +1823,7 @@ def _emit_design(
     from beamxp import hand_drive_core as core
 
     font_path = resolve_font_path(cfg.get("font"))
+    plate_font, _metrics = _plate_font_metrics(font_path)
     glyphs = _pattern_glyphs(active_pattern(cfg))
     spacing = _active_spacing(cfg)
     emboss_strength = _effective_emboss_strength(cfg)
@@ -1809,7 +1883,7 @@ def _emit_design(
             _save_png(_render_background_for(cfg, block_fmt, font_path, rear=rear), design_dir / bg_name)
             block: dict[str, object] = {
                 "size": {"x": _CANVAS[block_fmt][0], "y": _CANVAS[block_fmt][1]},
-                "text": _family_text_params(cfg, block_fmt, atlas.metrics),
+                "text": _family_text_params(cfg, block_fmt, atlas.metrics, plate_font),
                 "characterLayout": f"{font_rel}/platefont.json",
                 "generator": generator_rel,
             }
