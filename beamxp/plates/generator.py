@@ -609,6 +609,18 @@ def _split_two_line_text(text: str) -> tuple[str, str]:
     return " ".join(words[:best_index]), " ".join(words[best_index:])
 
 
+def _line_pos(x: float, y: float, scale: float) -> list[float]:
+    """A rendered line's placement, in the shape the design JSON needs.
+
+    core/licensePlateDesign.lua buildPlateRoot() reads a line's position and
+    size *only* from `line.pos`, indexed as [x, y, scale] (numberOrTable with
+    index 1/2/3); it never looks at sibling `x`/`y`/`scale` keys, which is why
+    those alone leave every line stacked at the plate centre at full size.
+    The named keys stay for render_plate_preview(), which reads them directly.
+    """
+    return [round(x, 4), round(y, 4), round(scale, 4)]
+
+
 def _two_line_ranges(pattern: str) -> tuple[tuple[int, int], tuple[int, int]]:
     """Character ranges of the two rendered lines, as the design JSON needs them.
 
@@ -1230,6 +1242,8 @@ def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics)
                 "maxWidth": round(0.84 if str(eu.get("sideBand")) == BAND_NONE else 0.78, 4),
             }
             top_range, bottom_range = _two_line_ranges(active_pattern(cfg))
+            top_y = round(_text_y_fraction(metrics, height, scale, 0.34), 4)
+            bottom_y = round(_text_y_fraction(metrics, height, scale, 0.70), 4)
             return {
                 "layout": "two-line",
                 "x": round(tx, 4),
@@ -1238,8 +1252,8 @@ def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics)
                 "color": color,
                 "limit": limit,
                 "lines": [
-                    {**line, "y": round(_text_y_fraction(metrics, height, scale, 0.34), 4), "limit": list(top_range)},
-                    {**line, "y": round(_text_y_fraction(metrics, height, scale, 0.70), 4), "limit": list(bottom_range)},
+                    {**line, "y": top_y, "limit": list(top_range), "pos": _line_pos(tx, top_y, scale)},
+                    {**line, "y": bottom_y, "limit": list(bottom_range), "pos": _line_pos(tx, bottom_y, scale)},
                 ],
             }
         scale = (height * 0.60) / metrics.cap_height

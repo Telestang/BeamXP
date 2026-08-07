@@ -478,6 +478,14 @@ class PlateXpTests(unittest.TestCase):
         params = plate_generator._family_text_params(config, "30-15", metrics)
         self.assertEqual(params["layout"], "two-line")
         self.assertEqual([line["limit"] for line in params["lines"]], [[0, 4], [5, 8]])
+        # buildPlateRoot() reads placement only from line.pos ([x, y, scale]);
+        # the sibling x/y/scale keys alone leave both lines stacked dead centre
+        # at full size, so pos must agree with them.
+        for line in params["lines"]:
+            self.assertEqual(line["pos"], [line["x"], line["y"], line["scale"]])
+        top, bottom = params["lines"]
+        self.assertLess(top["pos"][1], bottom["pos"][1])
+        self.assertLess(top["pos"][2], 1.0)
         # 0-based, end-exclusive: text:sub(limit[1] + 1, limit[2]) in skiaTemplate
         registration = plate_generator.generate_registration("@@## @@@")
         self.assertEqual(registration[0:4], registration.split(" ")[0])
