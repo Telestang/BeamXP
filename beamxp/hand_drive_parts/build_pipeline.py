@@ -69,6 +69,7 @@ from beamxp.core.files import (
     read_json_file,
     safe_id,
     safe_project_segment,
+    vehicle_catalog_entry_for_id,
     vehicle_ids_in_zip,
     vehicle_prefix,
     write_bytes_file,
@@ -133,39 +134,148 @@ def mod_id_for_context(context: VehicleContext) -> str:
     return f"XP{digest.upper()}"
 
 
-def write_mod_info(root: Path, context: VehicleContext) -> None:
+def showcase_preview_for_build(
+    context: VehicleContext,
+    output_vehicle_dir: Path | None,
+    generated_configs: Iterable[str],
+    config_sources: dict[str, str] | None,
+) -> Path | None:
+    """The generated preview standing in for the whole build.
+
+    The selector's tile image for this vehicle is already resolved the way the
+    engine resolves it (``_tile_preview_member``); when that image is a config's
+    own, the build's counterpart of that config is the same car, converted. A
+    tile that shows the model image instead -- or a default that this build did
+    not convert -- falls back to the first output by name, so the choice stays
+    fixed for a given build rather than depending on dict order.
+    """
+    if output_vehicle_dir is None:
+        return None
+    outputs = sorted(str(name) for name in generated_configs if name)
+    if not outputs:
+        return None
+
+    preferred: list[str] = []
+    entry = vehicle_catalog_entry_for_id(context.source_zip, context.vehicle_id)
+    tile_config = Path(entry.preview_member).stem if entry and entry.preview_member else ""
+    if tile_config:
+        sources = config_sources or {}
+        preferred = [name for name in outputs if sources.get(name, name) == tile_config]
+
+    for output_config in (*preferred, *outputs):
+        for suffix in (".jpg", ".png", ".jpeg"):
+            candidate = output_vehicle_dir / f"{output_config}{suffix}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def mod_description_bbcode(
+    context: VehicleContext,
+    generated_configs: Iterable[str],
+) -> str:
+    """The body the info panel renders, as BBCode.
+
+    ``modmanager.js`` runs ``modData.text`` through ``Utils.parseBBCode``, so
+    this is the one field that can carry more than a single line.
+    """
+    outputs = sorted(str(name) for name in generated_configs if name)
+    lines = [
+        f"[B]{context.vehicle_id}[/B] converted by "
+        f"[URL=https://github.com/Telestang/beamng-hand-drive-converter]BeamXP[/URL].",
+        "",
+        "This mod adds hand-drive converted configurations alongside the "
+        "vehicle they came from. Mirrored geometry, relocated interior parts, "
+        "handed lighting and license plates are generated from the source "
+        "vehicle, so the original stays installed and untouched.",
+        "",
+        f"[B]Requires:[/B] {context.source_zip.name} -- the configurations here "
+        "reference its parts and meshes, and will not load without it.",
+        "",
+        f"[B]Configurations added ({len(outputs)}):[/B]",
+    ]
+    lines.extend(f"[*]{name}" for name in outputs)
+    lines.extend(
+        [
+            "",
+            "[I]Generated automatically; report conversion problems to the tool, "
+            "not to the author of the source vehicle.[/I]",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_mod_info(
+    root: Path,
+    context: VehicleContext,
+    output_vehicle_dir: Path | None = None,
+    generated_configs: Iterable[str] = (),
+    config_sources: dict[str, str] | None = None,
+) -> None:
     """Write the manifest the mod manager shows for this build.
 
-    Field names follow the repo manifests the game already reads:
-    ``ui/modules/modmanager/info.html`` binds Unique ID to ``tagid`` and Author
-    to ``username``, the cards use ``title``/``tag_line``/``version_string``,
-    and the description body is ``text`` run through the BBCode parser.
+    Field names follow the repo manifests the game already reads
+    (``ui/modules/modmanager/info.html``): the panel binds Unique ID to
+    ``tagid`` and Author to ``username``, the header to
+    ``icon``/``prefix_title``/``title``/``tag_line``, the table to
+    ``version_string``/``last_update``/``category_title``, and the body to
+    ``text`` through the BBCode parser. ``attachments`` is what modmanager.lua
+    turns into ``imgs`` for the image strip, prefixing each ``thumb_filename``
+    with this folder.
+
+    Left unset on purpose: ``filesize``, ``download_count`` and ``rating_avg``
+    are facts about a repository entry. A locally generated mod has none, and a
+    made-up number in a field the player can check against the zip is worse
+    than the blank row.
     """
     mod_id = mod_id_for_context(context)
     mod_info = root / "mod_info" / mod_id
     mod_info.mkdir(parents=True, exist_ok=True)
+    generated_configs = sorted(str(name) for name in generated_configs if name)
     source_name = conversion_source_name(context)
-    description = (
-        f"Generated BeamXP handedness and/or plate configuration overlay for "
-        f"{context.vehicle_id}. Depends on {context.source_zip.name}."
+    title = f"{context.vehicle_id} BeamXP Conversion"
+    tag_line = (
+        f"Hand-drive conversion of {context.vehicle_id}, generated from "
+        f"{context.source_zip.name}."
     )
-    info = {
+    description = mod_description_bbcode(context, generated_configs)
+
+    info: dict[str, object] = {
         "tagid": mod_id,
         "username": MOD_AUTHOR,
-        "title": f"{context.vehicle_id} BeamXP Conversion",
-        "tag_line": f"BeamXP hand-drive conversion of {context.vehicle_id}.",
+        "prefix_title": "BeamXP",
+        "title": title,
+        "tag_line": tag_line,
         "version_string": MOD_VERSION,
+        "current_version_id": MOD_VERSION,
+        # The panel formats this with Angular's date filter, which reads an
+        # ISO 8601 string directly; a bare epoch number there is milliseconds
+        # and renders as 1970.
+        "last_update": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "category_title": "Configurations",
         "filename": package_name_for_context(context),
         "path": f"{mod_id}/",
         "text": description,
         # Kept from the pre-manifest layout: harmless to the mod manager, and
         # still the fields a human reads in the file itself.
-        "name": f"{context.vehicle_id} BeamXP Conversion",
+        "name": title,
         "version": MOD_VERSION,
         "authors": MOD_AUTHOR,
         "description": description,
         "source": source_name,
     }
+
+    preview = showcase_preview_for_build(
+        context, output_vehicle_dir, generated_configs, config_sources
+    )
+    if preview is not None:
+        thumbnail = f"preview{preview.suffix.lower()}"
+        _atomic_copy_file(preview, mod_info / thumbnail)
+        info["icon"] = thumbnail
+        info["attachments"] = [
+            {"filename": thumbnail, "thumb_filename": thumbnail, "title": title}
+        ]
+
     write_text_file(mod_info / "info.json", json.dumps(info, indent=2), encoding="utf-8")
 
 
@@ -1768,7 +1878,13 @@ def build_batch(
         original_configs,
     ))
     generated_configs.sort()
-    write_mod_info(output_root, context)
+    write_mod_info(
+        output_root,
+        context,
+        output_vehicle_dir,
+        generated_configs,
+        output_config_sources(context, conversion),
+    )
     # Licence plates are generated as a separate pass over the written output
     # so plate logic stays fully decoupled from the handedness transforms.
     try:
@@ -1861,4 +1977,4 @@ def build_batch(
         texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'integrate_texture_correction_artifacts', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'integrate_texture_correction_artifacts', 'build_batch']

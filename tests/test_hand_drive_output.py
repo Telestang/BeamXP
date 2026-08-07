@@ -333,15 +333,44 @@ class ModManifestTests(unittest.TestCase):
     # what left the Unique ID and Author fields blank.
     MOD_INFO_RE = re.compile(r"^/?mod_info/([0-9a-zA-Z]*)/info\.json$")
 
-    def _write(self, zip_stem: str, vehicle_id: str) -> tuple[Path, dict[str, object]]:
+    def _write(
+        self,
+        zip_stem: str,
+        vehicle_id: str,
+        *,
+        generated_configs: tuple[str, ...] = (),
+        config_sources: dict[str, str] | None = None,
+    ) -> tuple[Path, dict[str, object]]:
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
+        self.root = root
         source = root / f"{zip_stem}.zip"
         with zipfile.ZipFile(source, "w") as archive:
             archive.writestr(f"vehicles/{vehicle_id}/{vehicle_id}.jbeam", "{}")
+            archive.writestr(f"vehicles/{vehicle_id}/{vehicle_id}.dae", "")
+            # No model default.jpg, so the tile falls through to the default
+            # config's own image -- the case _tile_preview_member resolves.
+            archive.writestr(
+                f"vehicles/{vehicle_id}/info.json", json.dumps({"default_pc": "base"})
+            )
+            for config in ("base", "sport"):
+                archive.writestr(f"vehicles/{vehicle_id}/{config}.pc", "{}")
+                archive.writestr(f"vehicles/{vehicle_id}/{config}.jpg", f"{config} image")
+
+        output_vehicle_dir = root / "vehicles" / vehicle_id
+        output_vehicle_dir.mkdir(parents=True, exist_ok=True)
+        for config in generated_configs:
+            (output_vehicle_dir / f"{config}.jpg").write_text(f"{config} render")
+
         context = OutputPackageNameTests._context(zip_stem, vehicle_id)
         context = replace(context, source_zip=source)
-        core.write_mod_info(root, context)
+        core.write_mod_info(
+            root,
+            context,
+            output_vehicle_dir if generated_configs else None,
+            generated_configs,
+            config_sources,
+        )
         manifest = next(root.rglob("info.json"))
         return manifest.relative_to(root), json.loads(manifest.read_text())
 
@@ -367,6 +396,51 @@ class ModManifestTests(unittest.TestCase):
         self.assertNotEqual(core.mod_id_for_context(one), core.mod_id_for_context(sibling))
         # Alphanumeric or the folder does not match at all.
         self.assertTrue(core.mod_id_for_context(one).isalnum())
+
+    def test_the_thumbnail_is_the_converted_tile_image(self) -> None:
+        # The selector's tile for this vehicle shows base.jpg, so the mod's
+        # thumbnail is that same car after conversion.
+        relative, info = self._write(
+            "acme",
+            "acme",
+            generated_configs=("base_rhd", "sport_rhd"),
+            config_sources={"base_rhd": "base", "sport_rhd": "sport"},
+        )
+        self.assertEqual(info["icon"], "preview.jpg")
+        # modmanager.lua builds the image strip from attachments' thumb_filename.
+        self.assertEqual(
+            [entry["thumb_filename"] for entry in info["attachments"]],
+            ["preview.jpg"],
+        )
+        thumbnail = self.root / relative.parent / str(info["icon"])
+        self.assertEqual(thumbnail.read_text(), "base_rhd render")
+
+    def test_the_thumbnail_falls_back_when_the_tile_config_was_not_converted(self) -> None:
+        relative, info = self._write(
+            "acme",
+            "acme",
+            generated_configs=("sport_rhd", "zzz_rhd"),
+            config_sources={"sport_rhd": "sport", "zzz_rhd": "zzz"},
+        )
+        thumbnail = self.root / relative.parent / str(info["icon"])
+        self.assertEqual(thumbnail.read_text(), "sport_rhd render")
+
+    def test_a_build_with_no_previews_leaves_the_thumbnail_out(self) -> None:
+        _relative, info = self._write("acme", "acme")
+        self.assertNotIn("icon", info)
+        self.assertNotIn("attachments", info)
+
+    def test_the_body_lists_what_the_build_added(self) -> None:
+        _relative, info = self._write(
+            "acme",
+            "acme",
+            generated_configs=("base_rhd", "sport_rhd"),
+            config_sources={"base_rhd": "base", "sport_rhd": "sport"},
+        )
+        # modmanager.js parses this field as BBCode for the description body.
+        self.assertIn("[*]base_rhd", info["text"])
+        self.assertIn("[*]sport_rhd", info["text"])
+        self.assertIn("acme.zip", info["text"])
 
 
 class GeneratedMirrorTests(unittest.TestCase):
