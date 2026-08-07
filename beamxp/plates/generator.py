@@ -3392,30 +3392,34 @@ def _retarget_plate_tags(value: object, fmt: str) -> object:
 
 
 def _apply_custom_format_maps(entry: dict[str, object]) -> None:
-    """Point the metallic map at the stock tag, keeping the rest of the stage.
+    """Keep only the tags a *custom* plate format actually binds.
 
-    A stock format's material reads four tags - base, -normal, -specular and
+    A stock format's material reads four - base, -normal, -specular and
     -metallic - and inheriting it retargets all four at the BeamXP rear format.
-    The metallic one is the map the renderer does not produce for a format it
-    does not ship: EuroPlates, which builds custom formats exactly the way we do
-    (own licenseplateFormat, renamed mesh under vehicles/common), pins its
-    metallic map to the stock "@licenseplate-default-metallic". A secondary map
-    that never binds does not show the missing-texture placeholder, it just
-    shades wrong.
+    Tested in game, a format the engine does not ship binds the base and
+    -specular tags but neither -normal nor -metallic: referencing either leaves
+    the rear shading visibly wrong, without the missing-texture placeholder a
+    broken base map would give. EuroPlates reaches the same shape from the same
+    constraint - it builds custom formats exactly the way we do (own
+    licenseplateFormat, renamed mesh under vehicles/common), pins its metallic
+    map to the stock "@licenseplate-default-metallic" and carries no normal map.
 
-    The normal map stays on the rear format's own tag. EuroPlates omits it
-    entirely, but dropping it costs the rear its relief while the front keeps
-    the emboss the design asks for, and this material is shared across every
-    design now, so a per-design normal PNG is not an option - a tag is the only
-    way relief can follow the active design.
+    So the rear plate has no relief of its own. Restoring the -normal tag was
+    tried and broke the shading again; a per-design normal PNG is not available
+    either, because this material is shared across every design. Giving the rear
+    relief means a single static normal map for all BeamXP rear plates - plate
+    edge relief but no per-character emboss - which is a deliberate look to
+    choose, not a fix to apply silently.
 
     Which maps the renderer emits per format is C++ (veh:renderLicensePlateSkia)
-    and not provable from the game's Lua.
+    and not provable from the game's Lua; this records what the game does.
     """
     stages = entry.get("Stages")
     if not isinstance(stages, list) or not stages or not isinstance(stages[0], dict):
         return
     stage = stages[0]
+    stage.pop("normalMap", None)
+    stage.pop("normalMapUseUV", None)
     # BeamXP's own multiplier, never present on a stock plate material.
     stage.pop("normalMapStrength", None)
     if "metallicMap" in stage:
