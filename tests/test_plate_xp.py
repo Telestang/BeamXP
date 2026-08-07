@@ -365,6 +365,52 @@ class PlateXpTests(unittest.TestCase):
         self.assertNotIn("normalMapStrength", entry["Stages"][0])
         self.assertIsNot(entry["Stages"][0], source["Stages"][0])
 
+    def test_clone_inherits_the_source_material_and_effect(self) -> None:
+        """Rebuilding them as a bare lambert drops whatever the exporter wrote.
+
+        The stock plate effect carries an emission colour and a reflectivity
+        float; a synthetic stand-in has neither, so the clone would differ from
+        the mesh it was copied from before any material JSON is consulted.
+        """
+        from xml.etree import ElementTree as ET
+
+        ns = "http://www.collada.org/2005/11/COLLADASchema"
+        doc = ET.fromstring(
+            f'<COLLADA xmlns="{ns}">'
+            '<library_effects><effect id="plate-effect"><profile_COMMON><technique sid="common">'
+            '<lambert><emission><color sid="emission">0 0 0 1</color></emission>'
+            '<diffuse><color sid="diffuse">0.735 0.735 0.735 1</color></diffuse>'
+            '<reflectivity><float sid="specular">50</float></reflectivity>'
+            "</lambert></technique></profile_COMMON></effect></library_effects>"
+            '<library_materials><material id="plate-material" name="plate">'
+            '<instance_effect url="#plate-effect"/></material></library_materials>'
+            '<library_visual_scenes><visual_scene><node id="plate">'
+            "<instance_geometry url=\"#g\"><bind_material><technique_common>"
+            '<instance_material symbol="plate-material" target="#plate-material"/>'
+            "</technique_common></bind_material></instance_geometry>"
+            "</node></visual_scene></library_visual_scenes></COLLADA>"
+        )
+        node = doc.find(f".//{{{ns}}}node")
+        mats = {m.get("id"): m for m in doc.iter(f"{{{ns}}}material")}
+        effects = {e.get("id"): e for e in doc.iter(f"{{{ns}}}effect")}
+
+        material, effect = plate_generator._inherited_material_pair(
+            doc, node, "bhdc_rear_plate", mats, effects
+        )
+        self.assertEqual(material.get("id"), "bhdc_rear_plate-material")
+        self.assertEqual(material.get("name"), "bhdc_rear_plate")
+        self.assertEqual(
+            material.find(f"{{{ns}}}instance_effect").get("url"), "#bhdc_rear_plate-effect"
+        )
+        self.assertEqual(effect.get("id"), "bhdc_rear_plate-effect")
+        text = ET.tostring(effect, encoding="unicode")
+        self.assertIn("emission", text)
+        self.assertIn("reflectivity", text)
+        self.assertIn("0.735", text)
+        # the source document must not be mutated
+        self.assertEqual(mats["plate-material"].get("id"), "plate-material")
+        self.assertEqual(effects["plate-effect"].get("id"), "plate-effect")
+
     def test_a_vehicles_own_archive_is_never_treated_as_shared(self) -> None:
         """common_zip_candidates() leads with the vehicle's own archive.
 

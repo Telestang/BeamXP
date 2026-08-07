@@ -3059,6 +3059,42 @@ def _source_material_name(root: ET.Element, node: ET.Element) -> str | None:
     return re.sub(r"-material$", "", material_id) or None
 
 
+def _inherited_material_pair(
+    root: ET.Element,
+    node: ET.Element,
+    output_mesh: str,
+    materials_by_id: dict[str, ET.Element],
+    effects_by_id: dict[str, ET.Element],
+) -> tuple[ET.Element, ET.Element | None] | None:
+    """Copy the material/effect a source node is bound to, renamed for the clone.
+
+    Rebuilding them from scratch loses whatever the exporter put there - the
+    stock plate effect has an emission colour and a reflectivity float that a
+    plain lambert does not.
+    """
+    instance = node.find(".//c:instance_material", transform_helpers.NS)
+    if instance is None:
+        return None
+    target = instance.get("target") or ""
+    source_material = materials_by_id.get(target[1:] if target.startswith("#") else target)
+    if source_material is None:
+        return None
+
+    material = copy.deepcopy(source_material)
+    material.set("id", f"{output_mesh}-material")
+    material.set("name", output_mesh)
+    effect = None
+    instance_effect = material.find("c:instance_effect", transform_helpers.NS)
+    if instance_effect is not None:
+        url = instance_effect.get("url") or ""
+        source_effect = effects_by_id.get(url[1:] if url.startswith("#") else url)
+        if source_effect is not None:
+            effect = copy.deepcopy(source_effect)
+            effect.set("id", f"{output_mesh}-effect")
+            instance_effect.set("url", f"#{output_mesh}-effect")
+    return material, effect
+
+
 def _write_rear_clone_daes(
     context,
     output_root: Path,
@@ -3096,6 +3132,20 @@ def _write_rear_clone_daes(
             for geom in library_geometries.findall("c:geometry", transform_helpers.NS)
             if geom.get("id")
         }
+        # Keep the source's own material/effect pair per clone rather than
+        # fabricating one: the stock plate effect carries an emission colour and
+        # a reflectivity of 50 that a bare lambert stand-in would drop.
+        source_material_elems = {
+            mat.get("id"): mat
+            for mat in library_materials.findall("c:material", transform_helpers.NS)
+            if mat.get("id")
+        }
+        source_effect_elems = {
+            eff.get("id"): eff
+            for eff in library_effects.findall("c:effect", transform_helpers.NS)
+            if eff.get("id")
+        }
+        inherited_pairs: list[tuple[ET.Element, ET.Element | None]] = []
         cloned_nodes: list[ET.Element] = []
         cloned_geometries: dict[str, ET.Element] = {}
         material_meshes: set[str] = set()
@@ -3115,6 +3165,11 @@ def _write_rear_clone_daes(
             inherited = _source_material_name(root, source_node)
             if inherited:
                 source_materials[clone.output_mesh] = inherited
+            pair = _inherited_material_pair(
+                root, source_node, clone.output_mesh, source_material_elems, source_effect_elems
+            )
+            if pair is not None:
+                inherited_pairs.append(pair)
             material_id = f"{clone.output_mesh}-material"
             _set_instance_materials(new_node, material_id)
 
@@ -3147,7 +3202,13 @@ def _write_rear_clone_daes(
             library_geometries.append(geometry)
         _clear_children(library_materials)
         _clear_children(library_effects)
-        for output_mesh in sorted(material_meshes):
+        inherited_meshes = set()
+        for material, effect in inherited_pairs:
+            inherited_meshes.add(material.get("name") or "")
+            library_materials.append(material)
+            if effect is not None:
+                library_effects.append(effect)
+        for output_mesh in sorted(material_meshes - inherited_meshes):
             _append_plate_effect(library_effects, output_mesh)
             _append_plate_material(library_materials, output_mesh)
         for visual_scene in library_visual_scenes.findall("c:visual_scene", transform_helpers.NS):
