@@ -365,6 +365,45 @@ class PlateXpTests(unittest.TestCase):
         self.assertNotIn("normalMapStrength", entry["Stages"][0])
         self.assertIsNot(entry["Stages"][0], source["Stages"][0])
 
+    def test_a_vehicles_own_archive_is_never_treated_as_shared(self) -> None:
+        """common_zip_candidates() leads with the vehicle's own archive.
+
+        Taking that list at face value files every vehicle-owned plate mesh as
+        shared and publishes it to vehicles/common under a name another
+        conversion would overwrite.
+        """
+        context = self._context(with_plate_parts=True)
+        self.assertFalse(plate_generator._is_shared_plate_zip(context, context.source_zip))
+
+    def test_shared_rear_format_follows_the_mesh_not_the_part(self) -> None:
+        """One material is written for all vehicles, so it cannot depend on a
+        part; the cloned part must request the same format or it asks the game
+        to render a tag its material never reads."""
+        self.assertEqual(
+            plate_generator._shared_rear_format("licenseplate-52-11"), "bhdc-rear-wide"
+        )
+        self.assertEqual(
+            plate_generator._shared_rear_format("licenseplate-52-11-r0_5"), "bhdc-rear-wide"
+        )
+        self.assertEqual(plate_generator._shared_rear_format("licenseplate"), "bhdc-rear-2-1")
+
+    def test_shared_clone_names_carry_no_machine_specific_digest(self) -> None:
+        """A shared asset is written to the same virtual path by every BeamXP
+        mod, so its names must not vary with the builder's archive layout."""
+        context = self._context(with_plate_parts=True)
+        obj = type("Obj", (), {"dae_path": "vehicles/common/empty.dae", "id": "licenseplate",
+                               "dae_source_zip": None})()
+        a = plate_generator._rear_clone_mesh_name(context, "licenseplate", obj, shared=True)
+        self.assertEqual(a, "bhdc_rear_licenseplate")
+        self.assertEqual(
+            plate_generator._rear_clone_dae_name(Path("/one/common.zip"), "vehicles/common/empty.dae", shared=True),
+            plate_generator._rear_clone_dae_name(Path("/other/common.zip"), "vehicles/common/empty.dae", shared=True),
+        )
+        # a vehicle-owned mesh still disambiguates by source archive
+        self.assertNotEqual(
+            plate_generator._rear_clone_mesh_name(context, "licenseplate", obj, shared=False), a
+        )
+
     def test_rear_material_keeps_the_explicit_nulls_of_its_source(self) -> None:
         """Materials are read by the engine's C++ material manager, not the Lua
         reader beamxp.core.sjson ports - and that reader drops null. Every stock

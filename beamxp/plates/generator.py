@@ -75,7 +75,7 @@ _CANVAS = {
 _DESIGN_SLOT = "licenseplate_design_2_1"
 _REAR_MESH_WIDE = "licenseplate-bhdc-rear-wide"
 _REAR_MESH_2_1 = "licenseplate-bhdc-rear-2-1"
-_REAR_FALLBACK_MESHES = {_REAR_MESH_WIDE, _REAR_MESH_2_1}
+_REAR_FALLBACK_MESHES = {_REAR_MESH_WIDE: _REAR_FORMAT_WIDE, _REAR_MESH_2_1: _REAR_FORMAT_2_1}
 _EU_BAND_FRACTION = 0.11
 _EU_BLUE = "#003399"
 _ATLAS_WIDTH = 1024
@@ -1978,11 +1978,23 @@ def _clone_rear_plate_part(
     if not plate_meshes:
         return None
     wide = _part_uses_wide_plate(part_body)
-    rear_fmt = _REAR_FORMAT_WIDE if wide else _REAR_FORMAT_2_1
     fallback_mesh = _REAR_MESH_WIDE if wide else _REAR_MESH_2_1
     mesh_map: dict[str, str] = {}
     for mesh in plate_meshes:
         mesh_map[mesh] = _rear_clone_for_mesh(context, mesh, clone_sources) or fallback_mesh
+    # A shared clone's material is written once for all vehicles, so its format
+    # follows the mesh's own aspect rather than this part's declaration. The
+    # part has to request the same format or it would ask the game to render a
+    # texture tag its material never reads.
+    mesh_formats = {
+        _shared_rear_format(clone_sources[out].source_mesh)
+        for out in mesh_map.values()
+        if out in clone_sources and clone_sources[out].shared
+    }
+    if len(mesh_formats) == 1:
+        rear_fmt = mesh_formats.pop()
+    else:
+        rear_fmt = _REAR_FORMAT_WIDE if wide else _REAR_FORMAT_2_1
 
     body = transform_helpers.replace_first(part_body, f'"{part_id}"', f'"{new_part_id}"')
     body = _rewrite_part_mesh_names(body, mesh_map)
@@ -2037,6 +2049,7 @@ class _RearMeshClone:
     source_node_id: str
     source_mesh: str
     output_mesh: str
+    shared: bool = False  # cloned from a stock archive -> lives in vehicles/common
 
 
 @dataclass(frozen=True)
@@ -2880,9 +2893,43 @@ def _offset_plate_y(part_body: str, amount: float) -> str:
     return re.sub(r'"pos"\s*:\s*\{(?P<body>[^}]*)\}', replace_pos, part_body)
 
 
-def _rear_clone_mesh_name(context, source_mesh: str, obj) -> str:
+def _shared_rear_format(source_mesh: str) -> str:
+    """The rear format a stock plate mesh's clone renders, from its aspect.
+
+    Matches _vanilla_plate_mesh_catalog: every "licenseplate-52-11*" node is the
+    wide plate, "licenseplate" is the 2:1 one.
+    """
+    wide = source_mesh.lower().startswith("licenseplate-52-11")
+    return _REAR_FORMAT_WIDE if wide else _REAR_FORMAT_2_1
+
+
+def _is_shared_plate_zip(context, source_zip) -> bool:
+    """Whether a cloned mesh came from BeamNG's shared archives.
+
+    Those meshes are the same file for every vehicle, so their clones are too
+    and belong in vehicles/common alongside the stock ones (48 vanilla vehicles
+    share the very meshes we are cloning).
+    """
     from beamxp import hand_drive_core as core
 
+    try:
+        # common_zip_candidates() lists the archives to search for shared assets
+        # and leads with the vehicle's own, which is emphatically not shared.
+        own = Path(context.source_zip).resolve()
+        candidates = {Path(z).resolve() for z in core.common_zip_candidates(context.source_zip)}
+        return Path(source_zip).resolve() in (candidates - {own})
+    except Exception:
+        return False
+
+
+def _rear_clone_mesh_name(context, source_mesh: str, obj, *, shared: bool) -> str:
+    from beamxp import hand_drive_core as core
+
+    if shared:
+        # No hash: one name for one stock mesh, identical in every BeamXP mod.
+        # A digest here would embed the builder's own archive path and make the
+        # shared asset differ per machine.
+        return core.safe_id(f"bhdc_rear_{source_mesh}")
     source_zip = obj.dae_source_zip or context.source_zip
     digest = hashlib.sha1(
         f"{source_zip}|{obj.dae_path}|{obj.id}|{source_mesh}".encode("utf-8", errors="replace")
@@ -2898,16 +2945,38 @@ def _rear_clone_for_mesh(
     obj = context.objects.get(source_mesh)
     if obj is None or not obj.dae_path:
         return None
-    output_mesh = _rear_clone_mesh_name(context, source_mesh, obj)
+    source_zip = obj.dae_source_zip or context.source_zip
+    shared = _is_shared_plate_zip(context, source_zip)
+    output_mesh = _rear_clone_mesh_name(context, source_mesh, obj, shared=shared)
     if output_mesh not in clone_sources:
         clone_sources[output_mesh] = _RearMeshClone(
-            source_zip=obj.dae_source_zip or context.source_zip,
+            source_zip=source_zip,
             dae_path=obj.dae_path,
             source_node_id=obj.id,
             source_mesh=source_mesh,
             output_mesh=output_mesh,
+            shared=shared,
         )
     return output_mesh
+
+
+def _shared_rear_clone_sources(context) -> dict[str, _RearMeshClone]:
+    """Every stock plate mesh, cloned whether this vehicle uses it or not.
+
+    The shared file has to be byte-identical in each BeamXP mod: they all write
+    it to the same virtual path, so a build that emitted only the meshes its own
+    vehicle needed could shadow another mod's wider copy and take that
+    vehicle's rear mesh with it.
+    """
+    sources: dict[str, _RearMeshClone] = {}
+    for record in _vanilla_plate_mesh_catalog(context):
+        obj = context.objects.get(record.mesh)
+        if obj is None or not obj.dae_path:
+            continue
+        if not _is_shared_plate_zip(context, obj.dae_source_zip or context.source_zip):
+            continue
+        _rear_clone_for_mesh(context, record.mesh, sources)
+    return sources
 
 
 def _namespace_tag(tag: str) -> str:
@@ -2959,9 +3028,14 @@ def _set_instance_materials(node: ET.Element, material_id: str) -> None:
         instance_material.set("target", f"#{material_id}")
 
 
-def _rear_clone_dae_name(source_zip: Path, dae_path: str) -> str:
-    digest = hashlib.sha1(f"{source_zip}|{dae_path}".encode("utf-8", errors="replace")).hexdigest()[:8]
+def _rear_clone_dae_name(source_zip: Path, dae_path: str, *, shared: bool = False) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(dae_path).stem).strip("._-") or "source"
+    if shared:
+        # Keyed on the archive-relative path only, so every machine writes the
+        # same filename for the same stock DAE.
+        digest = hashlib.sha1(dae_path.encode("utf-8", errors="replace")).hexdigest()[:8]
+        return f"bhdc_plate_rear_{stem}_{digest}.dae"
+    digest = hashlib.sha1(f"{source_zip}|{dae_path}".encode("utf-8", errors="replace")).hexdigest()[:8]
     return f"bhdc_plate_rear_{stem}_{digest}.dae"
 
 
@@ -2987,11 +3061,16 @@ def _source_material_name(root: ET.Element, node: ET.Element) -> str | None:
 
 def _write_rear_clone_daes(
     context,
+    output_root: Path,
     output_vehicle_dir: Path,
     clone_sources: dict[str, _RearMeshClone],
     summary: dict[str, object],
 ) -> dict[str, str]:
-    """Clone the source plate geometry, returning output mesh -> source material."""
+    """Clone the source plate geometry, returning output mesh -> source material.
+
+    Clones of stock meshes land in the shared vehicles/common folder; only a
+    mesh the vehicle itself owns stays in the vehicle folder.
+    """
     from beamxp import hand_drive_core as core
 
     source_materials: dict[str, str] = {}
@@ -3000,6 +3079,8 @@ def _write_rear_clone_daes(
         grouped.setdefault((clone.source_zip, clone.dae_path), []).append(clone)
 
     for (source_zip, dae_path), clones in sorted(grouped.items(), key=lambda item: (str(item[0][0]).lower(), item[0][1].lower())):
+        shared = all(clone.shared for clone in clones)
+        target_dir = (output_root / _SHARED_REAR_DIR) if shared else output_vehicle_dir
         tree = core.parse_dae(source_zip, dae_path)
         root = tree.getroot()
         library_geometries = root.find("c:library_geometries", transform_helpers.NS)
@@ -3074,7 +3155,7 @@ def _write_rear_clone_daes(
             for node in cloned_nodes:
                 visual_scene.append(node)
 
-        core.write_xml_tree(tree, output_vehicle_dir / _rear_clone_dae_name(source_zip, dae_path))
+        core.write_xml_tree(tree, target_dir / _rear_clone_dae_name(source_zip, dae_path, shared=shared))
 
     return source_materials
 
@@ -3295,6 +3376,10 @@ def _rear_material_entry(mesh: str, fmt: str, source_material: dict[str, object]
 
 _GAME_DEFAULT_FONT_DIR = "vehicles/common/licenseplates/default"
 _REAR_FALLBACK_PATH = f"{_GAME_DEFAULT_FONT_DIR}/licensePlate-default.json"
+# Stock plate meshes are shared by every vehicle from vehicles/common; their rear
+# clones are identical for every vehicle too, so they live alongside them rather
+# than being copied - under a different name - into each converted vehicle.
+_SHARED_REAR_DIR = "vehicles/common/licenseplates/bhdc"
 
 # Legacy-v2 equivalents of the stock v3 default blocks, so a rear plate under a
 # vanilla design shows the same generic plate the front does.  Every asset here
@@ -3510,28 +3595,64 @@ def apply_to_build(
         summary["configsUpdated"] += 1
 
     if rear_meshes_used:
-        fallback_meshes = sorted(mesh for mesh in rear_meshes_used if mesh in _REAR_FALLBACK_MESHES)
-        if fallback_meshes:
-            core.write_text_file(output_vehicle_dir / "bhdc_plate_rear.dae", _rear_plate_dae(fallback_meshes), encoding="utf-8")
-        cloned_source_materials: dict[str, str] = {}
-        if rear_mesh_clone_sources:
-            cloned_source_materials = _write_rear_clone_daes(
-                context, output_vehicle_dir, rear_mesh_clone_sources, summary
-            )
-        # The quads in _rear_plate_dae() are BeamXP's own, so they have no source
-        # material to inherit and fall back to the stock plate shape.
+        # Always the complete stock set, never just the meshes this vehicle
+        # happens to use, so every BeamXP mod writes the same shared files.
+        shared_sources = _shared_rear_clone_sources(context)
+        shared_sources.update(
+            {mesh: clone for mesh, clone in rear_mesh_clone_sources.items() if clone.shared}
+        )
+        all_sources = dict(rear_mesh_clone_sources)
+        all_sources.update(shared_sources)
+
+        cloned_source_materials = _write_rear_clone_daes(
+            context, output_root, output_vehicle_dir, all_sources, summary
+        ) if all_sources else {}
+
         known_materials = _plate_materials_for_context(context)
-        materials = {
-            mesh: _rear_material_entry(
-                mesh,
-                fmt,
-                known_materials.get(str(cloned_source_materials.get(mesh, "")).lower()),
-            )
-            for mesh, fmt in sorted(rear_meshes_used.items())
+
+        def material_for(mesh: str, fmt: str) -> dict[str, object]:
+            # BeamXP's own fallback quads have no source material to inherit and
+            # fall back to the stock plate shape.
+            source = known_materials.get(str(cloned_source_materials.get(mesh, "")).lower())
+            return _rear_material_entry(mesh, fmt, source)
+
+        # Shared side: every stock clone plus both fallback quads, identical in
+        # every mod. The quads are BeamXP geometry, so they are shared too.
+        shared_dir = output_root / _SHARED_REAR_DIR
+        core.write_text_file(
+            shared_dir / "bhdc_plate_rear.dae",
+            _rear_plate_dae(sorted(_REAR_FALLBACK_MESHES)),
+            encoding="utf-8",
+        )
+        shared_materials = {
+            clone.output_mesh: material_for(clone.output_mesh, _shared_rear_format(clone.source_mesh))
+            for clone in shared_sources.values()
         }
-        core.write_text_file(output_vehicle_dir / "bhdc_plate_rear.materials.json", json.dumps(materials, indent=2), encoding="utf-8")
+        shared_materials.update({
+            mesh: material_for(mesh, fmt) for mesh, fmt in _REAR_FALLBACK_MESHES.items()
+        })
+        core.write_text_file(
+            shared_dir / "bhdc_plate_rear.materials.json",
+            json.dumps(dict(sorted(shared_materials.items())), indent=2),
+            encoding="utf-8",
+        )
+
+        # Vehicle side: only a plate mesh this vehicle owns.
+        own_materials = {
+            mesh: material_for(mesh, fmt)
+            for mesh, fmt in sorted(rear_meshes_used.items())
+            if mesh not in shared_materials
+        }
+        if own_materials:
+            core.write_text_file(
+                output_vehicle_dir / "bhdc_plate_rear.materials.json",
+                json.dumps(own_materials, indent=2),
+                encoding="utf-8",
+            )
         _write_rear_design_compat(output_root)
         summary["rearVanillaFallbacks"] = sorted(_REAR_FALLBACK_BLOCKS)
+        summary["rearSharedMeshes"] = len(shared_materials)
+        summary["rearVehicleMeshes"] = len(own_materials)
 
     if part_bodies:
         jbeam_dir = output_vehicle_dir / "jbeam"
