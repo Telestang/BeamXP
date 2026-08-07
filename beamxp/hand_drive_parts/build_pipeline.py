@@ -173,33 +173,43 @@ def showcase_preview_for_build(
 def mod_description_bbcode(
     context: VehicleContext,
     generated_configs: Iterable[str],
+    image_path: str = "",
 ) -> str:
-    """The body the info panel renders, as BBCode.
+    """The mod's description page, as BBCode.
 
-    ``modmanager.js`` runs ``modData.text`` through ``Utils.parseBBCode``, so
-    this is the one field that can carry more than a single line.
+    ``repository-details.html`` binds the pane to ``modData.message``, which
+    ``repository.js`` runs through ``Utils.parseBBCode``. The parser turns
+    newlines into breaks and ``[img]`` into an ``<img>`` with that src verbatim
+    (``ui-vue/src/services/content/bbcode_main.js``), so the build's own preview
+    goes in the page by its in-game path. ``[url]`` is deliberately absent: the
+    parser emits a Vue component for it that the Angular page cannot mount.
     """
     outputs = sorted(str(name) for name in generated_configs if name)
-    lines = [
-        f"[B]{context.vehicle_id}[/B] converted by "
-        f"[URL=https://github.com/Telestang/beamng-hand-drive-converter]BeamXP[/URL].",
-        "",
-        "This mod adds hand-drive converted configurations alongside the "
-        "vehicle they came from. Mirrored geometry, relocated interior parts, "
-        "handed lighting and license plates are generated from the source "
-        "vehicle, so the original stays installed and untouched.",
-        "",
-        f"[B]Requires:[/B] {context.source_zip.name} -- the configurations here "
-        "reference its parts and meshes, and will not load without it.",
-        "",
-        f"[B]Configurations added ({len(outputs)}):[/B]",
-    ]
+    lines: list[str] = []
+    if image_path:
+        lines.extend([f"[img]{image_path}[/img]", ""])
+    lines.extend(
+        [
+            f"[b]{context.vehicle_id}[/b], hand-drive converted by BeamXP.",
+            "",
+            "This mod adds converted configurations alongside the vehicle they "
+            "came from. Mirrored geometry, relocated interior parts, handed "
+            "lighting and license plates are generated from the source vehicle, "
+            "so the original stays installed and untouched.",
+            "",
+            f"[b]Requires:[/b] {context.source_zip.name} -- the configurations "
+            "here reference its parts and meshes, and will not load without it.",
+            "",
+            f"[b]Configurations added ({len(outputs)}):[/b]",
+            "[list]",
+        ]
+    )
     lines.extend(f"[*]{name}" for name in outputs)
     lines.extend(
         [
-            "",
-            "[I]Generated automatically; report conversion problems to the tool, "
-            "not to the author of the source vehicle.[/I]",
+            "[/list]",
+            "[i]Generated automatically. Conversion problems belong to the tool, "
+            "not to the author of the source vehicle.[/i]",
         ]
     )
     return "\n".join(lines)
@@ -214,19 +224,25 @@ def write_mod_info(
 ) -> None:
     """Write the manifest the mod manager shows for this build.
 
-    Field names follow the repo manifests the game already reads
-    (``ui/modules/modmanager/info.html``): the panel binds Unique ID to
-    ``tagid`` and Author to ``username``, the header to
-    ``icon``/``prefix_title``/``title``/``tag_line``, the table to
-    ``version_string``/``last_update``/``category_title``, and the body to
-    ``text`` through the BBCode parser. ``attachments`` is what modmanager.lua
-    turns into ``imgs`` for the image strip, prefixing each ``thumb_filename``
-    with this folder.
+    A mod the repository has never heard of is served to the UI by
+    ``core_repository.requestModOffline``, which hands this file over as
+    ``modData`` untouched -- so every field the mod pages bind has to be in it,
+    spelled the way a repository entry spells it.
 
-    Left unset on purpose: ``filesize``, ``download_count`` and ``rating_avg``
-    are facts about a repository entry. A locally generated mod has none, and a
-    made-up number in a field the player can check against the zip is worse
-    than the blank row.
+    Three of those spellings are not obvious:
+
+    * the description page (``repository-details.html``) binds ``message``, not
+      ``text``; ``text`` feeds only the older fallback panel, so both are set;
+    * ``requestModOffline`` fills ``filesize`` from the file on disk, but only
+      for a manifest that has a ``message`` -- so the size comes free, and
+      guessing at it here would only get in the way;
+    * ``last_update`` is multiplied by 1000 before the date filter sees it
+      (``repository.js``), so it is epoch seconds. Anything else renders null.
+
+    ``icon`` is set for the mod manager's own panel, which resolves it against
+    this folder. The repository page cannot use it -- it rebuilds the icon as a
+    beamng.com URL from ``path`` regardless -- which is why the description
+    carries the preview itself.
     """
     mod_id = mod_id_for_context(context)
     mod_info = root / "mod_info" / mod_id
@@ -238,7 +254,15 @@ def write_mod_info(
         f"Hand-drive conversion of {context.vehicle_id}, generated from "
         f"{context.source_zip.name}."
     )
-    description = mod_description_bbcode(context, generated_configs)
+
+    preview = showcase_preview_for_build(
+        context, output_vehicle_dir, generated_configs, config_sources
+    )
+    thumbnail = f"preview{preview.suffix.lower()}" if preview is not None else ""
+    if preview is not None:
+        _atomic_copy_file(preview, mod_info / thumbnail)
+    image_path = f"/mod_info/{mod_id}/{thumbnail}" if thumbnail else ""
+    description = mod_description_bbcode(context, generated_configs, image_path)
 
     info: dict[str, object] = {
         "tagid": mod_id,
@@ -248,13 +272,13 @@ def write_mod_info(
         "tag_line": tag_line,
         "version_string": MOD_VERSION,
         "current_version_id": MOD_VERSION,
-        # The panel formats this with Angular's date filter, which reads an
-        # ISO 8601 string directly; a bare epoch number there is milliseconds
-        # and renders as 1970.
-        "last_update": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "last_update": int(datetime.now(UTC).timestamp()),
         "category_title": "Configurations",
+        # The panel hides its forum link for thread 1; this mod has no thread.
+        "discussion_thread_id": 1,
         "filename": package_name_for_context(context),
         "path": f"{mod_id}/",
+        "message": description,
         "text": description,
         # Kept from the pre-manifest layout: harmless to the mod manager, and
         # still the fields a human reads in the file itself.
@@ -264,13 +288,7 @@ def write_mod_info(
         "description": description,
         "source": source_name,
     }
-
-    preview = showcase_preview_for_build(
-        context, output_vehicle_dir, generated_configs, config_sources
-    )
-    if preview is not None:
-        thumbnail = f"preview{preview.suffix.lower()}"
-        _atomic_copy_file(preview, mod_info / thumbnail)
+    if thumbnail:
         info["icon"] = thumbnail
         info["attachments"] = [
             {"filename": thumbnail, "thumb_filename": thumbnail, "title": title}

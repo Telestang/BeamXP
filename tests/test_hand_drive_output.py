@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import zipfile
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from beamxp import hand_drive_core as core
@@ -437,10 +438,35 @@ class ModManifestTests(unittest.TestCase):
             generated_configs=("base_rhd", "sport_rhd"),
             config_sources={"base_rhd": "base", "sport_rhd": "sport"},
         )
-        # modmanager.js parses this field as BBCode for the description body.
-        self.assertIn("[*]base_rhd", info["text"])
-        self.assertIn("[*]sport_rhd", info["text"])
-        self.assertIn("acme.zip", info["text"])
+        # repository-details.html binds the description page to message;
+        # text feeds only the mod manager's own fallback panel.
+        for field in ("message", "text"):
+            self.assertIn("[*]base_rhd", info[field])
+            self.assertIn("[*]sport_rhd", info[field])
+            self.assertIn("acme.zip", info[field])
+
+    def test_the_body_shows_the_preview_by_its_in_game_path(self) -> None:
+        # The repository page rebuilds icon as a beamng.com URL, so the only
+        # way a local image reaches that page is an [img] in the body.
+        _relative, info = self._write(
+            "acme",
+            "acme",
+            generated_configs=("base_rhd",),
+            config_sources={"base_rhd": "base"},
+        )
+        image = re.compile(r"\[img\]\s*?(\S*?(?=\[/img\]))\[/img\]", re.I)
+        self.assertEqual(
+            image.findall(info["message"]),
+            [f"/mod_info/{info['tagid']}/preview.jpg"],
+        )
+
+    def test_last_update_is_the_epoch_seconds_the_page_multiplies(self) -> None:
+        # repository.js does new Date(last_update * 1000); anything that is not
+        # a number of seconds renders as null.
+        _relative, info = self._write("acme", "acme")
+        self.assertIsInstance(info["last_update"], int)
+        rendered = datetime.fromtimestamp(info["last_update"], UTC)
+        self.assertLess(abs((datetime.now(UTC) - rendered).total_seconds()), 600)
 
 
 class GeneratedMirrorTests(unittest.TestCase):
