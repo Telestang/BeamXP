@@ -3289,6 +3289,9 @@ def _rear_plate_dae(mesh_names: list[str]) -> str:
 # The four maps core/skiaTemplate.lua defaultMaps() renders for a licenseplate
 # design; the engine binds each as "@licenseplate-<format><suffix>".
 _PLATE_TAG_SUFFIXES = ("-normal", "-specular", "-metallic")
+# The stock 30-15 metallic map, which the engine always renders. A custom format
+# has no metallic map of its own (see _apply_custom_format_maps).
+_STOCK_METALLIC_TAG = "@licenseplate-default-metallic"
 _PLATE_TAG_RE = re.compile(r"^@licenseplate-(?P<base>.+?)(?P<suffix>-normal|-specular|-metallic)?$")
 
 # Shape of the stock plate materials (vehicles/common/licenseplates/{default,
@@ -3388,6 +3391,33 @@ def _retarget_plate_tags(value: object, fmt: str) -> object:
     return f"@licenseplate-{fmt}{match.group('suffix') or ''}"
 
 
+def _apply_custom_format_maps(entry: dict[str, object]) -> None:
+    """Limit the first stage to the maps a *custom* plate format actually gets.
+
+    A stock format's material reads four tags - base, -normal, -specular and
+    -metallic. Retargeting all four at a BeamXP rear format assumes the engine
+    renders all four for a format it does not ship, and it evidently does not:
+    the EuroPlates mod, which builds custom formats exactly the way we do
+    (own licenseplateFormat, renamed mesh under vehicles/common), points its
+    metallic map at the *stock* "@licenseplate-default-metallic" and carries no
+    normal map at all. A secondary map that never binds does not show the
+    missing-texture placeholder, it just shades wrong - which is why this looked
+    like a material difference rather than a broken texture.
+
+    Which maps the renderer emits per format is C++ (veh:renderLicensePlateSkia),
+    so this follows that worked example rather than anything provable from Lua.
+    """
+    stages = entry.get("Stages")
+    if not isinstance(stages, list) or not stages or not isinstance(stages[0], dict):
+        return
+    stage = stages[0]
+    stage.pop("normalMap", None)
+    stage.pop("normalMapStrength", None)
+    stage.pop("normalMapUseUV", None)
+    if "metallicMap" in stage:
+        stage["metallicMap"] = _STOCK_METALLIC_TAG
+
+
 def _rear_material_entry(mesh: str, fmt: str, source_material: dict[str, object] | None) -> dict[str, object]:
     """The cloned rear plate's material: the source plate's own definition with
     its texture tags repointed at the BeamXP rear format.
@@ -3405,6 +3435,7 @@ def _rear_material_entry(mesh: str, fmt: str, source_material: dict[str, object]
         base = None
     entry = copy.deepcopy(base if base is not None else _STOCK_PLATE_MATERIAL)
     entry = _retarget_plate_tags(entry, fmt)
+    _apply_custom_format_maps(entry)
     entry["name"] = mesh
     entry["mapTo"] = mesh
     return entry

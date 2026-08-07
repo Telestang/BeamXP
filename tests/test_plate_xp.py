@@ -354,16 +354,19 @@ class PlateXpTests(unittest.TestCase):
 
         self.assertEqual(entry["name"], "bhdc_rear_plate")
         self.assertEqual(entry["mapTo"], "bhdc_rear_plate")
-        rebased = json.loads(json.dumps(entry).replace("bhdc-rear-wide", "52-11"))
-        rebased["name"] = rebased["mapTo"] = "licenseplate-52-11"
-        self.assertEqual(rebased, source)
-        # Every map keeps its suffix, including the metallic map that
-        # skiaTemplate.defaultMaps() renders for licenseplate designs.
-        self.assertEqual(
-            entry["Stages"][0]["metallicMap"], "@licenseplate-bhdc-rear-wide-metallic"
-        )
-        self.assertNotIn("normalMapStrength", entry["Stages"][0])
-        self.assertIsNot(entry["Stages"][0], source["Stages"][0])
+        stage = entry["Stages"][0]
+        # Inherited: the stock finish, which a hand-authored stage kept losing.
+        self.assertEqual(stage["metallicFactor"], 1)
+        self.assertEqual(stage["retroreflectivity"], 0.5)
+        self.assertEqual(stage["baseColorMap"], "@licenseplate-bhdc-rear-wide")
+        self.assertEqual(stage["roughnessMap"], "@licenseplate-bhdc-rear-wide-specular")
+        self.assertNotIn("normalMapStrength", stage)
+        self.assertIsNot(stage, source["Stages"][0])
+        # ...but only the maps a custom format actually gets: see
+        # _apply_custom_format_maps and the EuroPlates mod it follows.
+        self.assertEqual(stage["metallicMap"], "@licenseplate-default-metallic")
+        self.assertNotIn("normalMap", stage)
+        self.assertNotIn("normalMapUseUV", stage)
 
     def test_clone_inherits_the_source_material_and_effect(self) -> None:
         """Rebuilding them as a bare lambert drops whatever the exporter wrote.
@@ -505,7 +508,7 @@ class PlateXpTests(unittest.TestCase):
         stage = entry["Stages"][0]
         self.assertEqual(stage["baseColorMap"], "@licenseplate-bhdc-rear-2-1")
         self.assertEqual(stage["metallicFactor"], 1)
-        self.assertEqual(stage["metallicMap"], "@licenseplate-bhdc-rear-2-1-metallic")
+        self.assertEqual(stage["metallicMap"], "@licenseplate-default-metallic")
         self.assertEqual(stage["retroreflectivity"], 0.5)
         self.assertEqual(stage["roughnessMap"], "@licenseplate-bhdc-rear-2-1-specular")
         # The module-level template must not be mutated by a previous call.
