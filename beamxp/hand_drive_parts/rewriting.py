@@ -66,6 +66,9 @@ from beamxp.core.files import (
     write_xml_tree,
     zip_member_path,
 )
+from beamxp.core.geometry import (
+    mirrored_base_rotation_global,
+)
 from beamxp.core.models import (
     BakedMeshSpec,
     BuildResult,
@@ -490,6 +493,97 @@ def rewrite_prop_meshes_with_globals(
                 jbeam_position,
             )
         out_lines.append(content + line_ending)
+    return "".join(out_lines)
+
+
+MIRROR_ROW_MESH_RE = re.compile(r'(\[\s*)"((?:[^"\\]|\\.)*)"')
+
+
+def mirror_row_mesh(row: str) -> str:
+    """The mesh a ``mirrors`` row binds, i.e. its first column."""
+    match = MIRROR_ROW_MESH_RE.search(row)
+    return match.group(2) if match else ""
+
+
+def _reflected_mirror_plane(source_row: str) -> tuple[
+    tuple[float, float, float] | None,
+    tuple[float, float, float] | None,
+    tuple[float, float, float] | None,
+]:
+    """A ``mirrors`` row's plane fields, reflected across the centreline.
+
+    ``lua/common/jbeam/sections/mirror.lua`` reads three of them: the offset
+    from the reference node (``refBaseTranslation``, legacy ``offset``) and the
+    plane's facing, as either a baseRotationGlobal euler or a legacy ``normal``
+    vector. Under a reflection the offset and the normal negate their x, and the
+    euler goes through the same rotation reflection props already use.
+    """
+    offset = vector_from_row(source_row, "refBaseTranslation")
+    if offset is None:
+        offset = vector_from_row(source_row, "offset")
+    rotation = vector_from_row(source_row, "baseRotationGlobal")
+    normal = vector_from_row(source_row, "normal")
+    return (
+        (-offset[0], offset[1], offset[2]) if offset is not None else None,
+        mirrored_base_rotation_global(rotation) if rotation is not None else None,
+        (-normal[0], normal[1], normal[2]) if normal is not None else None,
+    )
+
+
+def rewrite_mirror_rows(
+    array_text: str,
+    mesh_map: dict[str, str],
+    mirror_plane_sources: dict[str, str],
+) -> str:
+    """Carry a part's ``mirrors`` rows onto its converted meshes.
+
+    Two things move. The mesh column is a binding: ``addMirror(mesh, ...)``
+    looks the name up among the meshes the part renders, so a row still naming
+    the pre-conversion mesh binds nothing and the glass stops reflecting
+    altogether. And the plane fields describe where that glass faces; a mesh the
+    build reflected across the centreline needs them reflected too, or the
+    mirror keeps aiming at where the driver used to sit.
+
+    ``mirror_plane_sources`` maps a mesh to the authored row whose plane the
+    converted mesh inherits -- its own row for a plain mirror, the row of the
+    mesh it was swapped with for a structural pair, since the geometry the part
+    now renders is that mesh reflected. A mesh the build left alone is absent
+    and keeps its authored plane.
+    """
+    out_lines: list[str] = []
+    for line in array_text.splitlines(keepends=True):
+        content = line
+        ending = ""
+        if content.endswith("\r\n"):
+            content, ending = content[:-2], "\r\n"
+        elif content.endswith("\n"):
+            content, ending = content[:-1], "\n"
+
+        mesh = mirror_row_mesh(content)
+        if mesh and mesh != "mesh":
+            source_row = mirror_plane_sources.get(mesh)
+            if source_row is not None:
+                offset, rotation, normal = _reflected_mirror_plane(source_row)
+                if offset is not None:
+                    key = (
+                        "offset"
+                        if vector_pattern("offset").search(content)
+                        and not vector_pattern("refBaseTranslation").search(content)
+                        else "refBaseTranslation"
+                    )
+                    content = replace_or_append_inline_vector(content, key, offset)
+                if rotation is not None:
+                    content = replace_or_append_inline_vector(
+                        content, "baseRotationGlobal", rotation
+                    )
+                if normal is not None:
+                    content = replace_or_append_inline_vector(content, "normal", normal)
+            new_mesh = mesh_map.get(mesh)
+            if new_mesh and new_mesh != mesh:
+                content = MIRROR_ROW_MESH_RE.sub(
+                    lambda match: f'{match.group(1)}"{new_mesh}"', content, count=1
+                )
+        out_lines.append(content + ending)
     return "".join(out_lines)
 
 
@@ -2363,6 +2457,7 @@ def clone_part_for_target(
     mesh_pivots: dict[str, tuple[float, float, float]] | None = None,
     child_part_map: dict[str, str] | None = None,
     owners: TriggerOwners | None = None,
+    mirror_plane_sources: dict[str, str] | None = None,
 ) -> str:
     new_part_id = new_part_id or generated_part_name(source_part_id, target_hand)
     out = transform_helpers.replace_first(part_body, f'"{source_part_id}"', f'"{new_part_id}"')
@@ -2390,6 +2485,11 @@ def clone_part_for_target(
             shared_bake,
             mesh_pivots,
         ),
+    )
+    out = transform_helpers.replace_array_region(
+        out,
+        "mirrors",
+        lambda text: rewrite_mirror_rows(text, mesh_map, mirror_plane_sources or {}),
     )
     out = transform_helpers.replace_array_region(
         out,
@@ -2436,4 +2536,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']

@@ -156,6 +156,38 @@ def euler_matrix3(degrees: tuple[float, float, float]) -> list[list[float]]:
     return matrix3_from_matrix4(matrix)
 
 
+def base_rotation_global_matrix3(degrees: tuple[float, float, float]) -> list[list[float]]:
+    """An authored baseRotationGlobal euler (degrees) -> rotation 3x3.
+
+    The inverse of :func:`euler_yzx_from_matrix3`: the game's euler order is YZX
+    intrinsic, M = Ry(y)*Rz(z)*Rx(x).
+    """
+    matrix = identity_matrix()
+    for next_matrix in (
+        rotation_y_matrix(degrees[1]),
+        rotation_z_matrix(degrees[2]),
+        rotation_x_matrix(degrees[0]),
+    ):
+        matrix = multiply_matrix(matrix, next_matrix)
+    return matrix3_from_matrix4(matrix)
+
+
+def mirrored_base_rotation_global(
+    degrees: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """The same rotation reflected across the vehicle's centreline.
+
+    ``mirrors`` rows and props both state their rest orientation as a
+    baseRotationGlobal euler, and the engine turns it into a direction --
+    ``normal = (0,1,0) rotated by it`` for a mirror. Reflecting the rotation
+    (S*M*S, S = diag(-1,1,1)) reflects that direction, which is what a mesh
+    crossing the centreline needs.
+    """
+    return euler_yzx_from_matrix3(
+        mirror_rotation_matrix_x(base_rotation_global_matrix3(degrees))
+    )
+
+
 def prop_base_rotation_matrix3(degrees: tuple[float, float, float]) -> list[list[float]]:
     # Game prop baseRotation euler order is -X -Z +Y intrinsic
     # (lua/common/jbeam/sections/meshs.lua), i.e. B = Rx(-x)*Rz(-z)*Ry(+y).

@@ -105,6 +105,51 @@ CABIN_PARTS = {
 }
 
 
+def flexbodies(*meshes: str) -> str:
+    rows = ",\n".join(f'["{mesh}", ["body"]]' for mesh in meshes)
+    return (
+        ',\n"flexbodies": [\n'
+        '    ["mesh", "[group]:"],\n'
+        f"    {rows}\n"
+        "]"
+    )
+
+
+# The same cabin with mesh ids that are nothing like their part ids, plus a
+# sport seat that reuses the base seat's mesh -- the shape the Equivalent Parts
+# table actually records, because its rows come from the Parts Used mesh list.
+MESH_CABIN_PARTS = {
+    "car": (
+        part("car", "main", "Car", (("seat_FL", "seat_FL"), ("seat_FR", "seat_FR"))),
+        "car.jbeam",
+    ),
+    "seat_FL": (
+        part("seat_FL", "seat_FL", "Front Left Seat", extra=flexbodies("seat_base_L")),
+        "seats.jbeam",
+    ),
+    "seat_FR": (
+        part("seat_FR", "seat_FR", "Front Right Seat", extra=flexbodies("seat_base_R")),
+        "seats.jbeam",
+    ),
+    "sport_seat_FL": (
+        part("sport_seat_FL", "seat_FL", "Sport Seat", extra=flexbodies("seat_base_L", "sport_bolster_L")),
+        "seats.jbeam",
+    ),
+    "sport_seat_FR": (
+        part("sport_seat_FR", "seat_FR", "Sport Seat", extra=flexbodies("seat_base_R", "sport_bolster_R")),
+        "seats.jbeam",
+    ),
+    "race_seat_FL": (
+        part("race_seat_FL", "seat_FL", "Race Seat", extra=flexbodies("seat_shell_L")),
+        "seats.jbeam",
+    ),
+    "race_seat_FR": (
+        part("race_seat_FR", "seat_FR", "Race Seat", extra=flexbodies("seat_shell_R")),
+        "seats.jbeam",
+    ),
+}
+
+
 class SlotPairPlanTests(unittest.TestCase):
     def _context(self, instances: tuple[tuple[str, str, str], ...]) -> core.VehicleContext:
         return context_with_parts(CABIN_PARTS, {"trim": selection(instances)})
@@ -277,6 +322,72 @@ class EquivalentPartPlanTests(unittest.TestCase):
         self.assertEqual(
             [(entry["slotId"], entry["partId"]) for entry in plan["relocations"]],
             [("seat_FR", "rally_seat_FL")],
+        )
+
+    def test_equivalent_row_naming_a_mesh_reaches_the_part_that_carries_it(self) -> None:
+        # The table is filled from the Parts Used rows, which are mesh
+        # instances, so a row routinely names a mesh whose id is nothing like
+        # the part's -- bx pairs `racing_seat_FL`, carried by `race_seat_FL`.
+        context = context_with_parts(MESH_CABIN_PARTS, {"trim": selection((
+            ("car", "main", "/"),
+            ("race_seat_FL", "seat_FL", "/seat_FL/"),
+        ))})
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{
+                "left": "seat_shell_L@@/seat_FL/",
+                "right": "seat_shell_R@@/seat_FR/",
+                "kind": "seat",
+            }],
+        )
+        assert plan is not None
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["selections"]],
+            [("seat_FR", "race_seat_FR")],
+        )
+        self.assertEqual(
+            [(entry["slotId"], entry.get("setEmpty")) for entry in plan["clears"]],
+            [("seat_FL", "1")],
+        )
+
+    def test_a_row_that_hands_nothing_across_leaves_the_meshes_alone(self) -> None:
+        # Both sides already hold their own counterpart, so the row has nothing
+        # to swap on this trim. Reporting the parts as covered would drop their
+        # meshes from the generated pass and cancel the Swap Mesh set on them --
+        # the ardente's wing mirrors, which never change slots.
+        context = self._context((
+            ("car", "main", "/"),
+            ("seat_FL", "seat_FL", "/seat_FL/"),
+            ("seat_FR", "seat_FR", "/seat_FR/"),
+        ))
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{"left": "seat_FL", "right": "seat_FR", "kind": "seat"}],
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(core.authored_group_meshes(context, plan), set())
+
+    def test_a_part_row_wins_over_a_mesh_row_the_part_reuses(self) -> None:
+        # The sport seat reuses the base seat's mesh, so the base seat's mesh
+        # row must not capture it and swap it for the base part on the far side.
+        context = context_with_parts(MESH_CABIN_PARTS, {"trim": selection((
+            ("car", "main", "/"),
+            ("sport_seat_FL", "seat_FL", "/seat_FL/"),
+        ))})
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [
+                {"left": "seat_base_L", "right": "seat_base_R", "kind": "seat"},
+                {"left": "sport_seat_FL", "right": "sport_seat_FR", "kind": "seat"},
+            ],
+        )
+        assert plan is not None
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["selections"]],
+            [("seat_FR", "sport_seat_FR")],
         )
 
     def test_equivalent_preview_color_paths_only_include_written_changes(self) -> None:

@@ -19,6 +19,7 @@ from beamxp import transform_helpers
 from beamxp.core.beam_json import (
     add_missing_json_commas,
     display_name_from_localization_key,
+    localized_string,
     display_name_for,
     info_path_for_config,
     json_line_needs_comma,
@@ -383,22 +384,35 @@ def append_hand_label(name: object, target_hand: str) -> str:
     return f"{text} {target_hand}"
 
 
-def generated_info_display_name(info: dict[str, object], variant: VariantInfo) -> str:
+def generated_info_display_name(
+    info: dict[str, object],
+    variant: VariantInfo,
+    source_zip: Path | None = None,
+) -> str:
     for key in ("Configuration", "Name", "name", "configuration"):
         value = info.get(key)
         if isinstance(value, str) and value.strip():
-            return display_name_from_localization_key(value) or value.strip()
+            return display_name_from_localization_key(value, source_zip) or value.strip()
     return variant.display_name
 
 
-def generated_info_description(info: dict[str, object]) -> str:
+def generated_info_description(
+    info: dict[str, object],
+    source_zip: Path | None = None,
+) -> str:
     for key in ("Description", "description"):
         value = info.get(key)
         if not isinstance(value, str):
             continue
         text = value.strip()
-        if not text or display_name_from_localization_key(text):
+        if not text:
             return ""
+        if text.startswith("vehiclesData."):
+            # The build appends its own conversion note, so the key has to
+            # become the string it stands for. Nothing is invented for a key no
+            # locale table holds: a description is prose, and the name
+            # heuristic's prettified filename would be nonsense here.
+            return localized_string(text, source_zip) or ""
         return text
     return ""
 
@@ -495,8 +509,8 @@ def write_converted_config(
             info = load_context_info(context, variant.info_path)
         except Exception:
             info = {}
-    existing_name = generated_info_display_name(info, variant)
-    existing_description = generated_info_description(info)
+    existing_name = generated_info_display_name(info, variant, context.source_zip)
+    existing_description = generated_info_description(info, context.source_zip)
     converted_name = append_hand_label(existing_name, target_hand)
     info["Configuration"] = converted_name
     info["Name"] = converted_name
@@ -1038,6 +1052,13 @@ def _relocation_clone_body(
         context.mesh_pivots,
         None,
         relocation_trigger_owners,
+        # The part is crossing the car, so every mirror plane it carries is the
+        # reflection of its own authored one.
+        {
+            mesh: row
+            for mesh, row in authored_mirror_rows(context).items()
+            if mesh in meshes
+        },
     )
     return relocate_part_for_slot(
         body,
@@ -1235,6 +1256,7 @@ def write_generated_jbeam_and_configs(
     cloned_bodies: list[str] = []
     cloned_part_ids: set[str] = set()
     generated_configs: list[str] = []
+    mirror_rows = authored_mirror_rows(context)
     relocation_context = (
         _relocation_rewrite_context(context) if slot_pair_plans else None
     )
@@ -1338,6 +1360,18 @@ def write_generated_jbeam_and_configs(
                     # side-swap baked into the copy's node matrix never reaches
                     # the screen.
                     flexbody_row_transforms[mesh] = ("mirror", 0.0)
+            # A mirror's reflection plane belongs to its glass. Whatever the
+            # part ends up rendering is the mesh named here reflected across the
+            # centreline -- itself for a plain mirror, its structural twin for a
+            # swap -- so the converted row inherits that mesh's authored plane,
+            # reflected. Modes that leave the glass alone are absent and keep it.
+            mirror_plane_sources = {
+                mesh: mirror_rows[structural_sources.get(mesh, mesh)]
+                for mesh in mesh_hits
+                if object_modes.get(mesh)
+                in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
+                and structural_sources.get(mesh, mesh) in mirror_rows
+            }
             prop_row_transforms: dict[str, tuple[str, float]] = {}
             for mesh in mesh_hits:
                 if object_modes.get(mesh) == MODE_TRANSLATE and mesh in translated_prop_meshes:
@@ -1431,6 +1465,7 @@ def write_generated_jbeam_and_configs(
                     context.mesh_pivots,
                     generated_parts_for_source,
                     trigger_owners,
+                    mirror_plane_sources,
                 )
             )
 
@@ -1518,11 +1553,11 @@ def write_original_plate_configs(
                 info = load_context_info(context, variant.info_path)
             except Exception:
                 info = {}
-        existing_name = generated_info_display_name(info, variant)
+        existing_name = generated_info_display_name(info, variant, context.source_zip)
         plates_name = existing_name if existing_name.lower().endswith(" plates") else f"{existing_name} Plates"
         info["Configuration"] = plates_name
         info["Name"] = plates_name
-        description = generated_info_description(info)
+        description = generated_info_description(info, context.source_zip)
         info["Description"] = f"{description} - BeamXP plate configuration" if description else "BeamXP plate configuration"
         info["Config Type"] = "Custom"
         info["Source"] = conversion_source_name(context)

@@ -82,6 +82,7 @@ from beamxp.core.files import (
 )
 from beamxp.core.geometry import (
     PROP_VECTOR_RE,
+    base_rotation_global_matrix3,
     brg_rotation_matrix3,
     clamp_value,
     cross_product,
@@ -1427,15 +1428,7 @@ def prop_row_global_rotation_matrix(
 ) -> list[list[float]] | None:
     global_rotation = vector_from_row(row, "baseRotationGlobal")
     if global_rotation is not None:
-        # baseRotationGlobal euler order is YZX intrinsic: Ry(y)*Rz(z)*Rx(x)
-        matrix = identity_matrix()
-        for next_matrix in (
-            rotation_y_matrix(global_rotation[1]),
-            rotation_z_matrix(global_rotation[2]),
-            rotation_x_matrix(global_rotation[0]),
-        ):
-            matrix = multiply_matrix(matrix, next_matrix)
-        return matrix3_from_matrix4(matrix)
+        return base_rotation_global_matrix3(global_rotation)
 
     strings = re.findall(r'"((?:[^"\\]|\\.)*)"', row)
     if len(strings) < 5:

@@ -116,6 +116,36 @@ def part_mesh_names_for_context(context: VehicleContext, part_id: str) -> set[st
     return set(meshes)
 
 
+_MIRROR_ROW_INDEX_ATTR = "_authored_mirror_row_index"
+
+
+def authored_mirror_rows(context: VehicleContext) -> dict[str, str]:
+    """Every authored ``mirrors`` row in the vehicle, keyed by the mesh it binds.
+
+    A converted part inherits the plane of the mesh it ends up rendering, and
+    for a structural swap that mesh is authored in the part on the other side of
+    the car -- so the lookup has to span the vehicle, not the part being cloned.
+    Cached as a plain attribute for the same reasons as
+    ``_slot_type_part_index``.
+    """
+    part_index = context.part_body_index
+    cached = getattr(context, _MIRROR_ROW_INDEX_ATTR, None)
+    if cached is not None and cached[0] is part_index and cached[1] == len(part_index):
+        return cached[2]
+
+    rows: dict[str, str] = {}
+    for part_id, (part_body, _filename) in part_index.items():
+        array_text = transform_helpers.extract_named_array(part_body, "mirrors")
+        if not array_text:
+            continue
+        for line in array_text.splitlines():
+            mesh = mirror_row_mesh(line)
+            if mesh and mesh != "mesh":
+                rows.setdefault(mesh, line.strip())
+    setattr(context, _MIRROR_ROW_INDEX_ATTR, (part_index, len(part_index), rows))
+    return rows
+
+
 def part_slot_defs_for_context(context: VehicleContext, part_id: str) -> list[SlotDef]:
     cached = context.part_slot_defs_cache.get(part_id)
     if cached is not None:
@@ -1023,28 +1053,131 @@ def _side_pair_base_ref(ref: object) -> str:
     return str(ref or "").split("@@", 1)[0]
 
 
+def _side_pair_ref_path(ref: object) -> str:
+    text = str(ref or "")
+    return text.split("@@", 1)[1] if "@@" in text else ""
+
+
 def _selected_instance_ref(instance: dict[str, object]) -> str:
     part_id = str(instance.get("part_id") or "")
     slot_path = str(instance.get("slot_path") or "")
     return f"{part_id}@@{slot_path}" if slot_path else part_id
 
 
-def _side_pair_matches_ref(instance: dict[str, object], ref: object) -> bool:
+_MESH_OWNER_INDEX_ATTR = "_mesh_owner_part_index"
+
+
+def _mesh_owner_part_index(context: VehicleContext) -> dict[str, tuple[str, ...]]:
+    """Parts grouped by the meshes they declare.
+
+    The Equivalent Parts table is filled from the Parts Used rows, which are
+    mesh instances, so a row routinely names a mesh (``racing_seat_FL``) rather
+    than the part that carries it (``race_seat_FL``). Those rows have to reach a
+    part before anything can be swapped. Cached as a plain attribute for the
+    same reasons as ``_slot_type_part_index``.
+    """
+    part_index = context.part_body_index
+    cached = getattr(context, _MESH_OWNER_INDEX_ATTR, None)
+    if cached is not None and cached[0] is part_index and cached[1] == len(part_index):
+        return cached[2]
+
+    grouped: dict[str, list[str]] = {}
+    for part_id in part_index:
+        for mesh in part_mesh_names_for_context(context, part_id):
+            grouped.setdefault(mesh, []).append(part_id)
+    owners = {mesh: tuple(sorted(ids)) for mesh, ids in grouped.items()}
+    setattr(context, _MESH_OWNER_INDEX_ATTR, (part_index, len(part_index), owners))
+    return owners
+
+
+def _side_pair_matches_ref(
+    context: VehicleContext,
+    instance: dict[str, object],
+    ref: object,
+    *,
+    by_mesh: bool = True,
+) -> bool:
     text = str(ref or "")
     if not text:
         return False
-    return text == str(instance.get("part_id") or "") or text == _selected_instance_ref(instance)
+    if text == str(instance.get("part_id") or "") or text == _selected_instance_ref(instance):
+        return True
+    if not by_mesh:
+        return False
+    # A mesh-level row still names one part instance: the one whose body
+    # declares that mesh at that slot path.
+    ref_path = _side_pair_ref_path(text)
+    if ref_path and ref_path != str(instance.get("slot_path") or ""):
+        return False
+    part_id = str(instance.get("part_id") or "")
+    if not part_id:
+        return False
+    return _side_pair_base_ref(text) in part_mesh_names_for_context(context, part_id)
 
 
-def _side_pair_counterpart(pairs: Iterable[dict[str, object]], part_id: str) -> str:
-    for pair in pairs:
-        left = str(pair.get("left") or "")
-        right = str(pair.get("right") or "")
-        if _side_pair_base_ref(left) == part_id:
-            return _side_pair_base_ref(right)
-        if _side_pair_base_ref(right) == part_id:
-            return _side_pair_base_ref(left)
+def _side_pair_counterpart_ref(
+    context: VehicleContext,
+    pairs: Iterable[dict[str, object]],
+    instance: dict[str, object],
+) -> str:
+    """The other side of the first row this part instance answers to.
+
+    Rows naming the part itself are searched before rows naming one of its
+    meshes: an optional part routinely reuses the mesh of the part it replaces
+    -- etk800's sport seat carries ``etk800_seat_FL`` -- so a mesh row for the
+    base seat would otherwise capture the sport seat and swap it for the base
+    part on the far side.
+    """
+    pairs = list(pairs)
+    for by_mesh in (False, True):
+        for pair in pairs:
+            left = str(pair.get("left") or "")
+            right = str(pair.get("right") or "")
+            if _side_pair_matches_ref(context, instance, left, by_mesh=by_mesh):
+                return right
+            if _side_pair_matches_ref(context, instance, right, by_mesh=by_mesh):
+                return left
     return ""
+
+
+def _side_pair_counterpart_part(
+    context: VehicleContext,
+    ref: str,
+    source_part: str,
+    target_slot_def: SlotDef,
+) -> str:
+    """The part a counterpart row names, resolving a mesh row to its owner.
+
+    A row that already names a part is taken as written. A mesh row can be
+    carried by more than one part -- ``racingseat_base`` sits in both bx race
+    buckets -- so the owner that fits the slot the swap is aiming at wins, and
+    the source part's own mirrored name breaks any remaining tie.
+    """
+    part_id = _side_pair_base_ref(ref)
+    if not part_id:
+        return ""
+    if part_body_for_context(context, part_id) is not None:
+        return part_id
+
+    owners = _mesh_owner_part_index(context).get(part_id, ())
+    if not owners:
+        # Nothing in the vehicle carries this id. Handing the name back keeps
+        # the caller's "no counterpart exists" branch, which mirrors the source
+        # part into the opposite slot instead of dropping the row.
+        return part_id
+    fitting = [
+        owner
+        for owner in owners
+        if part_fits_slot(
+            transform_helpers.extract_part_slot_types(part_body_for_context(context, owner)[0]),
+            target_slot_def,
+        )
+    ]
+    candidates = fitting or list(owners)
+    mirrored = mirror_lateral_node_id(source_part)
+    if mirrored in candidates:
+        return mirrored
+    return candidates[0]
 
 
 def resolve_side_pair_plan(
@@ -1086,16 +1219,11 @@ def resolve_side_pair_plan(
         source_path = str(instance.get("slot_path") or "")
         if not source_part or not source_slot or not source_path:
             continue
-        matching_pairs = [
-            pair for pair in normalized
-            if _side_pair_matches_ref(instance, pair.get("left"))
-            or _side_pair_matches_ref(instance, pair.get("right"))
-        ]
-        if not matching_pairs:
+        counterpart_ref = _side_pair_counterpart_ref(context, normalized, instance)
+        if not counterpart_ref:
             continue
-        target_part = _side_pair_counterpart(matching_pairs, source_part)
         target_slot = mirror_lateral_node_id(source_slot)
-        if not target_part or not target_slot or target_slot == source_slot:
+        if not target_slot or target_slot == source_slot:
             continue
         target_usage = usage.get(target_slot)
         target_path = (
@@ -1108,6 +1236,25 @@ def resolve_side_pair_plan(
             if target_usage is not None
             else None
         ) or SlotDef(target_slot, "", allow_types=(target_slot,))
+
+        target_part = _side_pair_counterpart_part(
+            context, counterpart_ref, source_part, target_slot_def
+        )
+        if not target_part:
+            continue
+
+        # The mirrored slot already holds exactly what this row would write, so
+        # the row hands nothing across on this trim -- the usual case for a
+        # wing mirror or a seat the vehicle already fits on both sides. Marking
+        # the part covered anyway would drop its meshes from the generated pass
+        # and silently cancel the Swap Mesh the user set on them.
+        target_current = (
+            str(target_usage.part_by_config.get(config_name) or "")
+            if target_usage is not None
+            else ""
+        )
+        if target_current == target_part:
+            continue
 
         covered.add(source_part)
         handled_sources.add(source_slot)
@@ -1788,4 +1935,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']

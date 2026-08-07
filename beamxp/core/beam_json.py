@@ -183,10 +183,113 @@ def humanize_config_key(value: str) -> str:
     return " ".join(out)
 
 
-def display_name_from_localization_key(value: str) -> str | None:
+LOCALE_DIR = "locales/translations"
+FALLBACK_LANGUAGE = "en-US"
+
+_translation_cache: dict[str, dict[str, str]] = {}
+
+
+def _translations_from_dir(directory: Path) -> list[dict[str, str]]:
+    if not directory.is_dir():
+        return []
+    files: list[dict[str, str]] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            files.append({k: v for k, v in data.items() if isinstance(v, str)})
+    return files
+
+
+def _translations_from_zip(source_zip: Path) -> list[dict[str, str]]:
+    prefix = f"{LOCALE_DIR}/{FALLBACK_LANGUAGE}/"
+    files: list[dict[str, str]] = []
+    try:
+        with zipfile.ZipFile(source_zip) as zf:
+            names = sorted(
+                name
+                for name in zf.namelist()
+                if name.replace("\\", "/").lower().startswith(prefix.lower())
+                and name.lower().endswith(".json")
+            )
+            for name in names:
+                try:
+                    data = json.loads(zf.read(name).decode("utf-8-sig"))
+                except (KeyError, ValueError):
+                    continue
+                if isinstance(data, dict):
+                    files.append({k: v for k, v in data.items() if isinstance(v, str)})
+    except (OSError, zipfile.BadZipFile):
+        return []
+    return files
+
+
+def beamng_translations(source_zip: Path | None = None) -> dict[str, str]:
+    """The game's en-US string table, as ``core_locales.translate`` sees it.
+
+    ``lua/ge/extensions/core/locales.lua`` loads every JSON under
+    ``/locales/translations/<language>/`` into a flat key -> string list and
+    returns the first file that holds a key, falling back to en-US when the
+    active language has no entry. The game's language is not knowable from
+    here, so this reads the fallback the game itself would land on.
+
+    A mod vehicle ships its own keys in the same layout inside its zip, mounted
+    over the install's, so the zip is searched first.
+    """
+    cache_key = str(source_zip or "")
+    cached = _translation_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from beamxp.core.files import beamng_game_common_zips
+
+    files: list[dict[str, str]] = []
+    if source_zip is not None:
+        files.extend(_translations_from_zip(source_zip))
+    for common_zip in beamng_game_common_zips():
+        # <game>/content/vehicles/common.zip -> <game>/locales/translations/en-US
+        install_root = common_zip.parent.parent.parent
+        files.extend(
+            _translations_from_dir(install_root / LOCALE_DIR / FALLBACK_LANGUAGE)
+        )
+
+    merged: dict[str, str] = {}
+    for data in reversed(files):
+        merged.update(data)
+    _translation_cache[cache_key] = merged
+    return merged
+
+
+def localized_string(value: str, source_zip: Path | None = None) -> str | None:
+    """What ``_tr`` returns for a locale key, or None when nothing holds it."""
+    text = value.strip()
+    if not text:
+        return None
+    translated = beamng_translations(source_zip).get(text)
+    return translated.strip() if translated and translated.strip() else None
+
+
+def display_name_from_localization_key(
+    value: str,
+    source_zip: Path | None = None,
+) -> str | None:
+    """The string a ``vehiclesData.*`` key resolves to in the selector.
+
+    The game runs every ``Configuration``/``Name`` through ``_tr``
+    (``core/vehicles.lua``), so the key is the authored value and the locale
+    table holds the label the player reads -- "Ardente S 410Q Frisson (M)" for
+    ``vehiclesData.vivace.ardente_S_410Q_M.Configuration``. Only when the table
+    cannot be reached at all does this fall back to prettifying the key's own
+    config segment, which drops any word that is not in the config's filename.
+    """
     text = value.strip()
     if not text.startswith("vehiclesData."):
         return None
+    translated = localized_string(text, source_zip)
+    if translated is not None:
+        return translated
     parts = [part for part in text.split(".") if part]
     if len(parts) < 3:
         return None
@@ -207,7 +310,7 @@ def display_name_for(source_zip: Path, info_path: str | None, config_name: str) 
     for key in ("Configuration", "Name", "name", "configuration"):
         value = info.get(key)
         if isinstance(value, str) and value.strip():
-            localized_fallback = display_name_from_localization_key(value)
+            localized_fallback = display_name_from_localization_key(value, source_zip)
             return localized_fallback or value.strip()
     return humanize_config_key(config_name) or config_name
 

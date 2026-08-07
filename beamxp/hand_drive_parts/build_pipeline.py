@@ -7,6 +7,7 @@ Original source lines 5810-6096. Import the public orchestration module
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import re
@@ -87,22 +88,82 @@ from beamxp.core.models import (
 )
 from beamxp.plates import generator as plate_generator
 
+MOD_AUTHOR = "Telestang - BeamXP"
+MOD_VERSION = "0.2.1"
+
+
+def package_stem_for_context(context: VehicleContext) -> str:
+    """The one identity a conversion has: this vehicle, out of this zip.
+
+    One zip routinely holds several vehicles -- vivace.zip carries the vivace,
+    the ardente and the tograc -- and the tool converts one of them at a time.
+    Named the way ``project_dir_for`` names the project it came from: the zip,
+    plus the vehicle when they differ.
+    """
+    source_segment = safe_project_segment(context.source_zip.stem)
+    vehicle_segment = safe_project_segment(context.vehicle_id)
+    if source_segment.lower() == vehicle_segment.lower():
+        return vehicle_segment
+    return f"{source_segment}_{vehicle_segment}"
+
+
 def package_name_for_context(context: VehicleContext) -> str:
-    return f"{context.source_zip.stem}_XP_conversion.zip"
+    """The output mod's filename.
+
+    Carries the vehicle so converting the next vehicle out of the same zip does
+    not overwrite this one in the mods folder.
+    """
+    return f"{package_stem_for_context(context)}_XP_conversion.zip"
+
+
+def mod_id_for_context(context: VehicleContext) -> str:
+    """The mod's Unique ID, derived from what it is rather than assigned.
+
+    The mod manager reads its manifest from ``mod_info/<id>/info.json`` and
+    matches that folder against ``[0-9a-zA-Z]*``
+    (``core/modmanager.lua``), so the id is alphanumeric and, like a repo
+    tagid, upper case. There is no registry to draw a number from, so it is a
+    digest of the conversion's own identity: the same vehicle out of the same
+    zip always rebuilds to the same id, two vehicles out of one zip never
+    share one, and the XP prefix keeps it clear of a real repo tagid.
+    """
+    digest = hashlib.blake2b(
+        package_stem_for_context(context).lower().encode("utf-8"), digest_size=4
+    ).hexdigest()
+    return f"XP{digest.upper()}"
 
 
 def write_mod_info(root: Path, context: VehicleContext) -> None:
-    mod_info = root / "mod_info"
+    """Write the manifest the mod manager shows for this build.
+
+    Field names follow the repo manifests the game already reads:
+    ``ui/modules/modmanager/info.html`` binds Unique ID to ``tagid`` and Author
+    to ``username``, the cards use ``title``/``tag_line``/``version_string``,
+    and the description body is ``text`` run through the BBCode parser.
+    """
+    mod_id = mod_id_for_context(context)
+    mod_info = root / "mod_info" / mod_id
     mod_info.mkdir(parents=True, exist_ok=True)
     source_name = conversion_source_name(context)
+    description = (
+        f"Generated BeamXP handedness and/or plate configuration overlay for "
+        f"{context.vehicle_id}. Depends on {context.source_zip.name}."
+    )
     info = {
+        "tagid": mod_id,
+        "username": MOD_AUTHOR,
+        "title": f"{context.vehicle_id} BeamXP Conversion",
+        "tag_line": f"BeamXP hand-drive conversion of {context.vehicle_id}.",
+        "version_string": MOD_VERSION,
+        "filename": package_name_for_context(context),
+        "path": f"{mod_id}/",
+        "text": description,
+        # Kept from the pre-manifest layout: harmless to the mod manager, and
+        # still the fields a human reads in the file itself.
         "name": f"{context.vehicle_id} BeamXP Conversion",
-        "version": "0.2.1",
-        "authors": source_name,
-        "description": (
-            f"Generated BeamXP handedness and/or plate configuration overlay for {context.vehicle_id}. "
-            f"Depends on {context.source_zip.name}."
-        ),
+        "version": MOD_VERSION,
+        "authors": MOD_AUTHOR,
+        "description": description,
         "source": source_name,
     }
     write_text_file(mod_info / "info.json", json.dumps(info, indent=2), encoding="utf-8")
@@ -1800,4 +1861,4 @@ def build_batch(
         texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'package_name_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'integrate_texture_correction_artifacts', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'integrate_texture_correction_artifacts', 'build_batch']

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import re
+import shutil
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 from beamxp import hand_drive_core as core
@@ -287,6 +291,151 @@ class GeneratedCameraTests(unittest.TestCase):
         )
         self.assertIn('"rightHandCamera":false', rewritten)
         self.assertNotIn('"rightHandCamera":true', rewritten)
+
+
+class OutputPackageNameTests(unittest.TestCase):
+    @staticmethod
+    def _context(zip_stem: str, vehicle_id: str) -> core.VehicleContext:
+        return core.VehicleContext(
+            source_zip=Path(f"{zip_stem}.zip"),
+            vehicle_id=vehicle_id,
+            vehicle_path=f"vehicles/{vehicle_id}",
+            dae_paths=[],
+            variants={},
+            objects={},
+            preview_by_id={},
+            jbeam_texts={},
+            node_positions={},
+            project_dir=Path("project"),
+            part_body_index={},
+        )
+
+    def test_package_names_the_vehicle_when_the_zip_holds_several(self) -> None:
+        # vivace.zip ships the vivace, the ardente and the tograc; converting
+        # each in turn must not have them overwrite one another in the mods
+        # folder.
+        self.assertEqual(
+            core.package_name_for_context(self._context("vivace", "vivace_ardente")),
+            "vivace_vivace_ardente_XP_conversion.zip",
+        )
+
+    def test_package_stays_unrepeated_when_the_zip_is_the_vehicle(self) -> None:
+        self.assertEqual(
+            core.package_name_for_context(self._context("bx", "bx")),
+            "bx_XP_conversion.zip",
+        )
+
+
+class ModManifestTests(unittest.TestCase):
+    # core/modmanager.lua matches the lowercased in-zip path against this
+    # before it will read a manifest at all, then upper-cases the capture as
+    # the mod's id. A manifest anywhere else is silently never loaded, which is
+    # what left the Unique ID and Author fields blank.
+    MOD_INFO_RE = re.compile(r"^/?mod_info/([0-9a-zA-Z]*)/info\.json$")
+
+    def _write(self, zip_stem: str, vehicle_id: str) -> tuple[Path, dict[str, object]]:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        source = root / f"{zip_stem}.zip"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr(f"vehicles/{vehicle_id}/{vehicle_id}.jbeam", "{}")
+        context = OutputPackageNameTests._context(zip_stem, vehicle_id)
+        context = replace(context, source_zip=source)
+        core.write_mod_info(root, context)
+        manifest = next(root.rglob("info.json"))
+        return manifest.relative_to(root), json.loads(manifest.read_text())
+
+    def test_manifest_lands_where_the_mod_manager_reads_it(self) -> None:
+        relative, info = self._write("vivace", "vivace_ardente")
+        match = self.MOD_INFO_RE.match(relative.as_posix().lower())
+        assert match is not None, relative
+        self.assertEqual(match.group(1).upper(), info["tagid"])
+
+    def test_unique_id_and_author_are_the_fields_the_panel_binds(self) -> None:
+        _relative, info = self._write("vivace", "vivace_ardente")
+        # info.html binds Unique ID to tagid and Author to username.
+        self.assertEqual(info["tagid"], core.mod_id_for_context(
+            OutputPackageNameTests._context("vivace", "vivace_ardente")
+        ))
+        self.assertEqual(info["username"], "Telestang - BeamXP")
+
+    def test_the_id_is_reproducible_and_vehicle_specific(self) -> None:
+        one = OutputPackageNameTests._context("vivace", "vivace_ardente")
+        again = OutputPackageNameTests._context("vivace", "vivace_ardente")
+        sibling = OutputPackageNameTests._context("vivace", "vivace_tograc")
+        self.assertEqual(core.mod_id_for_context(one), core.mod_id_for_context(again))
+        self.assertNotEqual(core.mod_id_for_context(one), core.mod_id_for_context(sibling))
+        # Alphanumeric or the folder does not match at all.
+        self.assertTrue(core.mod_id_for_context(one).isalnum())
+
+
+class GeneratedMirrorTests(unittest.TestCase):
+    """The ``mirrors`` section, checked against BX's authored LHD/RHD pairs.
+
+    BX ships both hands of the same interior, so its own two rows are the
+    reference answer: the rear-view mirror keeps every field but flips the
+    rotation that aims it at the driver.
+    """
+
+    INTERIOR = (
+        "[\n"
+        '  ["mesh", "idRef:", "id1:", "id2:"],\n'
+        '  ["bx_mirror_int_lhd","rf1","rf1r","rf2",'
+        '{"refBaseTranslation":{"x":0.00,"y":-0.08,"z":-0.12},'
+        '"baseRotationGlobal":{"x":6,"y":0,"z":19}}],\n'
+        "]"
+    )
+    WING_L = (
+        "[\n"
+        '  ["mesh", "idRef:", "id1:", "id2:"],\n'
+        '  ["mirror_L","mi4l","mi3l","mi2l",'
+        '{"refBaseTranslation":{"x":-0.085,"y":-0.034,"z":0.05},'
+        '"baseRotationGlobal":{"x":0,"y":0,"z":-15}}],\n'
+        "]"
+    )
+    WING_R_ROW = (
+        '["mirror_R","mi4r","mi3r","mi2r",'
+        '{"refBaseTranslation":{"x":0.085,"y":-0.034,"z":0.05},'
+        '"baseRotationGlobal":{"x":0,"y":0,"z":22}}],'
+    )
+
+    def test_row_binds_the_mesh_the_converted_part_renders(self) -> None:
+        # addMirror() looks the mesh up among the part's own meshes, so a row
+        # left on the pre-conversion name reflects nothing at all.
+        rewritten = core.rewrite_mirror_rows(
+            self.INTERIOR,
+            {"bx_mirror_int_lhd": "bx_mirror_int_lhd_xp_rhd"},
+            {},
+        )
+        self.assertIn('["bx_mirror_int_lhd_xp_rhd","rf1"', rewritten)
+
+    def test_a_mirrored_mesh_re_aims_at_the_new_driver_side(self) -> None:
+        row = self.INTERIOR.splitlines()[2].strip()
+        rewritten = core.rewrite_mirror_rows(
+            self.INTERIOR,
+            {"bx_mirror_int_lhd": "bx_mirror_int_lhd_xp_rhd"},
+            {"bx_mirror_int_lhd": row},
+        )
+        # bx_mirror_int_rhd, authored: same offset, z negated.
+        self.assertIn('"refBaseTranslation":{"x":0,"y":-0.08,"z":-0.12}', rewritten)
+        self.assertIn('"baseRotationGlobal":{"x":6,"y":0,"z":-19}', rewritten)
+
+    def test_a_swapped_wing_mirror_inherits_the_other_side_s_plane(self) -> None:
+        # Swap Mesh renders the twin's glass reflected, so the plane comes from
+        # the twin's row -- the left mirror keeps its left offset but takes the
+        # aim the right mirror had, reflected.
+        rewritten = core.rewrite_mirror_rows(
+            self.WING_L,
+            {"mirror_L": "mirror_L_xp_rhd"},
+            {"mirror_L": self.WING_R_ROW},
+        )
+        self.assertIn('["mirror_L_xp_rhd","mi4l"', rewritten)
+        self.assertIn('"refBaseTranslation":{"x":-0.085,"y":-0.034,"z":0.05}', rewritten)
+        self.assertIn('"baseRotationGlobal":{"x":0,"y":0,"z":-22}', rewritten)
+
+    def test_a_mesh_the_build_left_alone_keeps_its_authored_plane(self) -> None:
+        rewritten = core.rewrite_mirror_rows(self.WING_L, {}, {})
+        self.assertEqual(rewritten, self.WING_L)
 
 
 class ReplaceSourceConfigOutputTests(unittest.TestCase):

@@ -190,39 +190,100 @@ class VehicleCatalogTests(unittest.TestCase):
         self.assertEqual(entry.source_vehicle_id, "acme")
         self.assertEqual(entry.config_names, ())
 
-    def test_localization_keys_fall_back_to_readable_display_names(self) -> None:
+    # A config's authored Configuration is a locale key that the engine puts
+    # through _tr before the selector shows it (core/vehicles.lua), so the
+    # string in the locale table is the name the player reads. Prettifying the
+    # key's own config segment is only a last resort: it can only ever produce
+    # words that are already in the filename, which is how
+    # ardente_S_410Q_M lost "Frisson".
+    LOCALE_FILE = "locales/translations/en-US/acme.translation.json"
+
+    def test_localization_keys_resolve_through_the_locale_table(self) -> None:
         zip_path = self._zip_path(
             {
-                "vehicles/vivace/vivace.dae": "",
-                "vehicles/vivace/vivace.jbeam": "",
-                "vehicles/vivace/ardente_190d_DCT.pc": "{}",
-                "vehicles/vivace/info_ardente_190d_DCT.json": """
+                "vehicles/acme/acme.dae": "",
+                "vehicles/acme/acme.jbeam": "",
+                "vehicles/acme/sport_410Q_M.pc": "{}",
+                "vehicles/acme/info_sport_410Q_M.json": """
                 {
-                  "Configuration": "vehiclesData.vivace.ardente_190d_A.Configuration"
+                  "Configuration": "vehiclesData.acme.sport_410Q_M.Configuration"
+                }
+                """,
+                self.LOCALE_FILE: """
+                {"vehiclesData.acme.sport_410Q_M.Configuration": "Sport 410Q Frisson (M)"}
+                """,
+            }
+        )
+
+        info_path = info_path_for_config(zip_path, "acme", "sport_410Q_M")
+        self.assertEqual(
+            display_name_for(zip_path, info_path, "sport_410Q_M"),
+            "Sport 410Q Frisson (M)",
+        )
+
+    def test_an_unresolvable_key_still_falls_back_to_a_readable_name(self) -> None:
+        zip_path = self._zip_path(
+            {
+                "vehicles/acme/acme.dae": "",
+                "vehicles/acme/acme.jbeam": "",
+                "vehicles/acme/sport_190d_DCT.pc": "{}",
+                "vehicles/acme/info_sport_190d_DCT.json": """
+                {
+                  "Configuration": "vehiclesData.acme.sport_190d_A.Configuration"
                 }
                 """,
             }
         )
 
-        info_path = info_path_for_config(zip_path, "vivace", "ardente_190d_DCT")
+        info_path = info_path_for_config(zip_path, "acme", "sport_190d_DCT")
         self.assertEqual(
-            display_name_for(zip_path, info_path, "ardente_190d_DCT"),
-            "Ardente 190d A",
+            display_name_for(zip_path, info_path, "sport_190d_DCT"),
+            "Sport 190d A",
         )
 
-    def test_generated_output_info_does_not_keep_localization_keys(self) -> None:
+    def test_generated_output_info_uses_the_translated_name(self) -> None:
+        zip_path = self._zip_path(
+            {
+                "vehicles/acme/acme.dae": "",
+                "vehicles/acme/acme.jbeam": "",
+                self.LOCALE_FILE: """
+                {
+                  "vehiclesData.acme.police.Configuration": "Sport Carabinieri (M)",
+                  "vehiclesData.acme.police.Description": "A patrol car."
+                }
+                """,
+            }
+        )
         variant = core.VariantInfo(
-            "ardente_carabinieri",
-            "vehicles/vivace/ardente_carabinieri.pc",
-            "vehicles/vivace/info_ardente_carabinieri.json",
-            "Ardente Carabinieri",
+            "police",
+            "vehicles/acme/police.pc",
+            "vehicles/acme/info_police.json",
+            "Police",
         )
         info = {
-            "Configuration": "vehiclesData.vivace.ardente_carabinieri.Configuration",
-            "Description": "vehiclesData.vivace.ardente_carabinieri.Description",
+            "Configuration": "vehiclesData.acme.police.Configuration",
+            "Description": "vehiclesData.acme.police.Description",
         }
 
-        self.assertEqual(core.generated_info_display_name(info, variant), "Ardente Carabinieri")
+        self.assertEqual(
+            core.generated_info_display_name(info, variant, zip_path),
+            "Sport Carabinieri (M)",
+        )
+        self.assertEqual(core.generated_info_description(info, zip_path), "A patrol car.")
+
+    def test_generated_output_info_never_keeps_an_unresolved_key(self) -> None:
+        variant = core.VariantInfo(
+            "carabinieri",
+            "vehicles/acme/carabinieri.pc",
+            "vehicles/acme/info_carabinieri.json",
+            "Acme Carabinieri",
+        )
+        info = {
+            "Configuration": "vehiclesData.acme.carabinieri.Configuration",
+            "Description": "vehiclesData.acme.carabinieri.Description",
+        }
+
+        self.assertEqual(core.generated_info_display_name(info, variant), "Carabinieri")
         self.assertEqual(core.generated_info_description(info), "")
 
 
