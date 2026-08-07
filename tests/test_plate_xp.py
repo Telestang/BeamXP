@@ -185,6 +185,7 @@ class PlateXpTests(unittest.TestCase):
     def test_inline_design_is_named_beamxp_custom(self) -> None:
         output = type("Design", (), {
             "design_json_rel": "vehicles/common/licenseplates/test/licensePlate.json",
+            "bundled": False,
         })()
         body = json.loads(plate_generator._design_part_body(output, "EU", custom=True))
         self.assertEqual(body["information"]["name"], "BeamXP Custom")
@@ -321,6 +322,169 @@ class PlateXpTests(unittest.TestCase):
             label="bhdc_licenseplates.jbeam",
         )
         self.assertEqual(generated_parts[rear_part]["licenseplateFormat"], "bhdc-rear-wide")
+
+    def test_cloned_rear_material_matches_the_plate_it_was_cloned_from(self) -> None:
+        """Only the @licenseplate-* tags may differ from the source plate.
+
+        A hand-authored stage made the rear diverge from the front: the stock
+        plate material is metallic (metallicFactor 1 + metallicMap) and
+        retroreflective (0.5), so omitting those rendered the rear flat and
+        killed its headlight response.
+        """
+        source = {
+            "name": "licenseplate-52-11",
+            "mapTo": "licenseplate-52-11",
+            "class": "Material",
+            "Stages": [
+                {
+                    "baseColorMap": "@licenseplate-52-11",
+                    "metallicFactor": 1,
+                    "metallicMap": "@licenseplate-52-11-metallic",
+                    "normalMap": "@licenseplate-52-11-normal",
+                    "normalMapUseUV": 1,
+                    "retroreflectivity": 0.5,
+                    "roughnessMap": "@licenseplate-52-11-specular",
+                },
+                {}, {}, {},
+            ],
+            "dynamicCubemap": True,
+            "version": 1.5,
+        }
+        entry = plate_generator._rear_material_entry("bhdc_rear_plate", "bhdc-rear-wide", source)
+
+        self.assertEqual(entry["name"], "bhdc_rear_plate")
+        self.assertEqual(entry["mapTo"], "bhdc_rear_plate")
+        rebased = json.loads(json.dumps(entry).replace("bhdc-rear-wide", "52-11"))
+        rebased["name"] = rebased["mapTo"] = "licenseplate-52-11"
+        self.assertEqual(rebased, source)
+        # Every map keeps its suffix, including the metallic map that
+        # skiaTemplate.defaultMaps() renders for licenseplate designs.
+        self.assertEqual(
+            entry["Stages"][0]["metallicMap"], "@licenseplate-bhdc-rear-wide-metallic"
+        )
+        self.assertNotIn("normalMapStrength", entry["Stages"][0])
+        self.assertIsNot(entry["Stages"][0], source["Stages"][0])
+
+    def test_rear_material_ignores_a_source_that_bakes_its_plate_texture(self) -> None:
+        baked = {
+            "name": "modplate",
+            "mapTo": "modplate",
+            "Stages": [{"baseColorMap": "vehicles/mod/plate_d.png"}, {}, {}, {}],
+        }
+        entry = plate_generator._rear_material_entry("bhdc_rear_plate", "bhdc-rear-wide", baked)
+        # Adopting it would leave the rear unable to show the registration.
+        self.assertEqual(entry["Stages"][0]["baseColorMap"], "@licenseplate-bhdc-rear-wide")
+
+    def test_rear_material_without_a_source_uses_the_stock_plate_shape(self) -> None:
+        entry = plate_generator._rear_material_entry("bhdc_rear_quad", "bhdc-rear-2-1", None)
+        stage = entry["Stages"][0]
+        self.assertEqual(stage["baseColorMap"], "@licenseplate-bhdc-rear-2-1")
+        self.assertEqual(stage["metallicFactor"], 1)
+        self.assertEqual(stage["metallicMap"], "@licenseplate-bhdc-rear-2-1-metallic")
+        self.assertEqual(stage["retroreflectivity"], 0.5)
+        self.assertEqual(stage["roughnessMap"], "@licenseplate-bhdc-rear-2-1-specular")
+        # The module-level template must not be mutated by a previous call.
+        self.assertEqual(
+            plate_generator._STOCK_PLATE_MATERIAL["Stages"][0]["baseColorMap"],
+            "@licenseplate-default",
+        )
+
+    def test_bundled_set_design_does_not_collide_with_the_library_part(self) -> None:
+        """A vehicle build bundles its own copy of a library set.
+
+        Both live on slot licenseplate_design_2_1 but point at different design
+        folders, so sharing one part name makes jbeam/io.lua getPart() pick by
+        folder search order (getAvailableParts logs "parts names are duplicate").
+        """
+        config = plate_generator.default_plate_config()
+        config["enabled"] = True
+        plate_generator.save_plate_set({"id": "uk-modern", "name": "UK Modern", "config": config})
+
+        context = self._context(with_plate_parts=True)
+        conversion = core.base_conversion_config(context)
+        settings = conversion["variants"]["base"]
+        core.set_variant_build_mode(settings, core.BUILD_ORIGINAL)
+        conversion["plate"] = {"mode": "set", "setId": "uk-modern", "config": config}
+
+        result = core.build_batch(context, conversion, write_zip=False)
+        vehicle_dir = result.unpacked_dir / "vehicles" / context.vehicle_id
+        bundled = core.parse_beamng_json(
+            (vehicle_dir / "jbeam/bhdc_licenseplates.jbeam").read_text(encoding="utf-8"),
+            label="bhdc_licenseplates.jbeam",
+        )
+        bundled_id = f"bhdc_{core.safe_id(context.vehicle_id)}_plateset_uk_modern"
+        self.assertIn(bundled_id, bundled)
+        self.assertNotIn("bhdc_plateset_uk_modern", bundled)
+
+        generated = json.loads((vehicle_dir / "base_plates.pc").read_text(encoding="utf-8"))
+        self.assertEqual(generated["parts"]["licenseplate_design_2_1"], bundled_id)
+
+        library = plate_generator.export_all_plate_sets()
+        with zipfile.ZipFile(library["zip"]) as archive:
+            shared = core.parse_beamng_json(
+                archive.read("vehicles/common/licenseplates/bhdc_plate_sets.jbeam").decode("utf-8"),
+                label="bhdc_plate_sets.jbeam",
+            )
+        # The library keeps the stable name so existing selections survive.
+        self.assertIn("bhdc_plateset_uk_modern", shared)
+        self.assertFalse(set(shared) & set(bundled))
+        self.assertNotEqual(
+            bundled[bundled_id]["information"]["name"],
+            shared["bhdc_plateset_uk_modern"]["information"]["name"],
+        )
+
+    def test_rear_formats_are_merged_into_the_stock_default_design(self) -> None:
+        """core/licensePlateDesign.lua mergeLegacyFormats() reads this exact path.
+
+        Without it setPlateText()'s per-format retry against the stock
+        sktemplate has no bhdc-rear-* block, nothing binds
+        @licenseplate-bhdc-rear-*, and the rear plate renders NO TEXTURE
+        whenever a vanilla design is selected.
+        """
+        context = self._context(with_plate_parts=True)
+        conversion = core.base_conversion_config(context)
+        settings = conversion["variants"]["base"]
+        core.set_variant_build_mode(settings, core.BUILD_ORIGINAL)
+        config = plate_generator.default_plate_config()
+        config["enabled"] = True
+        conversion["plate"] = {"mode": "custom", "setId": "", "config": config}
+
+        result = core.build_batch(context, conversion, write_zip=False)
+        fallback = result.unpacked_dir / "vehicles/common/licenseplates/default/licensePlate-default.json"
+        self.assertTrue(fallback.is_file())
+        design = json.loads(fallback.read_text(encoding="utf-8"))
+        formats = design["data"]["format"]
+        # Both formats always, so the file is byte-identical in every BeamXP mod
+        # and no conversion can shadow a format another conversion needs.
+        self.assertEqual(sorted(formats), ["bhdc-rear-2-1", "bhdc-rear-wide"])
+        # mergeLegacyFormats() only fills formats the sktemplate lacks, but a
+        # stock key here would still be a rewrite of vanilla content.
+        self.assertNotIn("52-11", formats)
+        self.assertNotIn("30-15", formats)
+        # The GE extension this replaced could never load: extNameToLuaPath()
+        # maps '_' to '/', so "bhdc_rearPlates" resolved to bhdc/rearPlates.
+        self.assertFalse((result.unpacked_dir / "lua").exists())
+        self.assertFalse((result.unpacked_dir / "scripts").exists())
+
+    def test_two_line_eu_design_carries_its_segment_ranges(self) -> None:
+        """licensePlateDesign.translateLegacyFormat() turns each line's `limit`
+        into format.segments; without it every segment is {0, 0} and skiaTemplate
+        resolves both lines to an empty string."""
+        font_path = plate_generator.resolve_font_path({"source": "default", "path": ""})
+        _font, metrics = plate_generator._plate_font_metrics(font_path)
+        config = plate_generator.default_plate_config()
+        config["pattern"] = "@@## @@@"
+
+        params = plate_generator._family_text_params(config, "30-15", metrics)
+        self.assertEqual(params["layout"], "two-line")
+        self.assertEqual([line["limit"] for line in params["lines"]], [[0, 4], [5, 8]])
+        # 0-based, end-exclusive: text:sub(limit[1] + 1, limit[2]) in skiaTemplate
+        registration = plate_generator.generate_registration("@@## @@@")
+        self.assertEqual(registration[0:4], registration.split(" ")[0])
+        self.assertEqual(registration[5:8], registration.split(" ")[1])
+
+        wide = plate_generator._family_text_params(config, "52-11", metrics)
+        self.assertNotIn("lines", wide)
 
     def test_eu_horizontal_text_offset_shifts_the_band_aware_centre(self) -> None:
         font_path = plate_generator.resolve_font_path({"source": "default", "path": ""})

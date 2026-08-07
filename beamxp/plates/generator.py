@@ -21,6 +21,7 @@ import random
 import re
 import string
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -80,7 +81,7 @@ _EU_BLUE = "#003399"
 _ATLAS_WIDTH = 1024
 _ATLAS_PAD = 6
 _CAP_TARGET = 100  # target capital letter height in atlas pixels
-_ASSET_VERSION = 8  # bump to invalidate hashed asset folders
+_ASSET_VERSION = 9  # bump to invalidate hashed asset folders
 EMBOSS_MAX_UI = 2.0  # upper bound of the emboss slider in the UI
 _EMBOSS_BLUR_RADIUS = 1.2
 _EMBOSS_NORMAL_HEIGHT = 10.0
@@ -606,6 +607,21 @@ def _split_two_line_text(text: str) -> tuple[str, str]:
             best_index = idx
             best_score = score
     return " ".join(words[:best_index]), " ".join(words[best_index:])
+
+
+def _two_line_ranges(pattern: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Character ranges of the two rendered lines, as the design JSON needs them.
+
+    core/licensePlateDesign.lua turns each `text.lines[i].limit` into
+    `format.segments[i]`, and core/skiaTemplate.lua resolves it as the 0-based,
+    end-exclusive slice `text:sub(limit[1] + 1, limit[2])`.  Without the field
+    the translation defaults every segment to {0, 0} and both lines render
+    empty, so the ranges are derived from the same split the preview uses.
+    """
+    text = str(pattern or "").strip()
+    top, bottom = _split_two_line_text(text)
+    end = len(text)
+    return (0, len(top)), (max(0, end - len(bottom)), end)
 
 
 def _pattern_glyphs(pattern: str) -> set[str]:
@@ -1213,6 +1229,7 @@ def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics)
                 "scale": round(scale, 4),
                 "maxWidth": round(0.84 if str(eu.get("sideBand")) == BAND_NONE else 0.78, 4),
             }
+            top_range, bottom_range = _two_line_ranges(active_pattern(cfg))
             return {
                 "layout": "two-line",
                 "x": round(tx, 4),
@@ -1221,8 +1238,8 @@ def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics)
                 "color": color,
                 "limit": limit,
                 "lines": [
-                    {**line, "y": round(_text_y_fraction(metrics, height, scale, 0.34), 4)},
-                    {**line, "y": round(_text_y_fraction(metrics, height, scale, 0.70), 4)},
+                    {**line, "y": round(_text_y_fraction(metrics, height, scale, 0.34), 4), "limit": list(top_range)},
+                    {**line, "y": round(_text_y_fraction(metrics, height, scale, 0.70), 4), "limit": list(bottom_range)},
                 ],
             }
         scale = (height * 0.60) / metrics.cap_height
@@ -1671,11 +1688,20 @@ def _mode_blocks(
 
 
 class _DesignOutput:
-    def __init__(self, key: str, part_id: str, rear_formats: dict[str, str], *, rear_differs: bool = False):
+    def __init__(
+        self,
+        key: str,
+        part_id: str,
+        rear_formats: dict[str, str],
+        *,
+        rear_differs: bool = False,
+        bundled: bool = False,
+    ):
         self.key = key
         self.part_id = part_id
         self.rear_formats = rear_formats  # vanilla fmt -> rear fmt id
         self.rear_differs = rear_differs  # rear texture differs from the front
+        self.bundled = bundled  # a library set shipped inside one vehicle build
 
 
 def _emit_design(
@@ -1685,7 +1711,18 @@ def _emit_design(
     cache: dict[str, _DesignOutput],
     *,
     set_id: str | None = None,
+    shared: bool = False,
 ) -> _DesignOutput:
+    """Write one design's assets and return the JBeam part that selects it.
+
+    `shared` marks the universal plates mod, whose parts live in
+    vehicles/common and are therefore visible to every model. A vehicle build
+    bundles its own copy of the same set, so that copy is namespaced per
+    vehicle: jbeam/io.lua getPart() searches /vehicles/<model>/ before
+    /vehicles/common/ and would silently pick one of two same-named parts
+    pointing at different design folders, which getAvailableParts() reports as
+    "parts names are duplicate".
+    """
     from beamxp import hand_drive_core as core
 
     font_path = resolve_font_path(cfg.get("font"))
@@ -1773,18 +1810,29 @@ def _emit_design(
     }
     core.write_text_file(design_dir / "licensePlate.json", json.dumps(design_json, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    part_id = f"bhdc_plateset_{_safe_set_id(set_id).replace('-', '_')}" if set_id else f"bhdc_plate_design_{design_key}"
-    out = _DesignOutput(design_key, part_id, rear_formats, rear_differs=rear_differs)
+    if not set_id:
+        # Only ever emitted into the vehicle's own folder, so the content hash
+        # already keeps it unique.
+        part_id = f"bhdc_plate_design_{design_key}"
+    else:
+        set_slug = _safe_set_id(set_id).replace("-", "_")
+        part_id = f"bhdc_plateset_{set_slug}" if shared else f"{prefix}_plateset_{set_slug}"
+    out = _DesignOutput(design_key, part_id, rear_formats, rear_differs=rear_differs, bundled=bool(set_id) and not shared)
     out.design_json_rel = f"{design_rel}/licensePlate.json"
     cache[cache_key] = out
     return out
 
 
 def _design_part_body(out: _DesignOutput, size_label: str, *, custom: bool = False) -> str:
+    name = "BeamXP Custom" if custom else f"BeamXP {size_label} Plate Design"
+    if out.bundled:
+        # Distinct from the same set in the universal plates mod, which is
+        # offered on the same slot whenever both mods are installed.
+        name = f"{name} (bundled)"
     return json.dumps({
         "information": {
             "authors": "BeamXP",
-            "name": "BeamXP Custom" if custom else f"BeamXP {size_label} Plate Design",
+            "name": name,
             "value": 0,
         },
         "slotType": _DESIGN_SLOT,
@@ -2819,14 +2867,36 @@ def _rear_clone_dae_name(source_zip: Path, dae_path: str) -> str:
     return f"bhdc_plate_rear_{stem}_{digest}.dae"
 
 
+def _source_material_name(root: ET.Element, node: ET.Element) -> str | None:
+    """The engine material name bound to a COLLADA node.
+
+    instance_material targets a <material id>, whose `name` is what BeamNG
+    matches against a JBeam material's `mapTo` (see _append_plate_material).
+    """
+    instance = node.find(".//c:instance_material", transform_helpers.NS)
+    if instance is None:
+        return None
+    target = instance.get("target") or instance.get("symbol") or ""
+    material_id = target[1:] if target.startswith("#") else target
+    if not material_id:
+        return None
+    for material in root.findall(".//c:library_materials/c:material", transform_helpers.NS):
+        if material.get("id") == material_id:
+            return material.get("name") or material_id
+    # No library entry (some exporters bind the name directly)
+    return re.sub(r"-material$", "", material_id) or None
+
+
 def _write_rear_clone_daes(
     context,
     output_vehicle_dir: Path,
     clone_sources: dict[str, _RearMeshClone],
     summary: dict[str, object],
-) -> None:
+) -> dict[str, str]:
+    """Clone the source plate geometry, returning output mesh -> source material."""
     from beamxp import hand_drive_core as core
 
+    source_materials: dict[str, str] = {}
     grouped: dict[tuple[Path, str], list[_RearMeshClone]] = {}
     for clone in clone_sources.values():
         grouped.setdefault((clone.source_zip, clone.dae_path), []).append(clone)
@@ -2861,6 +2931,11 @@ def _write_rear_clone_daes(
             new_node = copy.deepcopy(source_node)
             new_node.set("id", clone.output_mesh)
             new_node.set("name", clone.output_mesh)
+            # Read the source binding before overwriting it: the clone inherits
+            # that material so the rear plate matches the front it came from.
+            inherited = _source_material_name(root, source_node)
+            if inherited:
+                source_materials[clone.output_mesh] = inherited
             material_id = f"{clone.output_mesh}-material"
             _set_instance_materials(new_node, material_id)
 
@@ -2902,6 +2977,8 @@ def _write_rear_clone_daes(
                 visual_scene.append(node)
 
         core.write_xml_tree(tree, output_vehicle_dir / _rear_clone_dae_name(source_zip, dae_path))
+
+    return source_materials
 
 
 def _rear_plate_dae(mesh_names: list[str]) -> str:
@@ -2969,256 +3046,180 @@ def _rear_plate_dae(mesh_names: list[str]) -> str:
     )
 
 
-def _rear_material_entry(mesh: str, fmt: str, normal_strength: float) -> dict[str, object]:
-    tag = f"@licenseplate-{fmt}"
-    return {
-        "name": mesh,
-        "mapTo": mesh,
-        "class": "Material",
-        "Stages": [
-            {
-                "baseColorMap": tag,
-                "normalMap": f"{tag}-normal",
-                "normalMapStrength": round(normal_strength, 3),
-                "normalMapUseUV": 1,
-                "roughnessFactor": 0.8,
-                "roughnessMap": f"{tag}-specular",
-            },
-            {}, {}, {},
-        ],
-        "activeLayers": 1,
-        "dynamicCubemap": True,
-        "version": 1.5,
-    }
+# The four maps core/skiaTemplate.lua defaultMaps() renders for a licenseplate
+# design; the engine binds each as "@licenseplate-<format><suffix>".
+_PLATE_TAG_SUFFIXES = ("-normal", "-specular", "-metallic")
+_PLATE_TAG_RE = re.compile(r"^@licenseplate-(?P<base>.+?)(?P<suffix>-normal|-specular|-metallic)?$")
+
+# Shape of the stock plate materials (vehicles/common/licenseplates/{default,
+# driver_training}/main.materials.json), used only when the source mesh's own
+# material cannot be found.  Both stock entries are identical apart from the tag.
+_STOCK_PLATE_MATERIAL: dict[str, object] = {
+    "class": "Material",
+    "Stages": [
+        {
+            "baseColorMap": "@licenseplate-default",
+            "metallicFactor": 1,
+            "metallicMap": "@licenseplate-default-metallic",
+            "normalMap": "@licenseplate-default-normal",
+            "normalMapUseUV": 1,
+            "retroreflectivity": 0.5,
+            "roughnessMap": "@licenseplate-default-specular",
+        },
+        {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None},
+        {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None},
+        {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None},
+    ],
+    "dynamicCubemap": True,
+    "version": 1.5,
+}
+
+
+def _plate_materials_for_context(context) -> dict[str, dict[str, object]]:
+    """Material name -> definition, for every material the vehicle can see.
+
+    Keyed on the COLLADA material name (the JBeam `mapTo`), lowercased.  The
+    vehicle's own archive wins over the shared ones, matching how BeamNG
+    resolves a vehicle's materials.
+    """
+    from beamxp import hand_drive_core as core
+
+    cached = getattr(context, "_bhdc_plate_materials", None)
+    if isinstance(cached, dict):
+        return cached
+
+    found: dict[str, dict[str, object]] = {}
+    zips = core.common_zip_candidates(context.source_zip) + [context.source_zip]
+    for zip_path in zips:
+        try:
+            archive = zipfile.ZipFile(zip_path)
+        except Exception:
+            continue
+        with archive:
+            for name in sorted(archive.namelist()):
+                if not name.replace("\\", "/").lower().endswith(".materials.json"):
+                    continue
+                try:
+                    data = core.parse_beamng_json(
+                        archive.read(name).decode("utf-8", errors="replace"), label=name
+                    )
+                except Exception:
+                    continue
+                for key, value in data.items():
+                    if not isinstance(value, dict):
+                        continue
+                    material_name = str(value.get("mapTo") or value.get("name") or key)
+                    found[material_name.lower()] = value
+    context._bhdc_plate_materials = found
+    return found
+
+
+def _retarget_plate_tags(value: object, fmt: str) -> object:
+    """Repoint every "@licenseplate-*" texture tag at `fmt`, keeping its map."""
+    if isinstance(value, dict):
+        return {key: _retarget_plate_tags(item, fmt) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_retarget_plate_tags(item, fmt) for item in value]
+    if not isinstance(value, str):
+        return value
+    match = _PLATE_TAG_RE.match(value)
+    if match is None:
+        return value
+    return f"@licenseplate-{fmt}{match.group('suffix') or ''}"
+
+
+def _rear_material_entry(mesh: str, fmt: str, source_material: dict[str, object] | None) -> dict[str, object]:
+    """The cloned rear plate's material: the source plate's own definition with
+    its texture tags repointed at the BeamXP rear format.
+
+    Authoring one by hand made the rear diverge from the front it was cloned
+    from - the stock plate material is metallic (metallicFactor 1 plus a
+    metallicMap) and retroreflective (0.5), so a hand-written stage without
+    those renders the rear as a flat, non-reflective plate that also stops
+    lighting up under headlights.
+    """
+    base = source_material if isinstance(source_material, dict) else None
+    # A source that never reads a plate tag is showing a baked texture; adopting
+    # it would leave the rear clone unable to display the registration at all.
+    if base is not None and "@licenseplate-" not in json.dumps(base):
+        base = None
+    entry = copy.deepcopy(base if base is not None else _STOCK_PLATE_MATERIAL)
+    entry = _retarget_plate_tags(entry, fmt)
+    entry["name"] = mesh
+    entry["mapTo"] = mesh
+    return entry
 
 
 # --------------------------------------------------------------------------
 # Vanilla design compatibility for the cloned rear plates
 #
 # The cloned rear parts request the custom formats _REAR_FORMAT_WIDE/_2_1.
-# The game only generates plate textures for formats defined by the active
-# design's licensePlate.json, so switching to a vanilla design would leave the
-# rear meshes untextured ("[NO TEXTURE]" in setPlateText, core/vehicles.lua).
-# Two layers fix that:
-#  1. licensePlate-default-<fmt>.json fallback files - the game's documented
-#     per-format fallback - so the rear always gets at least the stock generic
-#     plate look, even if our extension is not loaded.
-#  2. A small GE Lua extension hooked on onLicensePlateChanged that re-renders
-#     the rear texture tags from the active design's matching *front* format,
-#     so rear plates mirror the front under any vanilla design.
+# core/vehicles.lua setPlateText() renders one texture per format in
+# licenseFormats and, when the active design has no block for a format, retries
+# that single format against DEFAULT_SKTEMPLATE_PATH:
+#
+#     vehicles/common/licenseplates/default/licensePlate-default.sktemplate.json
+#
+# If that retry also fails nothing binds the "@licenseplate-<format>" tag and
+# the rear material renders the engine's missing-texture placeholder
+# ("NO TEXTURE"); the front, meanwhile, silently renders from the stock default
+# design.  So the rear formats have to exist in the game's own default design.
+#
+# core/licensePlateDesign.lua loadDesign() reads the sktemplate and then calls
+# mergeLegacyFormats() with the legacy sibling path - licensePlate-default.json
+# in the same folder - copying in every format the sktemplate does *not* define.
+# The base game ships no such file, so writing one adds the two rear formats to
+# the default design without touching a single stock format or game file.
+#
+# The file is byte-identical in every BeamXP mod (both rear formats, always), so
+# conversions installed side by side shadow each other harmlessly instead of one
+# vehicle's narrower copy hiding the format another vehicle needs.
 
-_REAR_TO_FRONT = {_REAR_FORMAT_WIDE: _FORMAT_WIDE, _REAR_FORMAT_2_1: _FORMAT_2_1}
-_REAR_COMPAT_EXTENSION = "bhdc_rearPlates"
-
-# Copies of the game's own default plate blocks (licensePlate-default.json and
-# licensePlate-default-52-11.json) so the static fallback matches the stock
-# look; all referenced assets ship with the base game.
 _GAME_DEFAULT_FONT_DIR = "vehicles/common/licenseplates/default"
+_REAR_FALLBACK_PATH = f"{_GAME_DEFAULT_FONT_DIR}/licensePlate-default.json"
+
+# Legacy-v2 equivalents of the stock v3 default blocks, so a rear plate under a
+# vanilla design shows the same generic plate the front does.  Every asset here
+# ships with the base game.  No "characterLayout"/"generator": licensePlateDesign
+# then uses the built-in 'plate' font at lineHeight 80, so "scale" reproduces the
+# stock font sizes (180 = 80 * 2.25 wide, 110 = 80 * 1.375 square) and the text
+# node is the same shrink-to-fit box the stock design uses.
 _REAR_FALLBACK_BLOCKS = {
     _REAR_FORMAT_WIDE: {
         "size": {"x": 1024, "y": 196},
-        "text": {"x": 0.50, "y": 0.45, "scale": 1.7, "color": "black", "limit": 10},
+        "text": {"scale": 2.25, "color": "black"},
         "diffuse": {
-            "spriteImg": f"{_GAME_DEFAULT_FONT_DIR}/platefont_d.png",
             "backgroundImg": f"{_GAME_DEFAULT_FONT_DIR}/license_plate_generic_new_wide_d.png",
-            "fillStyle": "white",
-        },
-        "bump": {
-            "spriteImg": f"{_GAME_DEFAULT_FONT_DIR}/platefont_n.png",
-            "backgroundImg": "vehicles/common/licenseplates/driver_training/license_plate_german_new_wide_n.png",
-            "fillStyle": "rgb(127,127,255)",
-        },
-        "specular": {
-            "spriteImg": f"{_GAME_DEFAULT_FONT_DIR}/platefont_s.png",
-            "fillStyle": "rgb(233,233,233)",
         },
     },
     _REAR_FORMAT_2_1: {
         "size": {"x": 512, "y": 256},
-        "text": {"x": 0.5, "y": 0.5, "scale": 1, "color": "black", "limit": 8},
-        "diffuse": {
-            "spriteImg": f"{_GAME_DEFAULT_FONT_DIR}/platefont_d.png",
-            "fillStyle": "white",
-        },
-        "bump": {
-            "spriteImg": f"{_GAME_DEFAULT_FONT_DIR}/platefont_n.png",
-            "backgroundImg": f"{_GAME_DEFAULT_FONT_DIR}/licenseplate-default_n.png",
-            "fillStyle": "rgb(0,0,255)",
-        },
-        "specular": {
-            "spriteImg": f"{_GAME_DEFAULT_FONT_DIR}/platefont_s.png",
-            "fillStyle": "rgb(233,233,233)",
-        },
+        "text": {"scale": 1.375, "color": "black"},
+        "diffuse": {"fillStyle": "#ffffff"},
     },
 }
 
 
-def _rear_fallback_design(rear_fmt: str) -> dict[str, object]:
-    """A licensePlate-default-<rear_fmt>.json body for the game's fallback path."""
+def _rear_fallback_design() -> dict[str, object]:
+    """The legacy licensePlate-default.json merged into the stock default design.
+
+    Only the BeamXP rear formats: mergeLegacyFormats() copies a format across
+    solely when the sktemplate lacks it, so "52-11"/"30-15" stay stock.
+    """
     return {
-        "name": "BeamHDC rear plate fallback",
+        "name": "BeamXP rear plate fallback",
         "version": 2,
-        "data": {"format": {rear_fmt: _REAR_FALLBACK_BLOCKS[rear_fmt]}},
+        "data": {"format": dict(_REAR_FALLBACK_BLOCKS)},
     }
 
 
-def _rear_mod_script_lua() -> str:
-    return (
-        "-- Generated by BeamXP. Keeps the cloned rear licence plates textured\n"
-        "-- when a vanilla plate design is selected (see lua/ge/extensions/"
-        f"{_REAR_COMPAT_EXTENSION}.lua).\n"
-        f'setExtensionUnloadMode("{_REAR_COMPAT_EXTENSION}", "manual")\n'
-    )
-
-
-def _rear_plates_extension_lua() -> str:
-    """GE extension: mirror the front plate texture onto the bhdc rear formats
-    whenever the active design does not define them itself.
-
-    Keep this file byte-identical across BeamHDC mods: several installed
-    conversions may each ship a copy at the same virtual path, and the game
-    mounts whichever it finds first.
-    """
-    return r"""-- Generated by BeamHDC (shared across BeamHDC conversions - keep in sync).
---
--- BeamHDC conversions clone rear licence plate parts onto the custom plate
--- formats "bhdc-rear-wide"/"bhdc-rear-2-1" so front and rear plates can carry
--- different textures. Vanilla plate designs do not define those formats, so
--- selecting one would leave the rear plates untextured. setPlateText()
--- (lua/ge/extensions/core/vehicles.lua) fires onLicensePlateChanged after
--- generating plate textures; this extension re-renders the rear texture tags
--- from the active design's matching front format so the rear mirrors the
--- front. Static fallback files under vehicles/common/licenseplates/default/
--- cover the case where this extension is not loaded.
-local M = {}
-
-local REAR_TO_FRONT = {
-  ["bhdc-rear-wide"] = "52-11",
-  ["bhdc-rear-2-1"] = "30-15",
-}
-
--- setPlateText tags the 30-15 textures as "default" rather than by format id
-local FRONT_TAG_PREFIX = {
-  ["52-11"] = "@licenseplate-52-11",
-  ["30-15"] = "@licenseplate-default",
-}
-
-local function designFormatTable(designPath)
-  if type(designPath) ~= "string" or designPath == "" or not FS:fileExists(designPath) then
-    return nil
-  end
-  local design = jsonReadFile(designPath)
-  if not design then return nil end
-  if design.version == 1 then
-    return { ["30-15"] = design.data }
-  end
-  return design.data and design.data.format or nil
-end
-
-local function frontBlockFor(formatTable, frontFmt)
-  local block = formatTable and formatTable[frontFmt]
-  if block then return block end
-  -- mirror the game's own per-format fallback for designs that lack the
-  -- front format too (e.g. version-1 designs asked for a wide plate)
-  local fallbackPath = "vehicles/common/licenseplates/default/licensePlate-default-" .. frontFmt .. ".json"
-  if not FS:fileExists(fallbackPath) then return nil end
-  local fallback = jsonReadFile(fallbackPath)
-  return fallback and fallback.data and fallback.data.format and fallback.data.format[frontFmt] or nil
-end
-
-local function skipGeneration(veh)
-  return settings.getValue("SkipGenerateLicencePlate")
-    or veh:getDynDataFieldbyName("licenseNoGen", 0)
-    or headless_mode
-end
-
--- mirrors the texture generation half of setPlateText for a single tag
-local function renderTag(veh, tag, txt, block, frontFmt)
-  local data = deepcopy(block)
-  if data.characterLayout then
-    if FS:fileExists(data.characterLayout) then
-      data.characterLayout = jsonReadFile(data.characterLayout)
-    end
-  else
-    data.characterLayout = jsonReadFile("vehicles/common/licenseplates/default/platefont.json")
-  end
-  if data.generator then
-    if FS:fileExists(data.generator) then
-      data.generator = "local://local/" .. data.generator
-    end
-  else
-    data.generator = "local://local/vehicles/common/licenseplates/default/licenseplate-default.html"
-  end
-  data.format = frontFmt
-  local designData = { data = data }
-  local modes = { diffuse = "", bump = "-normal", specular = "-specular" }
-  for mode, suffix in pairs(modes) do
-    veh:createUITexture(tag .. suffix, data.generator, data.size.x, data.size.y, UI_TEXTURE_USAGE_AUTOMATIC, 1)
-    veh:queueJSUITexture(tag .. suffix, 'init("' .. mode .. '","' .. txt .. '", ' .. jsonEncode(designData) .. ');')
-  end
-end
-
-local function onLicensePlateChanged(plateText, vehId, designPath, formats)
-  if type(formats) ~= "table" then return end
-  local veh = vehId and getObjectByID(vehId) or nil
-  if not veh then return end
-
-  local formatTable = nil
-  local formatTableLoaded = false
-  for _, fmt in ipairs(formats) do
-    local frontFmt = REAR_TO_FRONT[fmt]
-    if frontFmt then
-      if not formatTableLoaded then
-        formatTable = designFormatTable(designPath)
-        formatTableLoaded = true
-      end
-      if not (formatTable and formatTable[fmt]) then
-        local rearTag = "@licenseplate-" .. fmt
-        if skipGeneration(veh) then
-          local premade = "/vehicles/common/licenseplates/premade" .. FRONT_TAG_PREFIX[frontFmt]
-          veh:setTaggedTexture(rearTag, premade .. ".dds")
-          veh:setTaggedTexture(rearTag .. "-normal", premade .. "-normal.dds")
-          veh:setTaggedTexture(rearTag .. "-specular", premade .. "-specular.dds")
-        else
-          local block = frontBlockFor(formatTable, frontFmt)
-          if block then
-            local txt = type(plateText) == "string" and plateText or ""
-            renderTag(veh, rearTag, txt, block, frontFmt)
-          end
-        end
-      end
-    end
-  end
-end
-
-M.onLicensePlateChanged = onLicensePlateChanged
-
-return M
-"""
-
-
-def _write_rear_design_compat(output_root: Path, prefix: str, rear_formats_used: set[str]) -> None:
-    """Ship the vanilla-design compatibility files alongside the rear clones."""
+def _write_rear_design_compat(output_root: Path) -> None:
+    """Register the BeamXP rear formats with the game's own default design."""
     from beamxp import hand_drive_core as core
 
-    fallback_dir = output_root / "vehicles" / "common" / "licenseplates" / "default"
-    for rear_fmt in sorted(rear_formats_used):
-        core.write_text_file(
-            fallback_dir / f"licensePlate-default-{rear_fmt}.json",
-            json.dumps(_rear_fallback_design(rear_fmt), indent=2),
-            encoding="utf-8",
-        )
     core.write_text_file(
-        output_root / "lua" / "ge" / "extensions" / f"{_REAR_COMPAT_EXTENSION}.lua",
-        _rear_plates_extension_lua(),
-        encoding="utf-8",
-    )
-    # modScript path is namespaced per vehicle so BeamXP mods never shadow
-    # each other's scripts; the extension file itself is identical in all of
-    # them, so shadowing there is harmless.
-    core.write_text_file(
-        output_root / "scripts" / prefix / "modScript.lua",
-        _rear_mod_script_lua(),
+        output_root / _REAR_FALLBACK_PATH,
+        json.dumps(_rear_fallback_design(), indent=2),
         encoding="utf-8",
     )
 
@@ -3329,7 +3330,7 @@ def apply_to_build(
     prefix = f"bhdc_{core.safe_id(context.vehicle_id)}"
     design_cache: dict[str, _DesignOutput] = {}
     part_bodies: dict[str, str] = {}
-    rear_meshes_used: dict[str, tuple[str, float]] = {}  # mesh -> (rear format, max normal strength)
+    rear_meshes_used: dict[str, str] = {}  # cloned rear mesh -> rear format
     rear_mesh_clone_sources: dict[str, _RearMeshClone] = {}
     rng = random.Random()
 
@@ -3372,7 +3373,6 @@ def apply_to_build(
                 cloned = _clone_rear_parts_for_config(
                     context,
                     config_name,
-                    cfg,
                     design,
                     part_bodies,
                     rear_meshes_used,
@@ -3395,16 +3395,25 @@ def apply_to_build(
         fallback_meshes = sorted(mesh for mesh in rear_meshes_used if mesh in _REAR_FALLBACK_MESHES)
         if fallback_meshes:
             core.write_text_file(output_vehicle_dir / "bhdc_plate_rear.dae", _rear_plate_dae(fallback_meshes), encoding="utf-8")
+        cloned_source_materials: dict[str, str] = {}
         if rear_mesh_clone_sources:
-            _write_rear_clone_daes(context, output_vehicle_dir, rear_mesh_clone_sources, summary)
+            cloned_source_materials = _write_rear_clone_daes(
+                context, output_vehicle_dir, rear_mesh_clone_sources, summary
+            )
+        # The quads in _rear_plate_dae() are BeamXP's own, so they have no source
+        # material to inherit and fall back to the stock plate shape.
+        known_materials = _plate_materials_for_context(context)
         materials = {
-            mesh: _rear_material_entry(mesh, fmt, normal_strength)
-            for mesh, (fmt, normal_strength) in sorted(rear_meshes_used.items())
+            mesh: _rear_material_entry(
+                mesh,
+                fmt,
+                known_materials.get(str(cloned_source_materials.get(mesh, "")).lower()),
+            )
+            for mesh, fmt in sorted(rear_meshes_used.items())
         }
         core.write_text_file(output_vehicle_dir / "bhdc_plate_rear.materials.json", json.dumps(materials, indent=2), encoding="utf-8")
-        rear_formats_used = {fmt for fmt, _strength in rear_meshes_used.values()}
-        _write_rear_design_compat(output_root, prefix, rear_formats_used)
-        summary["rearVanillaFallbacks"] = sorted(rear_formats_used)
+        _write_rear_design_compat(output_root)
+        summary["rearVanillaFallbacks"] = sorted(_REAR_FALLBACK_BLOCKS)
 
     if part_bodies:
         jbeam_dir = output_vehicle_dir / "jbeam"
@@ -3438,7 +3447,7 @@ def export_plate_sets(records: list[dict[str, object]], target_zip: Path) -> dic
         errors = validate_plate_config(cfg)
         if errors:
             raise PlateError(f"Plate set '{record.get('name') or set_id}' is not buildable:\n- " + "\n- ".join(errors))
-        design = _emit_design(cfg, output_root, "bhdc_plates", cache, set_id=set_id)
+        design = _emit_design(cfg, output_root, "bhdc_plates", cache, set_id=set_id, shared=True)
         part_bodies[design.part_id] = _design_part_body(design, str(record.get("name") or cfg.get("size")))
         exported.append(set_id)
 
@@ -3493,10 +3502,9 @@ def export_all_plate_sets(target_zip: Path | None = None) -> dict[str, object] |
 def _clone_rear_parts_for_config(
     context,
     config_name: str,
-    cfg: dict[str, object],
     design: _DesignOutput,
     part_bodies: dict[str, str],
-    rear_meshes_used: dict[str, tuple[str, float]],
+    rear_meshes_used: dict[str, str],
     rear_mesh_clone_sources: dict[str, _RearMeshClone],
     parts: dict[str, object],
     summary: dict[str, object],
@@ -3526,13 +3534,8 @@ def _clone_rear_parts_for_config(
                 continue
             body, rear_fmt, output_meshes = cloned
             part_bodies[new_part_id] = body
-            normal_strength = _effective_emboss_strength(cfg)
             for rear_mesh in output_meshes:
-                existing = rear_meshes_used.get(rear_mesh)
-                rear_meshes_used[rear_mesh] = (
-                    rear_fmt,
-                    max(normal_strength, existing[1] if existing else 0.0),
-                )
+                rear_meshes_used.setdefault(rear_mesh, rear_fmt)
             summary["rearPartsCloned"] = int(summary.get("rearPartsCloned", 0)) + 1
         parts[slot_text] = new_part_id
         cloned_any = True
