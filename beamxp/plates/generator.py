@@ -81,7 +81,7 @@ _EU_BLUE = "#003399"
 _ATLAS_WIDTH = 1024
 _ATLAS_PAD = 6
 _CAP_TARGET = 100  # target capital letter height in atlas pixels
-_ASSET_VERSION = 9  # bump to invalidate hashed asset folders
+_ASSET_VERSION = 10  # bump to invalidate hashed asset folders
 EMBOSS_MAX_UI = 2.0  # upper bound of the emboss slider in the UI
 _EMBOSS_BLUR_RADIUS = 1.2
 _EMBOSS_NORMAL_HEIGHT = 10.0
@@ -607,6 +607,14 @@ def _split_two_line_text(text: str) -> tuple[str, str]:
             best_index = idx
             best_score = score
     return " ".join(words[:best_index]), " ".join(words[best_index:])
+
+
+# buildPlateRoot() gives a `lines` entry letterSpacing = (line.xAdv or 0) + 2,
+# while every other layout keeps textNode()'s letterSpacing of 0.  The user's
+# spacing is already baked into the atlas xadvance (build_font_atlas), so that
+# constant is a second, hidden source of spacing on two-line plates only.
+# Cancel it and let the spacing control be the only one.
+_LINE_XADV = -2
 
 
 def _line_pos(x: float, y: float, scale: float) -> list[float]:
@@ -1252,8 +1260,8 @@ def _family_text_params(cfg: dict[str, object], fmt: str, metrics: _FontMetrics)
                 "color": color,
                 "limit": limit,
                 "lines": [
-                    {**line, "y": top_y, "limit": list(top_range), "pos": _line_pos(tx, top_y, scale)},
-                    {**line, "y": bottom_y, "limit": list(bottom_range), "pos": _line_pos(tx, bottom_y, scale)},
+                    {**line, "y": top_y, "limit": list(top_range), "pos": _line_pos(tx, top_y, scale), "xAdv": _LINE_XADV},
+                    {**line, "y": bottom_y, "limit": list(bottom_range), "pos": _line_pos(tx, bottom_y, scale), "xAdv": _LINE_XADV},
                 ],
             }
         scale = (height * 0.60) / metrics.cap_height
@@ -1393,12 +1401,14 @@ def render_plate_preview(
                 return max(font.getlength(ch), metrics.cap_height * 0.32)
             return font.getlength(ch)
 
-        advances = [(char_advance(ch) + spacing) * line_scale + 2 for ch in line]
+        # No constant of its own: the spacing control is the only source, so the
+        # preview matches what the game draws (see _LINE_XADV).
+        advances = [(char_advance(ch) + spacing) * line_scale for ch in line]
         total = sum(advances)
         max_width = float(line_params.get("maxWidth", params.get("maxWidth", 0)) or 0)
         if max_width and total > width * max_width and total > 0:
             line_scale *= (width * max_width) / total
-            advances = [(char_advance(ch) + spacing) * line_scale + 2 for ch in line]
+            advances = [(char_advance(ch) + spacing) * line_scale for ch in line]
             total = sum(advances)
         draw_font = _load_font(font_path, max(8, round(metrics.font_px * line_scale)))
         x = width * float(line_params.get("x", params.get("x", 0.5))) - total / 2

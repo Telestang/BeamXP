@@ -486,6 +486,33 @@ class PlateXpTests(unittest.TestCase):
         top, bottom = params["lines"]
         self.assertLess(top["pos"][1], bottom["pos"][1])
         self.assertLess(top["pos"][2], 1.0)
+
+    def test_letter_spacing_comes_only_from_the_spacing_control(self) -> None:
+        """buildPlateRoot gives a `lines` entry letterSpacing (xAdv or 0) + 2.
+
+        Every other layout keeps textNode's 0, and the spacing setting is
+        already baked into the atlas xadvance, so that constant would space
+        two-line plates differently from every other format.
+        """
+        font_path = plate_generator.resolve_font_path({"source": "default", "path": ""})
+        _font, metrics = plate_generator._plate_font_metrics(font_path)
+        for spacing in (-10, 0, 12, 30):
+            config = plate_generator.default_plate_config()
+            config["pattern"] = "@@## @@@"
+            config["eu"]["spacing"] = spacing
+            params = plate_generator._family_text_params(config, "30-15", metrics)
+            for line in params["lines"]:
+                self.assertEqual(line["xAdv"] + 2, 0, f"spacing={spacing}")
+            atlas = plate_generator.build_font_atlas(font_path, set("AB12"), spacing)
+            advances = {
+                entry["id"]: int(entry["xadvance"]) for entry in atlas.layout["chars"]["char"]
+            }
+            plain = plate_generator.build_font_atlas(font_path, set("AB12"), 0)
+            base = {entry["id"]: int(entry["xadvance"]) for entry in plain.layout["chars"]["char"]}
+            self.assertTrue(
+                all(advances[k] - base[k] == spacing for k in advances),
+                "the spacing control must be the one that moves the glyphs",
+            )
         # 0-based, end-exclusive: text:sub(limit[1] + 1, limit[2]) in skiaTemplate
         registration = plate_generator.generate_registration("@@## @@@")
         self.assertEqual(registration[0:4], registration.split(" ")[0])
