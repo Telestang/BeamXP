@@ -3392,28 +3392,32 @@ def _retarget_plate_tags(value: object, fmt: str) -> object:
 
 
 def _apply_custom_format_maps(entry: dict[str, object]) -> None:
-    """Limit the first stage to the maps a *custom* plate format actually gets.
+    """Point the metallic map at the stock tag, keeping the rest of the stage.
 
     A stock format's material reads four tags - base, -normal, -specular and
-    -metallic. Retargeting all four at a BeamXP rear format assumes the engine
-    renders all four for a format it does not ship, and it evidently does not:
-    the EuroPlates mod, which builds custom formats exactly the way we do
-    (own licenseplateFormat, renamed mesh under vehicles/common), points its
-    metallic map at the *stock* "@licenseplate-default-metallic" and carries no
-    normal map at all. A secondary map that never binds does not show the
-    missing-texture placeholder, it just shades wrong - which is why this looked
-    like a material difference rather than a broken texture.
+    -metallic - and inheriting it retargets all four at the BeamXP rear format.
+    The metallic one is the map the renderer does not produce for a format it
+    does not ship: EuroPlates, which builds custom formats exactly the way we do
+    (own licenseplateFormat, renamed mesh under vehicles/common), pins its
+    metallic map to the stock "@licenseplate-default-metallic". A secondary map
+    that never binds does not show the missing-texture placeholder, it just
+    shades wrong.
 
-    Which maps the renderer emits per format is C++ (veh:renderLicensePlateSkia),
-    so this follows that worked example rather than anything provable from Lua.
+    The normal map stays on the rear format's own tag. EuroPlates omits it
+    entirely, but dropping it costs the rear its relief while the front keeps
+    the emboss the design asks for, and this material is shared across every
+    design now, so a per-design normal PNG is not an option - a tag is the only
+    way relief can follow the active design.
+
+    Which maps the renderer emits per format is C++ (veh:renderLicensePlateSkia)
+    and not provable from the game's Lua.
     """
     stages = entry.get("Stages")
     if not isinstance(stages, list) or not stages or not isinstance(stages[0], dict):
         return
     stage = stages[0]
-    stage.pop("normalMap", None)
+    # BeamXP's own multiplier, never present on a stock plate material.
     stage.pop("normalMapStrength", None)
-    stage.pop("normalMapUseUV", None)
     if "metallicMap" in stage:
         stage["metallicMap"] = _STOCK_METALLIC_TAG
 

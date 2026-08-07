@@ -362,11 +362,13 @@ class PlateXpTests(unittest.TestCase):
         self.assertEqual(stage["roughnessMap"], "@licenseplate-bhdc-rear-wide-specular")
         self.assertNotIn("normalMapStrength", stage)
         self.assertIsNot(stage, source["Stages"][0])
-        # ...but only the maps a custom format actually gets: see
-        # _apply_custom_format_maps and the EuroPlates mod it follows.
+        # ...except the metallic map, which the renderer does not produce for a
+        # format it does not ship (see _apply_custom_format_maps / EuroPlates).
         self.assertEqual(stage["metallicMap"], "@licenseplate-default-metallic")
-        self.assertNotIn("normalMap", stage)
-        self.assertNotIn("normalMapUseUV", stage)
+        # The normal map keeps the rear format's own tag: it is what carries the
+        # relief, and a shared material cannot reference a per-design PNG.
+        self.assertEqual(stage["normalMap"], "@licenseplate-bhdc-rear-wide-normal")
+        self.assertEqual(stage["normalMapUseUV"], 1)
 
     def test_clone_inherits_the_source_material_and_effect(self) -> None:
         """Rebuilding them as a bare lambert drops whatever the exporter wrote.
@@ -509,6 +511,7 @@ class PlateXpTests(unittest.TestCase):
         self.assertEqual(stage["baseColorMap"], "@licenseplate-bhdc-rear-2-1")
         self.assertEqual(stage["metallicFactor"], 1)
         self.assertEqual(stage["metallicMap"], "@licenseplate-default-metallic")
+        self.assertEqual(stage["normalMap"], "@licenseplate-bhdc-rear-2-1-normal")
         self.assertEqual(stage["retroreflectivity"], 0.5)
         self.assertEqual(stage["roughnessMap"], "@licenseplate-bhdc-rear-2-1-specular")
         # The module-level template must not be mutated by a previous call.
