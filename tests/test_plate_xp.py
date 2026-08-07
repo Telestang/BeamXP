@@ -365,6 +365,46 @@ class PlateXpTests(unittest.TestCase):
         self.assertNotIn("normalMapStrength", entry["Stages"][0])
         self.assertIsNot(entry["Stages"][0], source["Stages"][0])
 
+    def test_rear_material_keeps_the_explicit_nulls_of_its_source(self) -> None:
+        """Materials are read by the engine's C++ material manager, not the Lua
+        reader beamxp.core.sjson ports - and that reader drops null. Every stock
+        plate material spells out "metallicFactor": null on its unused stages,
+        so dropping them is the one way a copied material can differ from its
+        source that cannot be checked from Lua."""
+        raw = json.dumps({
+            "licenseplate-52-11": {
+                "name": "licenseplate-52-11",
+                "mapTo": "licenseplate-52-11",
+                "class": "Material",
+                "Stages": [
+                    {"baseColorMap": "@licenseplate-52-11", "metallicFactor": 1},
+                    {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None},
+                    {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None},
+                    {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None},
+                ],
+                "version": 1.5,
+            }
+        }, indent=2)
+        # the tolerant reader is what silently ate them
+        self.assertEqual(
+            core.parse_beamng_json(raw, label="t")["licenseplate-52-11"]["Stages"][1], {}
+        )
+
+        source = plate_generator._read_material_file(raw, "t")["licenseplate-52-11"]
+        self.assertEqual(
+            source["Stages"][1], {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None}
+        )
+        entry = plate_generator._rear_material_entry("bhdc_rear_plate", "bhdc-rear-wide", source)
+        for stage in entry["Stages"][1:]:
+            self.assertEqual(
+                stage, {"metallicFactor": None, "normalMapUseUV": None, "retroreflectivity": None}
+            )
+        self.assertIn('"metallicFactor": null', json.dumps(entry, indent=2))
+
+        # a hand-edited file the strict reader chokes on still loads
+        loose = '{"m": {"mapTo": "m", "Stages": [{"baseColorMap": "@licenseplate-52-11"},],},}'
+        self.assertIn("m", plate_generator._read_material_file(loose, "t"))
+
     def test_rear_material_ignores_a_source_that_bakes_its_plate_texture(self) -> None:
         baked = {
             "name": "modplate",

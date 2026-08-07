@@ -3173,6 +3173,26 @@ _STOCK_PLATE_MATERIAL: dict[str, object] = {
 }
 
 
+def _read_material_file(text: str, label: str) -> dict[str, object]:
+    """Parse a *.materials.json, keeping explicit nulls.
+
+    Materials are consumed by the engine's C++ material manager, not by the
+    Lua reader beamxp.core.sjson ports - and that reader drops null, because
+    null is nil in Lua. Every stock plate material spells out
+    "metallicFactor": null (and friends) on its unused stages, so dropping
+    them makes a copied material differ from the one it was copied from in
+    the one way we cannot check from Lua. Strict JSON keeps them; the
+    tolerant reader stays as the fallback for hand-edited files.
+    """
+    from beamxp import hand_drive_core as core
+
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return core.parse_beamng_json(text, label=label)
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _plate_materials_for_context(context) -> dict[str, dict[str, object]]:
     """Material name -> definition, for every material the vehicle can see.
 
@@ -3198,8 +3218,8 @@ def _plate_materials_for_context(context) -> dict[str, dict[str, object]]:
                 if not name.replace("\\", "/").lower().endswith(".materials.json"):
                     continue
                 try:
-                    data = core.parse_beamng_json(
-                        archive.read(name).decode("utf-8", errors="replace"), label=name
+                    data = _read_material_file(
+                        archive.read(name).decode("utf-8", errors="replace"), name
                     )
                 except Exception:
                     continue
