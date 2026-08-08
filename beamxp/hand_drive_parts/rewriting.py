@@ -2472,6 +2472,43 @@ def _twin_node_row(row: str, twin_name: str, position: Vec3) -> str | None:
     return out
 
 
+def _part_node_positions(part_body: str) -> dict[str, Vec3]:
+    """Node positions as THIS part declares them.
+
+    The shared map is keyed on name alone, and one vehicle folder can carry
+    more than one model: vivace.zip ships the Vivace and the Ardente as separate
+    part trees picked by which body fills the vivace_body slot, each with its
+    own dash. Both dashes name their nodes int_strw and int_stalk -- the same
+    nodes for two different cars, 50 to 75 mm apart -- and only the fitted
+    model's are real at once, so the map holds whichever model was built.
+    Converting the other one's parts against it builds their frames from the
+    wrong car.
+
+    Rows whose coordinates are expressions are left out rather than guessed at
+    -- there is nothing to resolve a variable with here, and the shared map is
+    a better answer than none.
+    """
+    positions: dict[str, Vec3] = {}
+    nodes_text = transform_helpers.extract_named_array(part_body, "nodes")
+    if not nodes_text:
+        return positions
+    for start, end in _row_spans(nodes_text):
+        row = nodes_text[start:end]
+        spans = _row_element_spans(row)
+        if len(spans) < 4:
+            continue
+        node_id = _row_string_value(row[spans[0][0] : spans[0][1]])
+        if node_id is None or node_id.endswith(":"):
+            continue
+        try:
+            positions[node_id] = tuple(
+                float(row[start:end].strip()) for start, end in spans[1:4]
+            )
+        except ValueError:
+            continue
+    return positions
+
+
 def _row_indent(array_text: str, start: int) -> str:
     match = re.match(r"[ \t]*", array_text[array_text.rfind("\n", 0, start) + 1 : start])
     return match.group(0) if match else ""
@@ -2592,6 +2629,12 @@ def generate_trigger_frame_twins(
     driven = hydro_driven_nodes(part_body)
     if not driven or not owners:
         return part_body, {}, {}, []
+    # The frame is the one place the conversion INVENTS a position rather than
+    # rewriting one already written down, so it is the one place a name-keyed
+    # lookup can plant a node on another part's geometry. Read this part's own
+    # rows over the shared map; merging keeps every other name, so the generated
+    # names still avoid colliding with anything in the vehicle.
+    node_positions = {**node_positions, **_part_node_positions(part_body)}
     requests, notes = _requested_frame_twins(part_body, node_positions, owners, driven)
     if not requests:
         return part_body, {}, {}, notes

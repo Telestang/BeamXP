@@ -481,6 +481,21 @@ STALK_NODES["f5r"] = (-0.33, -0.9, 0.30)
 STALK_OWNERS = ([((0.4186, -0.4588, 0.7969), "translate", -0.71, None)], {}, [])
 
 
+# The other MODEL's dash. vivace.zip carries the Vivace and the Ardente as
+# separate part trees in one vehicle folder, and each dash names its nodes the
+# same way at its own coordinates -- so the shared map only ever holds the
+# geometry of whichever model was built.
+VIVACE_STALK_PART = (
+    ARDENTE_STALK_PART.replace('"ardente_dash"', '"vivace_dash"')
+    .replace("[\"dshr\", -0.355, -0.6203, 0.9431]", "[\"dshr\", -0.368, -0.7, 0.99]")
+    .replace("[\"dshl\", 0.355, -0.6203, 0.9431]", "[\"dshl\", 0.368, -0.7, 0.99]")
+    .replace("[\"dsh2r\", -0.355, -0.5735, 0.7659]", "[\"dsh2r\", -0.368, -0.646, 0.78]")
+    .replace("[\"dsh2l\", 0.355, -0.5735, 0.7659]", "[\"dsh2l\", 0.368, -0.646, 0.78]")
+    .replace("[\"int_strw\", 0.355, -0.4397, 0.8037]", "[\"int_strw\", 0.368, -0.452, 0.851]")
+    .replace("[\"int_stalk\", 0.5656, -0.455, 0.8367]", "[\"int_stalk\", 0.576, -0.485, 0.901]")
+)
+
+
 def build_twins(part=ARDENTE_STALK_PART, nodes=STALK_NODES, owners=STALK_OWNERS):
     return generate_trigger_frame_twins(
         part, nodes, build_node_mirror_map(nodes), owners, HAND_RHD
@@ -639,6 +654,33 @@ class TriggerFrameTwinTest(unittest.TestCase):
         # the game refuses to build at all
         self.assertNotEqual(twin[2], twin[3])
         self.assertEqual({twin[2], twin[3]}, {"dsh2l", "dsh2r"})
+
+    def test_a_twin_is_built_from_its_own_part_not_the_fitted_one(self):
+        """The frame invents a position, so it must read the right geometry.
+
+        Two models can share one vehicle folder, and both name their nodes the
+        same way -- int_strw belongs to the Vivace and to the Ardente, 50 mm
+        apart. The shared map is keyed on name alone, so it holds whichever
+        model was built, and reading it put the Vivace dash's generated node on
+        the Ardente's geometry.
+        """
+        # the shared map holds the ARDENTE values, as building it leaves them
+        _body, twins, positions, _notes = build_twins(part=VIVACE_STALK_PART)
+        self.assertTrue(twins, "the vivace dash generated no frame at all")
+
+        authored = {"int_strw": (0.368, -0.452, 0.851),
+                    "int_stalk": (0.576, -0.485, 0.901)}
+        for source, twin in twins.items():
+            got = positions[twin]
+            want = authored[source]
+            # a slide moves x only, so y and z are the authored ones untouched
+            self.assertAlmostEqual(got[1], want[1], places=9, msg=f"{twin} y")
+            self.assertAlmostEqual(got[2], want[2], places=9, msg=f"{twin} z")
+            self.assertAlmostEqual(got[0], want[0] - 0.71, places=9, msg=f"{twin} x")
+            self.assertNotAlmostEqual(
+                got[1], STALK_NODES[source][1], places=4,
+                msg=f"{twin} landed on the fitted part's geometry",
+            )
 
     def test_the_twins_get_the_rows_that_hold_and_drive_them(self):
         body, twins, _positions, _notes = build_twins()
