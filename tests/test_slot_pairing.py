@@ -150,6 +150,47 @@ MESH_CABIN_PARTS = {
 }
 
 
+# A door assembly that declares its own card's flexbody, with the card also
+# sold as a part in a child slot -- etk800's shape, and the one that makes a
+# mesh-named row reachable from two very different parts.
+DOOR_CARD_PARTS = {
+    "car": (
+        part("car", "main", "Car", (("door_FL", "door_FL"), ("door_FR", "door_FR"))),
+        "car.jbeam",
+    ),
+    "door_FL": (
+        part(
+            "door_FL",
+            "door_FL",
+            "Front Left Door",
+            (("doorpanel_FL", "doorpanel_FL"),),
+            extra=flexbodies("door_skin_FL", "doorpanel_FL"),
+        ),
+        "doors.jbeam",
+    ),
+    "door_FR": (
+        part(
+            "door_FR",
+            "door_FR",
+            "Front Right Door",
+            (("doorpanel_FR", "doorpanel_FR"),),
+            extra=flexbodies("door_skin_FR", "doorpanel_FR"),
+        ),
+        "doors.jbeam",
+    ),
+    "doorpanel_FL": (
+        part("doorpanel_FL", "doorpanel_FL", "Front Left Door Card",
+             extra=flexbodies("doorpanel_FL")),
+        "doors.jbeam",
+    ),
+    "doorpanel_FR": (
+        part("doorpanel_FR", "doorpanel_FR", "Front Right Door Card",
+             extra=flexbodies("doorpanel_FR")),
+        "doors.jbeam",
+    ),
+}
+
+
 class SlotPairPlanTests(unittest.TestCase):
     def _context(self, instances: tuple[tuple[str, str, str], ...]) -> core.VehicleContext:
         return context_with_parts(CABIN_PARTS, {"trim": selection(instances)})
@@ -368,6 +409,43 @@ class EquivalentPartPlanTests(unittest.TestCase):
         )
         self.assertIsNone(plan)
         self.assertEqual(core.authored_group_meshes(context, plan), set())
+
+    def test_a_door_card_row_never_reaches_the_door_that_carries_it(self) -> None:
+        # The door declares the card's flexbody, so the card's row matches the
+        # door as readily as the card -- and the door does not fit the opposite
+        # door's card slot, so it used to come out as a whole-door relocation.
+        # The preview then drew every door mesh twice, the second copy mirrored
+        # over the Swap Mesh the row was about.
+        context = context_with_parts(DOOR_CARD_PARTS, {"trim": selection((
+            ("car", "main", "/"),
+            ("door_FL", "door_FL", "/door_FL/"),
+            ("doorpanel_FL", "doorpanel_FL", "/door_FL/doorpanel_FL/"),
+            ("door_FR", "door_FR", "/door_FR/"),
+            ("doorpanel_FR", "doorpanel_FR", "/door_FR/doorpanel_FR/"),
+        ))})
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{"left": "doorpanel_FL", "right": "doorpanel_FR", "kind": "door"}],
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(core.authored_group_meshes(context, plan), set())
+
+    def test_a_card_row_still_reaches_the_door_when_no_card_part_exists(self) -> None:
+        # With no dedicated card part in the trim, the door IS the part that
+        # answers for the mesh -- and the answer is the opposite door, which
+        # already occupies its slot, so the row hands nothing across.
+        context = context_with_parts(DOOR_CARD_PARTS, {"trim": selection((
+            ("car", "main", "/"),
+            ("door_FL", "door_FL", "/door_FL/"),
+            ("door_FR", "door_FR", "/door_FR/"),
+        ))})
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{"left": "doorpanel_FL", "right": "doorpanel_FR", "kind": "door"}],
+        )
+        self.assertIsNone(plan)
 
     def test_a_part_row_wins_over_a_mesh_row_the_part_reuses(self) -> None:
         # The sport seat reuses the base seat's mesh, so the base seat's mesh

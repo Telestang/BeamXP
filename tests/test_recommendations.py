@@ -126,19 +126,23 @@ class CabinFurnitureTests(unittest.TestCase):
 
 class HandedFamilyTests(unittest.TestCase):
     def test_door_cards_and_wing_mirrors_swap_meshes(self) -> None:
+        # The cross-swap IS the conversion for these two: their parts are
+        # slot-locked, so an Equivalent Parts row alongside it would be a
+        # second mechanism aimed at the same meshes -- and the row is written
+        # against the mesh, which the whole door also declares.
         recs = recommend(named_cabin())
         card = recs["veh_doorpanel_FL"]
         self.assertEqual(card["kind"], "pair")
         self.assertEqual(card["mode"], core.MODE_MIRROR_STRUCTURAL)
         self.assertEqual(card["source_id"], "veh_doorpanel_FR")
-        self.assertEqual(card["pair_kind"], "door")
-        self.assertTrue(card["equivalent"])
+        self.assertEqual(card["pair_kind"], "")
+        self.assertFalse(card["equivalent"])
 
         wing = recs["veh_mirror_L"]
         self.assertEqual(wing["mode"], core.MODE_MIRROR_STRUCTURAL)
         self.assertEqual(wing["source_id"], "veh_mirror_R")
-        self.assertEqual(wing["pair_kind"], "mirror")
-        self.assertTrue(wing["equivalent"])
+        self.assertEqual(wing["pair_kind"], "")
+        self.assertFalse(wing["equivalent"])
 
     def test_rear_door_cards_pair_as_readily_as_front_ones(self) -> None:
         centers = named_cabin()

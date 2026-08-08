@@ -114,8 +114,13 @@ def build_mode_recommendations(
                     else "left/right name pair"
                 ),
                 "confidence": confidence_for(text_by_id[first], text_by_id[second]),
-                "equivalent": True,
-                "pair_kind": _side_pair_kind_for_mesh(first, second),
+                # Only the seat converts by slot occupancy, so only the seat
+                # earns an Equivalent Parts row. A door card or a wing mirror
+                # is slot-locked -- its part fits nothing but its own side --
+                # so the cross-swap IS the conversion, and a second row saying
+                # the same thing in the other mechanism can only fight it.
+                "equivalent": seats,
+                "pair_kind": _side_pair_kind_for_mesh(first, second) if seats else "",
             })
             continue
         if recommendation_matches(text, UNPAIRED_MIRROR_EXCLUDE_PATTERNS):

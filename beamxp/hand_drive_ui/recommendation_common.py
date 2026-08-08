@@ -87,9 +87,18 @@ MIRROR_PATTERNS = (
 
 # The families that convert by swapping sides rather than by transforming a
 # mesh in place. Vanilla bx ships all three as authored LHD/RHD pairs.
+#
+# The mirror rule is deliberately just "anything mirror related", because a
+# wing mirror is never one mesh: the casing comes with a stalk, a turn-signal
+# repeater, and on some vehicles a separate lens over it, and every vehicle
+# spells those differently -- mirrorstalk, mirrorsignal, mirror_signal,
+# mirrorsignalglass, sidemirror_mount. Enumerating the spellings only ever
+# misses one, and the pairing does the real work anyway: a name with no
+# opposite-side twin falls through to a plain Mirror below, which is the right
+# answer for the centred interior mirrors this also catches.
 HANDED_PATTERNS = (
     r"door_?panel|door_?card",
-    r"(?:^|_)mirror(?:_|$)|mirror_?stalk",
+    r"mirror",
     r"(?:^|_)(?:race_?)?seats?(?:_|$)|racing_?seat",
 )
 

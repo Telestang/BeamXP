@@ -1090,6 +1090,11 @@ def _mesh_owner_part_index(context: VehicleContext) -> dict[str, tuple[str, ...]
     return owners
 
 
+def mesh_owner_parts(context: VehicleContext, mesh: str) -> tuple[str, ...]:
+    """Every part that declares this mesh, in id order."""
+    return _mesh_owner_part_index(context).get(mesh, ())
+
+
 def _side_pair_matches_ref(
     context: VehicleContext,
     instance: dict[str, object],
@@ -1115,29 +1120,62 @@ def _side_pair_matches_ref(
     return _side_pair_base_ref(text) in part_mesh_names_for_context(context, part_id)
 
 
+def _refs_answered_by_part_name(
+    pairs: Iterable[dict[str, object]],
+    instances: Iterable[dict[str, object]],
+) -> set[str]:
+    """Row sides a selected part instance answers to by its own name.
+
+    The mesh fallback below reaches every part that DECLARES a mesh, and an
+    assembly declares its trim's meshes as readily as the dedicated part does:
+    etk800's ``etk800_door_FL`` carries ``etk800_doorpanel_FL``'s flexbody, so
+    a door-card row matches the door as well as the card. Per-instance
+    ordering cannot separate them -- each instance only ever sees its own
+    matches -- so the row has to be taken off the table for everyone once the
+    part it actually names has answered for it. Otherwise a row about a door
+    card relocates the whole door.
+    """
+    refs = {
+        str(pair.get(side) or "")
+        for pair in pairs
+        for side in ("left", "right")
+    }
+    refs.discard("")
+    answered: set[str] = set()
+    for instance in instances:
+        names = {str(instance.get("part_id") or ""), _selected_instance_ref(instance)}
+        answered |= refs & names
+    return answered
+
+
 def _side_pair_counterpart_ref(
     context: VehicleContext,
     pairs: Iterable[dict[str, object]],
     instance: dict[str, object],
-) -> str:
-    """The other side of the first row this part instance answers to.
+    answered_refs: set[str] = frozenset(),
+) -> tuple[str, bool]:
+    """The other side of the first row this part instance answers to, and how.
 
     Rows naming the part itself are searched before rows naming one of its
     meshes: an optional part routinely reuses the mesh of the part it replaces
     -- etk800's sport seat carries ``etk800_seat_FL`` -- so a mesh row for the
     base seat would otherwise capture the sport seat and swap it for the base
-    part on the far side.
+    part on the far side. The flag says which of the two answered, because a
+    part that merely carries the named mesh has a much weaker claim on the row
+    than the part the row names.
     """
     pairs = list(pairs)
     for by_mesh in (False, True):
         for pair in pairs:
             left = str(pair.get("left") or "")
             right = str(pair.get("right") or "")
+            if by_mesh and (left in answered_refs or right in answered_refs):
+                continue  # a part named on this row has already answered it
             if _side_pair_matches_ref(context, instance, left, by_mesh=by_mesh):
-                return right
+                return right, by_mesh
             if _side_pair_matches_ref(context, instance, right, by_mesh=by_mesh):
-                return left
-    return ""
+                return left, by_mesh
+    return "", False
 
 
 def _side_pair_counterpart_part(
@@ -1206,6 +1244,7 @@ def resolve_side_pair_plan(
     selected = selected_parts_for_config(context, config_name)
     usage = slot_usage_for_configs(context, [config_name])
     instances = selected_part_instances(selected)
+    answered_refs = _refs_answered_by_part_name(normalized, instances)
     selections: list[dict[str, object]] = []
     relocations: list[dict[str, object]] = []
     clears: list[dict[str, str]] = []
@@ -1219,7 +1258,9 @@ def resolve_side_pair_plan(
         source_path = str(instance.get("slot_path") or "")
         if not source_part or not source_slot or not source_path:
             continue
-        counterpart_ref = _side_pair_counterpart_ref(context, normalized, instance)
+        counterpart_ref, carries_the_mesh = _side_pair_counterpart_ref(
+            context, normalized, instance, answered_refs
+        )
         if not counterpart_ref:
             continue
         target_slot = mirror_lateral_node_id(source_slot)
@@ -1256,13 +1297,21 @@ def resolve_side_pair_plan(
         if target_current == target_part:
             continue
 
-        covered.add(source_part)
-        handled_sources.add(source_slot)
         found = part_body_for_context(context, target_part)
-        if found is not None and part_fits_slot(
+        fits = found is not None and part_fits_slot(
             transform_helpers.extract_part_slot_types(found[0]),
             target_slot_def,
-        ):
+        )
+        # A part that only carries the named mesh may hand a fitting
+        # counterpart across, but it must never be the thing that moves: a row
+        # about a door card is not a licence to relocate the whole door, and
+        # the card's own Swap Mesh already answers for the mesh.
+        if carries_the_mesh and not fits:
+            continue
+
+        covered.add(source_part)
+        handled_sources.add(source_slot)
+        if fits:
             selections.append(
                 {
                     "sourceSlotId": source_slot,
@@ -1935,4 +1984,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'mesh_owner_parts', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']

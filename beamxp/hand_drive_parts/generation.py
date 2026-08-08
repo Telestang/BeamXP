@@ -1204,6 +1204,73 @@ def _generated_clone_excluded(
     return any("seat" in token for token in tokens)
 
 
+def swapped_light_slot_placements(
+    context: VehicleContext,
+    part_body: str,
+    object_modes: dict[str, str],
+    structural_sources: dict[str, str],
+) -> dict[str, dict[str, object]]:
+    """Bulb placements this part has to take from its opposite-side twin.
+
+    A wing-mirror indicator only needs moving when the lens it shines through
+    was reskinned from the other side's, and the vehicle answers both halves of
+    that itself. Which lamp belongs to which lens is the deform group they
+    share -- sunburst2's bulb and its ``sunburst2_mirrorsignal_L`` flexbody are
+    both ``mirrorsignal_L_break``, and nothing else in the jbeam says they are
+    one lamp. Which part holds the far-side lamp is whoever declares the mesh
+    the lens was swapped from, and which of that part's lamps is the same lamp
+    is the lateral twin of the circuit name (``signal_L_filament`` ->
+    ``signal_R_filament``), so a mirror carrying both an indicator and a
+    daytime running light cannot mix them up.
+
+    Only the six placement numbers travel, reflected. The circuit, the deform
+    group, the nodes the lamp rides on and the beam cookie all stay this side's
+    -- which is what keeps the left indicator flashing with the left signal
+    after its glass has come from the right.
+
+    A lens mesh several parts share cannot say which of their lamps is the far
+    side of this one, and a wing mirror never poses that question: every signal
+    lens in the fleet that more than one part declares belongs to parts with no
+    lamp at all. So an unresolved far side is left alone rather than guessed
+    at, which keeps this to the case it was written for.
+    """
+    slots = light_slot_placements(part_body)
+    if not slots:
+        return {}
+    meshes_by_group = deform_group_flexbody_meshes(part_body)
+    out: dict[str, dict[str, object]] = {}
+    for electric, placement in slots.items():
+        group = str(placement.get("deformGroup") or "")
+        # Replace Source reskins a row exactly as Swap Mesh does -- both take
+        # their geometry from structural_sources and both have the build mirror
+        # the flexbody row -- so a lamp behind either has equally moved.
+        twin_meshes = {
+            structural_sources[mesh]
+            for mesh in meshes_by_group.get(group, ())
+            if object_modes.get(mesh) in {MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
+            and mesh in structural_sources
+        }
+        if not twin_meshes:
+            continue
+        twin_electric = mirror_lateral_node_id(electric)
+        if twin_electric == electric:
+            continue  # a circuit with no side in its name names no far side
+        candidates: list[dict[str, object]] = []
+        for twin_part in sorted({
+            owner for mesh in sorted(twin_meshes) for owner in mesh_owner_parts(context, mesh)
+        }):
+            found = part_body_for_context(context, twin_part)
+            if found is None:
+                continue
+            twin_slot = light_slot_placements(found[0]).get(twin_electric)
+            if twin_slot is not None and twin_slot not in candidates:
+                candidates.append(twin_slot)
+        if len(candidates) != 1:
+            continue
+        out[electric] = mirrored_light_placement(candidates[0])
+    return out
+
+
 def _part_has_handed_light_slots(part_body: str) -> bool:
     has_beam_electric = re.search(
         r'"\$electric"\s*:\s*"(?:lowbeam|highbeam|lowhighbeam)',
@@ -1492,6 +1559,15 @@ def write_generated_jbeam_and_configs(
                 in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
                 and structural_sources.get(mesh, mesh) in mirror_rows
             }
+            # An indicator repeater is a lamp inside a lens. Swap the lens for
+            # the other side's and the lamp has to travel with it, or it goes
+            # on shining out of a casing that is no longer there.
+            part_light_placements = swapped_light_slot_placements(
+                context,
+                part_body,
+                object_modes,
+                structural_sources,
+            )
             prop_row_transforms: dict[str, tuple[str, float]] = {}
             for mesh in mesh_hits:
                 if object_modes.get(mesh) == MODE_TRANSLATE and mesh in translated_prop_meshes:
@@ -1596,6 +1672,7 @@ def write_generated_jbeam_and_configs(
                     trigger_owners,
                     mirror_plane_sources,
                     part_trigger_follows,
+                    part_light_placements,
                 )
             )
 
@@ -2045,7 +2122,13 @@ def full_vehicle_preview_payload(
     source_node_positions = dict(context.node_positions)
     source_node_positions.update(source_selected_nodes)
     mirror = mirror_x_matrix4()
-    convertible = {MODE_TRANSLATE, MODE_MIRROR_POSITION, MODE_MIRROR, MODE_REPLACE_SOURCE}
+    convertible = {
+        MODE_TRANSLATE,
+        MODE_MIRROR_POSITION,
+        MODE_MIRROR,
+        MODE_MIRROR_STRUCTURAL,
+        MODE_REPLACE_SOURCE,
+    }
     source_meshes = structural_mirror_sources(context, conversion, object_modes)
     rotation_counts: dict[str, int] = {}
 
@@ -2064,7 +2147,12 @@ def full_vehicle_preview_payload(
             dae_entries.append({"zip": str(zip_path), "dae_path": obj.dae_path})
         return index
 
-    def final_matrix(mesh: str, mode: str, world: list[list[float]]) -> list[list[float]]:
+    def final_matrix(
+        mesh: str,
+        mode: str,
+        world: list[list[float]],
+        kind: str = "flex",
+    ) -> list[list[float]]:
         if target_hand is None or mode not in convertible:
             return world
         if mode == MODE_TRANSLATE:
@@ -2076,7 +2164,26 @@ def full_vehicle_preview_payload(
         if mode == MODE_MIRROR_POSITION:
             return multiply_matrix(translation_matrix((-2.0 * world[0][3], 0.0, 0.0)), world)
         if mode == MODE_REPLACE_SOURCE:
+            # Replace Source renders another mesh where this row stands, and
+            # the child-preview pass forces this mode onto rows that keep their
+            # OWN geometry -- so there is nothing here to reflect.
             return world
+        if mode == MODE_MIRROR_STRUCTURAL and kind == "prop":
+            # A Swap Mesh prop is handed the twin's geometry, which arrives
+            # sitting at the TWIN's pivot on the far side of the car. The build
+            # anchors it at mirror(twin position) with the copy reflected in
+            # prop-model space, which is T(A)*R*S*T(-p_twin) -- and since the
+            # pair reflects (p_twin = S*p), that is the row's own placement with
+            # the reflection applied to the geometry first, i.e. world*S. Left-
+            # multiplying instead would subtract this side's pivot from geometry
+            # standing on the other side, and fling the mesh across the car.
+            return multiply_matrix(world, mirror)
+        # Mirror, and Swap Mesh on a flexbody: the build mirrors the row's own
+        # pos/rot and supplies a world-mirrored copy of the mesh
+        # (P'*(S*M*S)*(S*g) = S*(P*M*g) in mesh_placement.baked_dae_matrix), so
+        # what lands on screen is this row's placement reflected. Without it a
+        # swapped pair merely trades geometry across two rows that are already
+        # each other's reflection, and the render does not change at all.
         return multiply_matrix(mirror, world)
 
     def preview_part_array(part_id: str, array_key: str) -> str | None:
@@ -2430,7 +2537,7 @@ def full_vehicle_preview_payload(
                             "slot_path": slot_path,
                             "kind": kind,
                             "mode": mode if target_hand is not None else MODE_SKIP,
-                            "matrix": matrix4_flat(final_matrix(mesh, mode, world)),
+                            "matrix": matrix4_flat(final_matrix(mesh, mode, world, kind)),
                             "stock_matrix": matrix4_flat(world),
                             "keep_node_translation": (
                                 kind != "flex" or flexbody_row_needs_node_translation(context, geometry_mesh)
@@ -2523,7 +2630,7 @@ def full_vehicle_preview_payload(
                 "part": extra_part_id,
                 "kind": kind,
                 "mode": mode if target_hand is not None else MODE_SKIP,
-                "matrix": matrix4_flat(final_matrix(mesh, mode, world)),
+                "matrix": matrix4_flat(final_matrix(mesh, mode, world, kind)),
                 "stock_matrix": matrix4_flat(world),
                 "keep_node_translation": (
                     kind != "flex" or flexbody_row_needs_node_translation(context, geometry_mesh)
@@ -2662,4 +2769,4 @@ def preview_trigger_boxes(
     boxes.sort(key=lambda box: (str(box["id"]), tuple(box["at"])))
     return boxes
 
-__all__ = ['converted_trigger_corners', 'preview_trigger_boxes', 'authored_trigger_placements', 'authored_trigger_positions', 'trigger_modes_for_part', 'trigger_owners_for_config', 'trigger_owners_for_part', 'generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload']
+__all__ = ['converted_trigger_corners', 'preview_trigger_boxes', 'authored_trigger_placements', 'authored_trigger_positions', 'trigger_modes_for_part', 'trigger_owners_for_config', 'trigger_owners_for_part', 'generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload', 'swapped_light_slot_placements']

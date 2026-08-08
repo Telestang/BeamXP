@@ -2872,6 +2872,217 @@ def rewrite_light_pattern_for_target(part_body: str, target_hand: str) -> str:
     )
 
 
+# A turn-signal repeater is not authored in the part that carries it. The lamp
+# is a shared bulb part -- vehicles/common/lightEmitters/incandescentBulbs.jbeam
+# -- holding one SPOTLIGHT prop whose every field is a jbeam variable, and the
+# part that mounts it fills those in from its own slots2 row:
+#
+#   ["sunburst2_mirror_L_signal_bulb", ["incandescent_amber_5W"], [],
+#    "incandescent_amber_5W", "Left Mirror Turn Signal Bulb",
+#    {"coreSlot":true, "variables":{
+#        "$electric":"signal_L_filament",
+#        "$nodeRef":"mi4l", "$nodeX":"mi3l", "$nodeY":"mi2l",
+#        "$deformGroup":"mirrorsignal_L_break",
+#        "$posX":0.979, "$posY":-0.55, "$posZ":0.96,
+#        "$rotX":0, "$rotY":0, "$rotZ":140}}]
+#
+# The bulb reads $pos* as baseTranslationGlobal and $rot* as
+# baseRotationGlobal, so those six numbers alone say where the lamp sits inside
+# the lens and which way it shines -- in vehicle space, like any other global
+# placement the build reflects. Everything else says WHICH indicator this is:
+# $electric is the circuit that flashes it, $deformGroup the damage that kills
+# it, $nodeRef/$nodeX/$nodeY the nodes it rides on. Those must never cross
+# sides, or the left mirror starts blinking with the right stalk.
+LIGHT_PLACEMENT_KEYS = ("$posX", "$posY", "$posZ", "$rotX", "$rotY", "$rotZ")
+
+_SLOT_VARIABLE_RE = re.compile(
+    r'"(\$[A-Za-z0-9_]+)"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|"(?:[^"\\]|\\.)*")'
+)
+
+
+def _top_level_bracket_spans(array_text: str) -> list[str]:
+    """Each ``[...]`` row of a jbeam array, brackets included."""
+    spans: list[str] = []
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] != "[":
+            idx += 1
+            continue
+        try:
+            end = transform_helpers.find_matching(array_text, idx, "[", "]")
+        except ValueError:
+            idx += 1
+            continue
+        spans.append(array_text[idx : end + 1])
+        idx = end + 1
+    return spans
+
+
+def _slot_row_variables(row: str) -> dict[str, str]:
+    """The ``$name`` values a slots2 row sets, as raw jbeam literals."""
+    return {name: value for name, value in _SLOT_VARIABLE_RE.findall(row)}
+
+
+def _placement_number(value: str | None) -> float | None:
+    if value is None or value.startswith('"'):
+        return None  # an expression or a string is not a placement we can move
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def light_slot_placements(part_body: str) -> dict[str, dict[str, object]]:
+    """Each light slot this part mounts, keyed by the circuit that drives it.
+
+    Keyed on ``$electric`` because that is the one field naming the lamp's
+    identity rather than its position: a part may mount two (sbr's B mirror
+    carries a daytime running light beside the indicator), and the circuit is
+    what tells them apart on both sides of the car.
+    """
+    array_text = transform_helpers.extract_named_array(part_body, "slots2")
+    if not array_text:
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for row in _top_level_bracket_spans(array_text):
+        variables = _slot_row_variables(row)
+        electric = variables.get("$electric", "")
+        if not electric.startswith('"'):
+            continue
+        pos = tuple(_placement_number(variables.get(key)) for key in LIGHT_PLACEMENT_KEYS[:3])
+        rot = tuple(_placement_number(variables.get(key)) for key in LIGHT_PLACEMENT_KEYS[3:])
+        if any(value is None for value in pos) or any(value is None for value in rot):
+            continue
+        deform_group = variables.get("$deformGroup", '""')
+        out[electric.strip('"')] = {
+            "pos": pos,
+            "rot": rot,
+            "deformGroup": deform_group.strip('"'),
+        }
+    return out
+
+
+def mirrored_light_placement(placement: dict[str, object]) -> dict[str, object]:
+    """A bulb's placement reflected across the centreline.
+
+    The same reflection every other global placement gets: x negates, and the
+    euler goes through mirrored_base_rotation_global. Checked against the
+    vanilla wing-mirror pairs -- reflecting the left bulb of bastion, etkc,
+    roamer, sbr, scintilla, sunburst2 and the ardente reproduces the authored
+    right-hand rotation matrix exactly, though the euler triple it comes back
+    as need not be the one the author typed (110 and -70/180/140 are the same
+    rotation). The vivace's two sides differ by 3.1 degrees, which is the whole
+    reason this exists: on such a mirror the bulb cannot stay where it was.
+    """
+    pos = placement["pos"]
+    rot = placement["rot"]
+    return {
+        "pos": (-pos[0], pos[1], pos[2]),
+        "rot": mirrored_base_rotation_global(rot),
+        "deformGroup": placement.get("deformGroup", ""),
+    }
+
+
+def deform_group_flexbody_meshes(part_body: str) -> dict[str, set[str]]:
+    """Which flexbody meshes each ``deformGroup`` covers.
+
+    A bulb and the lens it shines through are joined by nothing but a shared
+    deform group: sunburst2's mirror bulb declares
+    ``"$deformGroup":"mirrorsignal_L_break"`` and its lens flexbody sits under
+    ``{"deformGroup":"mirrorsignal_L_break", ...}``. That is the only authored
+    statement that the two are one lamp, so it is what decides whether swapping
+    the lens has to take the bulb with it.
+    """
+    array_text = transform_helpers.extract_named_array(part_body, "flexbodies")
+    if not array_text:
+        return {}
+    groups: dict[str, set[str]] = {}
+    standing = ""
+    header_seen = False
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        char = array_text[idx]
+        if char not in "[{":
+            idx += 1
+            continue
+        try:
+            end = transform_helpers.find_matching(
+                array_text, idx, char, "]" if char == "[" else "}"
+            )
+        except ValueError:
+            idx += 1
+            continue
+        span = array_text[idx : end + 1]
+        if char == "{":
+            match = re.search(r'"deformGroup"\s*:\s*"((?:[^"\\]|\\.)*)"', span)
+            if match is not None:
+                standing = match.group(1)
+        elif not header_seen:
+            header_seen = True  # ["mesh", "[group]:", ...] names no mesh
+        else:
+            mesh = flexbody_row_mesh(span)
+            # A row may override the standing group in its own trailing object.
+            own = re.search(r'"deformGroup"\s*:\s*"((?:[^"\\]|\\.)*)"', span)
+            group = own.group(1) if own is not None else standing
+            if mesh and group:
+                groups.setdefault(group, set()).add(mesh)
+        idx = end + 1
+    return groups
+
+
+def rewrite_light_slot_placements(
+    array_text: str,
+    placements: dict[str, dict[str, object]],
+) -> str:
+    """Move each named light slot's bulb to the placement given.
+
+    Keyed by the slot's own ``$electric``, so a row is only touched when the
+    caller has decided that this exact lamp's geometry moved. The circuit,
+    deform group, node refs and cookie are left exactly as authored.
+    """
+    if not placements:
+        return array_text
+
+    def rewrite_row(row: str) -> str:
+        variables = _slot_row_variables(row)
+        electric = variables.get("$electric", "").strip('"')
+        placement = placements.get(electric)
+        if placement is None:
+            return row
+        values = tuple(placement["pos"]) + tuple(placement["rot"])
+        out = row
+        for key, value in zip(LIGHT_PLACEMENT_KEYS, values):
+            out = re.sub(
+                rf'("{re.escape(key)}"\s*:\s*)'
+                r'-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?',
+                lambda match, value=value: (
+                    f"{match.group(1)}{transform_helpers.format_num(value)}"
+                ),
+                out,
+                count=1,
+            )
+        return out
+
+    out: list[str] = []
+    cursor = 0
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] != "[":
+            idx += 1
+            continue
+        try:
+            end = transform_helpers.find_matching(array_text, idx, "[", "]")
+        except ValueError:
+            idx += 1
+            continue
+        out.append(array_text[cursor:idx])
+        out.append(rewrite_row(array_text[idx : end + 1]))
+        cursor = end + 1
+        idx = end + 1
+    out.append(array_text[cursor:])
+    return "".join(out)
+
+
 def clone_part_for_target(
     part_body: str,
     source_part_id: str,
@@ -2890,6 +3101,7 @@ def clone_part_for_target(
     owners: TriggerOwners | None = None,
     mirror_plane_sources: dict[str, str] | None = None,
     trigger_follows: TriggerFollowMap | None = None,
+    light_slot_placements_map: dict[str, dict[str, object]] | None = None,
 ) -> str:
     new_part_id = new_part_id or generated_part_name(source_part_id, target_hand)
     out = transform_helpers.replace_first(part_body, f'"{source_part_id}"', f'"{new_part_id}"')
@@ -2957,11 +3169,14 @@ def clone_part_for_target(
     out = transform_helpers.replace_array_region(
         out,
         "slots2",
-        lambda text: rewrite_child_slot_defaults(
-            text,
-            child_part_map or {},
-            3,
-            suffix_for_hand(target_hand),
+        lambda text: rewrite_light_slot_placements(
+            rewrite_child_slot_defaults(
+                text,
+                child_part_map or {},
+                3,
+                suffix_for_hand(target_hand),
+            ),
+            light_slot_placements_map or {},
         ),
     )
     out = rewrite_light_pattern_for_target(out, target_hand)
@@ -2973,4 +3188,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['twinned_trigger_ids', 'trigger_placement_frame', 'trigger_sphere_mesh', 'trigger_shape_mesh', 'trigger_box_centre', 'trigger_box_extents', 'trigger_box_size_vector', '_trigger_row_shape', '_trigger_row_vector', '_trigger_row_size', 'trigger_box_axes', 'trigger_box_corners', 'TRIGGER_BOX_TRIANGLES', '_trigger_row_centre', 'iter_trigger_rows', 'target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'frame_axis_anchors', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['twinned_trigger_ids', 'trigger_placement_frame', 'trigger_sphere_mesh', 'trigger_shape_mesh', 'trigger_box_centre', 'trigger_box_extents', 'trigger_box_size_vector', '_trigger_row_shape', '_trigger_row_vector', '_trigger_row_size', 'trigger_box_axes', 'trigger_box_corners', 'TRIGGER_BOX_TRIANGLES', '_trigger_row_centre', 'iter_trigger_rows', 'target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'LIGHT_PLACEMENT_KEYS', 'light_slot_placements', 'mirrored_light_placement', 'deform_group_flexbody_meshes', 'rewrite_light_slot_placements', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'frame_axis_anchors', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
