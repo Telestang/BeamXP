@@ -6,9 +6,16 @@
 -- "GE Lua", and paste the ONE LINE below. It writes triggers_dump.json into
 -- the BeamNG user folder and prints a summary.
 --
--- Everything is vehicle-relative, and the ref-node positions come from the
--- same call as the centre, so the vehicle's own orientation cancels out of
--- any comparison -- it does not matter which way the car is parked.
+-- The dump is SELF-consistent: centre, ref, xn and yn all share one frame, so
+-- checking the placement maths against it needs nothing else. That is what the
+-- EngineGroundTruthTests cases do.
+--
+-- It is NOT the jbeam frame. The origin is v:getPosition(), which is not the
+-- jbeam origin, and the car is parked at whatever heading it was parked at. On
+-- an etk800 that is a 0.33/0.23/-0.23 m shift and 0.64 degrees, which makes the
+-- app's own preview coordinates look ~450 mm wrong when they are fine. To
+-- compare against the app, fit a rigid transform (centroids + Kabsch) first;
+-- the residual after that is the real error.
 
 -- ===== paste this line =====================================================
 local v=be:getPlayerVehicle(0) local vd=extensions.core_vehicle_manager.getVehicleData(v:getID()) local d=vd and vd.vdata local p=v:getPosition() local function V(a) if a==nil then return nil end if type(a)=="number" then return a end return {a.x or a[1],a.y or a[2],a.z or a[3]} end local function N(i) local ok,q=pcall(function() return v:getNodePosition(tonumber(i)) end) if ok and q then return {q.x,q.y,q.z} end end local function P(o,k) local ok,x=pcall(function() return o[k] end) if ok then return V(x) end end local o={} local T for k,r in pairs(d and d.triggers or {}) do local t=v:getTrigger(r.cid or k) if t then T=t local c=t:getCenter() o[#o+1]={id=tostring(r.id or k),shape=tostring(r.type or "box"),centre=c and {c.x-p.x,c.y-p.y,c.z-p.z} or nil,ref=N(r.idRef),xn=N(r.idX),yn=N(r.idY),size=r.size,bt=r.baseTranslation,br=r.baseRotation,rot=r.rotation,tr=V(r.translation),to=V(r.translationOffset),obt=P(t,"baseTranslation"),oto=P(t,"translationOffset"),obr=P(t,"baseRotation"),orot=P(t,"rotation"),otr=P(t,"translation")} end end local m={} for _,x in ipairs({"getCenter","getAxis","getHalfExtents","getExtents","getTransform","getRotation","getBoxSize","getSphereSize","getCorners","getDirection"}) do if T and pcall(function() if x=="getAxis" then return T[x](T,0) end return T[x](T) end) then m[#m+1]=x end end jsonWriteFile("triggers_dump.json",{triggers=o,methods=m},true) print(#o .. " triggers -> triggers_dump.json ; methods: " .. table.concat(m,","))

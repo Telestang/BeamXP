@@ -33,6 +33,7 @@ from beamxp.hand_drive_parts.rewriting import (
     rewrite_triggers,
     trigger_column_names,
     trigger_frame,
+    trigger_placement_frame,
     local_to_world,
     triggers_needing_manual_review,
 )
@@ -1170,14 +1171,44 @@ class EngineGroundTruthTests(unittest.TestCase):
     ENGINE reported through VehicleTrigger:getCenter(). Everything is
     expressed in that frame, so the vehicle's position and heading drop out.
 
-    These are the cases the engine pins exactly. Boxes rotated about more than
-    one axis still carry a few mm of residual, which is tracked separately --
-    see the note on dump_triggers.lua.
+    The etk800 rows are the ones that pin the rotation convention: it ships
+    boxes rotated about z alone, which no other dump had, and those are what
+    show the y and z euler columns driving each other's frame axis. The
+    Ardente rows are then an independent check on a different vehicle --
+    hood_int in particular is rotated about all three axes at once.
+
+    Tolerance is the fixture's own 5-decimal rounding (0.01 mm per axis), not
+    slack in the maths: against the unrounded dumps every one of these is
+    exact to the printed precision.
     """
 
     # (name, ref, xNode, yNode, size, baseTranslation, baseRotation deg,
     #  and the centre the ENGINE reported) -- all vehicle-relative.
     CASES = [
+        # etk800. Named for what each one contributes -- the dump reports only
+        # a numeric id, and guessing a part name from a ref node would be a
+        # guess written down as fact.
+        ("etk800 #0 no rotation",
+         (1.17958, 0.52300, 0.67628), (1.17960, -0.05676, 0.65026), (1.23980, 0.49589, 0.39605),
+         {"x": 0.2, "y": 0.05, "z": 0.05}, {"x": 0.08, "y": 0.07, "z": -0.029},
+         (0.0, 0.0, 0.0), (1.20342, 0.33765, 0.57651)),
+        ("etk800 #1 x, and a negative size.y",
+         (1.17973, -0.50649, 0.62563), (1.17960, -0.05676, 0.65026), (1.23983, -0.53383, 0.36536),
+         {"x": 0.15, "y": -0.05, "z": 0.06}, {"x": 0.45, "y": -0.02, "z": -0.085},
+         (12.0, 0.0, -0.2), (1.06763, 0.02234, 0.62401)),
+        ("etk800 #10 y and z together",
+         (0.32971, -1.88634, 0.58658), (-0.04025, -1.83626, 0.58135), (0.32967, -1.60715, 0.67390),
+         {"x": 0.08, "y": 0.04, "z": 0.08}, {"x": -0.04, "y": -0.04, "z": -0.04},
+         (0.0, -4.0, 4.0), (0.33406, -1.88404, 0.56944)),
+        ("etk800 #17 z alone",
+         (0.32978, 2.52605, 0.50678), (0.02975, 2.51605, 0.50646), (0.32933, 2.45773, 0.82612),
+         {"x": 0.1, "y": 0.08, "z": 0.08}, {"x": -0.05, "y": 0.22, "z": 0.0},
+         (0.0, 0.0, -3.0), (0.32891, 2.43512, 0.75323)),
+        ("etk800 #18 z alone, different extents",
+         (0.32978, 2.52605, 0.50678), (0.02975, 2.51605, 0.50646), (0.32933, 2.45773, 0.82612),
+         {"x": 0.12, "y": 0.06, "z": 0.06}, {"x": -0.06, "y": 0.0, "z": 0.06},
+         (0.0, 0.0, -3.0), (0.33131, 2.43487, 0.51797)),
+        # Ardente
         ("hazard",
          (0.51473, -0.28077, 0.53278), (-0.19528, -0.28079, 0.53236), (0.51463, -0.32782, 0.70990),
          {"x": 0.03, "y": 0.025, "z": 0.015}, {"x": 0.34, "y": -0.04, "z": -0.09},
@@ -1207,14 +1238,20 @@ class EngineGroundTruthTests(unittest.TestCase):
     def test_the_preview_places_boxes_where_the_engine_does(self) -> None:
         for name, ref, xn, yn, size, bt, rot, engine in self.CASES:
             with self.subTest(name):
-                frame = trigger_frame(ref, xn, yn)
-                anchor = local_to_world(frame, (bt["x"], bt["y"], bt["z"]))
+                # Position measures along the raw ref vectors, orientation uses
+                # the squared-up frame -- the same split the app applies.
+                anchor = local_to_world(
+                    trigger_placement_frame(ref, xn, yn), (bt["x"], bt["y"], bt["z"])
+                )
                 if isinstance(size, (int, float)):
-                    centre = anchor
+                    centre = anchor            # a sphere is centred on its offset
                 else:
-                    centre = trigger_box_centre(anchor, trigger_box_axes(frame, rot), size)
+                    axes = trigger_box_axes(trigger_frame(ref, xn, yn), rot)
+                    centre = trigger_box_centre(anchor, axes, size)
                 error = math.dist(centre, engine)
-                self.assertLess(error, 0.0005, f"{name}: {error * 1000:.3f} mm from the engine")
+                self.assertLess(
+                    error, 0.00005, f"{name}: {error * 1000:.3f} mm from the engine"
+                )
 
 
 if __name__ == "__main__":

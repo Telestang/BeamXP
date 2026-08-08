@@ -1278,14 +1278,18 @@ def trigger_placement_frame(
 
     triggerLabelPlacement.lua squares the frame up before using it, but that
     is for orienting a label; the engine's own placement does not. Measured
-    against VehicleTrigger:getCenter() on a vanilla Ardente
-    (scripts/dump_triggers.lua), taking y straight from pY - pRef cuts the
-    median error from 4.5 mm to 1.1 mm and the worst from 52 mm to 14 mm.
+    against VehicleTrigger:getCenter() (scripts/dump_triggers.lua), taking y
+    straight from pY - pRef places all 19 of a vanilla etk800's triggers
+    exactly; squaring it up first leaves a 9.7 mm median and 36 mm worst, and
+    only 4 of the 19 exact.
 
     It shows up only where the two ref vectors are not perpendicular, which is
     why dash-mounted boxes were always exact and door-mounted ones were tens
-    of millimetres out -- and why hood_int was exact despite a badly skewed
-    frame: its offset has no y component to be wrong about.
+    of millimetres out -- and why one skewed-frame case was exact anyway: its
+    offset has no y component to be wrong about.
+
+    Orientation is a separate question and does use the squared-up frame; see
+    trigger_box_axes.
     """
     nx = tuple(p_x[i] - p_ref[i] for i in range(3))
     ny = tuple(p_y[i] - p_ref[i] for i in range(3))
@@ -2009,38 +2013,31 @@ def trigger_box_axes(
 ) -> tuple[Vec3, Vec3, Vec3]:
     """The box's own axes: the node frame, turned by its euler columns.
 
-    BeamNG builds the orientation from the ref-node frame and then applies the
-    euler columns about world axes, pre-multiplied in the order y, -z, -x for
-    baseRotation and again for rotation (triggerLabelPlacement.lua, whose
-    comments state it matches the C++ asyncUpdate sequence and signs). Degrees
-    in the jbeam, radians here.
+    The rotation columns are NOT in frame order: the frame turns about its own
+    evolving z by the .y column, then y by -.z, then x by -.x -- the sequence
+    applyTriggerRotationsInPlace uses in triggerLabelPlacement.lua, which
+    states it matches the C++ asyncUpdate order and signs. The y/z pairing is
+    the same swap the size column uses (see trigger_box_size_vector), so the
+    two are one convention rather than two quirks. Degrees in jbeam, radians
+    here.
+
+    _mirror_euler already derived its rule from this sequence; this function
+    did not follow it, and the disagreement was the whole residual. Dumps of a
+    vanilla etk800 and a vanilla Ardente (scripts/dump_triggers.lua) settle it
+    for the Lua: all 17 etk800 boxes land at 0.000 mm and every Ardente case at
+    its rounding floor, hood_int included, which is turned about all three axes
+    at once. Of 576 plausible axis/sign/order conventions only this one fits --
+    the next best leaves 5.6 mm.
     """
     import math
 
     axes = [list(frame[1]), list(frame[2]), list(frame[3])]
     for values in (base_rotation, rotation):
         x_deg, y_deg, z_deg = (float(value) for value in values)
-        # Fitted to the engine's own placements (scripts/dump_triggers.lua):
-        # about world x by -x, then y by -y, then z by +z, each applied to the
-        # result so far.
-        #
-        # Exact where the rotation is zero or about x alone -- the Ardente's
-        # hazard switch at 45 deg lands within a micrometre -- and the error
-        # after that scales with the y and z angles: 1 deg of z costs about
-        # 1 mm (sunvisors), 4 deg costs 4 mm (trunk), and the hood's
-        # -10/-11/2 costs 14 mm. So the x handling is right and the y/z
-        # handling is not quite.
-        #
-        # It is NOT the vehicle settling: dumped from a reset, paused car the
-        # live ref-node geometry matches the authored geometry to four
-        # decimals on every trigger but the tailgate, whose panel really does
-        # drop ~10 mm. Chasing the last millimetre was judged not worth it for
-        # a preview aid; the ground-truth cases are pinned in
-        # EngineGroundTruthTests if anyone wants to pick it up.
         for axis, radians in (
+            (2, math.radians(y_deg)),
+            (1, math.radians(-z_deg)),
             (0, math.radians(-x_deg)),
-            (1, math.radians(-y_deg)),
-            (2, math.radians(z_deg)),
         ):
             if abs(radians) < 1e-12:
                 continue
