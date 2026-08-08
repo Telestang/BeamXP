@@ -593,6 +593,53 @@ class TriggerFrameTwinTest(unittest.TestCase):
             math.dist(stretched, (0, 0, 0)), math.dist(authored, (0, 0, 0)) * 1.5
         )
 
+    @staticmethod
+    def _lever_arm(driven, pivot, anchor):
+        """How far the driven node sits from the hinge it turns about.
+
+        bdebugImpl.lua's drawTorsionBar labels node2 -> node3 "axis" and draws
+        the triangles as (id1,id2,id3) and (id4,id2,id3), so this distance is
+        what decides how far id1 travels for a given input.
+        """
+        axis = [anchor[i] - pivot[i] for i in range(3)]
+        length = math.sqrt(sum(c * c for c in axis))
+        unit = [c / length for c in axis]
+        arm = [driven[i] - pivot[i] for i in range(3)]
+        along = sum(arm[i] * unit[i] for i in range(3))
+        return math.sqrt(max(0.0, sum(c * c for c in arm) - along * along))
+
+    def test_the_twin_hinge_keeps_the_authored_lever_arm(self):
+        """The frame has to swing as far as the authored one, not just start level.
+
+        A slid frame that keeps its authored anchor pivots about an axis that
+        now runs the width of the car: on the Ardente the lever collapsed from
+        214 mm to 50 mm, so the headlights trigger followed the indicator stalk
+        at a quarter of the travel. The resting position was right the whole
+        time, which is why placement tests never saw it.
+        """
+        body, twins, positions, _notes = build_twins()
+        nodes = dict(STALK_NODES)
+        nodes.update(positions)
+        rows = [
+            row
+            for row in sjson.decode("{" + body + "}")["ardente_dash"]["torsionHydros"]
+            if isinstance(row, list) and not str(row[0]).endswith(":")
+        ]
+        by_driven = {row[0]: row for row in rows}
+        authored = by_driven["int_stalk"]
+        twin = by_driven[twins["int_stalk"]]
+
+        arms = [
+            self._lever_arm(nodes[row[0]], nodes[row[1]], nodes[row[2]])
+            for row in (authored, twin)
+        ]
+        self.assertAlmostEqual(arms[1], arms[0], places=9)
+        self.assertGreater(arms[0], 0.2)        # a real stalk arc, not a nub
+        # and the far arm still exists: id3 == id4 is the degenerate torsionbar
+        # the game refuses to build at all
+        self.assertNotEqual(twin[2], twin[3])
+        self.assertEqual({twin[2], twin[3]}, {"dsh2l", "dsh2r"})
+
     def test_the_twins_get_the_rows_that_hold_and_drive_them(self):
         body, twins, _positions, _notes = build_twins()
         strw, stalk = twins["int_strw"], twins["int_stalk"]
@@ -604,18 +651,20 @@ class TriggerFrameTwinTest(unittest.TestCase):
         # empty node group carry over rather than being invented
         self.assertLess(nodes.index('["int_stalk"'), nodes.index(f'["{stalk}"'))
         self.assertLess(nodes.index(f'["{strw}"'), nodes.index('["int_stalk"'))
+        # Every anchor comes from the other half of the cage, because the slide
+        # carried the frame there. The authored dsh2l beam becomes a dsh2r one.
         for pair in (
-            f'["dsh2r",    "{strw}"]',
             f'["dsh2l",    "{strw}"]',
-            f'["{stalk}","dsh2l"]',
+            f'["dsh2r",    "{strw}"]',
+            f'["{stalk}","dsh2r"]',
             f'["{stalk}","{strw}"]',
         ):
             self.assertIn(pair, beams)
-        self.assertIn(f'["{strw}", "dsh2l", "dsh2r", "f5l"]', bars)
-        # the driver is copied with its input and factor untouched: a slid stalk
-        # keeps its prop's ref nodes, so it keeps its rotation sense too
+        self.assertIn(f'["{strw}", "dsh2r", "dsh2l", "f5r"]', bars)
+        # the driver is copied with its input and factor untouched -- only the
+        # nodes move sides, so the stalk keeps its rotation sense
         self.assertIn(
-            f'["{stalk}","{strw}","dsh2l","dsh2r",'
+            f'["{stalk}","{strw}","dsh2r","dsh2l",'
             '  {"inputSource":"turnsignal","factor":-0.12}]',
             hydros,
         )
@@ -626,7 +675,7 @@ class TriggerFrameTwinTest(unittest.TestCase):
         self.assertIn([stalk, strw], part["beams"])
         self.assertEqual(
             part["torsionHydros"][-1],
-            [stalk, strw, "dsh2l", "dsh2r", {"inputSource": "turnsignal", "factor": -0.12}],
+            [stalk, strw, "dsh2r", "dsh2l", {"inputSource": "turnsignal", "factor": -0.12}],
         )
 
     def test_a_frame_with_no_beams_to_copy_is_left_alone(self):

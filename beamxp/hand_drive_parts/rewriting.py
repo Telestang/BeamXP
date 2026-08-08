@@ -2386,6 +2386,26 @@ def hydro_driven_nodes(part_body: str) -> set[str]:
     return driven
 
 
+def frame_axis_anchors(part_body: str) -> set[str]:
+    """The nodes a driver row turns its frame about -- the id3 column.
+
+    bdebugImpl.lua's drawTorsionBar labels node2 -> node3 "axis" and draws the
+    two triangles as (id1,id2,id3) and (id4,id2,id3), so id3 with id2 is the
+    hinge, id1 the driven lever and id4 only the reference plane. That makes
+    id3 the column that decides how far the driven node actually travels.
+    """
+    anchors: set[str] = set()
+    for section in _FRAME_DRIVER_SECTIONS:
+        array_text = transform_helpers.extract_named_array(part_body, section)
+        if not array_text:
+            continue
+        for start, end in _row_spans(array_text):
+            ids = _row_node_ids(array_text[start:end])
+            if ids and len(ids) >= 3:
+                anchors.add(ids[2][2])
+    return anchors
+
+
 def _row_node_ids(row: str) -> list[tuple[int, int, str]] | None:
     """Spans of the bare string elements in a row, or None for a header row.
 
@@ -2598,15 +2618,42 @@ def generate_trigger_frame_twins(
             node_positions[node_id], action, delta, matrix
         )
 
+    # Whether the anchors have to come from the other half of the cage. A
+    # reflected frame always does, the way bx's authored RHD interior hangs its
+    # column off the right-hand dash nodes. A slid one does too whenever the
+    # slide carries the frame across the car, which the LHD/RHD offset always
+    # does: leaving the authored anchor behind swings the driven node about an
+    # axis that no longer resembles the authored one. On the Ardente's
+    # indicator stalk that shortened the lever from 214 mm to 50 mm, so the
+    # headlights trigger followed the stalk at a quarter of the travel.
+    #
+    # Decided from the axis column alone, and then applied to every anchor in
+    # the frame. Per-column choice cannot work: the far arm has no counterpart
+    # to land on (it wants x = -1.065 on the Ardente, off the car), so scoring
+    # it on its own keeps the authored node and collides with the axis pick,
+    # and id3 == id4 is the degenerate torsionbar the game rejects outright.
+    def _anchor_crosses_over() -> bool:
+        for anchor in frame_axis_anchors(part_body):
+            authored = node_positions.get(anchor)
+            if authored is None or anchor in twin_names:
+                continue
+            twin_side = _mirrored_node_id(anchor, node_mirror_map, node_positions)
+            if twin_side is None or twin_side == anchor:
+                continue
+            target = _owner_transform_point(authored, action, delta, matrix)
+            here = max(abs(authored[i] - target[i]) for i in range(3))
+            there = max(abs(node_positions[twin_side][i] - target[i]) for i in range(3))
+            if there < here:
+                return True
+        return False
+
+    mirror_anchors = reflecting or _anchor_crosses_over()
+
     def remap(value: str) -> str | None:
         twin = twin_names.get(value)
         if twin is not None:
             return twin
-        # A reflected frame wants the mirrored half of the cage, the way bx's
-        # authored RHD interior hangs its column off the right-hand dash nodes.
-        # A slid one keeps the authored anchors, because the prop it follows
-        # keeps its own ref nodes and so its rotation sense too.
-        if reflecting:
+        if mirror_anchors:
             return _mirrored_node_id(value, node_mirror_map, node_positions)
         return value
 
@@ -2883,4 +2930,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['twinned_trigger_ids', 'trigger_placement_frame', 'trigger_sphere_mesh', 'trigger_shape_mesh', 'trigger_box_centre', 'trigger_box_extents', 'trigger_box_size_vector', '_trigger_row_shape', '_trigger_row_vector', '_trigger_row_size', 'trigger_box_axes', 'trigger_box_corners', 'TRIGGER_BOX_TRIANGLES', '_trigger_row_centre', 'iter_trigger_rows', 'target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['twinned_trigger_ids', 'trigger_placement_frame', 'trigger_sphere_mesh', 'trigger_shape_mesh', 'trigger_box_centre', 'trigger_box_extents', 'trigger_box_size_vector', '_trigger_row_shape', '_trigger_row_vector', '_trigger_row_size', 'trigger_box_axes', 'trigger_box_corners', 'TRIGGER_BOX_TRIANGLES', '_trigger_row_centre', 'iter_trigger_rows', 'target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'frame_axis_anchors', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
