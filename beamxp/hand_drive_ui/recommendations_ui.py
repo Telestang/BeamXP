@@ -210,7 +210,7 @@ class RecommendationsUIMixin:
         self.recommendation_modal = modal
         modal.title("Recommended Mesh Transforms")
         modal.transient(self)
-        modal.geometry("1040x560")
+        modal.geometry("1150x560")
         modal.minsize(820, 420)
         modal.columnconfigure(0, weight=1)
         modal.rowconfigure(2, weight=1)
@@ -242,7 +242,7 @@ class RecommendationsUIMixin:
         frame.grid(row=2, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        columns = ("apply", "mode", "part", "source", "current", "reason")
+        columns = ("apply", "mode", "part", "source", "equivalent", "current", "reason")
         tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
         self.recommendation_tree = tree
         headings = {
@@ -250,6 +250,7 @@ class RecommendationsUIMixin:
             "mode": "Transform",
             "part": "Mesh",
             "source": "Swap Source",
+            "equivalent": "Equivalent Parts",
             "current": "Current",
             "reason": "Reason",
         }
@@ -258,6 +259,7 @@ class RecommendationsUIMixin:
             "mode": 132,
             "part": 290,
             "source": 250,
+            "equivalent": 110,
             "current": 190,
             "reason": 220,
         }
@@ -272,7 +274,7 @@ class RecommendationsUIMixin:
                 width=widths[column],
                 minwidth=50,
                 stretch=column in {"part", "reason"},
-                anchor="center" if column == "apply" else "w",
+                anchor="center" if column in {"apply", "equivalent"} else "w",
             )
         self._register_tree_headings(tree, headings)
         yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
@@ -356,6 +358,7 @@ class RecommendationsUIMixin:
                     mode_label(recommendation["mode"]),
                     self._part_option_label(object_id, label_universe),
                     self._part_option_label(source_id, label_universe) if source_id else "",
+                    "Y" if recommendation.get("equivalent") else "N",
                     current,
                     recommendation.get("reason", ""),
                 ),
@@ -421,18 +424,31 @@ class RecommendationsUIMixin:
             return
 
         applied = 0
+        equivalences = 0
         for recommendation in selected_rows:
             mode = recommendation["mode"]
             object_id = recommendation["object_id"]
             source_id = recommendation.get("source_id", "")
+            if recommendation.get("equivalent") and source_id:
+                core.set_side_pair(
+                    self.conversion,
+                    object_id,
+                    source_id,
+                    kind=str(recommendation.get("pair_kind") or "part"),
+                )
+                equivalences += 1
             if mode == core.MODE_MIRROR_STRUCTURAL and source_id:
                 self._apply_structural_pair(object_id, source_id)
                 applied += 2
             else:
+                # A seat's mesh stays untransformed: the equivalent parts row
+                # is what moves it across, so Skip also clears any structural
+                # pair a previous pass left on the two meshes.
                 self._apply_single_part_mode(object_id, mode)
                 applied += 1
 
         self._refresh_parts()
+        self._refresh_slots()
         self._refresh_delta_label()
         self._update_detail()
         if self.recommendation_modal is not None and self.recommendation_modal.winfo_exists():
@@ -443,7 +459,10 @@ class RecommendationsUIMixin:
             self._tree_heading_text.pop(self.recommendation_tree, None)
         self.recommendation_tree = None
         self.recommendation_rows = {}
-        self.status_var.set(f"Applied {len(selected_rows)} recommendation(s) to {applied} part setting(s)")
+        summary = f"Applied {len(selected_rows)} recommendation(s) to {applied} part setting(s)"
+        if equivalences:
+            summary = f"{summary} and {equivalences} equivalent parts row(s)"
+        self.status_var.set(summary)
 
     def _apply_single_part_mode(self, object_id: str, mode: str) -> None:
         settings = self._part_settings(object_id)

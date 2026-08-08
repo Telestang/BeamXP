@@ -284,7 +284,6 @@ class SlotsWorkflowMixin:
                 "label": f"{left} <-> {right}",
                 "left": self._explicit_side_pair_label(left, explicit_ids),
                 "right": self._explicit_side_pair_label(right, explicit_ids),
-                "kind": self._side_pair_kind_label(pair.get("kind")),
                 "slots": "equivalent parts",
                 "plan": "Equivalent",
                 "active": "Y",
@@ -316,7 +315,6 @@ class SlotsWorkflowMixin:
             row_index = 0
             for row in rows:
                 values = (
-                    row["kind"],
                     row["left"],
                     row["right"],
                 )

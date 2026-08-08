@@ -1,192 +1,172 @@
 from __future__ import annotations
 
-from .recommendation_classifier import _classify_meshes_for_trim
 from .recommendation_common import (
-    _spatial_entries_for_trim,
-    _spatial_surfaces_for_trim,
+    HANDED_PATTERNS,
+    LOW_CONFIDENCE_PATTERNS,
+    MIRROR_PATTERNS,
+    TRANSLATE_EXCLUDE_PATTERNS,
+    TRANSLATE_PATTERNS,
+    UNPAIRED_MIRROR_EXCLUDE_PATTERNS,
+    _is_seat_mesh_id,
+    _side_pair_kind_for_mesh,
+    mesh_center,
+    recommendation_matches,
+    recommendation_text,
 )
-from .recommendation_pairing import (
-    _inherit_mounted_parts,
-    _passenger_footwell_forced,
-    _resolve_trim_pairs,
-)
+from .recommendation_pairing import resolve_side_twin
 from .shared import core
+
+
+def _driver_side(context: core.VehicleContext, steering_ids: set[str], center_x: float) -> int:
+    """+1 when the wheel sits left of the centreline, -1 when it sits right.
+
+    Only used to decide which member of a pair the modal names first, so a
+    vehicle with no locatable wheel simply keeps the left-hand convention.
+    """
+    offsets = []
+    for object_id in steering_ids:
+        center = mesh_center(context, object_id)
+        if center is not None:
+            offsets.append(center[0] - center_x)
+    offsets = [offset for offset in offsets if abs(offset) > 0.01]
+    if not offsets:
+        return 1
+    return 1 if sum(offsets) >= 0.0 else -1
 
 
 def build_mode_recommendations(
     context: core.VehicleContext,
     object_ids: list[str],
 ) -> list[dict[str, str]]:
-    """Classify meshes for hand conversion from the driver's viewpoint.
+    """Recommend a conversion mode for each mesh from its name and placement.
 
-    Batch model: the intrinsic class is a property of the mesh, not the trim,
-    so each unique mesh is classified once (in the first trim that contains
-    it) and memoised; later trims only re-solve low-confidence meshes whose
-    position is trim-dependent, plus the inherently per-trim structural
-    pairing. State is cached on the context so reopening the modal reuses
-    every solved trim. No driver frame (no camera and no wheel) means no
-    trustworthy spatial reasoning: the answer is no recommendations, never a
-    name-based guess."""
-    available = {o for o in object_ids if o in context.objects and o in context.preview_by_id}
+    Handed families go first, because a door card or a wing mirror that has
+    an opposite-side twin converts by swapping sides rather than by
+    transforming anything: whichever rule would otherwise claim it, the swap
+    wins. Seats are handed too, but their slot accepts either side's part, so
+    they convert as an Equivalent Parts row and their meshes stay untouched.
+    What is left is judged on the job its name describes -- driver controls
+    and instruments move with the driver, asymmetric cabin furniture mirrors,
+    and anything the tables do not recognise is left alone rather than
+    guessed at.
+    """
+    available = sorted(
+        object_id for object_id in set(object_ids) if object_id in context.objects
+    )
     if not available:
         return []
-    # A vehicle with no camera and no wheel anywhere is untrustworthy; bail
-    # before any work. The frame is then recomputed per trim inside the loop so
-    # each trim's driver camera carries that trim's cab nodeMove: multi-cab
-    # vehicles (us_semi cabover vs conventional) and LHD/RHD splits (bx, covet)
-    # get the correct driver-side eye instead of a meaningless average of both
-    # cabs'/sides' cameras.
-    if core.driver_frame_for_context(context) is None:
-        return []
 
-    state = getattr(context, "_spatial_recommendation_state", None)
-    if state is None:
-        state = {
-            "memo": {}, "vetoed": set(), "hard_vetoed": set(),
-            "scoped": set(), "pair_votes": {}, "trims_done": set(),
-        }
-        context._spatial_recommendation_state = state
-    memo: dict[str, tuple[str, str, str, dict]] = state["memo"]
-    vetoed: set[str] = state["vetoed"]
-    hard_vetoed: set[str] = state.setdefault("hard_vetoed", set())
-    scoped: set[str] = state.setdefault("scoped", set())
-    pair_votes: dict[str, dict[str, int]] = state["pair_votes"]
-
-    trims: list[str | None] = sorted(context.variants) if context.variants else [None]
-    for trim in trims:
-        present, entries_np = _spatial_entries_for_trim(context, trim, available)
-        if not present:
-            continue
-        frame = core.driver_frame_for_context(context, config_name=trim)
-        if frame is None:
-            continue
-        surface_np: dict[str, object] = {}
-        todo = [
-            o for o in present
-            if o not in memo
-            or (o in context.variant_dependent_meshes
-                and (memo[o][0] == "none" or memo[o][2] == "low")
-                and trim not in state["trims_done"])
-        ]
-        if todo:
-            surface_np = _spatial_surfaces_for_trim(
-                context, trim, present, entries_np
-            )
-            verdicts, newly_vetoed = _classify_meshes_for_trim(
-                context, frame, present, entries_np, todo,
-                hard_vetoed=hard_vetoed,
-                scoped=scoped,
-                surface_np=surface_np,
-            )
-            vetoed.update(newly_vetoed)
-            for o in todo:
-                verdict = verdicts.get(o, ("none", "", "med", {}))
-                previous = memo.get(o)
-                if previous is None or previous[0] == "none":
-                    memo[o] = verdict
-                elif previous[2] == "low" and verdict[0] != "none" and verdict[2] != "low":
-                    memo[o] = verdict  # a trim resolved the borderline case
-            forced = _passenger_footwell_forced(
-                frame, present, entries_np, memo, hard_vetoed
-            )
-            forced_todo = [
-                o for o in present
-                if o in forced and memo.get(o, ("none",))[0] == "none"
-            ]
-            if forced_todo:
-                if not surface_np:
-                    surface_np = _spatial_surfaces_for_trim(
-                        context, trim, present, entries_np
-                    )
-                forced_verdicts, forced_vetoed = _classify_meshes_for_trim(
-                    context, frame, present, entries_np, forced_todo, forced,
-                    hard_vetoed, scoped, surface_np,
-                )
-                vetoed.update(forced_vetoed)
-                for o in forced_todo:
-                    verdict = forced_verdicts.get(o, ("none", "", "med", {}))
-                    if verdict[0] != "none":
-                        memo[o] = verdict
-                        vetoed.discard(o)
-        if trim not in state["trims_done"]:
-            _resolve_trim_pairs(
-                context, frame, present, entries_np, memo, vetoed, pair_votes
-            )
-            _inherit_mounted_parts(
-                context, frame, present, entries_np, memo, vetoed, pair_votes, scoped
-            )
-            # Contact inheritance may expose an off-centre L/R satellite pair
-            # after the initial structural pass. Resolve those new pairables
-            # now; lone satellites retain the normal aesthetic-Mirror fallback.
-            _resolve_trim_pairs(
-                context, frame, present, entries_np, memo, vetoed, pair_votes
-            )
-            state["trims_done"].add(trim)
-
-    # Meshes no trim uses stay unclassified on purpose: the union of mutually
-    # exclusive variants is not a cabin, and a part no config fits cannot be
-    # converted anyway.
+    text_by_id = {
+        object_id: recommendation_text(context, object_id) for object_id in available
+    }
+    steering_ids = {
+        object_id
+        for object_id in available
+        if core.steering_ref_score(object_id, context.objects[object_id]) >= 15
+    }
+    center_x = core.estimated_vehicle_center_x(context, set(available), steering_ids)
+    side = _driver_side(context, steering_ids, center_x)
 
     recommendations: list[dict[str, str]] = []
-    emitted_pairs: set[frozenset] = set()
-    requested = set(object_ids)
-    for object_id in sorted(requested & set(memo)):
-        mode, reason, confidence, _extra = memo[object_id]
-        if mode in {"none", "functional_skip"}:
+    claimed: set[str] = set()
+
+    def confidence_for(*texts: str) -> str:
+        return (
+            "low"
+            if any(recommendation_matches(text, LOW_CONFIDENCE_PATTERNS) for text in texts)
+            else "med"
+        )
+
+    for object_id in available:
+        if object_id in claimed:
             continue
-        if confidence == "low":
-            reason = f"{reason} (low confidence)"
-        if mode == "pairable":
-            votes = pair_votes.get(object_id)
-            twin = max(votes, key=lambda t: (votes[t], t)) if votes else None
-            if twin is not None and twin in requested:
-                key = frozenset((object_id, twin))
-                if key in emitted_pairs:
-                    continue
-                emitted_pairs.add(key)
-                # name the driver-side member so the modal reads naturally
-                obj_a = context.objects.get(object_id)
-                obj_b = context.objects.get(twin)
-                first, second = object_id, twin
-                if (
-                    obj_a is not None
-                    and obj_b is not None
-                    and frame.side * obj_b.x > frame.side * obj_a.x
-                ):
-                    first, second = twin, object_id
-                recommendations.append({
-                    "kind": "pair",
-                    "object_id": first,
-                    "source_id": second,
-                    "mode": core.MODE_MIRROR_STRUCTURAL,
-                    "reason": reason,
-                    "confidence": confidence,
-                })
-            else:
-                entry = {
-                    "kind": "single",
-                    "object_id": object_id,
-                    "source_id": "",
-                    "mode": core.MODE_MIRROR,
-                    "reason": f"{reason}; twin absent in this trim",
-                    "confidence": confidence,
-                }
-                recommendations.append(entry)
+        text = text_by_id[object_id]
+        if not recommendation_matches(text, HANDED_PATTERNS):
+            continue
+        twin_id = resolve_side_twin(
+            context,
+            object_id,
+            [candidate for candidate in available if candidate not in claimed],
+            center_x,
+        )
+        if twin_id is not None:
+            claimed.add(object_id)
+            claimed.add(twin_id)
+            # Name the driver-side member first so the modal reads naturally.
+            first, second = object_id, twin_id
+            center_a = mesh_center(context, object_id)
+            center_b = mesh_center(context, twin_id)
+            if (
+                center_a is not None
+                and center_b is not None
+                and side * (center_b[0] - center_x) > side * (center_a[0] - center_x)
+            ):
+                first, second = twin_id, object_id
+            seats = _is_seat_mesh_id(first) or _is_seat_mesh_id(second)
+            recommendations.append({
+                "kind": "equivalent" if seats else "pair",
+                "object_id": first,
+                "source_id": second,
+                "mode": core.MODE_SKIP if seats else core.MODE_MIRROR_STRUCTURAL,
+                "reason": (
+                    "left/right name pair; seats swap as equivalent parts"
+                    if seats
+                    else "left/right name pair"
+                ),
+                "confidence": confidence_for(text_by_id[first], text_by_id[second]),
+                "equivalent": True,
+                "pair_kind": _side_pair_kind_for_mesh(first, second),
+            })
+            continue
+        if recommendation_matches(text, UNPAIRED_MIRROR_EXCLUDE_PATTERNS):
+            continue  # a cabin-spanning bench has no side to swap with
+        if recommendation_matches(text, TRANSLATE_PATTERNS):
+            continue  # instrument named for a handed family: judged below
+        # One-sided seat or mirror hardware -- a racing seat base, a single
+        # wing mirror -- has no counterpart to swap with, so it mirrors.
+        claimed.add(object_id)
+        recommendations.append({
+            "kind": "single",
+            "object_id": object_id,
+            "source_id": "",
+            "mode": core.MODE_MIRROR,
+            "reason": "one-sided seat/mirror part; no opposite-side counterpart",
+            "confidence": confidence_for(text),
+            "equivalent": False,
+            "pair_kind": "",
+        })
+
+    for object_id in available:
+        if object_id in claimed:
+            continue
+        text = text_by_id[object_id]
+        if object_id in steering_ids:
+            mode, reason = core.MODE_TRANSLATE, "steering wheel"
+        elif recommendation_matches(text, TRANSLATE_PATTERNS) and not recommendation_matches(
+            text,
+            TRANSLATE_EXCLUDE_PATTERNS,
+        ):
+            mode, reason = core.MODE_TRANSLATE, "driver control or instrument name"
+        elif recommendation_matches(text, MIRROR_PATTERNS):
+            mode, reason = core.MODE_MIRROR, "asymmetric interior name"
         else:
-            entry = {
-                "kind": "single",
-                "object_id": object_id,
-                "source_id": "",
-                "mode": core.MODE_TRANSLATE if mode == "translate" else core.MODE_MIRROR,
-                "reason": reason,
-                "confidence": confidence,
-            }
-            recommendations.append(entry)
+            continue
+        recommendations.append({
+            "kind": "single",
+            "object_id": object_id,
+            "source_id": "",
+            "mode": mode,
+            "reason": reason,
+            "confidence": confidence_for(text),
+            "equivalent": False,
+            "pair_kind": "",
+        })
 
     mode_order = {
         core.MODE_TRANSLATE: 0,
         core.MODE_MIRROR: 1,
         core.MODE_MIRROR_STRUCTURAL: 2,
+        core.MODE_SKIP: 3,
     }
     recommendations.sort(
         key=lambda item: (

@@ -1,0 +1,66 @@
+-- Dump every interaction trigger of the current vehicle as the ENGINE places
+-- it, so BeamXP's preview geometry can be checked against ground truth rather
+-- than inferred from the jbeam.
+--
+-- Spawn the vehicle, open the console (~), set the dropdown on the left to
+-- "GE Lua", and paste the ONE LINE below. It writes triggers_dump.json into
+-- the BeamNG user folder and prints a summary.
+--
+-- Everything is vehicle-relative, and the ref-node positions come from the
+-- same call as the centre, so the vehicle's own orientation cancels out of
+-- any comparison -- it does not matter which way the car is parked.
+
+-- ===== paste this line =====================================================
+local v=be:getPlayerVehicle(0) local vd=extensions.core_vehicle_manager.getVehicleData(v:getID()) local d=vd and vd.vdata local p=v:getPosition() local function V(a) if a==nil then return nil end if type(a)=="number" then return a end return {a.x or a[1],a.y or a[2],a.z or a[3]} end local function N(i) local ok,q=pcall(function() return v:getNodePosition(tonumber(i)) end) if ok and q then return {q.x,q.y,q.z} end end local function P(o,k) local ok,x=pcall(function() return o[k] end) if ok then return V(x) end end local o={} local T for k,r in pairs(d and d.triggers or {}) do local t=v:getTrigger(r.cid or k) if t then T=t local c=t:getCenter() o[#o+1]={id=tostring(r.id or k),shape=tostring(r.type or "box"),centre=c and {c.x-p.x,c.y-p.y,c.z-p.z} or nil,ref=N(r.idRef),xn=N(r.idX),yn=N(r.idY),size=r.size,bt=r.baseTranslation,br=r.baseRotation,rot=r.rotation,tr=V(r.translation),to=V(r.translationOffset),obt=P(t,"baseTranslation"),oto=P(t,"translationOffset"),obr=P(t,"baseRotation"),orot=P(t,"rotation"),otr=P(t,"translation")} end end local m={} for _,x in ipairs({"getCenter","getAxis","getHalfExtents","getExtents","getTransform","getRotation","getBoxSize","getSphereSize","getCorners","getDirection"}) do if T and pcall(function() if x=="getAxis" then return T[x](T,0) end return T[x](T) end) then m[#m+1]=x end end jsonWriteFile("triggers_dump.json",{triggers=o,methods=m},true) print(#o .. " triggers -> triggers_dump.json ; methods: " .. table.concat(m,","))
+-- ===========================================================================
+
+-- The same thing, readable, if you would rather run it from a file:
+--
+--   local v = be:getPlayerVehicle(0)
+--   local vd = extensions.core_vehicle_manager.getVehicleData(v:getID())
+--   local d = vd and vd.vdata
+--   local p = v:getPosition()
+--
+--   local function n(i)                       -- a ref node, vehicle-relative
+--     local ok, q = pcall(function() return v:getNodePosition(tonumber(i)) end)
+--     if ok and q then return {q.x, q.y, q.z} end
+--   end
+--
+--   local o, T = {}, nil
+--   for k, r in pairs(d and d.triggers or {}) do
+--     local t = v:getTrigger(r.cid or k)
+--     if t then
+--       T = t
+--       local c = t:getCenter()               -- where the ENGINE puts it
+--       o[#o + 1] = {
+--         id = tostring(r.id or k),
+--         shape = tostring(r.type or "box"),
+--         centre = c and {c.x - p.x, c.y - p.y, c.z - p.z} or nil,
+--         ref = n(r.idRef), xn = n(r.idX), yn = n(r.idY),
+--         size = r.size,
+--         bt = r.baseTranslation,
+--         -- degrees or radians depending on whether this copy has been
+--         -- through the vehicle Lua; obvious from the magnitude (30 vs 0.52)
+--         br = r.baseRotation,
+--         rot = r.rotation,
+--       }
+--     end
+--   end
+--
+--   -- Which geometry getters this build exposes. getCenter is the one the
+--   -- game's own label placement uses; any of the others would settle the
+--   -- box orientation outright instead of it having to be fitted.
+--   local m = {}
+--   for _, x in ipairs({"getCenter", "getAxis", "getHalfExtents", "getExtents",
+--                       "getTransform", "getRotation", "getBoxSize",
+--                       "getSphereSize", "getCorners", "getDirection"}) do
+--     if T and pcall(function()
+--       if x == "getAxis" then return T[x](T, 0) end
+--       return T[x](T)
+--     end) then
+--       m[#m + 1] = x
+--     end
+--   end
+--
+--   jsonWriteFile("triggers_dump.json", {triggers = o, methods = m}, true)
+--   print(#o .. " triggers -> triggers_dump.json ; methods: " .. table.concat(m, ","))

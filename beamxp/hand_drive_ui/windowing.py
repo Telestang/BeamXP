@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from .shared import *
 
+# Appended to the heading of the column a table is sorted by. Column fitting
+# leaves room for one, so they live here rather than inline.
+TREE_SORT_ASCENDING = " ▲"
+TREE_SORT_DESCENDING = " ▼"
+
 
 class WindowingMixin:
     """Window lifecycle, monitor placement, modal helpers, and Treeview sorting."""
@@ -173,6 +178,70 @@ class WindowingMixin:
     def _row_tags(self, index: int) -> tuple[str, ...]:
         return ("oddrow",) if index % 2 else ("evenrow",)
 
+    # ----- one-shot column fitting -----------------------------------------
+
+    # Room for the cell padding either side of the text, and for the
+    # disclosure area ttk reserves in front of a #0 label.
+    TREE_CELL_PADDING = 18
+    TREE_INDENT_PADDING = 26
+
+    def _tree_font(self, style_name: str, fallback: str) -> tkfont.Font:
+        spec = self.ttk_style.lookup(style_name, "font") or fallback
+        try:
+            return tkfont.Font(root=self, font=spec)
+        except tk.TclError:
+            return tkfont.Font(root=self)
+
+    def _fit_tree_columns(self, tree: ttk.Treeview, *, max_width: int = 460) -> None:
+        """Widen every column to the widest thing in it.
+
+        Column widths are the user's to drag, so this is a one-shot: the
+        caller fires it when a table first has rows and then leaves the
+        widths alone. Re-running it on every refresh would snap a column back
+        the moment any cell in it changed, which is worse than never fitting.
+
+        Cell text repeats heavily down a column -- most of them hold a mode
+        name or a Y/N -- so only the distinct strings are measured. Headings
+        are measured with the sort arrow allowed for, since any of them can
+        be clicked and a heading fitted exactly would then clip it.
+
+        The rows are read a row at a time rather than a cell at a time: each
+        read crosses into Tcl, and the parts table is four hundred rows by
+        fourteen columns.
+        """
+        rows = tree.get_children("")
+        if not rows:
+            return
+        with timed_ui("_fit_tree_columns"):
+            body_font = self._tree_font("Treeview", "TkDefaultFont")
+            heading_font = self._tree_font("Treeview.Heading", "TkHeadingFont")
+            # the plain labels, so a table fitted while sorted doesn't leave
+            # room for two arrows
+            labels = self._tree_heading_text.get(tree, {})
+            # tk hands "show" back as Tcl string objects, so compare on str()
+            raw_show = tree["show"]
+            show = {
+                str(part)
+                for part in (raw_show.split() if isinstance(raw_show, str) else raw_show)
+            }
+            columns = list(tree["columns"])
+            texts_by_column: dict[str, set[str]] = {column: set() for column in columns}
+            for row in rows:
+                for column, value in zip(columns, tree.item(row, "values")):
+                    texts_by_column[column].add(str(value))
+            if "tree" in show:
+                columns.insert(0, "#0")
+                texts_by_column["#0"] = {str(tree.item(row, "text")) for row in rows}
+            for column in columns:
+                extra = self.TREE_INDENT_PADDING if column == "#0" else self.TREE_CELL_PADDING
+                texts = texts_by_column[column]
+                widest = max((body_font.measure(text) for text in texts), default=0)
+                if "headings" in show:
+                    label = labels.get(column) or str(tree.heading(column, "text"))
+                    widest = max(widest, heading_font.measure(label + TREE_SORT_DESCENDING))
+                minwidth = int(tree.column(column, "minwidth") or 0)
+                tree.column(column, width=max(minwidth, min(widest + extra, max_width)))
+
     # ----- generic click-to-sort for all table views -----------------------
 
     def _tree_column_name(self, tree: ttk.Treeview, column_id: str) -> str | None:
@@ -268,6 +337,6 @@ class WindowingMixin:
             return
         entry = self._tree_sort.get(tree)
         sort_column, descending = entry if entry else (None, False)
-        arrow = " ▼" if descending else " ▲"
+        arrow = TREE_SORT_DESCENDING if descending else TREE_SORT_ASCENDING
         for column, label in base.items():
             tree.heading(column, text=label + arrow if column == sort_column else label)

@@ -4449,6 +4449,9 @@ class PartPreview:
     blend_paths: tuple[Path, ...] = ()
     report_path: Path | None = None
     report: dict[str, object] = field(default_factory=dict)
+    # Parts the export skipped, each {"source_part": ..., "error": ...}. A
+    # part with no correctable atlas does not stop the rest of the selection.
+    failed_parts: tuple[dict[str, object], ...] = ()
 
 
 def _base_colours_by_alias(results: list[RhdTextureResult]) -> dict[str, Path]:
@@ -4706,6 +4709,7 @@ def export_parts_preview(
     base_colours = _base_colours_by_alias(results)
     dae_paths: list[Path] = []
     dae_exports: list[dict[str, object]] = []
+    failed_parts: list[dict[str, object]] = []
     used_names: set[str] = set()
     for part_index, part in enumerate(parts, start=1):
         log(f"\nsweeping {part.label} for the hand conversion")
@@ -4723,12 +4727,37 @@ def export_parts_preview(
         dae_path = _unique_output_path(
             output_directory, part.node_name or part.label, "_rhd.dae", used_names
         )
-        export_info = export_transformed_part_dae(
-            loaded,
-            sweep,
-            dae_path,
-            blender_base_colours=base_colours or None,  # type: ignore[arg-type]
-        )
+        try:
+            export_info = export_transformed_part_dae(
+                loaded,
+                sweep,
+                dae_path,
+                blender_base_colours=base_colours or None,  # type: ignore[arg-type]
+            )
+        except Exception as exc:
+            # One part that cannot be wired says nothing about the others.
+            # Scintilla's race console carries only scintilla_main_carbon, a
+            # detail material with no base-colour atlas, so there is nothing
+            # to correct on it -- and letting that abort the loop cost the
+            # nine other marked meshes sharing scintilla.dae their correction.
+            log(f"  ! skipped {part.label}: {type(exc).__name__}: {exc}")
+            failed_parts.append(
+                {
+                    "source_part": _part_report(part),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            emit_progress(
+                progress,
+                "end",
+                "export_part_dae",
+                f"Skipped {part.label}: {exc}",
+                part=part.key,
+                part_index=part_index,
+                part_total=len(parts),
+                failed=True,
+            )
+            continue
         dae_paths.append(dae_path)
         generated_rows = _generated_mesh_rows_from_export(export_info)
         dae_exports.append(
@@ -4761,6 +4790,15 @@ def export_parts_preview(
             generated_mesh_rows=len(generated_rows),
             seconds=timing["seconds"],
         )
+
+    if not dae_paths:
+        # Nothing exported at all: the caller asked for a conversion and got
+        # none, so this stays the hard error it has always been.
+        details = "; ".join(
+            f"{entry['source_part'].get('label') or entry['source_part'].get('key')}: {entry['error']}"
+            for entry in failed_parts
+        ) or "no parts selected"
+        raise ValueError(f"No part could be exported for the hand conversion ({details}).")
 
     blend_paths: list[Path] = []
     if bake and script is not None:
@@ -4810,6 +4848,7 @@ def export_parts_preview(
         "selected_parts": [_part_report(part) for part in parts],
         "texture_jobs": [result.report for result in results],
         "dae_exports": dae_exports,
+        "failed_parts": failed_parts,
         "phase_timings": phase_timings,
         "outputs": {
             "dae_paths": [str(path) for path in dae_paths],
@@ -4886,6 +4925,7 @@ def export_parts_preview(
         blend_paths=tuple(blend_paths),
         report_path=report_path,
         report=report,
+        failed_parts=tuple(failed_parts),
     )
 
 

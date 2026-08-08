@@ -90,6 +90,7 @@ class LayoutMixin:
         self.main_paned_h = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self.main_paned_v = ttk.PanedWindow(self, orient=tk.VERTICAL)
         self.main_orientation: str | None = None
+        self.main_sash_pending = False
 
         left = self.tables_pane = ttk.Frame(self)
         left.columnconfigure(0, weight=1)
@@ -124,6 +125,11 @@ class LayoutMixin:
         if event.width <= 1 or event.height <= 1:
             return
         self._apply_main_orientation("portrait" if event.height > event.width else "landscape")
+        if self.main_sash_pending:
+            # Deferred, because the pane has not been given the new geometry
+            # yet at the moment this event arrives -- reading its width here
+            # returns the old one, or 1 before the window is first mapped.
+            self.after_idle(self._centre_main_sash)
 
     def _apply_main_orientation(self, mode: str) -> None:
         if mode == self.main_orientation:
@@ -135,16 +141,45 @@ class LayoutMixin:
             paned.grid_remove()
         if mode == "landscape":
             paned = self.main_paned_h
-            # Keep the tables at their requested width and give spare
-            # horizontal space to the ModernGL preview. The sash remains
-            # user-adjustable.
-            paned.add(self.tables_pane, weight=0)
+            # Even weights, so a window resize grows the tables and the
+            # preview together rather than handing it all to one of them.
+            paned.add(self.tables_pane, weight=1)
             paned.add(self.preview_pane, weight=1)
         else:
             paned = self.main_paned_v
             paned.add(self.tables_pane, weight=1)
             paned.add(self.preview_pane, weight=1)
         paned.grid(row=1, column=0, sticky="nsew", padx=10, pady=4)
+        self.main_sash_pending = True
+        self.after_idle(self._centre_main_sash)
+
+    def _main_paned(self) -> ttk.PanedWindow:
+        return self.main_paned_h if self.main_orientation == "landscape" else self.main_paned_v
+
+    def _centre_main_sash(self) -> None:
+        """Split the window down the middle, once per orientation.
+
+        Weights only divide up space a resize adds; the sash itself starts
+        wherever the panes' requested sizes put it, and the tables ask for far
+        more than they get, which left the preview a strip down the side. Half
+        and half is the useful default -- but only a default: the sash is the
+        user's to drag, so this fires while armed and not again.
+        """
+        if not self.main_sash_pending:
+            return
+        paned = self._main_paned()
+        span = (
+            paned.winfo_width()
+            if self.main_orientation == "landscape"
+            else paned.winfo_height()
+        )
+        # Before the window is mapped there is nothing to halve; the Configure
+        # that comes with mapping (and with the maximise on start) lands here
+        # again with a real size.
+        if span <= 1:
+            return
+        self.main_sash_pending = False
+        paned.sashpos(0, span // 2)
 
     def _build_variant_panel(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
@@ -157,6 +192,13 @@ class LayoutMixin:
             side="right",
             padx=(0, 6),
         )
+        self.recommend_button = ttk.Button(
+            header,
+            text="Recommend Transforms",
+            command=self._open_recommendations_modal,
+            state="disabled",
+        )
+        self.recommend_button.pack(side="right", padx=(0, 6))
 
         frame = ttk.Frame(parent)
         frame.grid(row=1, column=0, sticky="nsew")
@@ -220,9 +262,29 @@ class LayoutMixin:
         self.variant_tree.bind("<Configure>", lambda _event: self._close_tree_combo_editor(), add="+")
 
     def _build_slot_panel(self, parent: ttk.Frame) -> None:
+        """Equivalent Parts and Triggers, side by side.
+
+        Both are two-column tables about where a thing ends up rather than how
+        it is transformed, and neither needs the full table width, so they
+        share one row instead of stacking and squeezing Parts Used.
+        """
+        row = ttk.Frame(parent)
+        row.grid(row=2, column=0, rowspan=2, sticky="nsew", pady=(10, 0))
+        row.columnconfigure(0, weight=1, uniform="sidetables")
+        row.columnconfigure(1, weight=1, uniform="sidetables")
+        row.rowconfigure(1, weight=1)
+        self._build_side_pair_table(row, column=0)
+        self._build_trigger_table(row, column=1)
+
+    def _build_side_pair_table(self, parent: ttk.Frame, column: int) -> None:
         """Vehicle-level left/right equivalent part relationships."""
+        holder = ttk.Frame(parent)
+        holder.grid(row=0, column=column, rowspan=2, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0))
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(1, weight=1)
+        parent = holder
         header = ttk.Frame(parent)
-        header.grid(row=2, column=0, sticky="ew", pady=(10, 4))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         header.columnconfigure(1, weight=1)
         ttk.Label(header, text="Equivalent Parts").grid(row=0, column=0, sticky="w")
         self.slot_filter_entry = ttk.Entry(header, textvariable=self.slot_filter_var)
@@ -240,32 +302,30 @@ class LayoutMixin:
             command=self._remove_selected_side_pair,
             state="disabled",
         )
-        self.remove_side_pair_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        self.remove_side_pair_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
         self.clear_slot_pairs_button = ttk.Button(
             header,
             text="Clear",
             command=self._clear_slot_pairs,
             state="disabled",
         )
-        self.clear_slot_pairs_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
+        self.clear_slot_pairs_button.grid(row=0, column=5, sticky="e", padx=(6, 0))
         self.slot_filter_var.trace_add("write", lambda *_args: self._refresh_slots())
 
         frame = ttk.Frame(parent)
-        frame.grid(row=3, column=0, sticky="nsew")
+        frame.grid(row=1, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        columns = ("kind", "left", "right")
+        columns = ("left", "right")
         self.slot_tree = ttk.Treeview(
             frame, columns=columns, show="headings", height=8, selectmode="browse"
         )
         headings = {
-            "kind": "Type",
             "left": "Left Part",
             "right": "Right Part",
         }
         widths = {
-            "kind": 110,
             "left": 360,
             "right": 360,
         }
@@ -275,7 +335,7 @@ class LayoutMixin:
                 col,
                 width=widths[col],
                 minwidth=44,
-                stretch=col in {"left", "right"},
+                stretch=True,
                 anchor="w",
             )
         self._register_tree_headings(self.slot_tree, headings)
@@ -299,6 +359,74 @@ class LayoutMixin:
         for sequence in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>", "<Configure>"):
             self.slot_tree.bind(sequence, lambda _event: self._close_tree_combo_editor(), add="+")
 
+    def _build_trigger_table(self, parent: ttk.Frame, column: int) -> None:
+        """Which mesh each interaction trigger travels with."""
+        holder = ttk.Frame(parent)
+        holder.grid(row=0, column=column, rowspan=2, sticky="nsew", padx=(6, 0) if column else (0, 6))
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(holder)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text="Triggers").grid(row=0, column=0, sticky="w")
+        self.trigger_filter_entry = ttk.Entry(header, textvariable=self.trigger_filter_var)
+        self.trigger_filter_entry.grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        self.reset_trigger_button = ttk.Button(
+            header,
+            text="Auto",
+            command=self._reset_selected_trigger,
+            state="disabled",
+        )
+        self.reset_trigger_button.grid(row=0, column=2, sticky="e")
+        self.clear_triggers_button = ttk.Button(
+            header,
+            text="Clear",
+            command=self._clear_trigger_modes,
+            state="disabled",
+        )
+        self.clear_triggers_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        self.trigger_filter_var.trace_add("write", lambda *_args: self._refresh_triggers())
+
+        frame = ttk.Frame(holder)
+        frame.grid(row=1, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        columns = ("trigger", "mode")
+        self.trigger_tree = ttk.Treeview(
+            frame, columns=columns, show="headings", height=8, selectmode="browse"
+        )
+        headings = {"trigger": "Trigger", "mode": "Transform"}
+        widths = {"trigger": 330, "mode": 130}
+        for col in columns:
+            self.trigger_tree.heading(col, text=headings[col], anchor="w")
+            self.trigger_tree.column(
+                col, width=widths[col], minwidth=44, stretch=col == "trigger", anchor="w"
+            )
+        self._register_tree_headings(self.trigger_tree, headings)
+        yscroll = ttk.Scrollbar(
+            frame,
+            orient=tk.VERTICAL,
+            command=lambda *args: self._scroll_tree(self.trigger_tree, "yview", *args),
+        )
+        xscroll = ttk.Scrollbar(
+            frame,
+            orient=tk.HORIZONTAL,
+            command=lambda *args: self._scroll_tree(self.trigger_tree, "xview", *args),
+        )
+        self.trigger_tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.trigger_tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        self._configure_tree_rows(self.trigger_tree)
+        self.trigger_tree.bind("<Button-1>", self._trigger_click)
+        self.trigger_tree.bind(
+            "<<TreeviewSelect>>", lambda _event: self._trigger_selection_changed()
+        )
+        for sequence in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>", "<Configure>"):
+            self.trigger_tree.bind(sequence, lambda _event: self._close_tree_combo_editor(), add="+")
+
     def _build_part_panel(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
         header.grid(row=4, column=0, sticky="ew", pady=(10, 4))
@@ -307,13 +435,6 @@ class LayoutMixin:
         self.part_filter_entry = ttk.Entry(header, textvariable=self.filter_var)
         self.part_filter_entry.grid(row=0, column=1, sticky="ew", padx=(8, 6))
         self.part_filter_entry.insert(0, "")
-        self.recommend_button = ttk.Button(
-            header,
-            text="Recommend Transforms",
-            command=self._open_recommendations_modal,
-            state="disabled",
-        )
-        self.recommend_button.grid(row=0, column=2, sticky="e")
         self.show_all_parts_button = ttk.Button(
             header,
             text="Show All",

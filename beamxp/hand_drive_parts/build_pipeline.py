@@ -671,11 +671,35 @@ def export_texture_correction_artifacts(
                 "\n".join(log_lines) + ("\n" if log_lines else ""),
                 encoding="utf-8",
             )
+            # A part with no correctable atlas is skipped by the exporter
+            # rather than failing its whole DAE, so the meshes it stands for
+            # are reported as failures on their own.
+            skipped_aliases: set[str] = set()
+            for entry in getattr(preview, "failed_parts", ()) or ():
+                source_part = entry.get("source_part") if isinstance(entry, dict) else None
+                if not isinstance(source_part, dict):
+                    continue
+                aliases = {
+                    str(source_part.get(key) or "")
+                    for key in ("key", "node_id", "node_name")
+                } - {""}
+                skipped_aliases.update(aliases)
+                report["failures"].append(
+                    {
+                        "sourceZip": str(source_zip),
+                        "dae": dae_member,
+                        "meshes": sorted(mesh for mesh in matched_meshes if mesh in aliases),
+                        "error": str(entry.get("error") or "unknown error"),
+                    }
+                )
+            corrected_meshes = [
+                mesh for mesh in matched_meshes if mesh not in skipped_aliases
+            ]
             report["jobs"].append(
                 {
                     "sourceZip": str(source_zip),
                     "dae": dae_member,
-                    "meshes": matched_meshes,
+                    "meshes": corrected_meshes,
                     "selectedParts": [
                         {
                             "key": str(getattr(part, "key", "") or ""),
@@ -692,9 +716,11 @@ def export_texture_correction_artifacts(
                 }
             )
             if progress is not None:
+                skipped = len(getattr(preview, "failed_parts", ()) or ())
                 progress(
-                    f"Texture correction finished {len(parts)} mesh(es) "
+                    f"Texture correction finished {len(corrected_meshes)} mesh(es) "
                     f"in {float(preview.seconds):.1f}s"
+                    + (f", skipped {skipped}" if skipped else "")
                 )
         except Exception as exc:
             if log_lines:

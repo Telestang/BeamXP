@@ -1271,6 +1271,32 @@ def trigger_frame(p_ref: Vec3, p_x: Vec3, p_y: Vec3) -> tuple[Vec3, Vec3, Vec3, 
     return (p_ref, x_axis, y_axis, z_axis)
 
 
+def trigger_placement_frame(
+    p_ref: Vec3, p_x: Vec3, p_y: Vec3
+) -> tuple[Vec3, Vec3, Vec3, Vec3] | None:
+    """The frame an offset is measured along -- y NOT orthogonalised.
+
+    triggerLabelPlacement.lua squares the frame up before using it, but that
+    is for orienting a label; the engine's own placement does not. Measured
+    against VehicleTrigger:getCenter() on a vanilla Ardente
+    (scripts/dump_triggers.lua), taking y straight from pY - pRef cuts the
+    median error from 4.5 mm to 1.1 mm and the worst from 52 mm to 14 mm.
+
+    It shows up only where the two ref vectors are not perpendicular, which is
+    why dash-mounted boxes were always exact and door-mounted ones were tens
+    of millimetres out -- and why hood_int was exact despite a badly skewed
+    frame: its offset has no y component to be wrong about.
+    """
+    nx = tuple(p_x[i] - p_ref[i] for i in range(3))
+    ny = tuple(p_y[i] - p_ref[i] for i in range(3))
+    x_axis = _vec_normalized(nx)
+    y_axis = _vec_normalized(ny)
+    z_axis = _vec_normalized(_vec_cross(ny, nx))
+    if x_axis is None or y_axis is None or z_axis is None:
+        return None
+    return (p_ref, x_axis, y_axis, z_axis)
+
+
 def mirror_trigger_offset(
     values: Vec3,
     source_frame: tuple[Vec3, Vec3, Vec3, Vec3],
@@ -1421,6 +1447,13 @@ def _prop_mounted_transform(
     return None if best is None else (best[1], best[2], best[3])
 
 
+# What the user said this trigger follows, resolved to a transform. Present
+# means authoritative: a value moves the box with that mesh, and None pins it
+# where it was authored. A trigger absent from the map has no answer from the
+# user and falls through to the attribution ladder below.
+TriggerFollowMap = dict[str, TriggerOwnerTransform | None]
+
+
 def _owning_transform(
     centre: Vec3,
     ref_node: str,
@@ -1432,6 +1465,9 @@ def _owning_transform(
     failing that the flexbody that claims the box's anchor node. Returns None
     when neither resolves -- there is deliberately no default, because guessing
     moves a box onto geometry that never went anywhere.
+
+    This is the fallback, not the authority: a trigger the user has explicitly
+    pointed at a mesh never reaches here (see TriggerFollowMap).
     """
     prop_anchors, node_transforms, flex_bounds = owners
     mounted = _prop_mounted_transform(centre, prop_anchors)
@@ -1702,6 +1738,53 @@ def _mirror_box_size(values: Vec3) -> Vec3:
     return (values[0], -values[1], values[2])
 
 
+def _trigger_row_vector(
+    row: str,
+    spans: list[tuple[int, int]],
+    index_of: dict[str, int],
+    column: str,
+) -> Vec3:
+    """One xyz column of a trigger row, or zeroes when it has none."""
+    position = index_of.get(column)
+    if position is None or position >= len(spans):
+        return (0.0, 0.0, 0.0)
+    start, end = spans[position]
+    return _parse_vector(row[start:end]) or (0.0, 0.0, 0.0)
+
+
+def _trigger_row_size(
+    row: str,
+    spans: list[tuple[int, int]],
+    index_of: dict[str, int],
+) -> object:
+    """The size column: an xyz box extent, or a bare sphere radius."""
+    position = index_of.get("size")
+    if position is None or position >= len(spans):
+        return None
+    start, end = spans[position]
+    text = row[start:end].strip()
+    vector = _parse_vector(text)
+    if vector is not None:
+        return vector
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _trigger_row_shape(
+    row: str,
+    spans: list[tuple[int, int]],
+    index_of: dict[str, int],
+) -> str:
+    """The row's declared shape, defaulting to a box as BeamNG does."""
+    position = index_of.get("type")
+    if position is None or position >= len(spans):
+        return "box"
+    value = _row_string_value(row[spans[position][0]:spans[position][1]])
+    return (value or "box").strip().lower()
+
+
 def _trigger_row_centre(
     row: str,
     spans: list[tuple[int, int]],
@@ -1747,12 +1830,14 @@ def _mirror_trigger_row(
     node_mirror_map: dict[str, str],
     owners: TriggerOwners | None = None,
     frame_twins: dict[str, str] | None = None,
+    follows: TriggerFollowMap | None = None,
 ) -> tuple[str, str | None]:
     """Mirror one trigger row. Returns the row and a reason when left untouched."""
     spans = _row_element_spans(row)
     if len(spans) < len(_TRIGGER_NODE_COLUMNS) + 1:
         return row, None
     index_of = {name: idx for idx, name in enumerate(columns) if name}
+    trigger_id = _row_string_value(row[spans[0][0] : spans[0][1]]) if spans else None
 
     source_ids: list[str] = []
     for column in _TRIGGER_NODE_COLUMNS:
@@ -1772,7 +1857,13 @@ def _mirror_trigger_row(
     if authored_frame is None:
         return row, "ref nodes are collinear"
 
-    owner = _trigger_row_owner(row, spans, index_of, source_ids, authored_frame, owners)
+    if follows is not None and trigger_id in follows:
+        # The user answered this one, so the ladder does not get a vote.
+        owner = follows[trigger_id]
+        if owner is None:
+            return row, "pinned in place by the Triggers table"
+    else:
+        owner = _trigger_row_owner(row, spans, index_of, source_ids, authored_frame, owners)
     if owner is None:
         return row, None
     owner_action, owner_delta, owner_matrix = owner
@@ -1899,12 +1990,266 @@ def _mirror_trigger_row(
     return out, None
 
 
+def _euler_matrix(axis: int, radians: float) -> list[list[float]]:
+    """Rotation about one world axis, as a 3x3 row-major matrix."""
+    import math
+
+    cos, sin = math.cos(radians), math.sin(radians)
+    if axis == 0:
+        return [[1.0, 0.0, 0.0], [0.0, cos, -sin], [0.0, sin, cos]]
+    if axis == 1:
+        return [[cos, 0.0, sin], [0.0, 1.0, 0.0], [-sin, 0.0, cos]]
+    return [[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]]
+
+
+def trigger_box_axes(
+    frame: tuple[Vec3, Vec3, Vec3, Vec3],
+    base_rotation: Vec3 = (0.0, 0.0, 0.0),
+    rotation: Vec3 = (0.0, 0.0, 0.0),
+) -> tuple[Vec3, Vec3, Vec3]:
+    """The box's own axes: the node frame, turned by its euler columns.
+
+    BeamNG builds the orientation from the ref-node frame and then applies the
+    euler columns about world axes, pre-multiplied in the order y, -z, -x for
+    baseRotation and again for rotation (triggerLabelPlacement.lua, whose
+    comments state it matches the C++ asyncUpdate sequence and signs). Degrees
+    in the jbeam, radians here.
+    """
+    import math
+
+    axes = [list(frame[1]), list(frame[2]), list(frame[3])]
+    for values in (base_rotation, rotation):
+        x_deg, y_deg, z_deg = (float(value) for value in values)
+        # Fitted to the engine's own placements (scripts/dump_triggers.lua):
+        # about world x by -x, then y by -y, then z by +z, each applied to the
+        # result so far.
+        #
+        # Exact where the rotation is zero or about x alone -- the Ardente's
+        # hazard switch at 45 deg lands within a micrometre -- and the error
+        # after that scales with the y and z angles: 1 deg of z costs about
+        # 1 mm (sunvisors), 4 deg costs 4 mm (trunk), and the hood's
+        # -10/-11/2 costs 14 mm. So the x handling is right and the y/z
+        # handling is not quite.
+        #
+        # It is NOT the vehicle settling: dumped from a reset, paused car the
+        # live ref-node geometry matches the authored geometry to four
+        # decimals on every trigger but the tailgate, whose panel really does
+        # drop ~10 mm. Chasing the last millimetre was judged not worth it for
+        # a preview aid; the ground-truth cases are pinned in
+        # EngineGroundTruthTests if anyone wants to pick it up.
+        for axis, radians in (
+            (0, math.radians(-x_deg)),
+            (1, math.radians(-y_deg)),
+            (2, math.radians(z_deg)),
+        ):
+            if abs(radians) < 1e-12:
+                continue
+            matrix = _euler_matrix(axis, radians)
+            # The axes turn as a set -- each new axis is a combination of the
+            # old three -- not as three vectors each spun on their own. The
+            # difference is a transpose, and it is worth tens of mm on a box
+            # with rotation about more than one axis.
+            axes = [
+                [sum(matrix[b][a] * axes[b][i] for b in range(3)) for i in range(3)]
+                for a in range(3)
+            ]
+    return tuple(tuple(axis_vector) for axis_vector in axes)
+
+
+def trigger_box_corners(
+    centre: Vec3,
+    axes: tuple[Vec3, Vec3, Vec3],
+    size: object,
+) -> list[Vec3]:
+    """The box's eight corners in vehicle space.
+
+    ``size`` is a full-extent vector for a box or a radius for a sphere; a
+    sphere is drawn as the cube that bounds it, which is enough to see where
+    the thing is and whether it moved.
+    """
+    if isinstance(size, (int, float)) and not isinstance(size, bool):
+        half = (abs(float(size)),) * 3  # a sphere's radius is already a half-extent
+    else:
+        half = tuple(value / 2.0 for value in trigger_box_extents(size))
+    corners: list[Vec3] = []
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                scaled = (sx * half[0], sy * half[1], sz * half[2])
+                corners.append(
+                    tuple(
+                        centre[i] + sum(scaled[a] * axes[a][i] for a in range(3))
+                        for i in range(3)
+                    )
+                )
+    return corners
+
+
+# Corner order above is (sx, sy, sz) with z fastest, so these index the six
+# faces as two triangles each.
+TRIGGER_BOX_TRIANGLES = (
+    (0, 1, 3), (0, 3, 2),  # -x
+    (4, 6, 7), (4, 7, 5),  # +x
+    (0, 4, 5), (0, 5, 1),  # -y
+    (2, 3, 7), (2, 7, 6),  # +y
+    (0, 2, 6), (0, 6, 4),  # -z
+    (1, 5, 7), (1, 7, 3),  # +z
+)
+
+
+def trigger_sphere_mesh(
+    centre: Vec3,
+    radius: float,
+    rings: int = 6,
+    segments: int = 10,
+) -> tuple[list[Vec3], tuple[tuple[int, int, int], ...]]:
+    """A sphere trigger's surface, as vertices and triangles.
+
+    BeamNG has exactly two trigger shapes -- box and sphere
+    (lua/common/jbeam/sections/events.lua sets typeId 0 or 1) -- and a
+    sphere's ``size`` is a bare radius rather than an extent vector. Drawing
+    one as its bounding cube overstates it by the corners, which on a 15 mm
+    dashboard switch is most of what you see.
+
+    Orientation is deliberately ignored: a sphere has none, so the euler
+    columns cannot move it.
+    """
+    import math
+
+    radius = abs(float(radius))
+    rings = max(int(rings), 2)
+    segments = max(int(segments), 3)
+    vertices: list[Vec3] = [(centre[0], centre[1], centre[2] + radius)]
+    for ring in range(1, rings):
+        polar = math.pi * ring / rings
+        z = math.cos(polar) * radius
+        ring_radius = math.sin(polar) * radius
+        for segment in range(segments):
+            azimuth = 2.0 * math.pi * segment / segments
+            vertices.append((
+                centre[0] + math.cos(azimuth) * ring_radius,
+                centre[1] + math.sin(azimuth) * ring_radius,
+                centre[2] + z,
+            ))
+    vertices.append((centre[0], centre[1], centre[2] - radius))
+
+    south = len(vertices) - 1
+    faces: list[tuple[int, int, int]] = []
+
+    def ring_vertex(ring: int, segment: int) -> int:
+        return 1 + (ring - 1) * segments + (segment % segments)
+
+    for segment in range(segments):  # north cap
+        faces.append((0, ring_vertex(1, segment), ring_vertex(1, segment + 1)))
+    for ring in range(1, rings - 1):  # bands
+        for segment in range(segments):
+            a = ring_vertex(ring, segment)
+            b = ring_vertex(ring, segment + 1)
+            c = ring_vertex(ring + 1, segment + 1)
+            d = ring_vertex(ring + 1, segment)
+            faces.append((a, d, c))
+            faces.append((a, c, b))
+    for segment in range(segments):  # south cap
+        faces.append((south, ring_vertex(rings - 1, segment + 1), ring_vertex(rings - 1, segment)))
+    return vertices, tuple(faces)
+
+
+def trigger_box_size_vector(size: object) -> Vec3:
+    """The size column as a signed vector along the ref frame's axes.
+
+    The components are NOT in frame order: size.y is the extent along the
+    frame's z and size.z the extent along its y. That is the engine's own
+    doing, read back out of it -- dump a vehicle's triggers with
+    scripts/dump_triggers.lua and the swap is exact on every box whose
+    rotation is about a single axis (the Ardente's hazard switch at 45 deg
+    lands within 0.002 mm, its two unrotated cubes within 0.004 mm).
+
+    Signs are kept, because the vector is a corner offset rather than an
+    extent: a negative component means the box grows the other way, which is
+    how an author mirrors a pair (ardente door_L_int's +0.03 against
+    door_R_int's -0.03).
+    """
+    if isinstance(size, dict):
+        values = tuple(float(size.get(key, 0.1) or 0.0) for key in ("x", "y", "z"))
+    elif isinstance(size, (list, tuple)) and len(size) == 3:
+        values = tuple(float(value) for value in size)
+    elif isinstance(size, (int, float)) and not isinstance(size, bool):
+        return (float(size) * 2.0,) * 3
+    else:
+        return (0.1, 0.1, 0.1)
+    return (values[0], values[2], values[1])
+
+
+def trigger_box_extents(size: object) -> Vec3:
+    """The box's extents along the frame axes, unsigned."""
+    return tuple(abs(value) for value in trigger_box_size_vector(size))
+
+
+def trigger_box_centre(
+    anchor: Vec3,
+    axes: tuple[Vec3, Vec3, Vec3],
+    size: object,
+) -> Vec3:
+    """The centre of a box trigger, given the corner that positions it.
+
+    ``baseTranslation`` places a CORNER of the box, not its middle -- the
+    documentation says as much ("the center of rotation being the corner of
+    the box that defines position"), and the vehicles prove it. The Ardente
+    authors its sunvisor pair with the same offset except for bt.z, which
+    differs by exactly the box's z size: the compensation you need when the
+    mirrored frame flips z and the box still has to grow the same way. Read
+    as a corner, that pair comes out symmetric to four decimals and the
+    hazard switch lands dead centre on the middle button; read as a centre,
+    they are 39.6 mm and 15 mm out.
+    """
+    half = tuple(value / 2.0 for value in trigger_box_size_vector(size))
+    return tuple(
+        anchor[i] + sum(half[a] * axes[a][i] for a in range(3))
+        for i in range(3)
+    )
+
+
+def trigger_shape_mesh(
+    anchor: Vec3,
+    axes: tuple[Vec3, Vec3, Vec3],
+    size: object,
+    shape: str = "box",
+) -> tuple[list[Vec3], tuple[tuple[int, int, int], ...]]:
+    """The drawable surface of one trigger, whichever shape it is.
+
+    ``anchor`` is the row's placement point: a sphere sits on it, a box hangs
+    one of its corners there.
+    """
+    if str(shape).strip().lower() == "sphere":
+        radius = size if isinstance(size, (int, float)) and not isinstance(size, bool) else 0.05
+        return trigger_sphere_mesh(anchor, radius)
+    centre = trigger_box_centre(anchor, axes, size)
+    return list(trigger_box_corners(centre, axes, size)), TRIGGER_BOX_TRIANGLES
+
+
+def twinned_trigger_ids(trigger_ids) -> set[str]:
+    """Ids that already have their opposite number alongside them.
+
+    A twinned pair covers both sides already, and each half is bolted to its
+    own side's nodes, so mirroring them would put two boxes on one door and
+    none on the other. The scintilla's four sunvisor triggers are the case in
+    point: sunvisor_L_close/_R_close and _L_open/_R_open all live in one part.
+    """
+    known = {str(trigger_id) for trigger_id in trigger_ids if trigger_id}
+    return {
+        trigger_id
+        for trigger_id in known
+        if (swapped := mirror_lateral_node_id(trigger_id)) != trigger_id and swapped in known
+    }
+
+
 def rewrite_triggers(
     array_text: str,
     node_positions: dict[str, Vec3],
     node_mirror_map: dict[str, str],
     owners: TriggerOwners | None = None,
     frame_twins: dict[str, str] | None = None,
+    follows: TriggerFollowMap | None = None,
 ) -> str:
     columns = trigger_column_names(array_text)
     if not columns:
@@ -1916,16 +2261,7 @@ def rewrite_triggers(
         row = array_text[start:end]
         spans = _row_element_spans(row)
         ids.append(_row_string_value(row[spans[0][0] : spans[0][1]]) if spans else None)
-    # A twinned pair already covers both sides and each half is bolted to its own
-    # side's nodes, so mirroring them would put two triggers on one door and none
-    # on the other. Vanilla keeps such pairs in their own part, so this guard is
-    # belt and braces -- but a modded part that mixes them would otherwise break.
-    known_ids = {trigger_id for trigger_id in ids if trigger_id}
-    twinned = {
-        trigger_id
-        for trigger_id in known_ids
-        if (swapped := mirror_lateral_node_id(trigger_id)) != trigger_id and swapped in known_ids
-    }
+    twinned = twinned_trigger_ids(trigger_id for trigger_id in ids if trigger_id)
 
     newline = "\r\n" if "\r\n" in array_text else "\n"
     out = array_text
@@ -1934,7 +2270,7 @@ def rewrite_triggers(
             continue
         row = array_text[start:end]
         mirrored, reason = _mirror_trigger_row(
-            row, columns, node_positions, node_mirror_map, owners, frame_twins
+            row, columns, node_positions, node_mirror_map, owners, frame_twins, follows
         )
         out = out[:start] + mirrored + out[end:]
         if reason is not None:
@@ -2403,6 +2739,14 @@ def _iter_trigger_rows(part_body: str):
             yield trigger_id, row, spans, index_of, source_ids
 
 
+def iter_trigger_rows(part_body: str):
+    """Public view of one part's trigger rows, for the Triggers table.
+
+    Yields (trigger id, row text, element spans, column index, ref node ids).
+    """
+    yield from _iter_trigger_rows(part_body)
+
+
 def part_has_relocatable_trigger(
     part_body: str,
     node_positions: dict[str, Vec3],
@@ -2458,6 +2802,7 @@ def clone_part_for_target(
     child_part_map: dict[str, str] | None = None,
     owners: TriggerOwners | None = None,
     mirror_plane_sources: dict[str, str] | None = None,
+    trigger_follows: TriggerFollowMap | None = None,
 ) -> str:
     new_part_id = new_part_id or generated_part_name(source_part_id, target_hand)
     out = transform_helpers.replace_first(part_body, f'"{source_part_id}"', f'"{new_part_id}"')
@@ -2509,7 +2854,12 @@ def clone_part_for_target(
             out,
             trigger_section,
             lambda text: rewrite_triggers(
-                text, trigger_node_positions, node_mirror_map, owners, frame_twins
+                text,
+                trigger_node_positions,
+                node_mirror_map,
+                owners,
+                frame_twins,
+                trigger_follows,
             ),
         )
     out = transform_helpers.replace_array_region(
@@ -2536,4 +2886,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['twinned_trigger_ids', 'trigger_placement_frame', 'trigger_sphere_mesh', 'trigger_shape_mesh', 'trigger_box_centre', 'trigger_box_extents', 'trigger_box_size_vector', '_trigger_row_shape', '_trigger_row_vector', '_trigger_row_size', 'trigger_box_axes', 'trigger_box_corners', 'TRIGGER_BOX_TRIANGLES', '_trigger_row_centre', 'iter_trigger_rows', 'target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']

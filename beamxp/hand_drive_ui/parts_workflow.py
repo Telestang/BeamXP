@@ -6,6 +6,22 @@ from .shared import *
 class PartsWorkflowMixin:
     """Part inventory refresh, filtering, selection, viewer synchronisation, and variant interaction."""
 
+    # Resolving one trim's mesh instances re-parses that trim's whole part
+    # tree -- around a fifth of a second on the etk800, and the callers want
+    # every trim. The worker's numbering pass already walks all of them, so
+    # the results are kept here for the UI thread to read back instead of
+    # repeating the walk: that is what took `_refresh_slots` to six seconds
+    # for two Equivalent Parts labels.
+    #
+    # Both threads reach this, hence the lock. It is held around the dict and
+    # not around the resolve, so a miss on the UI thread never waits on the
+    # worker; the worst case is the same trim resolved twice.
+    _mesh_instance_cache: dict[tuple, tuple[object, list]] = {}
+    _mesh_instance_cache_lock = threading.Lock()
+    # Two generations' worth of trims for a large vehicle, so an edit that
+    # changes the pairings does not evict the trims still on screen.
+    MESH_INSTANCE_CACHE_LIMIT = 128
+
     def _part_row_mesh_id(self, row_id: object) -> str:
         text = str(row_id)
         return getattr(self, "part_row_mesh_ids", {}).get(text, text.split("@@", 1)[0])
@@ -146,6 +162,16 @@ class PartsWorkflowMixin:
         return base
 
     def _mesh_instance_number_for_ref(self, ref: str) -> tuple[int, int] | None:
+        """Which of a mesh's instances this ref is, and how many there are.
+
+        This used to find out by walking every trim looking for the instance
+        that owns the ref -- six seconds to label two Equivalent Parts rows.
+        The numbering pass already visits every instance, so it records each
+        ref's number keys on the way past and this is a pair of lookups.
+
+        The keys are in trim order and the first one that has been given an
+        ordinal wins, which is the trim the old walk would have stopped at.
+        """
         if self.context is None:
             return None
         mesh_id = ref.split("@@", 1)[0]
@@ -154,19 +180,10 @@ class PartsWorkflowMixin:
         numbering = self._vehicle_mesh_instance_numbering().get(mesh_id, {})
         if not numbering:
             return None
-        for config_name in sorted(self.context.variants):
-            try:
-                instances = self._mesh_transform_instances_for_config(config_name)
-            except Exception:
-                continue
-            for instance in instances:
-                if instance.mesh_id != mesh_id:
-                    continue
-                if instance.instance_id != ref:
-                    continue
-                ordinal = numbering.get(self._mesh_instance_number_key(instance))
-                if ordinal is not None:
-                    return ordinal, len(numbering)
+        for number_key in self.mesh_instance_keys_cache.get(ref, ()):
+            ordinal = numbering.get(number_key)
+            if ordinal is not None:
+                return ordinal, len(numbering)
         return None
 
     def _mesh_instance_label_for_ref(
@@ -183,7 +200,30 @@ class PartsWorkflowMixin:
         return f"{display} #{ordinal}" if count > 1 else display
 
     @staticmethod
+    def _mesh_plan_fingerprint(conversion: object) -> str:
+        """What a trim's resolved mesh instances actually depend on.
+
+        Slot and side pairings rewrite which part fills which slot. The rest
+        of the conversion -- transforms, offsets, plates -- never moves a part
+        between slots, so leaving it out means editing a transform does not
+        throw away a resolution that is still correct.
+        """
+        if not isinstance(conversion, dict):
+            return ""
+        try:
+            return json.dumps(
+                {
+                    "slotPairs": core.normalized_slot_pairs(conversion.get("slotPairs")),
+                    "sidePairs": core.normalized_side_pairs(conversion.get("sidePairs")),
+                },
+                sort_keys=True,
+            )
+        except Exception:
+            return ""
+
+    @classmethod
     def _mesh_transform_instances_for_config_data(
+        cls,
         context: core.VehicleContext | None,
         conversion: dict[str, object],
         config_name: str,
@@ -192,6 +232,42 @@ class PartsWorkflowMixin:
             return []
         if not isinstance(conversion, dict):
             conversion = {}
+        # The worker is handed a copy of the conversion, so the key is the
+        # pairing content rather than the dict's identity -- that is what lets
+        # the UI thread read back what the worker resolved.
+        key = (id(context), cls._mesh_plan_fingerprint(conversion), config_name)
+        with cls._mesh_instance_cache_lock:
+            cached = cls._mesh_instance_cache.get(key)
+        if cached is not None:
+            return cached[1]
+        instances = cls._resolve_mesh_transform_instances(context, conversion, config_name)
+        with cls._mesh_instance_cache_lock:
+            # The context is held alongside its instances, not for its own
+            # sake but so its address cannot be handed to a later context
+            # while entries keyed on it are still here.
+            cls._mesh_instance_cache[key] = (context, instances)
+            while len(cls._mesh_instance_cache) > cls.MESH_INSTANCE_CACHE_LIMIT:
+                cls._mesh_instance_cache.pop(next(iter(cls._mesh_instance_cache)))
+        return instances
+
+    @classmethod
+    def _clear_mesh_instance_cache(cls) -> None:
+        """Let go of the outgoing vehicle when a new one is loaded.
+
+        Entries pin the context they were resolved for, so without this the
+        old vehicle's parsed jbeam would be held until the entries aged out.
+        An in-flight worker from the outgoing vehicle may add one back after
+        this; it is stale but not wrong, and it ages out.
+        """
+        with cls._mesh_instance_cache_lock:
+            cls._mesh_instance_cache.clear()
+
+    @staticmethod
+    def _resolve_mesh_transform_instances(
+        context: core.VehicleContext,
+        conversion: dict[str, object],
+        config_name: str,
+    ) -> list[core.MeshTransformInstance]:
         plan = core.slot_pair_plans_for_variants(context, conversion, [config_name]).get(config_name)
         if plan is None:
             return core.selected_mesh_transform_instances_for_config(context, config_name)
@@ -213,20 +289,9 @@ class PartsWorkflowMixin:
         )
 
     def _mesh_numbering_cache_key(self) -> tuple[object, str]:
-        conversion = getattr(self, "conversion", {})
-        if not isinstance(conversion, dict):
-            return (id(self.context), "")
-        try:
-            fingerprint = json.dumps(
-                {
-                    "slotPairs": core.normalized_slot_pairs(conversion.get("slotPairs")),
-                    "sidePairs": core.normalized_side_pairs(conversion.get("sidePairs")),
-                },
-                sort_keys=True,
-            )
-        except Exception:
-            fingerprint = ""
-        return (id(self.context), fingerprint)
+        # The numbering is read off the same resolved instances, so it turns
+        # stale on exactly the same edits.
+        return (id(self.context), self._mesh_plan_fingerprint(getattr(self, "conversion", {})))
 
     def _vehicle_mesh_instance_numbering(self) -> dict[str, dict[str, int]]:
         if self.context is None:
@@ -237,9 +302,13 @@ class PartsWorkflowMixin:
             and isinstance(getattr(self, "mesh_instance_numbering_cache", None), dict)
         ):
             return self.mesh_instance_numbering_cache
-        numbering = self._vehicle_mesh_instance_numbering_data(self.context, getattr(self, "conversion", {}))
+        numbering, keys_by_ref = self._cached_vehicle_mesh_instance_index(
+            self.context,
+            getattr(self, "conversion", {}),
+        )
         self.mesh_instance_numbering_key = cache_key
         self.mesh_instance_numbering_cache = numbering
+        self.mesh_instance_keys_cache = keys_by_ref
         return numbering
 
     @classmethod
@@ -248,20 +317,41 @@ class PartsWorkflowMixin:
         context: core.VehicleContext,
         conversion: dict[str, object],
     ) -> dict[str, dict[str, int]]:
+        return cls._vehicle_mesh_instance_index_data(context, conversion)[0]
+
+    @classmethod
+    def _vehicle_mesh_instance_index_data(
+        cls,
+        context: core.VehicleContext,
+        conversion: dict[str, object],
+    ) -> tuple[dict[str, dict[str, int]], dict[str, list[str]]]:
+        """One walk of every trim, producing both halves of the numbering.
+
+        The numbering answers "which of this mesh's places is number two"; the
+        second map answers "which place is this ref", in trim order. Working
+        the second one out later meant walking every trim again, so it is
+        gathered here where the instances are already in hand.
+        """
         keys_by_mesh: dict[str, set[str]] = {}
+        keys_by_ref: dict[str, list[str]] = {}
         for config_name in sorted(context.variants):
             try:
                 instances = cls._mesh_transform_instances_for_config_data(context, conversion, config_name)
             except Exception:
                 continue
             for instance in instances:
-                if instance.count_for_mesh <= 1:
-                    continue
                 mesh_id = str(instance.mesh_id)
                 key = cls._mesh_instance_number_key(instance)
-                if mesh_id and key:
+                if not mesh_id or not key:
+                    continue
+                ref = str(instance.instance_id)
+                if ref:
+                    seen = keys_by_ref.setdefault(ref, [])
+                    if key not in seen:
+                        seen.append(key)
+                if instance.count_for_mesh > 1:
                     keys_by_mesh.setdefault(mesh_id, set()).add(key)
-        return {
+        numbering = {
             mesh_id: {
                 key: index + 1
                 for index, key in enumerate(sorted(keys, key=str.lower))
@@ -269,6 +359,7 @@ class PartsWorkflowMixin:
             for mesh_id, keys in keys_by_mesh.items()
             if len(keys) > 1
         }
+        return numbering, keys_by_ref
 
     @classmethod
     def _part_table_rows_data(
@@ -502,7 +593,10 @@ class PartsWorkflowMixin:
         selected_variants: tuple[str, ...],
     ) -> dict[str, object]:
         with timed_worker("part table snapshot"):
-            vehicle_numbering = cls._vehicle_mesh_instance_numbering_data(context, conversion)
+            vehicle_numbering, instance_keys = cls._cached_vehicle_mesh_instance_index(
+                context,
+                conversion,
+            )
             table_rows = cls._part_table_rows_data(
                 context,
                 conversion,
@@ -510,9 +604,9 @@ class PartsWorkflowMixin:
                 list(ids),
                 vehicle_numbering,
             )
-            flexbody_meshes, prop_meshes, _all_meshes = core.selected_mesh_roles(
+            flexbody_meshes, prop_meshes, _all_meshes = cls._cached_selected_mesh_roles(
                 context,
-                list(selected_variants),
+                selected_variants,
             )
             return {
                 "rows": table_rows,
@@ -520,7 +614,51 @@ class PartsWorkflowMixin:
                 "flexbody_meshes": flexbody_meshes,
                 "prop_meshes": prop_meshes,
                 "vehicle_numbering": vehicle_numbering,
+                "vehicle_instance_keys": instance_keys,
             }
+
+    @classmethod
+    def _cached_vehicle_mesh_instance_index(
+        cls,
+        context: core.VehicleContext,
+        conversion: dict[str, object],
+    ) -> tuple[dict[str, dict[str, int]], dict[str, list[str]]]:
+        """The instance numbering, worked out at most once per pairing set.
+
+        Numbering walks every trim and resolves each one's part tree -- 3.6 s
+        on the etk800 -- for a couple of hundred kilobytes of answer that the
+        vehicle's own files determine. So it is kept beside the project: the
+        first load of a vehicle pays for it and later ones read it back.
+        """
+        fingerprint = cls._mesh_plan_fingerprint(conversion)
+        cached = core.load_cached_mesh_numbering(context, fingerprint)
+        if cached is not None:
+            return cached
+        index = cls._vehicle_mesh_instance_index_data(context, conversion)
+        core.save_cached_mesh_numbering(context, fingerprint, index)
+        return index
+
+    @classmethod
+    def _cached_selected_mesh_roles(
+        cls,
+        context: core.VehicleContext,
+        selected_variants: tuple[str, ...],
+    ) -> tuple[set[str], set[str], set[str]]:
+        """Which meshes are flexbodies and which are props, across the selection.
+
+        Same story as the numbering, one trim at a time: the split is settled
+        by the vehicle's files, so what previous sessions worked out is handed
+        to the resolver's own per-trim cache and only the trims missing from it
+        are walked. Whatever that leaves behind is written back, so selecting a
+        trim the vehicle has not been asked about before costs its walk once.
+        """
+        known = core.load_cached_mesh_roles(context)
+        for config_name, roles in known.items():
+            context.mesh_roles_cache.setdefault(config_name, roles)
+        result = core.selected_mesh_roles(context, list(selected_variants))
+        if len(context.mesh_roles_cache) > len(known):
+            core.save_cached_mesh_roles(context, dict(context.mesh_roles_cache))
+        return result
 
     def _schedule_part_table_snapshot(self, *, reset_view: bool = False) -> None:
         if self.context is None:
@@ -584,6 +722,7 @@ class PartsWorkflowMixin:
                 self.part_table_snapshot_key = None
                 self.part_table_snapshot = None
                 self._refresh_slots()
+                self._refresh_triggers()
                 self._refresh_derived_output_summary()
                 return
             # The x/y/z columns read placed geometry, so make sure it matches the
@@ -611,9 +750,11 @@ class PartsWorkflowMixin:
         flexbody_meshes = set(snapshot.get("flexbody_meshes") or set())
         prop_meshes = set(snapshot.get("prop_meshes") or set())
         vehicle_numbering = snapshot.get("vehicle_numbering")
-        if isinstance(vehicle_numbering, dict):
+        instance_keys = snapshot.get("vehicle_instance_keys")
+        if isinstance(vehicle_numbering, dict) and isinstance(instance_keys, dict):
             self.mesh_instance_numbering_key = self._mesh_numbering_cache_key()
             self.mesh_instance_numbering_cache = vehicle_numbering
+            self.mesh_instance_keys_cache = instance_keys
         active_ids = self._preview_active_ids()
         self.part_row_mesh_ids = {str(row["row_id"]): str(row["mesh_id"]) for row in table_rows}
         self.part_row_side_refs = {str(row["row_id"]): str(row["side_ref"]) for row in table_rows}
@@ -716,12 +857,29 @@ class PartsWorkflowMixin:
             )
             row_index += 1
         self.current_part_ids = displayed
+        self._fit_part_columns_once()
         self._refresh_slots()
+        self._refresh_triggers()
         self._restore_tree_order(self.part_tree, previous_order)
         visible_keep = [item for item in keep if self.part_tree.exists(item)]
         if visible_keep:
             self.part_tree.selection_set(visible_keep)
         self._refresh_viewer(reset=reset_view)
+
+    def _fit_part_columns_once(self) -> None:
+        """Fit the Mesh Transforms columns to the vehicle that just loaded.
+
+        The arming is spent here rather than on every rebuild: a mode edit, a
+        filter keystroke and a preview refresh all rebuild these rows, and any
+        of them snapping the columns back would undo a width the user had
+        dragged. A rebuild with nothing in it -- a filter that matches no mesh
+        while the vehicle is still loading -- leaves the arming for the
+        refresh that does have rows to measure.
+        """
+        if not getattr(self, "part_columns_need_fit", False) or not self.current_part_ids:
+            return
+        self.part_columns_need_fit = False
+        self._fit_tree_columns(self.part_tree)
 
     def _refresh_preview_dependent_part_cells(self) -> None:
         """Update cells that depend on the latest GPU scene without rebuilding
@@ -922,6 +1080,10 @@ class PartsWorkflowMixin:
             # Selection only drives the highlight outline (skipped for hidden parts
             # in the renderer); it never adds a part to the visible set above.
             selected_ids = self._selected_preview_ids() if self.viewer_supports_scene else selected_meshes
+            # A selected trigger row halos its box, the same as a selected mesh
+            # row halos its mesh -- the box is scene geometry with no part row,
+            # so its id has to be added here rather than coming from the table.
+            selected_ids = set(selected_ids) | self._selected_trigger_scene_ids()
             self.viewer.set_selected_ids(selected_ids)
 
     def _preview_active_ids(self) -> set[str]:

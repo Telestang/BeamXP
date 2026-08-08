@@ -53,6 +53,13 @@ MODE_COLORS = {
     "equivalent": (0.54, 0.84, 0.40),
     "output": (0.95, 0.60, 0.25),
 }
+# A trigger nothing is moving. Deliberately NOT the meshes' grey: a box
+# left behind is the failure this table exists to catch, and it has to be
+# distinguishable from a mesh that is merely set to Skip.
+TRIGGER_UNMOVED_COLOR = (0.90, 0.22, 0.22)
+# Boxes are hollow volumes drawn around real geometry, so they are painted
+# see-through -- otherwise a dashboard switch box hides the switch.
+TRIGGER_OPACITY = 0.5
 SELECTED_COLOR = (1.0, 0.85, 0.20)
 OUTLINE_COLOR = (0.05, 0.95, 1.0)
 PREVIEW_BACKGROUND = (0.075, 0.08, 0.09)
@@ -354,10 +361,26 @@ class SceneData:
     pick_to_row: dict[str, str] = field(default_factory=dict)
     pick_to_parent: dict[str, str] = field(default_factory=dict)
     pick_names: list[str] = field(default_factory=list)
+    # Group names of the drawn trigger boxes, so the app can tell a box
+    # apart from a mesh when one is clicked.
+    trigger_names: list[str] = field(default_factory=list)
 
     @property
     def triangle_count(self) -> int:
         return len(self.triangles)
+
+
+TRIGGER_SCENE_PREFIX = "trig"
+
+
+def trigger_scene_name(trigger_id: object, at: object) -> str:
+    """The scene/group name for one trigger box.
+
+    Deliberately the same string the Triggers table uses for its row id, so a
+    picked box maps straight back to its row with no extra bookkeeping.
+    """
+    values = tuple(at) if isinstance(at, (list, tuple)) else (0.0, 0.0, 0.0)
+    return "|".join([TRIGGER_SCENE_PREFIX, str(trigger_id), *(str(v) for v in values)])
 
 
 MODE_PALETTE_ORDER = [
@@ -370,6 +393,26 @@ MODE_PALETTE_ORDER = [
     "equivalent",
     "output",
 ]
+
+# A trigger box is coloured by the transform it will receive, using the same
+# palette the meshes use -- except when nothing is moving it, which gets its
+# own red rather than borrowing the meshes' grey.
+MODE_PALETTE_INDEX = {mode: index for index, mode in enumerate(MODE_PALETTE_ORDER)}
+TRIGGER_UNMOVED_INDEX = len(MODE_PALETTE_ORDER)
+SELECTED_INDEX = TRIGGER_UNMOVED_INDEX + 1
+
+
+def trigger_palette_index(action: object) -> int:
+    """Palette slot for a trigger box, from the transform it will receive.
+
+    "skip", or no answer at all, both mean the box stays where it was -- the
+    thing worth seeing at a glance -- so both go red rather than borrowing
+    the grey a skipped MESH wears.
+    """
+    name = str(action or "")
+    if name in ("", "skip"):
+        return TRIGGER_UNMOVED_INDEX
+    return MODE_PALETTE_INDEX.get(name, TRIGGER_UNMOVED_INDEX)
 
 
 def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
@@ -526,6 +569,49 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
             groups.setdefault(instance_name, []).append(span)
         pick_names.append(instance_name)
 
+    # Trigger boxes are drawn from their node frame rather than loaded from a
+    # DAE, because a trigger has no mesh -- it is three node references and an
+    # offset. They join the same buffers as everything else, so selection and
+    # picking come for free; the colour is the transform the box will receive,
+    # which is what makes a wrong answer visible in the viewport.
+    trigger_names: list[str] = []
+    for box in payload.get("trigger_boxes", []) or []:
+        # Each trigger carries its own surface: a box is eight corners, a
+        # sphere a small tessellated ball. Drawing every one as a cube
+        # overstated the spheres by their corners, which on a 15 mm dashboard
+        # switch is most of what you can see.
+        vertices = box.get("vertices") or []
+        face_list = box.get("faces") or []
+        if len(vertices) < 3 or not face_list:
+            continue
+        row_id = trigger_scene_name(box.get("id"), box.get("at"))
+        if row_id in groups:
+            continue
+        stock_vertices = box.get("vertices_stock") or vertices
+        if len(stock_vertices) != len(vertices):
+            stock_vertices = vertices
+        points = np.asarray(vertices, dtype=np.float32)
+        stock_points = np.asarray(stock_vertices, dtype=np.float32)
+        faces = np.asarray(face_list, dtype=np.int32) + vert_base
+        # The action is what will actually happen to the box; mode is the
+        # user's answer, which older payloads carry on its own.
+        palette_index = trigger_palette_index(
+            box.get("action") if box.get("action") is not None else box.get("mode")
+        )
+        # Converted and original placements, the same pair every mesh carries,
+        # so the Original layout toggle moves the boxes with the geometry.
+        verts_conv.append(points)
+        verts_stock.append(stock_points)
+        tris.append(faces)
+        color_ids.append(np.full(len(points), float(palette_index), dtype=np.float32))
+        span = (tri_base, tri_base + len(faces), vert_base, vert_base + len(points))
+        groups.setdefault(row_id, []).append(span)
+        modes[row_id] = str(box.get("mode") or "")
+        pick_names.append(row_id)
+        trigger_names.append(row_id)
+        vert_base += len(points)
+        tri_base += len(faces)
+
     base_groups = set(mesh_counts) & set(groups)
     extra &= base_groups
     if not tris:
@@ -547,6 +633,7 @@ def build_scene(payload: dict, cache_dir: Path | None = None) -> SceneData:
         pick_to_row=pick_to_row,
         pick_to_parent=pick_to_parent,
         pick_names=pick_names,
+        trigger_names=trigger_names,
     )
 
 
@@ -573,10 +660,11 @@ void main() {
 
 FRAGMENT_SHADER = """
 #version 330
-uniform vec3 palette[9];
+uniform vec3 palette[10];
 uniform vec3 background;
 uniform float dimmed_opacity;
 uniform float global_opacity;
+uniform float alpha_scale;
 in vec3 v_viewpos;
 in float v_color;
 in float v_selected;
@@ -586,18 +674,21 @@ void main() {
     vec3 normal = normalize(cross(dFdx(v_viewpos), dFdy(v_viewpos)));
     float diffuse = abs(normal.z);                       // headlight
     float rim = pow(1.0 - abs(normal.z), 2.0) * 0.10;
-    int index = clamp(int(v_color + 0.5), 0, 7);
+    int index = clamp(int(v_color + 0.5), 0, 8);
     float selected = clamp(v_selected, 0.0, 1.0);
     float dimmed = clamp(v_dimmed, 0.0, 1.0) * (1.0 - selected);
+    // Selection does not repaint the object: it keeps its mode colour and
+    // is marked by the outline pass instead, so "what is this part set to"
+    // stays readable while it is selected.
     vec3 base = palette[index];
-    base = mix(base, palette[8], selected);
     vec3 color = base * (0.38 + 0.62 * diffuse) + rim;
     // Dimmed (out-of-filter) parts recede toward the background but stay solid.
     color = mix(background, color, mix(1.0, dimmed_opacity, dimmed));
     // Global opacity is a REAL alpha: the fragment is blended against whatever
     // is behind it (grid, back faces, other parts) by GL_BLEND, so lowering it
     // makes geometry genuinely see-through instead of merely darker.
-    frag = vec4(color, global_opacity);
+    // alpha_scale is the trigger pass painting itself half see-through.
+    frag = vec4(color, global_opacity * alpha_scale);
 }
 """
 
@@ -620,6 +711,10 @@ out vec4 frag;
 void main() { frag = vec4(v_rgb, 1.0); }
 """
 
+# Selection outline: the selected triangles' edges, drawn after the geometry
+# with depth testing off so the wireframe reads through whatever is in front
+# of it. It marks the selection on its own -- the surface keeps its mode
+# colour, so "what is this part set to" stays readable while it is selected.
 OUTLINE_VERTEX_SHADER = """
 #version 330
 uniform mat4 mvp;
@@ -665,6 +760,24 @@ void main() { frag = vec4(color, 1.0); }
 """
 
 
+def visible_group_names(
+    scene: SceneData,
+    mesh_names,
+    triggers_visible: bool = True,
+) -> set[str]:
+    """Which scene groups belong in the index buffer.
+
+    Trigger boxes are added regardless of the mesh filter. That filter is
+    driven by the parts table, which has no row for a trigger, so filtering
+    boxes through it leaves every one of them unindexed -- drawn nowhere, and
+    invisible however far you zoom in.
+    """
+    names = set(mesh_names or ())
+    if triggers_visible:
+        names.update(scene.trigger_names)
+    return names
+
+
 def _perspective(fov_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
     f = 1.0 / math.tan(math.radians(fov_deg) / 2.0)
     out = np.zeros((4, 4), dtype=np.float64)
@@ -694,11 +807,15 @@ class GLRenderer:
             vertex_shader=PICK_VERTEX_SHADER,
             fragment_shader=PICK_FRAGMENT_SHADER,
         )
-        palette = [MODE_COLORS[m] for m in MODE_PALETTE_ORDER] + [SELECTED_COLOR]
+        palette = (
+            [MODE_COLORS[m] for m in MODE_PALETTE_ORDER]
+            + [TRIGGER_UNMOVED_COLOR, SELECTED_COLOR]
+        )
         self.prog["palette"].write(np.asarray(palette, dtype=np.float32).tobytes())
         self.prog["background"].write(np.asarray(PREVIEW_BACKGROUND, dtype=np.float32).tobytes())
         self.prog["dimmed_opacity"].value = DIMMED_OPACITY
         self.prog["global_opacity"].value = 1.0
+        self.prog["alpha_scale"].value = 1.0
         self._global_opacity = 1.0
         self.outline_prog["color"].write(np.asarray(OUTLINE_COLOR, dtype=np.float32).tobytes())
         self.size = (0, 0)
@@ -713,20 +830,28 @@ class GLRenderer:
         self._vbo_dimmed = None
         self._ibo = None
         self._ibo_outline = None
+        self._ibo_trigger = None
         self._vbo_pickid = None
         self._vao_conv = None
         self._vao_stock = None
         self._vao_outline_conv = None
+        self._vao_trigger_conv = None
+        self._vao_trigger_stock = None
         self._vao_outline_stock = None
         self._vao_pick_conv = None
         self._vao_pick_stock = None
+        self._vao_pick_trigger_conv = None
+        self._vao_pick_trigger_stock = None
         self._pick_names: list[str] = []
         self._pick_fbo = None
         self._pick_size = (0, 0)
         self._index_count = 0
         self._outline_index_count = 0
+        self._trigger_index_count = 0
         self._selected_names: set[str] = set()
         self._visible_names: set[str] | None = None
+        # Trigger boxes ignore the parts filter; this is their own switch.
+        self._triggers_visible = True
         self._grid_vao = None
         self._grid_count = 0
         self._build_grid()
@@ -775,12 +900,17 @@ class GLRenderer:
                 "_vbo_pickid",
                 "_ibo",
                 "_ibo_outline",
+                "_ibo_trigger",
                 "_vao_conv",
                 "_vao_stock",
                 "_vao_outline_conv",
+                "_vao_trigger_conv",
+                "_vao_trigger_stock",
                 "_vao_outline_stock",
                 "_vao_pick_conv",
                 "_vao_pick_stock",
+                "_vao_pick_trigger_conv",
+                "_vao_pick_trigger_stock",
             ):
                 buf = getattr(self, attr)
                 if buf is not None:
@@ -799,6 +929,7 @@ class GLRenderer:
             self._vbo_dimmed = self.ctx.buffer(np.zeros(len(scene.color_ids), dtype=np.float32).tobytes())
             self._ibo = self.ctx.buffer(scene.triangles.tobytes())
             self._ibo_outline = self.ctx.buffer(reserve=4)
+            self._ibo_trigger = self.ctx.buffer(reserve=4)
             layout = [
                 (self._vbo_conv, "3f", "in_pos"),
                 (self._vbo_color, "1f", "in_color"),
@@ -813,6 +944,14 @@ class GLRenderer:
                 (self._vbo_dimmed, "1f", "in_dimmed"),
             ]
             self._vao_stock = self.ctx.vertex_array(self.prog, layout_stock, index_buffer=self._ibo)
+            # Same vertices, same program: only the index buffer differs, so
+            # the trigger boxes can be drawn as their own pass.
+            self._vao_trigger_conv = self.ctx.vertex_array(
+                self.prog, layout, index_buffer=self._ibo_trigger
+            )
+            self._vao_trigger_stock = self.ctx.vertex_array(
+                self.prog, layout_stock, index_buffer=self._ibo_trigger
+            )
             self._vao_outline_conv = self.ctx.vertex_array(
                 self.outline_prog,
                 [(self._vbo_conv, "3f", "in_pos")],
@@ -840,6 +979,19 @@ class GLRenderer:
                 self.pick_prog,
                 [(self._vbo_stock, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
                 index_buffer=self._ibo,
+            )
+            # Trigger boxes live in their own index buffer for the translucent
+            # pass, so picking needs its own VAOs over that buffer too --
+            # otherwise the boxes are drawn but not clickable.
+            self._vao_pick_trigger_conv = self.ctx.vertex_array(
+                self.pick_prog,
+                [(self._vbo_conv, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
+                index_buffer=self._ibo_trigger,
+            )
+            self._vao_pick_trigger_stock = self.ctx.vertex_array(
+                self.pick_prog,
+                [(self._vbo_stock, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
+                index_buffer=self._ibo_trigger,
             )
             self._index_count = scene.triangle_count * 3
             self._outline_index_count = 0
@@ -869,29 +1021,54 @@ class GLRenderer:
     def _name_visible(self, name: str) -> bool:
         if self.scene is None or self._visible_names is None:
             return True
+        if name in self.scene.trigger_names:
+            return self._triggers_visible
         mesh = self.scene.alias_to_mesh.get(name, name)
         row = self.scene.pick_to_row.get(name, "")
         return name in self._visible_names or mesh in self._visible_names or row in self._visible_names
 
+    def set_triggers_visible(self, visible: bool) -> None:
+        self._triggers_visible = bool(visible)
+        self.set_visible(self._visible_names)
+
     def set_visible(self, mesh_names: set[str] | None) -> None:
-        """None -> everything visible; otherwise rebuild the index buffer."""
+        """None -> everything visible; otherwise rebuild the index buffer.
+
+        Trigger boxes are exempt from the mesh filter. It is driven by the
+        parts table, which has no row for a trigger, so filtering them by it
+        would leave every box permanently unindexed and therefore invisible.
+        """
         with _timed_ui("GLRenderer.set_visible"):
             if self.scene is None or self._ibo is None:
                 return
             self._visible_names = set(mesh_names) if mesh_names is not None else None
+            triggers = set(self.scene.trigger_names)
             if mesh_names is None:
-                triangles = self.scene.triangles
+                mesh_visible = set(self.scene.groups) - triggers
             else:
+                mesh_visible = visible_group_names(self.scene, mesh_names, False)
+
+            def gather(names) -> np.ndarray:
                 spans = [
                     self.scene.triangles[t0:t1]
-                    for name in mesh_names
+                    for name in names
                     for (t0, t1, _v0, _v1) in self.scene.groups.get(name, ())
                 ]
-                triangles = np.vstack(spans) if spans else np.zeros((0, 3), dtype=np.int32)
-            self._ibo.orphan(max(triangles.nbytes, 4))
-            if triangles.nbytes:
-                self._ibo.write(triangles.tobytes())
-            self._index_count = triangles.size
+                return np.vstack(spans) if spans else np.zeros((0, 3), dtype=np.int32)
+
+            triangles = gather(mesh_visible - triggers)
+            trigger_triangles = (
+                gather(triggers) if self._triggers_visible
+                else np.zeros((0, 3), dtype=np.int32)
+            )
+            for buffer, data, attr in (
+                (self._ibo, triangles, "_index_count"),
+                (self._ibo_trigger, trigger_triangles, "_trigger_index_count"),
+            ):
+                buffer.orphan(max(data.nbytes, 4))
+                if data.nbytes:
+                    buffer.write(data.tobytes())
+                setattr(self, attr, data.size)
             self._rebuild_outline_indices()
 
     def set_global_opacity(self, opacity: float) -> None:
@@ -1016,6 +1193,21 @@ class GLRenderer:
             vao.render(mode=self._moderngl.TRIANGLES, vertices=self._index_count)
             fbo.depth_mask = True
 
+        # Trigger boxes last and half see-through, with depth writes off. Last
+        # so they blend over the geometry they surround rather than depending
+        # on buffer order; writes off so two overlapping boxes cannot reject
+        # each other, and so a box never hides a mesh behind it.
+        trigger_vao = self._vao_trigger_stock if show_stock else self._vao_trigger_conv
+        if trigger_vao is not None and self._trigger_index_count:
+            if self.prog.get("mvp", None) is not None:
+                self.prog["mvp"].write(mvp.T.copy().tobytes())
+                self.prog["view"].write(view.astype(np.float32).T.copy().tobytes())
+            self.prog["alpha_scale"].value = TRIGGER_OPACITY
+            fbo.depth_mask = False
+            trigger_vao.render(mode=self._moderngl.TRIANGLES, vertices=self._trigger_index_count)
+            fbo.depth_mask = True
+            self.prog["alpha_scale"].value = 1.0
+
         outline_vao = self._vao_outline_stock if show_stock else self._vao_outline_conv
         if outline_vao is not None and self._outline_index_count:
             self.ctx.disable(self._moderngl.DEPTH_TEST)
@@ -1060,14 +1252,21 @@ class GLRenderer:
     ) -> str | None:
         """Return the mesh name under canvas pixel (x, y), or None for empty
         space. Only currently VISIBLE geometry is drawn into the pick buffer
-        (the pick VAOs share the visible index buffer), so hidden/soloed-out
-        parts are never selectable. x, y use tk canvas coords (origin top-left)."""
+        (the pick VAOs share the visible index buffers), so hidden/soloed-out
+        parts are never selectable. Meshes and trigger boxes are separate
+        buffers and both are drawn. x, y use tk canvas coords (top-left)."""
         width = max(16, int(width))
         height = max(16, int(height))
         if not (0 <= x < width and 0 <= y < height):
             return None
         vao = self._vao_pick_stock if show_stock else self._vao_pick_conv
-        if vao is None or not self._index_count or not self._pick_names:
+        trigger_vao = (
+            self._vao_pick_trigger_stock if show_stock else self._vao_pick_trigger_conv
+        )
+        drawable = (vao is not None and self._index_count) or (
+            trigger_vao is not None and self._trigger_index_count
+        )
+        if not drawable or not self._pick_names:
             return None
 
         _view, _proj, mvp = self._compute_view_proj(width, height, target, yaw, pitch, distance)
@@ -1080,7 +1279,14 @@ class GLRenderer:
         self.ctx.disable(self._moderngl.BLEND)
         self._pick_fbo.depth_mask = True
         self.pick_prog["mvp"].write(mvp.T.copy().tobytes())
-        vao.render(mode=self._moderngl.TRIANGLES, vertices=self._index_count)
+        if vao is not None and self._index_count:
+            vao.render(mode=self._moderngl.TRIANGLES, vertices=self._index_count)
+        # Solid for picking even though it is drawn see-through: a box you can
+        # see in front of a mesh is a box you expect to be able to click.
+        if trigger_vao is not None and self._trigger_index_count:
+            trigger_vao.render(
+                mode=self._moderngl.TRIANGLES, vertices=self._trigger_index_count
+            )
 
         # tk canvas y is top-down; the GL framebuffer is bottom-up.
         flipped_y = height - 1 - y

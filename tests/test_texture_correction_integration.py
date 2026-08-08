@@ -135,6 +135,61 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertTrue(any("Texture correction:" in message for message in progress_messages))
             self.assertTrue(any("finished" in message for message in progress_messages))
 
+    def test_a_skipped_part_is_reported_per_mesh_not_per_dae(self) -> None:
+        """One unbindable mesh must not be reported as ten failed ones.
+
+        The exporter skips a part it cannot wire and carries on, so the job
+        keeps the meshes it did correct and only the skipped mesh lands in
+        failures. Reporting the whole DAE as failed is what hid ten silently
+        uncorrected scintilla meshes behind one carbon-fibre console.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            context = minimal_context(tmp)
+            loaded = SimpleNamespace(
+                parts=[
+                    SimpleNamespace(key="scintilla_dashboard", node_id="scintilla_dashboard", node_name="Dashboard"),
+                    SimpleNamespace(key="scintilla_dash_controls", node_id="scintilla_dash_controls", node_name="Controls"),
+                ]
+            )
+            preview = SimpleNamespace(
+                report_path=tmp / "scintilla_rhd_preview.report.json",
+                dae_paths=(tmp / "scintilla_dashboard_rhd.dae",),
+                textures=[object()],
+                seconds=1.5,
+                failed_parts=(
+                    {
+                        "source_part": {
+                            "key": "scintilla_dash_controls",
+                            "label": "scintilla_dash_controls",
+                            "node_id": "scintilla_dash_controls",
+                            "node_name": "Controls",
+                        },
+                        "error": "ValueError: archive texture aliases did not match carbon",
+                    },
+                ),
+            )
+            progress_messages: list[str] = []
+
+            with (
+                patch("mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.scan_vehicle_archive", return_value=object()),
+                patch("mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.extract_archive_member", return_value=tmp / "source.dae"),
+                patch("mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.load_dae", return_value=loaded),
+                patch("mesh_segmentation_transform.mirror_texture_for_rhd.export_parts_preview", return_value=preview),
+            ):
+                report = core.export_texture_correction_artifacts(
+                    context,
+                    tmp / "unpacked_output",
+                    ["scintilla_dashboard", "scintilla_dash_controls"],
+                    progress=progress_messages.append,
+                )
+
+            self.assertEqual(report["jobs"][0]["meshes"], ["scintilla_dashboard"])
+            self.assertEqual(len(report["failures"]), 1)
+            self.assertEqual(report["failures"][0]["meshes"], ["scintilla_dash_controls"])
+            self.assertIn("carbon", report["failures"][0]["error"])
+            self.assertTrue(any("skipped 1" in message for message in progress_messages))
+
     def test_jbeam_patch_replaces_every_flexbody_array(self) -> None:
         source = """{
           "part_a": {

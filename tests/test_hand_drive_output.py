@@ -293,6 +293,63 @@ class GeneratedCameraTests(unittest.TestCase):
         self.assertIn('"rightHandCamera":false', rewritten)
         self.assertNotIn('"rightHandCamera":true', rewritten)
 
+    def _seat_plan(self, seat_body: str) -> dict[str, str]:
+        part_index = {
+            "car": (part("car", "main", "Car", (("seat_FL", "seat_FL"),)), "car.jbeam"),
+            "seat_FL": (seat_body, "interior.jbeam"),
+        }
+        selected = {
+            "parts": {"car", "seat_FL"},
+            "main_part": "car",
+            "part_instances": [
+                {
+                    "instance_id": "/car",
+                    "part_id": "car",
+                    "slot_id": "main",
+                    "slot_path": "/",
+                    "parent_instance_id": None,
+                },
+                {
+                    "instance_id": "/seat_FL/seat_FL",
+                    "part_id": "seat_FL",
+                    "slot_id": "seat_FL",
+                    "slot_path": "/seat_FL/",
+                    "parent_instance_id": "/car",
+                },
+            ],
+            "selected_by_slot": {"main": "car", "seat_FL": "seat_FL"},
+            "part_slot_options": {},
+        }
+        return generation_impl._generated_clone_plan(
+            context_with_parts(part_index, selected),
+            selected,
+            core.HAND_RHD,
+            "trim",
+            {},
+            {"f1ll": "f1rr", "f1r": "f1l"},
+            set(),
+        )
+
+    def test_a_seat_owning_the_driver_camera_is_still_cloned(self) -> None:
+        # etk800 declares its dash camera inside every driver-seat variant.
+        # Seats otherwise cross the car by slot occupancy, but no slot swap
+        # moves a camera -- and on a vehicle whose two seat slots are both
+        # filled the swap never runs -- so the clone has to happen anyway.
+        seat = (
+            '"seat_FL": {\n'
+            '"information": {"name": "Front Left Seat"},\n'
+            '"slotType": "seat_FL",\n'
+            f'"camerasInternal": {self.CAMERA_ARRAY}\n'
+            "}"
+        )
+        self.assertEqual(self._seat_plan(seat), {"seat_FL": "seat_FL_xp_rhd"})
+
+    def test_a_seat_without_a_camera_still_crosses_by_slot_occupancy(self) -> None:
+        self.assertEqual(
+            self._seat_plan(part("seat_FL", "seat_FL", "Front Left Seat")),
+            {},
+        )
+
 
 class OutputPackageNameTests(unittest.TestCase):
     @staticmethod

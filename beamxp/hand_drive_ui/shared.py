@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from beamxp import hand_drive_core as core
 from beamxp.model_preview import ModelPreview
@@ -132,20 +132,30 @@ def part_type_label(
     return "Unknown"
 
 
+# The transform order the dropdowns offer, commonest answer first. The
+# hotkeys below run along the same row of keys in the same order, so the
+# two must stay in step.
 MODE_CYCLE_VALUES = [
     core.MODE_SKIP,
     core.MODE_TRANSLATE,
-    core.MODE_MIRROR_POSITION,
     core.MODE_MIRROR,
     core.MODE_MIRROR_STRUCTURAL,
+    core.MODE_MIRROR_POSITION,
     core.MODE_REPLACE_SOURCE,
 ]
 MODE_VALUES_BY_LABEL = {mode_label(mode): mode for mode in MODE_CYCLE_VALUES}
-MODE_HOTKEYS = {
-    "q": core.MODE_SKIP,
-    "w": core.MODE_TRANSLATE,
-    "e": core.MODE_MIRROR,
-    "r": core.MODE_MIRROR_STRUCTURAL,
+MODE_HOTKEYS = dict(zip("qwerty", MODE_CYCLE_VALUES))
+
+# Widgets that are being typed into. A letter key belongs to whatever is
+# being typed, so the transform hotkeys stand down for these.
+TYPING_WIDGET_CLASSES = {
+    "Entry",
+    "TEntry",
+    "Text",
+    "Combobox",
+    "TCombobox",
+    "Spinbox",
+    "TSpinbox",
 }
 
 BUILD_LABELS = {
@@ -209,6 +219,7 @@ __all__ = [
     "SOURCE_ROOT_DIR",
     "STRUCTURAL_PROMPT_DELAY_MS",
     "THIS_DIR",
+    "TYPING_WIDGET_CLASSES",
     "ModelPreview",
     "Path",
     "PlateEditorDialog",
@@ -241,6 +252,7 @@ __all__ = [
     "timed_ui",
     "timed_worker",
     "tk",
+    "tkfont",
     "ttk",
     "yn_label",
 ]

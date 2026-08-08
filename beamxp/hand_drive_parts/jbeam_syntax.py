@@ -429,7 +429,31 @@ def trailing_options_object(values: list[str]) -> str | None:
     return None
 
 
+# Resolving one trim asks the same few hundred part bodies for their slots
+# over and over -- 11,894 calls over 435 distinct bodies for the etk800's 29
+# trims -- and each one re-masks the comments and re-scans the text. The
+# answer depends on nothing but the body, so it is remembered.
+_SLOT_DEF_CACHE: dict[str, tuple[SlotDef, ...]] = {}
+# A vehicle's whole part set is a few hundred bodies; the limit is only there
+# so a long session across many vehicles cannot grow without bound. Clearing
+# outright beats evicting one at a time: the next resolve refills what it
+# needs, and part bodies come in whole-vehicle sets rather than singly.
+_SLOT_DEF_CACHE_LIMIT = 4096
+
+
 def extract_slot_defs(part_body: str) -> list[SlotDef]:
+    cached = _SLOT_DEF_CACHE.get(part_body)
+    if cached is None:
+        cached = tuple(_parse_slot_defs(part_body))
+        if len(_SLOT_DEF_CACHE) >= _SLOT_DEF_CACHE_LIMIT:
+            _SLOT_DEF_CACHE.clear()
+        _SLOT_DEF_CACHE[part_body] = cached
+    # A fresh list each time: SlotDef is frozen, but callers have always been
+    # handed a list of their own and one of them may yet append to it.
+    return list(cached)
+
+
+def _parse_slot_defs(part_body: str) -> list[SlotDef]:
     out: list[SlotDef] = []
     seen: set[str] = set()
 

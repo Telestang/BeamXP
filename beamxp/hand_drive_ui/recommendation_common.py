@@ -1,189 +1,174 @@
+"""Name and placement rules behind Recommend Transforms.
+
+The recommender used to reason spatially: it rebuilt each trim's point
+clouds, cast rays from the driver's eye to decide what an occupant could
+actually see, and scored self-symmetry vertex by vertex. That cost seconds
+per vehicle and still disagreed with the hand-verified baselines often
+enough to need reviewing anyway.
+
+Mesh names carry the same intent far more cheaply, because BeamNG's authors
+encode a part's job in its name -- and the handed families we care about
+(door cards, wing mirrors, seats) are named for their side. Placement is
+used only to confirm what a name claims: an L/R pair has to straddle the
+centreline. Centres come from the preview bounds already cached for the 3D
+view, so a full pass over a vehicle is a dictionary walk.
+"""
+
 from __future__ import annotations
+
+import re
 
 from .shared import core
 
-# Thresholds are metres or fractions, tuned against the hand-verified
-# etk800 / pickup / sunburst2 baselines.
-SPATIAL_PAIR_DISTANCE = 0.020
-SPATIAL_PAIR_MIN_OFFSET = 0.05
-SPATIAL_REACH_LIMIT = 1.35
-SPATIAL_CONTACT_LIMIT = 0.0201
-SPATIAL_VISIBLE_FRACTION = 0.28
-SPATIAL_PASSENGER_VISIBLE_FRACTION = 0.08
+# A named twin must sit at least this far off the centreline before the
+# pairing is believed: a centred mesh has no opposite side to swap with.
+PAIR_MIN_OFFSET = 0.05
+
+# The side tokens a mesh name uses to say which side it is on. "lhd"/"rhd"
+# are deliberately absent -- they mark mutually exclusive builds of the whole
+# cabin, not two halves of one, and are masked out below.
+SIDE_TOKEN_PAIRS = (
+    ("_fl", "_fr"),
+    ("_fr", "_fl"),
+    ("_rl", "_rr"),
+    ("_rr", "_rl"),
+    ("_frontleft", "_frontright"),
+    ("_frontright", "_frontleft"),
+    ("_rearleft", "_rearright"),
+    ("_rearright", "_rearleft"),
+    ("_left", "_right"),
+    ("_right", "_left"),
+    ("_driver", "_passenger"),
+    ("_passenger", "_driver"),
+    ("_l", "_r"),
+    ("_r", "_l"),
+    ("-l", "-r"),
+    ("-r", "-l"),
+    (".l", ".r"),
+    (".r", ".l"),
+)
+
+TRANSLATE_PATTERNS = (
+    r"digidash|digital_?dash|cluster|instrument",
+    r"gauge|gauges|needle|speedo|tacho|tachometer",
+    r"(?:gas|brake|clutch|throttle).*pedal|pedal.*(?:gas|brake|clutch|throttle)",
+    r"pedalbox|pedal_box|padalbox",
+    r"steer(?:ing)?_?wheel|steerwheel|(?:^|_)steer_[0-9]",
+    r"paddle|signal_?stalk|wiper_?stalk",
+    r"shift_?light",
+    # Only the column TOP moves with the wheel (ignition and stalk details
+    # face the driver); column bodies and racks stay in the mirror pool.
+    r"steering_?column\w*top",
+)
+
+TRANSLATE_EXCLUDE_PATTERNS = (
+    # A pedalbox's own footplate moves with the pedals; standalone
+    # footplates and stands are cabin furniture and stay in the mirror pool.
+    r"(?<!box_)footplate|(?:^|_)stand(?:_|$)|stand_plate",
+)
+
+# Headliners and sunvisors deliberately do NOT appear here: they span the
+# cabin symmetrically on essentially every vehicle, so mirroring them only
+# generates mesh copies with no visual change.
+MIRROR_PATTERNS = (
+    r"dash|dashboard|console",
+    r"parking_?brake|park_?brake|pbrake|hand_?brake|(?:^|_)hb_",
+    r"shifter|shift_?knob|(?:^|_)grp_shift",
+    r"radio|laptop|interior",
+    r"steering_?column|(?:^|_)column(?:_|$)",
+    r"intmirror|grp_mirror|hazard|dash_key|(?:^|_)key(?:_|$)",
+    r"extinguisher|footplate|(?:^|_)stand(?:_|$)|stand_plate|cable",
+    # A display panel mirrors like any other fascia part. The texture flip
+    # that keeps it readable is derived at build time from the
+    # beamNavigator controller, not recommended here. "windscreen" must not
+    # match; "gauges_screen" is claimed by the translate patterns first.
+    r"(?<!wind)screen",
+)
+
+# The families that convert by swapping sides rather than by transforming a
+# mesh in place. Vanilla bx ships all three as authored LHD/RHD pairs.
+HANDED_PATTERNS = (
+    r"door_?panel|door_?card",
+    r"(?:^|_)mirror(?:_|$)|mirror_?stalk",
+    r"(?:^|_)(?:race_?)?seats?(?:_|$)|racing_?seat",
+)
+
+# Plural "seats" meshes are cabin-spanning benches (etk800_seats_R = rear
+# bench, where R means rear, not right): symmetric, nothing to mirror.
+UNPAIRED_MIRROR_EXCLUDE_PATTERNS = (
+    r"seats(?:_|$)",
+)
+
+# Names whose verdict rides on a single token the mesh resolution cannot
+# confirm, so the row is offered as a suggestion rather than a finding.
+LOW_CONFIDENCE_PATTERNS = (
+    r"steering_?column|(?:^|_)column(?:_|$)",
+)
+
+# Each handed family converts by a different mechanism: a seat rides in a
+# slot the opposite part also fits, while a door card is locked to its side
+# and can only cross-swap its mesh.
+_SEAT_NAME_RE = re.compile(r"\b(seat|bucket|racingseat)\b")
+_SEAT_NAME_TOKENS = ("seat_", "_seat", "racingseat", "seatbase", "seat_base")
+_DOOR_CARD_NAME_RE = re.compile(r"door[^a-z0-9]{0,2}(panel|card)")
 
 
-def _driver_control_outboard_limit(below_eye: float) -> float:
-    """Outboard reach of the control volume at a given height.
+def _is_seat_mesh_id(object_id: str) -> bool:
+    text = object_id.lower()
+    if _SEAT_NAME_RE.search(text):
+        return True
+    return any(token in text for token in _SEAT_NAME_TOKENS)
 
-    Dashboard controls cluster close to the steering column, while foot
-    controls legitimately spread farther towards the driver's door.  Blend
-    between those two widths so the volume follows the sloping control area
-    instead of treating the whole dashboard/footwell as a rectangular slab.
+
+def _is_door_card_mesh_id(object_id: str) -> bool:
+    """A door card is named for its lining panel, not the door skin."""
+    return bool(_DOOR_CARD_NAME_RE.search(object_id.lower()))
+
+
+def _side_pair_kind_for_mesh(*names: str) -> str:
+    """The Equivalent Parts family an equivalence row belongs to."""
+    text = " ".join(name.lower() for name in names if name)
+    if _is_seat_mesh_id(text):
+        return "seat"
+    if _is_door_card_mesh_id(text):
+        return "door"
+    if "mirror" in text:
+        return "mirror"
+    return "part"
+
+
+def recommendation_text(context: core.VehicleContext, object_id: str) -> str:
+    """The name evidence for one mesh: its id plus its DAE node name."""
+    values = [object_id]
+    obj = context.objects.get(object_id)
+    if obj is not None and obj.name and obj.name != object_id:
+        values.append(obj.name)
+    return re.sub(r"[^a-z0-9]+", "_", " ".join(values).lower())
+
+
+def recommendation_matches(text: str, patterns: tuple[str, ...]) -> bool:
+    return any(re.search(pattern, text) is not None for pattern in patterns)
+
+
+def mesh_center(context: core.VehicleContext, object_id: str) -> tuple[float, float, float] | None:
+    """Where a mesh sits, from the bounds already cached for the preview.
+
+    A DaeObject's own x/y/z is the node transform, which is the origin for
+    well over half of a real vehicle's meshes (the placement lives in the
+    flexbody rows instead). The preview centre is the geometry's, so it is
+    the only cheap position worth gating a pairing on.
     """
-    footwell_fraction = min(max((below_eye - 0.45) / 0.25, 0.0), 1.0)
-    return 0.24 + 0.09 * footwell_fraction
-
-
-def _is_enclosed_candidate(
-    stats: dict[str, float],
-    out80: float,
-    half_width: float,
-) -> bool:
-    """Whether shell evidence places a mesh inside the occupied cabin."""
-    ordinarily_inboard = out80 <= half_width - 0.02
-    lined_at_boundary = (
-        stats["front_vf"] >= 0.25
-        and stats["front_backed"] >= 0.75
-        and stats["front_lined"] >= 0.75
-        and out80 <= half_width
-        and stats["front_depth"] <= 0.35
-    )
-    return (
-        stats["front_vf"] >= 0.08
-        and stats["front_backed"] >= 0.45
-        and stats["front_depth"] <= 0.45
-        and (ordinarily_inboard or lined_at_boundary)
-    )
-
-
-def _unscoped_contact_is_cabin_furniture(
-    points: object,
-    frame: core.DriverFrame,
-) -> bool:
-    """Bound hidden contact inheritance to the occupant-sized cabin volume."""
-    import numpy as np
-
-    if points is None:
-        return False
-    cloud = np.asarray(points, dtype=float)
-    if len(cloud) < 4:
-        return False
-    centroid = cloud.mean(axis=0)
-    z70 = float(np.percentile(cloud[:, 2], 70))
-    driver_eye = np.asarray(frame.eye, dtype=float)
-    passenger_eye = driver_eye.copy()
-    passenger_eye[0] = 2.0 * frame.center_x - driver_eye[0]
-    driver_forward = np.asarray(frame.forward, dtype=float)
-    passenger_forward = driver_forward.copy()
-    passenger_forward[0] *= -1.0
-
-    def inside_from(eye: np.ndarray, forward: np.ndarray) -> bool:
-        ahead = float((centroid[:2] - eye[:2]) @ forward[:2])
-        range80 = float(np.percentile(np.linalg.norm(cloud - eye, axis=1), 80))
-        return (
-            -0.60 <= ahead <= 1.00
-            and eye[2] - 0.70 <= z70 <= eye[2] + 0.35
-            and range80 <= 1.60
-        )
-
-    return inside_from(driver_eye, driver_forward) or inside_from(
-        passenger_eye, passenger_forward
-    )
-
-
-def _spatial_entries_for_trim(
-    context: core.VehicleContext,
-    trim: str | None,
-    available: set[str],
-) -> tuple[list[str], dict[str, object]]:
-    """Meshes present in one trim with their per-trim point clouds."""
-    if trim is None:
-        present = sorted(available)
-        entries = context.preview_by_id
-        resolved = {}
-    else:
-        present = sorted(core.used_meshes_for_config(context, trim) & available)
-        entries = core.preview_entries_for_config(context, trim)
-        resolved = core.resolved_mesh_positions_for_config(context, trim)
-    import numpy as np
-
-    arrays: dict[str, object] = {}
-    for object_id in present:
-        placement = resolved.get(object_id)
-        if placement is not None and (
-            len(placement.matrices) > 1
-            or object_id in context.variant_dependent_meshes
-        ):
-            rebuilt = core.vertex_cloud_for_resolved_placement(context, object_id, placement)
-            if rebuilt is not None:
-                arrays[object_id] = rebuilt
-                continue
-        item = entries.get(object_id) or context.preview_by_id.get(object_id)
-        if item is None:
-            continue
-        arrays[object_id] = np.array(item["sample_points"], dtype=float)
-    return [o for o in present if o in arrays], arrays
-
-
-def _spatial_surfaces_for_trim(
-    context: core.VehicleContext,
-    trim: str | None,
-    present: list[str],
-    entries_np: dict[str, object],
-) -> dict[str, object]:
-    """Filled DAE surfaces at the same per-trim placement as point clouds."""
-    import numpy as np
-
-    base = core.full_surface_triangles_for_ids(context, present)
-    resolved = (
-        core.resolved_mesh_positions_for_config(context, trim)
-        if trim is not None else {}
-    )
-    surfaces: dict[str, object] = {}
-    for object_id in present:
-        placement = resolved.get(object_id)
-        if placement is not None and (
-            len(placement.matrices) > 1
-            or object_id in context.variant_dependent_meshes
-        ):
-            rebuilt = core.surface_triangles_for_resolved_placement(
-                context, object_id, placement
-            )
-            if rebuilt is not None and len(rebuilt):
-                surfaces[object_id] = rebuilt
-                continue
-        triangles = base.get(object_id)
-        points = entries_np.get(object_id)
-        preview = context.preview_by_id.get(object_id)
-        if triangles is None or len(triangles) == 0 or points is None or preview is None:
-            continue
-        placed_center = (np.min(points, axis=0) + np.max(points, axis=0)) / 2.0
-        preview_center = np.asarray(preview.get("center"), dtype=float)
-        if preview_center.shape == (3,):
-            delta = placed_center - preview_center
-            if float(np.max(np.abs(delta))) > 1e-9:
-                triangles = triangles + delta
-        surfaces[object_id] = triangles
-    return surfaces
-
-
-def _mesh_symmetry(
-    context: core.VehicleContext,
-    object_id: str,
-    points: object,
-    center_x: float,
-) -> tuple[int, float]:
-    """Full-vertex symmetry evidence at this trim's x placement."""
-    import numpy as np
-
-    full = core.full_vertex_clouds_for_ids(context, (object_id,)).get(object_id)
-    if full is None or len(full) == 0:
-        full = np.asarray(points, dtype=float)
-    placed = np.asarray(points, dtype=float)
-    preview = context.preview_by_id.get(object_id, {})
-    base_center = preview.get("center")
-    if len(placed):
-        placed_center_x = float((placed[:, 0].min() + placed[:, 0].max()) / 2.0)
-    else:
-        placed_center_x = float(center_x)
-    shift_x = placed_center_x - float(base_center[0]) if base_center is not None else 0.0
-    key = (object_id, round(shift_x, 9), round(float(center_x), 9))
-    cache = getattr(context, "_mesh_symmetry_cache", None)
-    if cache is None:
-        cache = {}
-        context._mesh_symmetry_cache = cache
-    if key not in cache:
-        shifted = np.asarray(full, dtype=float).copy()
-        shifted[:, 0] += shift_x
-        cache[key] = core.reflected_orphan_stats(shifted, center_x)
-    return cache[key]
+    preview = context.preview_by_id.get(object_id)
+    if preview is not None:
+        center = preview.get("center")
+        if center is not None and len(center) == 3:
+            return (float(center[0]), float(center[1]), float(center[2]))
+    obj = context.objects.get(object_id)
+    if obj is None:
+        return None
+    if obj.x == 0.0 and obj.y == 0.0 and obj.z == 0.0:
+        # The exact origin means no placement was recorded on the node, not
+        # that the mesh straddles the centreline. Saying "unknown" keeps the
+        # name pairing; saying "centred" would silently veto it.
+        return None
+    return (float(obj.x), float(obj.y), float(obj.z))

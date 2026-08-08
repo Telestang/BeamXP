@@ -810,6 +810,108 @@ def _finalise_trigger_owners(
     return prop_anchors, node_transforms, flex_bounds
 
 
+def authored_trigger_placements(
+    part_body: str,
+    node_positions: dict[str, tuple[float, float, float]],
+) -> dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    """Each trigger's anchor point and the middle of the shape it places.
+
+    They differ for a box, whose baseTranslation is a corner: the anchor is
+    the raw authored value and makes the stable identity, while the centre is
+    where the thing actually is and so is what gets drawn and attributed.
+    """
+    placements: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = {}
+    for trigger_id, row, spans, index_of, source_ids in iter_trigger_rows(part_body):
+        if any(node_id not in node_positions for node_id in source_ids):
+            continue
+        frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
+        if frame is None:
+            continue
+        # The identity stays on the squared-up frame so a saved answer is not
+        # orphaned by corrections to how the engine is read; the placement
+        # uses the raw frame, which is what the engine actually measures along.
+        key_anchor = _trigger_row_centre(row, spans, index_of, frame)
+        if key_anchor is None:
+            continue
+        placement = trigger_placement_frame(
+            *(node_positions[node_id] for node_id in source_ids)
+        ) or frame
+        anchor = _trigger_row_centre(row, spans, index_of, placement) or key_anchor
+        shape = _trigger_row_shape(row, spans, index_of)
+        if shape == "sphere":
+            placements[trigger_id] = (key_anchor, anchor)
+            continue
+        axes = trigger_box_axes(
+            frame,
+            _trigger_row_vector(row, spans, index_of, "baseRotation"),
+            _trigger_row_vector(row, spans, index_of, "rotation"),
+        )
+        centre = trigger_box_centre(
+            anchor, axes, _trigger_row_size(row, spans, index_of)
+        )
+        placements[trigger_id] = (key_anchor, centre)
+    return placements
+
+
+def authored_trigger_positions(
+    part_body: str,
+    node_positions: dict[str, tuple[float, float, float]],
+) -> dict[str, tuple[float, float, float]]:
+    """Each trigger's anchor point -- the identity the Triggers table keys on.
+
+    Deliberately the raw authored placement rather than the shape's middle,
+    so a saved answer survives any later correction to how a shape is read.
+    """
+    positions: dict[str, tuple[float, float, float]] = {}
+    for trigger_id, row, spans, index_of, source_ids in iter_trigger_rows(part_body):
+        if any(node_id not in node_positions for node_id in source_ids):
+            continue
+        frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
+        if frame is None:
+            continue
+        centre = _trigger_row_centre(row, spans, index_of, frame)
+        if centre is not None:
+            positions[trigger_id] = centre
+    return positions
+
+
+def trigger_modes_for_part(
+    conversion: dict[str, object],
+    context: VehicleContext,
+    part_body: str,
+    node_positions: dict[str, tuple[float, float, float]],
+    target_hand: str,
+) -> dict[str, tuple[str, float, list[list[float]] | None] | None]:
+    """The user's answers for one part's triggers, as owner transforms.
+
+    Matched by authored position, so the same switch authored at the same
+    place in a road dash and a race dash takes one answer, and two boxes that
+    merely share a name do not. Only answered triggers appear here; the rest
+    fall through to the attribution ladder.
+    """
+    chosen = trigger_mode_map(conversion)
+    if not chosen:
+        return {}
+    magnitude = delta_magnitude(context, conversion)
+    resolved: dict[str, tuple[str, float, list[list[float]] | None] | None] = {}
+    for trigger_id, centre in authored_trigger_positions(part_body, node_positions).items():
+        key = trigger_position_key(trigger_id, centre)
+        mode = chosen.get(key) if key is not None else None
+        if mode is None:
+            continue
+        if mode == MODE_TRANSLATE:
+            resolved[trigger_id] = (
+                "translate",
+                signed_delta_for_target(target_hand, magnitude),
+                None,
+            )
+        elif mode == MODE_MIRROR:
+            resolved[trigger_id] = ("mirror", 0.0, None)
+        else:
+            resolved[trigger_id] = None  # Skip: leave the box where it was
+    return resolved
+
+
 def trigger_owners_for_part(
     context: VehicleContext,
     part_body: str,
@@ -1078,7 +1180,25 @@ def _relocation_clone_body(
     )
 
 
-def _generated_clone_excluded(source_part_id: str, part_body: str) -> bool:
+def _generated_clone_excluded(
+    source_part_id: str,
+    part_body: str,
+    node_mirror_map: dict[str, str],
+) -> bool:
+    """Whether a part is handled by moving it rather than by cloning it.
+
+    Seats cross the car by slot occupancy -- the opposite slot takes the same
+    part -- so cloning one would bake a second seat instead of moving the one
+    that exists.
+
+    A seat that declares the driver's internal camera is the exception, and
+    it is not a rare one: etk800 hangs its dash camera off every driver-seat
+    variant. Nothing about a slot swap moves that camera, and on a vehicle
+    whose two seat slots are already filled the swap does not even run, so
+    excluding the part would leave the driver's eye on the original side.
+    """
+    if part_has_transformable_internal_camera(part_body, node_mirror_map):
+        return False
     tokens = [source_part_id.lower()]
     tokens.extend(slot_type.lower() for slot_type in transform_helpers.extract_part_slot_types(part_body))
     return any("seat" in token for token in tokens)
@@ -1178,7 +1298,7 @@ def _generated_clone_plan(
         if found is None:
             continue
         part_body, _filename = found
-        if _generated_clone_excluded(source_part_id, part_body):
+        if _generated_clone_excluded(source_part_id, part_body, node_mirror_map):
             continue
         slot_defs = part_slot_defs_for_context(context, source_part_id)
         if slot_defs:
@@ -1313,7 +1433,7 @@ def write_generated_jbeam_and_configs(
             if found is None:
                 continue
             part_body, _filename = found
-            if _generated_clone_excluded(str(source_part_id), part_body):
+            if _generated_clone_excluded(str(source_part_id), part_body, node_mirror_map):
                 continue
             part_meshes = part_mesh_names_for_context(context, str(source_part_id))
             mesh_hits = sorted(mesh for mesh in part_meshes if mesh in object_modes)
@@ -1447,6 +1567,15 @@ def write_generated_jbeam_and_configs(
                 if str(source_part_id) in selected_part_ids
                 else part_trigger_owners
             )
+            # The Triggers table overrides all of the above for the rows the
+            # user has answered.
+            part_trigger_follows = trigger_modes_for_part(
+                conversion,
+                context,
+                part_body,
+                prop_node_positions,
+                target_hand,
+            )
 
             cloned_bodies.append(
                 clone_part_for_target(
@@ -1466,6 +1595,7 @@ def write_generated_jbeam_and_configs(
                     generated_parts_for_source,
                     trigger_owners,
                     mirror_plane_sources,
+                    part_trigger_follows,
                 )
             )
 
@@ -1846,6 +1976,7 @@ def full_vehicle_preview_payload(
     config_name: str,
     run_dir: Path,
     extra_meshes: Iterable[str] = (),
+    trigger_actions: dict[tuple, str] | None = None,
 ) -> dict[str, object]:
     """Full-vehicle Blender preview of one config after conversion.
 
@@ -2415,6 +2546,120 @@ def full_vehicle_preview_payload(
         "instances": instances,
         "skipped_meshes": skipped,
         "rotation_calibration": rotation_counts,
+        "trigger_boxes": preview_trigger_boxes(
+            context, conversion, selected, target_hand or HAND_RHD, trigger_actions
+        ),
     }
 
-__all__ = ['generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload']
+
+def converted_trigger_corners(
+    corners: list[tuple[float, float, float]],
+    action: str,
+    delta: float,
+) -> list[tuple[float, float, float]]:
+    """Where a box ends up once its transform is applied.
+
+    Mirroring reflects it across the centreline -- the rewrite repoints the
+    ref triple at the mirrored nodes, which lands the box on the reflection of
+    its authored point (see the door-pair regression). A move slides it along
+    x by the conversion delta. Skip leaves it exactly where it was.
+    """
+    if action == "mirror":
+        return [(-x, y, z) for x, y, z in corners]
+    if action == "translate":
+        return [(x + delta, y, z) for x, y, z in corners]
+    return list(corners)
+
+
+def preview_trigger_boxes(
+    context: VehicleContext,
+    conversion: dict[str, object],
+    selected: dict[str, object],
+    target_hand: str = HAND_RHD,
+    trigger_actions: dict[tuple, str] | None = None,
+) -> list[dict[str, object]]:
+    """The trigger boxes this config fits, as drawable corner sets.
+
+    A trigger has no mesh of its own -- it is three node references and an
+    offset -- so the preview has to build the geometry rather than load it.
+    Every box carries both placements, exactly as a mesh does: where it sits
+    once converted, and where it sits in the original layout.
+
+    ``trigger_actions`` maps (trigger id, position) to the action the box will
+    receive. The caller supplies it because working it out means running the
+    attribution ladder, which the UI has already done and cached.
+    """
+    node_positions = context.node_positions
+    chosen = trigger_mode_map(conversion)
+    actions = trigger_actions or {}
+    delta = signed_delta_for_target(target_hand, delta_magnitude(context, conversion))
+    mode_actions = {
+        MODE_SKIP: "skip",
+        MODE_TRANSLATE: "translate",
+        MODE_MIRROR: "mirror",
+    }
+    boxes: list[dict[str, object]] = []
+    seen: set[tuple] = set()
+    for part_id in sorted({str(part) for part in selected.get("parts", ())}):
+        found = part_body_for_context(context, part_id)
+        if found is None:
+            continue
+        part_body = found[0]
+        twinned = twinned_trigger_ids(
+            entry[0] for entry in iter_trigger_rows(part_body)
+        )
+        for trigger_id, row, spans, index_of, source_ids in iter_trigger_rows(part_body):
+            if any(node_id not in node_positions for node_id in source_ids):
+                continue
+            frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
+            if frame is None:
+                continue
+            key_anchor = _trigger_row_centre(row, spans, index_of, frame)
+            if key_anchor is None:
+                continue
+            placement = trigger_placement_frame(
+                *(node_positions[node_id] for node_id in source_ids)
+            ) or frame
+            centre = _trigger_row_centre(row, spans, index_of, placement) or key_anchor
+            key = trigger_position_key(trigger_id, key_anchor)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            mode = chosen.get(key)
+            if mode is None:
+                mode = MODE_SKIP if trigger_id in twinned else ""
+            # What the box will actually do: the user's answer if there is
+            # one, otherwise whatever the caller resolved from the ladder.
+            action = (
+                mode_actions.get(str(mode), "skip")
+                if mode
+                else str(actions.get(key, ""))
+            )
+            axes = trigger_box_axes(
+                frame,
+                _trigger_row_vector(row, spans, index_of, "baseRotation"),
+                _trigger_row_vector(row, spans, index_of, "rotation"),
+            )
+            shape = _trigger_row_shape(row, spans, index_of)
+            # `centre` here is the row's anchor: for a box that is a corner,
+            # and trigger_shape_mesh grows the shape from it.
+            authored, faces = trigger_shape_mesh(
+                centre, axes, _trigger_row_size(row, spans, index_of), shape
+            )
+            boxes.append({
+                "id": trigger_id,
+                "at": list(key[1]),
+                "mode": mode,
+                "action": action,
+                "shape": shape,
+                "faces": [list(face) for face in faces],
+                "vertices": [
+                    list(vertex)
+                    for vertex in converted_trigger_corners(authored, action, delta)
+                ],
+                "vertices_stock": [list(vertex) for vertex in authored],
+            })
+    boxes.sort(key=lambda box: (str(box["id"]), tuple(box["at"])))
+    return boxes
+
+__all__ = ['converted_trigger_corners', 'preview_trigger_boxes', 'authored_trigger_placements', 'authored_trigger_positions', 'trigger_modes_for_part', 'trigger_owners_for_config', 'trigger_owners_for_part', 'generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload']

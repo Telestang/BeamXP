@@ -46,7 +46,7 @@ If Defender (or anything else) flags a release for you, please [open an issue](#
 - Selects front and rear plate meshes independently from BeamNG's shared vanilla physical-plate library; each trim's stock part is labelled `(default)` and `None` is available per side.
 - Shows a live in-app 3D preview of the conversion that updates as you work.
 - Builds one output mod zip containing all selected XP trim outputs and installs it into your BeamNG mods folder.
-- Lets each part be set to `Skip`, `Translate`, `Mirror Aesthetic`, or `Mirror Structural` — via an in-table dropdown or the `Q`/`W`/`E`/`R` hotkeys.
+- Lets each part be set to `Skip`, `Move`, `Mirror`, `Swap Mesh`, `Mirror Move`, or `Replace Source` — via an in-table dropdown or the `Q`/`W`/`E`/`R`/`T`/`Y` hotkeys.
 - Recommends part modes automatically (`Recommend Modes`): left/right structural pairs, driver controls, screens, and asymmetric interior parts, with rules tuned against hand-verified conversions.
 - Un-mirrors the texture on mirrored display screens (`Flip Tex`) so satnav and infotainment content keeps its left/right reading.
 - Detects steering side where possible.
@@ -63,10 +63,10 @@ If Defender (or anything else) flags a release for you, please [open an issue](#
 2. Select a source BeamNG vehicle `.zip`.
 3. If prompted, choose the vehicle model ID.
 4. Select the variants/trims you want to convert.
-5. Click `Recommend Modes` to auto-fill the common cases, then set the rest by hand — click a part's `Mode` cell for a dropdown, or select part(s) and press `Q` (Skip), `W` (Mirror Aesthetic), `E` (Mirror Structural), or `R` (Translate):
-   - `Translate` for steering wheels, pedals, gauges, stalks, screens, and other driver-specific interior items.
-   - `Mirror Aesthetic` for parts that only need visual mirroring.
-   - `Mirror Structural` for paired parts where you want the opposite-side mesh on the existing structure, such as door cards or mirrors.
+5. Click `Recommend Modes` to auto-fill the common cases, then set the rest by hand — click a part's `Mode` cell for a dropdown, or select part(s) and press `Q` (Skip), `W` (Move), `E` (Mirror), `R` (Swap Mesh), `T` (Mirror Move), or `Y` (Replace Source):
+   - `Move` for steering wheels, pedals, gauges, stalks, screens, and other driver-specific interior items.
+   - `Mirror` for parts that only need visual mirroring.
+   - `Swap Mesh` for paired parts where you want the opposite-side mesh on the existing structure, such as door cards or mirrors.
 6. Mark the steering wheel part as `Steering Ref` if automatic delta detection needs help.
 7. Optionally set `Licence plates` to a custom design or a saved set — see Licence Plates below.
 8. Use the in-app preview or Blender preview to inspect alignment.
@@ -104,10 +104,11 @@ pip install -r requirements.txt
 
 `requirements.txt` covers the in-app preview (numpy, moderngl) and preview image handling (Pillow). PyInstaller is only installed by the packaging script if you build the Windows exe yourself.
 
-Recommend Modes automatically uses an OpenGL 4.3 compute-capable GPU for its
-spatial geometry kernels when available; it does not require CUDA. Unsupported
-or failed GPU setup falls back to the equivalent CPU implementation. Set
-`BEAMXP_SPATIAL_BACKEND=cpu` to force the reference CPU path for diagnostics.
+Recommend Modes reads part names and the mesh placements already cached for
+the preview, so it needs no GPU and finishes in well under a second. The
+OpenGL 4.3 compute kernels in `spatial_visibility_backend` remain for the
+standalone classifier sandbox in `spatial_classifier/`; set
+`BEAMXP_SPATIAL_BACKEND=cpu` to force the reference CPU path there.
 
 The tool can still build conversions without Blender configured.
 
@@ -158,7 +159,7 @@ For fine offset tuning, select the part that needs adjustment in a Blender previ
 
 ## Part Modes
 
-`Recommend Modes` scans the used-parts list and proposes a mode per part from its name: left/right pairs (door cards, mirrors, seats) become `Mirror Structural`, driver controls and instruments become `Translate`, asymmetric interior parts become `Mirror Aesthetic`, display screens get `Mirror Aesthetic` with `Flip Tex`, and one-sided seat or mirror hardware with no opposite counterpart is mirrored across. The rules are tuned against hand-verified conversions — the entire vanilla ETK 800-Series recommends correctly with no manual fixes. Review the list and apply the rows you agree with; nothing is changed until you apply.
+`Recommend Modes` scans the used-parts list and proposes a mode per part from its name: left/right pairs of door cards and wing mirrors become `Mirror Structural`, seats become an `Equivalent Parts` row instead (their slot takes either side's part, so the mesh is left alone), driver controls and instruments become `Translate`, asymmetric interior parts become `Mirror Aesthetic`, and one-sided seat or mirror hardware with no opposite counterpart is mirrored across. A name pair is only believed when the two meshes really do sit on opposite sides of the centreline. Review the list and apply the rows you agree with; nothing is changed until you apply.
 
 ### Translate
 
@@ -185,7 +186,7 @@ Swaps an opposite-side mirrored mesh onto the existing source-side JBeam structu
 
 ### Flip Tex
 
-Mirroring a mesh also mirror-images its texture. That is correct for most trim, but wrong for parts that display readable content — a satnav/infotainment screen, badges, decals with text. Toggle `Flip Tex` on a `Mirror Aesthetic` part to reflect its texture coordinates horizontally along with the geometry, so the image keeps its normal left/right reading. The reflection happens within the part's own UV footprint, so it keeps sampling the same region of a shared texture atlas. `Mirror Structural` deliberately does not offer it: that mode swaps in the opposite-side mesh, which already carries its own correct texture mapping. `Recommend Modes` proposes it automatically for display screens, found from the vehicle's own navigator controllers, glowMaps and emissive screen-like materials, so a cluster that groups its satnav and instrument displays into one mesh is covered as well.
+Mirroring a mesh also mirror-images its texture. That is correct for most trim, but wrong for parts that display readable content — a satnav/infotainment screen, badges, decals with text. Toggle `Flip Tex` on a `Mirror Aesthetic` part to reflect its texture coordinates horizontally along with the geometry, so the image keeps its normal left/right reading. The reflection happens within the part's own UV footprint, so it keeps sampling the same region of a shared texture atlas. `Mirror Structural` deliberately does not offer it: that mode swaps in the opposite-side mesh, which already carries its own correct texture mapping. It is not a recommendation: the build derives the flip from the vehicle's own navigator controllers, glowMaps and emissive screen-like materials, so a cluster that groups its satnav and instrument displays into one mesh is covered as well.
 
 ## Licence Plates
 

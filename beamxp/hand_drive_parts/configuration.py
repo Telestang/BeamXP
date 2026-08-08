@@ -211,6 +211,100 @@ def clear_side_pairs(conversion: dict[str, object]) -> None:
     conversion["sidePairs"] = []
 
 
+# A trigger box is placed by three jbeam nodes plus an offset in the frame
+# they build, so what it ends up attached to is a question the automatic
+# attribution can only guess at -- and on the scintilla it guesses nothing at
+# all for six of sixteen boxes. These records let the user answer directly.
+#
+# The key is the box's authored position, not the part it is declared in.
+# That is what makes the records trim-proof: the same switch declared in a
+# road dash and a race dash is one row when both author it at the same place,
+# and two rows -- "headlights #1", "headlights #2" -- when they do not. Either
+# way the answer travels with the box rather than with a trim's part list.
+TRIGGER_POSITION_PLACES = 3  # a millimetre; finer than any authored offset
+TRIGGER_MODES = (MODE_SKIP, MODE_TRANSLATE, MODE_MIRROR)
+
+
+def trigger_position_key(
+    trigger_id: object,
+    position: object,
+) -> tuple[str, tuple[float, float, float]] | None:
+    """(trigger id, position rounded to the millimetre), or None if unusable."""
+    name = str(trigger_id or "")
+    if not name or not isinstance(position, (list, tuple)) or len(position) != 3:
+        return None
+    try:
+        rounded = tuple(round(float(value), TRIGGER_POSITION_PLACES) for value in position)
+    except (TypeError, ValueError):
+        return None
+    return name, rounded
+
+
+def normalized_trigger_modes(value: object) -> list[dict[str, object]]:
+    """Clean saved per-trigger transform records, last entry per key winning."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    by_key: dict[tuple[str, tuple[float, float, float]], dict[str, object]] = {}
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        key = trigger_position_key(entry.get("id"), entry.get("at"))
+        if key is None:
+            continue
+        mode = str(entry.get("mode") or MODE_SKIP)
+        if mode not in TRIGGER_MODES:
+            continue
+        by_key[key] = {"id": key[0], "at": list(key[1]), "mode": mode}
+    return [by_key[key] for key in sorted(by_key)]
+
+
+def trigger_mode_map(
+    conversion: dict[str, object],
+) -> dict[tuple[str, tuple[float, float, float]], str]:
+    """(trigger id, authored position) -> the transform the user chose.
+
+    An absent key has no answer from the user, which is what the resolver
+    reads as "use the automatic attribution".
+    """
+    return {
+        trigger_position_key(entry["id"], entry["at"]): str(entry["mode"])
+        for entry in normalized_trigger_modes(conversion.get("triggers"))
+    }
+
+
+def set_trigger_mode(
+    conversion: dict[str, object],
+    trigger_id: str,
+    position: object,
+    mode: str,
+) -> None:
+    """Record the transform for the box of this id at this position."""
+    key = trigger_position_key(trigger_id, position)
+    if key is None or mode not in TRIGGER_MODES:
+        return
+    records = [
+        entry
+        for entry in normalized_trigger_modes(conversion.get("triggers"))
+        if trigger_position_key(entry["id"], entry["at"]) != key
+    ]
+    records.append({"id": key[0], "at": list(key[1]), "mode": mode})
+    conversion["triggers"] = normalized_trigger_modes(records)
+
+
+def clear_trigger_mode(conversion: dict[str, object], trigger_id: str, position: object) -> None:
+    """Drop one record, handing that box back to the automatic attribution."""
+    key = trigger_position_key(trigger_id, position)
+    conversion["triggers"] = [
+        entry
+        for entry in normalized_trigger_modes(conversion.get("triggers"))
+        if key is None or trigger_position_key(entry["id"], entry["at"]) != key
+    ]
+
+
+def clear_trigger_modes(conversion: dict[str, object]) -> None:
+    conversion["triggers"] = []
+
+
 def default_variant_settings(context: VehicleContext) -> dict[str, dict[str, object]]:
     return {
         name: {
@@ -258,6 +352,7 @@ def base_conversion_config(context: VehicleContext) -> dict[str, object]:
         "parts": default_part_settings(context),
         "slotPairs": [],
         "sidePairs": [],
+        "triggers": [],
         "plate": plate_generator.default_plate_binding(),
         "delta": {
             "manual": False,
@@ -359,6 +454,7 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
 
     merged["slotPairs"] = normalized_slot_pairs(data.get("slotPairs"))
     merged["sidePairs"] = normalized_side_pairs(data.get("sidePairs"))
+    merged["triggers"] = normalized_trigger_modes(data.get("triggers"))
 
     old_delta = data.get("delta", {})
     if isinstance(old_delta, dict):
@@ -461,6 +557,10 @@ def import_matching_conversion(
     if imported_side_pairs:
         out["sidePairs"] = imported_side_pairs
         counts["sidePairImported"] = len(imported_side_pairs)
+    imported_triggers = normalized_trigger_modes(imported.get("triggers"))
+    if imported_triggers:
+        out["triggers"] = imported_triggers
+        counts["triggerModeImported"] = len(imported_triggers)
     if isinstance(imported.get("plate"), dict):
         out["plate"] = plate_generator.normalized_plate_binding(imported["plate"])
     return out, counts
@@ -472,6 +572,7 @@ def save_conversion(context: VehicleContext, conversion: dict[str, object]) -> P
     conversion["plate"] = plate_generator.normalized_plate_binding(conversion.get("plate"))
     conversion["slotPairs"] = normalized_slot_pairs(conversion.get("slotPairs"))
     conversion["sidePairs"] = normalized_side_pairs(conversion.get("sidePairs"))
+    conversion["triggers"] = normalized_trigger_modes(conversion.get("triggers"))
     variants = conversion.get("variants", {})
     if isinstance(variants, dict):
         for settings in variants.values():
@@ -562,4 +663,4 @@ def set_slot_pair(conversion: dict[str, object], slot_type: str, partner: str) -
     conversion["slotPairs"] = normalized_slot_pairs(pairs)
 
 
-__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
+__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'trigger_position_key', 'normalized_trigger_modes', 'trigger_mode_map', 'set_trigger_mode', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']

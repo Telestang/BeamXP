@@ -4,15 +4,26 @@ The reference cases are taken from stock jbeam: etk800 ships a hand-authored
 door_FR_int/door_FL_int pair, so mirroring one must reproduce the other.
 """
 
-import unittest
-
+import json
 import math
+import unittest
 
 from beamxp import transform_helpers
 from beamxp.core import sjson
-from beamxp.core.constants import HAND_RHD
+from beamxp.core.constants import HAND_RHD, MODE_MIRROR, MODE_SKIP, MODE_TRANSLATE
+from beamxp.hand_drive_parts.configuration import (
+    clear_trigger_mode,
+    set_trigger_mode,
+    trigger_mode_map,
+)
+from beamxp.hand_drive_parts.generation import converted_trigger_corners
 from beamxp.hand_drive_parts.rewriting import (
+    TRIGGER_BOX_TRIANGLES,
     _mirror_euler,
+    trigger_box_axes,
+    trigger_box_centre,
+    trigger_box_corners,
+    trigger_shape_mesh,
     build_node_mirror_map,
     generate_trigger_frame_twins,
     hydro_driven_nodes,
@@ -886,6 +897,324 @@ class MeshVerdictToTriggerActionTest(unittest.TestCase):
         )
         swapped = ([((0.35, -0.57, 0.77), "skip", 0.0, None)], {}, [])
         self.assertEqual(mirror(text, ARDENTE_NODES, swapped), text)
+
+
+class ExplicitFollowTests(unittest.TestCase):
+    """The Triggers table answers a row outright; the ladder does not vote.
+
+    The scintilla hood release is why this exists: it is declared in the hood
+    part, sits in the driver's footwell, and no rung of the attribution ladder
+    claims it -- so it stayed on the left through a conversion.
+    """
+
+    ROW = (
+        '        ["hood_int", "dsh2l","dsh2r","dshl", "box", {"x":0.04, "y":0.04, "z":0.04},'
+        ' {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0},'
+        ' {"x":0.3, "y":0, "z":0}],'
+    )
+
+    @staticmethod
+    def _rewrite(follows, owners=None):
+        text = section(ExplicitFollowTests.ROW)
+        if owners is None:
+            owners = ([], {}, [])  # nothing attributable: the ladder finds nothing
+        return text, rewrite_triggers(
+            text,
+            ARDENTE_NODES,
+            build_node_mirror_map(ARDENTE_NODES),
+            owners,
+            None,
+            follows,
+        )
+
+    def test_following_a_mirrored_mesh_moves_a_box_the_ladder_missed(self) -> None:
+        text, out = self._rewrite({"hood_int": ("mirror", 0.0, None)})
+        self.assertNotEqual(out, text)
+        self.assertIn('"dsh2r","dsh2l","dshr"', out)
+
+    def test_pinning_beats_an_attribution_that_would_have_moved_it(self) -> None:
+        # The ladder would mirror this box; the user said leave it.
+        owners = ([], {node: ("mirror", 0.0) for node in ARDENTE_NODES}, [])
+        text, out = self._rewrite({"hood_int": None}, owners)
+        self.assertIn("hood_int -- pinned in place by the Triggers table", out)
+        self.assertIn(ExplicitFollowTests.ROW.strip(), out)
+
+    def test_an_unanswered_trigger_still_uses_the_ladder(self) -> None:
+        owners = ([], {node: ("mirror", 0.0) for node in ARDENTE_NODES}, [])
+        text, out = self._rewrite({"other_trigger": None}, owners)
+        self.assertNotEqual(out, text)
+        self.assertNotIn("pinned in place", out)
+
+
+class TriggerBoxGeometryTests(unittest.TestCase):
+    """The eight corners the preview draws for a trigger box."""
+
+    FRAME = trigger_frame(*(ETK_DOOR_NODES[n] for n in ("d7r", "d8r", "d4r")))
+
+    def test_corners_are_centred_on_the_box(self) -> None:
+        axes = trigger_box_axes(self.FRAME)
+        corners = trigger_box_corners((1.0, 2.0, 3.0), axes, {"x": 0.2, "y": 0.1, "z": 0.4})
+        self.assertEqual(len(corners), 8)
+        for index in range(3):
+            mean = sum(corner[index] for corner in corners) / 8.0
+            self.assertAlmostEqual(mean, (1.0, 2.0, 3.0)[index], places=9)
+
+    def test_a_size_vector_is_full_extents_with_y_and_z_swapped(self) -> None:
+        # size.y is the extent along the frame's z and size.z along its y --
+        # the engine's own doing, measured with scripts/dump_triggers.lua.
+        axes = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        corners = trigger_box_corners((0.0, 0.0, 0.0), axes, {"x": 0.2, "y": 0.4, "z": 0.6})
+        spans = [
+            max(c[i] for c in corners) - min(c[i] for c in corners) for i in range(3)
+        ]
+        for span, expected in zip(spans, (0.2, 0.6, 0.4)):
+            self.assertAlmostEqual(span, expected, places=9)
+
+    def test_a_sphere_radius_draws_the_cube_that_bounds_it(self) -> None:
+        axes = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        corners = trigger_box_corners((0.0, 0.0, 0.0), axes, 0.02)
+        for index in range(3):
+            span = max(c[index] for c in corners) - min(c[index] for c in corners)
+            self.assertAlmostEqual(span, 0.04, places=9)
+
+    def test_zero_rotation_leaves_the_axes_on_the_node_frame(self) -> None:
+        axes = trigger_box_axes(self.FRAME)
+        for axis, expected in zip(axes, self.FRAME[1:]):
+            for value, want in zip(axis, expected):
+                self.assertAlmostEqual(value, want, places=12)
+
+    def test_the_euler_columns_turn_the_box_without_moving_it(self) -> None:
+        turned = trigger_box_axes(self.FRAME, (-12.0, 0.0, -0.2))
+        self.assertNotAlmostEqual(turned[1][2], self.FRAME[2][2], places=6)
+        # still an orthonormal frame: a rotation, not a shear
+        for axis in turned:
+            self.assertAlmostEqual(sum(value * value for value in axis), 1.0, places=9)
+        for first in range(3):
+            for second in range(first + 1, 3):
+                dot = sum(turned[first][i] * turned[second][i] for i in range(3))
+                self.assertAlmostEqual(dot, 0.0, places=9)
+
+    def test_every_corner_is_used_by_the_triangle_list(self) -> None:
+        used = {index for triangle in TRIGGER_BOX_TRIANGLES for index in triangle}
+        self.assertEqual(used, set(range(8)))
+        self.assertEqual(len(TRIGGER_BOX_TRIANGLES), 12)
+
+
+class BoxCornerAnchorTests(unittest.TestCase):
+    """baseTranslation places a CORNER of a box, not its middle.
+
+    The documentation says so -- "the center of rotation being the corner of
+    the box that defines position" -- and the Ardente proves it twice over.
+    Both cases below are its real authored numbers.
+    """
+
+    # ardente_sunvisors: the pair is identical except for bt.z, which differs
+    # by exactly the box's z size. That is the compensation an author needs
+    # when the mirrored frame flips z and the box still grows the same way --
+    # and it only balances if the offset is read as a corner.
+    SUNVISOR_NODES = {
+        "rf1": (0.0, -0.2, 1.30),
+        "rf1l": (0.36, -0.22, 1.28),
+        "rf1r": (-0.36, -0.22, 1.28),
+        "rf2": (0.0, 0.42, 1.33),
+    }
+    SUNVISOR_SIZE = {"x": 0.09, "y": 0.04, "z": 0.04}
+
+    def _sunvisor_centre(self, side: str, base_z: float):
+        frame = trigger_frame(
+            *(self.SUNVISOR_NODES[n] for n in ("rf1", f"rf1{side}", "rf2"))
+        )
+        axes = trigger_box_axes(frame)
+        anchor = local_to_world(frame, (0.25, 0.05, base_z))
+        return trigger_box_centre(anchor, axes, self.SUNVISOR_SIZE)
+
+    def test_the_mirrored_sunvisor_pair_comes_out_symmetric(self) -> None:
+        left = self._sunvisor_centre("l", 0.0)
+        right = self._sunvisor_centre("r", -0.04)
+        self.assertAlmostEqual(left[0], -right[0], places=6)
+        self.assertAlmostEqual(left[1], right[1], places=6)
+        self.assertAlmostEqual(left[2], right[2], places=6)
+
+    def test_reading_the_offset_as_a_centre_breaks_that_symmetry(self) -> None:
+        # What the preview used to draw: the pair 40 mm apart in z.
+        def as_centre(side: str, base_z: float):
+            frame = trigger_frame(
+                *(self.SUNVISOR_NODES[n] for n in ("rf1", f"rf1{side}", "rf2"))
+            )
+            return local_to_world(frame, (0.25, 0.05, base_z))
+
+        left, right = as_centre("l", 0.0), as_centre("r", -0.04)
+        self.assertGreater(abs(left[2] - right[2]), 0.03)
+
+    def test_a_sphere_sits_on_its_anchor_rather_than_hanging_off_it(self) -> None:
+        # A sphere has no corner, and its size is a radius, so the anchor is
+        # the middle. These were the ones that already looked right.
+        vertices, _faces = trigger_shape_mesh(
+            (0.4, -0.5, 0.9), ((1, 0, 0), (0, 1, 0), (0, 0, 1)), 0.02, "sphere"
+        )
+        centre = [sum(v[i] for v in vertices) / len(vertices) for i in range(3)]
+        for value, expected in zip(centre, (0.4, -0.5, 0.9)):
+            self.assertAlmostEqual(value, expected, places=6)
+
+    def test_the_box_spans_its_size_from_the_anchor(self) -> None:
+        axes = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        vertices, _faces = trigger_shape_mesh(
+            (0.0, 0.0, 0.0), axes, {"x": 0.2, "y": 0.4, "z": 0.6}, "box"
+        )
+        low = [min(v[i] for v in vertices) for i in range(3)]
+        high = [max(v[i] for v in vertices) for i in range(3)]
+        for value in low:
+            self.assertAlmostEqual(value, 0.0, places=9)
+        # y/z swapped, as the engine reads them
+        for value, expected in zip(high, (0.2, 0.6, 0.4)):
+            self.assertAlmostEqual(value, expected, places=9)
+
+
+class ConvertedBoxPlacementTests(unittest.TestCase):
+    """Where the preview draws a box once its transform is applied."""
+
+    CORNERS = [(0.7, -0.5, 0.9), (0.8, -0.4, 1.0)]
+
+    def test_mirror_reflects_across_the_centreline(self) -> None:
+        moved = converted_trigger_corners(self.CORNERS, "mirror", -0.71)
+        self.assertEqual(moved, [(-0.7, -0.5, 0.9), (-0.8, -0.4, 1.0)])
+
+    def test_move_slides_along_x_by_the_conversion_delta(self) -> None:
+        moved = converted_trigger_corners(self.CORNERS, "translate", -0.71)
+        for (x, y, z), (sx, sy, sz) in zip(moved, self.CORNERS):
+            self.assertAlmostEqual(x, sx - 0.71, places=9)
+            self.assertAlmostEqual(y, sy, places=9)
+            self.assertAlmostEqual(z, sz, places=9)
+
+    def test_skip_and_an_unresolved_box_stay_where_they_were(self) -> None:
+        for action in ("skip", "", "something_unexpected"):
+            self.assertEqual(
+                converted_trigger_corners(self.CORNERS, action, -0.71),
+                list(self.CORNERS),
+                action,
+            )
+
+    def test_mirroring_twice_returns_the_box_to_its_start(self) -> None:
+        there = converted_trigger_corners(self.CORNERS, "mirror", 0.0)
+        back = converted_trigger_corners(there, "mirror", 0.0)
+        self.assertEqual(back, list(self.CORNERS))
+
+
+class TriggerModeRecordTests(unittest.TestCase):
+    """Records are keyed by the box's authored position, not by its part.
+
+    That is what makes them trim-proof: the same switch authored at the same
+    place by a road dash and a race dash is one answer, and two boxes that
+    merely share a name stay separate.
+    """
+
+    AT = (0.691, -0.756, 0.513)
+
+    def test_setting_and_clearing_one_box(self) -> None:
+        conversion: dict = {}
+        self.assertEqual(trigger_mode_map(conversion), {})
+        set_trigger_mode(conversion, "hood_int", self.AT, MODE_MIRROR)
+        self.assertEqual(trigger_mode_map(conversion), {("hood_int", self.AT): MODE_MIRROR})
+        clear_trigger_mode(conversion, "hood_int", self.AT)
+        self.assertEqual(trigger_mode_map(conversion), {})
+
+    def test_two_declarations_at_one_position_share_an_answer(self) -> None:
+        # ardente_dash and ardente_dash_race both author this box here.
+        conversion: dict = {}
+        set_trigger_mode(conversion, "headlights", self.AT, MODE_TRANSLATE)
+        set_trigger_mode(conversion, "headlights", list(self.AT), MODE_TRANSLATE)
+        self.assertEqual(len(conversion["triggers"]), 1)
+
+    def test_the_same_id_at_two_positions_is_two_rows(self) -> None:
+        conversion: dict = {}
+        other = (0.012, -0.429, 0.788)
+        set_trigger_mode(conversion, "headlights", self.AT, MODE_MIRROR)
+        set_trigger_mode(conversion, "headlights", other, MODE_SKIP)
+        self.assertEqual(
+            trigger_mode_map(conversion),
+            {("headlights", self.AT): MODE_MIRROR, ("headlights", other): MODE_SKIP},
+        )
+
+    def test_positions_match_to_the_millimetre(self) -> None:
+        conversion: dict = {}
+        set_trigger_mode(conversion, "hood_int", self.AT, MODE_MIRROR)
+        # the same box, re-derived with floating-point noise
+        noisy = (0.6910004, -0.7559996, 0.5130002)
+        set_trigger_mode(conversion, "hood_int", noisy, MODE_SKIP)
+        self.assertEqual(len(conversion["triggers"]), 1)
+        self.assertEqual(trigger_mode_map(conversion)[("hood_int", self.AT)], MODE_SKIP)
+
+    def test_records_survive_a_save_and_reload(self) -> None:
+        conversion: dict = {}
+        set_trigger_mode(conversion, "hood_int", self.AT, MODE_MIRROR)
+        reloaded = json.loads(json.dumps(conversion))
+        self.assertEqual(trigger_mode_map(reloaded), {("hood_int", self.AT): MODE_MIRROR})
+
+    def test_malformed_records_are_dropped_rather_than_crashing(self) -> None:
+        conversion = {
+            "triggers": [
+                {"id": "", "at": [0, 0, 0], "mode": MODE_MIRROR},
+                {"id": "t", "at": [0, 0], "mode": MODE_MIRROR},
+                {"id": "t", "at": [0, 0, 0], "mode": "nonsense"},
+                "not a record",
+            ]
+        }
+        self.assertEqual(trigger_mode_map(conversion), {})
+
+
+class EngineGroundTruthTests(unittest.TestCase):
+    """Placements measured from the running game, not inferred from jbeam.
+
+    Captured with scripts/dump_triggers.lua on a vanilla Ardente: each case is
+    the trigger's own ref-node frame, its authored row, and the centre the
+    ENGINE reported through VehicleTrigger:getCenter(). Everything is
+    expressed in that frame, so the vehicle's position and heading drop out.
+
+    These are the cases the engine pins exactly. Boxes rotated about more than
+    one axis still carry a few mm of residual, which is tracked separately --
+    see the note on dump_triggers.lua.
+    """
+
+    # (name, ref, xNode, yNode, size, baseTranslation, baseRotation deg,
+    #  and the centre the ENGINE reported) -- all vehicle-relative.
+    CASES = [
+        ("hazard",
+         (0.51473, -0.28077, 0.53278), (-0.19528, -0.28079, 0.53236), (0.51463, -0.32782, 0.70990),
+         {"x": 0.03, "y": 0.025, "z": 0.015}, {"x": 0.34, "y": -0.04, "z": -0.09},
+         (45.0, 0.0, 0.0), (0.15972, -0.19057, 0.52978)),
+        ("headlights",
+         (0.51469, -0.14702, 0.57077), (0.72542, -0.16214, 0.60306), (-0.19538, -0.32784, 0.70948),
+         0.025, {"x": 0.2, "y": 0, "z": 0},
+         (0.0, 0.0, 0.0), (0.71189, -0.16117, 0.60100)),
+        ("hood_int",
+         (1.01904, -0.58992, 0.28770), (0.47583, -0.65000, 0.36528), (0.91354, -0.51309, 0.66654),
+         {"x": 0.04, "y": 0.08, "z": 0.08}, {"x": 0.13, "y": 0, "z": -0.15},
+         (-14.0, -6.0, -9.0), (0.84951, -0.49958, 0.31072)),
+        ("sw_ignition",
+         (0.32005, 0.00001, 0.00018), (0.00000, 0.00000, -0.00000), (0.32000, 0.62315, 0.00154),
+         0.015, {"x": 0.125, "y": 0.052, "z": 0.34},
+         (0.0, 0.0, 0.0), (0.19485, 0.05127, 0.34023)),
+        ("tailgate_int",
+         (0.51473, -0.28077, 0.53278), (-0.19528, -0.28079, 0.53236), (0.51463, -0.32782, 0.70990),
+         {"x": 0.025, "y": 0.025, "z": 0.025}, {"x": -0.32, "y": 0.01, "z": -0.04},
+         (0.0, 0.0, 0.0), (0.82221, -0.25995, 0.56177)),
+        ("toggleESCMode",
+         (0.00000, 0.00000, -0.00000), (0.32005, 0.00001, 0.00018), (-0.00000, 0.62314, 0.00136),
+         {"x": 0.025, "y": 0.025, "z": 0.025}, {"x": 0.109, "y": 0.084, "z": -0.33},
+         (0.0, 0.0, 0.0), (0.12132, 0.09581, 0.31778)),
+    ]
+
+    def test_the_preview_places_boxes_where_the_engine_does(self) -> None:
+        for name, ref, xn, yn, size, bt, rot, engine in self.CASES:
+            with self.subTest(name):
+                frame = trigger_frame(ref, xn, yn)
+                anchor = local_to_world(frame, (bt["x"], bt["y"], bt["z"]))
+                if isinstance(size, (int, float)):
+                    centre = anchor
+                else:
+                    centre = trigger_box_centre(anchor, trigger_box_axes(frame, rot), size)
+                error = math.dist(centre, engine)
+                self.assertLess(error, 0.0005, f"{name}: {error * 1000:.3f} mm from the engine")
 
 
 if __name__ == "__main__":

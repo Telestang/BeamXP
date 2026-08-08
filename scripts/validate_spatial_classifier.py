@@ -233,7 +233,7 @@ def validate_vehicle(
                 reason = functional_skip_reasons[object_id]
             detection_method = detection_methods.get(
                 object_id,
-                "not admitted by spatial scope or vetoed",
+                "no name rule claimed this mesh",
             )
             if actual == core.MODE_MIRROR_STRUCTURAL:
                 detection_method += ", structural pair resolution"

@@ -252,8 +252,16 @@ class BuildAndPreviewMixin:
         self.viewer.set_message(f"building preview: {config}...")
         self.mesh_scene_running = True
         extra_meshes = tuple(self._selected_extra_preview_ids())
+        # Resolved on this thread: the worker cannot run the attribution
+        # ladder cheaply, but the Triggers table has already cached it.
+        trigger_actions = self._trigger_actions()
         future = self.part_resolver.submit(
-            self._mesh_scene_worker, context, conversion_copy, config, extra_meshes
+            self._mesh_scene_worker,
+            context,
+            conversion_copy,
+            config,
+            extra_meshes,
+            trigger_actions,
         )
         future.add_done_callback(
             lambda completed, current_seq=seq, current_snapshot=snapshot: self.worker_queue.put(
@@ -267,6 +275,7 @@ class BuildAndPreviewMixin:
         conversion: dict[str, object],
         config_name: str,
         extra_meshes: tuple[str, ...] = (),
+        trigger_actions: dict[tuple, str] | None = None,
     ):
         payload = core.full_vehicle_preview_payload(
             context,
@@ -274,6 +283,7 @@ class BuildAndPreviewMixin:
             config_name,
             context.project_dir / "blender_preview",
             extra_meshes=extra_meshes,
+            trigger_actions=trigger_actions,
         )
         cache_dir = context.project_dir / "blender_preview" / "dae_cache" / "mesh_cache"
         return mesh_preview.build_scene(payload, cache_dir)

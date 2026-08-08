@@ -29,6 +29,9 @@ from beamxp.core.models import VehicleContext
 #     spawn (the BX race trims' door controls).
 CONTEXT_CACHE_VERSION = 13
 HAND_DETECTION_CACHE_VERSION = 1
+# Bump when the mesh numbering or the flexbody/prop role split changes shape or
+# meaning, so an existing project stops reusing what the old rule produced.
+PART_TABLE_CACHE_VERSION = 1
 
 
 def context_cache_path(source_zip: Path, vehicle_id: str) -> Path:
@@ -173,6 +176,176 @@ def clear_parts_cache(context: VehicleContext) -> None:
         parts_cache_path(context).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+# ----- part table preparation -------------------------------------------
+#
+# Building the parts table costs about five seconds on the etk800 and none of
+# it depends on the session: numbering every mesh instance walks all 29 trims
+# resolving each one's part tree (3.6 s), and splitting meshes into flexbodies
+# and props walks them again (1.4 s). Both answers are small -- a few kilobytes
+# -- and both are settled by the vehicle's own files, so they are written
+# beside the project and read back on the next load.
+
+
+def part_table_cache_fingerprint(context: VehicleContext) -> str:
+    return hashlib.sha1(
+        f"{PART_TABLE_CACHE_VERSION}:{context_fingerprint_hash(context.source_zip)}".encode("utf-8")
+    ).hexdigest()
+
+
+def _part_table_cache_file(context: VehicleContext, name: str) -> Path | None:
+    """Where a part-table cache lives, or None if this context has no project.
+
+    Saving already tolerates an unwritable project dir; not having one at all
+    is the same situation, so it reads and writes nothing rather than failing
+    the caller that only wanted the answer.
+    """
+    project_dir = getattr(context, "project_dir", None)
+    return Path(project_dir) / name if project_dir else None
+
+
+def _load_part_table_cache(path: Path | None, context: VehicleContext, section: str) -> dict:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or data.get("fingerprint") != part_table_cache_fingerprint(context):
+        return {}
+    entries = data.get(section)
+    return entries if isinstance(entries, dict) else {}
+
+
+def _save_part_table_cache(path: Path | None, context: VehicleContext, section: str, entries: dict) -> None:
+    if path is None:
+        return
+    try:
+        write_text_file(
+            path,
+            json.dumps(
+                {"fingerprint": part_table_cache_fingerprint(context), section: entries},
+                indent=1,
+            ),
+        )
+    except Exception:
+        pass
+
+
+def mesh_numbering_cache_path(context: VehicleContext) -> Path | None:
+    return _part_table_cache_file(context, "mesh_numbering_cache.json")
+
+
+def mesh_numbering_cache_key(plan_fingerprint: str) -> str:
+    return hashlib.sha1(str(plan_fingerprint).encode("utf-8")).hexdigest()
+
+
+def load_cached_mesh_numbering(
+    context: VehicleContext,
+    plan_fingerprint: str,
+) -> tuple[dict[str, dict[str, int]], dict[str, list[str]]] | None:
+    """Mesh instance numbering for one set of slot/side pairings.
+
+    Two maps: each mesh's number for each place it appears, and the places
+    each instance ref covers in trim order. They come from one walk and are
+    useless apart, so a half-written entry counts as a miss.
+    """
+    entries = _load_part_table_cache(mesh_numbering_cache_path(context), context, "numbering")
+    entry = entries.get(mesh_numbering_cache_key(plan_fingerprint))
+    if not isinstance(entry, dict):
+        return None
+    numbering = entry.get("byMesh")
+    keys_by_ref = entry.get("byRef")
+    if not isinstance(numbering, dict) or not isinstance(keys_by_ref, dict):
+        return None
+    return (
+        {
+            str(mesh_id): {str(key): int(ordinal) for key, ordinal in keys.items()}
+            for mesh_id, keys in numbering.items()
+            if isinstance(keys, dict)
+        },
+        {
+            str(ref): [str(key) for key in keys]
+            for ref, keys in keys_by_ref.items()
+            if isinstance(keys, list)
+        },
+    )
+
+
+def save_cached_mesh_numbering(
+    context: VehicleContext,
+    plan_fingerprint: str,
+    index: tuple[dict[str, dict[str, int]], dict[str, list[str]]],
+    max_entries: int = 4,
+) -> None:
+    numbering, keys_by_ref = index
+    path = mesh_numbering_cache_path(context)
+    entries = _load_part_table_cache(path, context, "numbering")
+    key = mesh_numbering_cache_key(plan_fingerprint)
+    entries.pop(key, None)
+    entries[key] = {
+        "byMesh": {
+            str(mesh_id): {str(number_key): int(ordinal) for number_key, ordinal in keys.items()}
+            for mesh_id, keys in numbering.items()
+        },
+        "byRef": {
+            str(ref): [str(number_key) for number_key in keys]
+            for ref, keys in keys_by_ref.items()
+        },
+    }
+    while len(entries) > max_entries:
+        entries.pop(next(iter(entries)))
+    _save_part_table_cache(path, context, "numbering", entries)
+
+
+def mesh_roles_cache_path(context: VehicleContext) -> Path | None:
+    return _part_table_cache_file(context, "mesh_roles_cache.json")
+
+
+def load_cached_mesh_roles(
+    context: VehicleContext,
+) -> dict[str, tuple[set[str], set[str], set[str]]]:
+    """Every trim's flexbody/prop/all mesh split that has been worked out before.
+
+    Returned for the caller to seed `context.mesh_roles_cache` with, which is
+    what the resolver reads; a trim missing from here is simply resolved.
+    """
+    entries = _load_part_table_cache(mesh_roles_cache_path(context), context, "meshRoles")
+    roles: dict[str, tuple[set[str], set[str], set[str]]] = {}
+    for config_name, value in entries.items():
+        if not isinstance(value, list) or len(value) != 3:
+            continue
+        if not all(isinstance(group, list) for group in value):
+            continue
+        if config_name not in context.variants:
+            continue
+        roles[str(config_name)] = tuple({str(mesh) for mesh in group} for group in value)
+    return roles
+
+
+def save_cached_mesh_roles(
+    context: VehicleContext,
+    roles: dict[str, tuple[set[str], set[str], set[str]]],
+) -> None:
+    entries = {
+        str(config_name): [sorted(str(mesh) for mesh in group) for group in value]
+        for config_name, value in roles.items()
+        if isinstance(value, tuple) and len(value) == 3
+    }
+    if not entries:
+        return
+    _save_part_table_cache(mesh_roles_cache_path(context), context, "meshRoles", entries)
+
+
+def clear_part_table_caches(context: VehicleContext) -> None:
+    for path in (mesh_numbering_cache_path(context), mesh_roles_cache_path(context)):
+        if path is None:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def variant_hands_cache_path(context: VehicleContext) -> Path:

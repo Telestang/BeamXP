@@ -410,6 +410,101 @@ class MultiPartPreviewTests(unittest.TestCase):
         self.assertIn("export_part_dae", reported_phases)
         self.assertIn("write_preview_report", reported_phases)
 
+    def _preview_with_export_results(self, results: list[object]):
+        """Run a two-part export whose per-part DAE writes give `results`."""
+        dash = part("dash")
+        console = part("console")
+        binding = ArchiveTextureBinding(
+            dae_material="interior",
+            material_key="interior",
+            materials_member="vehicles/car/main.materials.json",
+            texture_reference="/vehicles/car/interior.dds",
+            texture_member="vehicles/car/interior.dds",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "interior.dds"
+            Image.new("RGBA", (4, 4), (0, 0, 0, 255)).save(source, format="PNG")
+            mask = np.ones((4, 4), dtype=bool)
+            masks = rhd.DomainMasks(
+                mirror=mask,
+                rigid=np.zeros((4, 4), dtype=bool),
+                conflict_coverage=0.0,
+                mirrored_triangles=2,
+                rigid_triangles=0,
+                parts_analysed=2,
+            )
+            texture_result = rhd.RhdTextureResult(
+                texture_member=binding.texture_member,
+                size=(4, 4),
+                parts_analysed=2,
+                mirrored_triangles=2,
+                rigid_triangles=0,
+                mirror_coverage=1.0,
+                rigid_coverage=0.0,
+                conflict_coverage=0.0,
+                glyph_regions=0,
+                mirrored_glyph_regions=0,
+                material_aliases=("interior",),
+                png_path=workspace / "interior_rhd.png",
+                report={"texture": binding.texture_member, "selected_parts": []},
+            )
+            with (
+                patch.object(
+                    rhd,
+                    "texture_bindings_for_parts",
+                    return_value={binding.texture_member: [(dash, binding), (console, binding)]},
+                ),
+                patch.object(rhd, "material_symbols_for_binding", return_value=("interior-material",)),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(rhd, "build_domain_masks", return_value=masks),
+                patch.object(rhd, "build_rhd_texture", return_value=texture_result),
+                patch.object(rhd, "write_blender_preview", return_value=None),
+                patch.object(rhd, "sweep_part", return_value=object()),
+                patch.object(rhd, "export_transformed_part_dae", side_effect=results),
+            ):
+                return rhd.export_parts_preview(
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                    [dash, console],
+                    workspace,
+                    bake=False,
+                    log=lambda *_a: None,
+                )
+
+    def test_a_part_with_no_bindable_atlas_does_not_sink_the_others(self) -> None:
+        # Scintilla's race console carries only scintilla_main_carbon, a detail
+        # material with no base-colour atlas, so it cannot be wired. It used to
+        # abort the whole per-DAE export, costing the nine other marked meshes
+        # in scintilla.dae their correction with no error raised anywhere.
+        export_info = {
+            "carrier": {
+                "node_id": "generated_carrier",
+                "geometry_ids": ["generated_carrier_mesh"],
+                "triangle_count": 2,
+            },
+            "rigid_symmetric_nodes": [],
+        }
+        preview = self._preview_with_export_results(
+            [ValueError("archive texture aliases did not match carbon"), export_info]
+        )
+
+        self.assertEqual(len(preview.dae_paths), 1)
+        self.assertEqual(len(preview.failed_parts), 1)
+        self.assertEqual(preview.failed_parts[0]["source_part"]["key"], "dash")
+        self.assertIn("carbon", preview.failed_parts[0]["error"])
+        self.assertEqual(
+            [entry["source_part"]["key"] for entry in preview.report["dae_exports"]],
+            ["console"],
+        )
+
+    def test_an_export_where_every_part_fails_is_still_an_error(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self._preview_with_export_results(
+                [ValueError("no atlas"), ValueError("no atlas")]
+            )
+        self.assertIn("No part could be exported", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

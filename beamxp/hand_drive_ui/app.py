@@ -8,6 +8,7 @@ from .plates_workflow import PlatesWorkflowMixin
 from .recommendations_ui import RecommendationsUIMixin
 from .shared import *
 from .slots_workflow import SlotsWorkflowMixin
+from .triggers_workflow import TriggersWorkflowMixin
 from .variant_workflow import VariantWorkflowMixin
 from .vehicle_browser import VehicleBrowserMixin
 from .vehicle_workflow import VehicleWorkflowMixin
@@ -23,6 +24,7 @@ class HandDriveToolApp(
     VariantWorkflowMixin,
     PartsWorkflowMixin,
     SlotsWorkflowMixin,
+    TriggersWorkflowMixin,
     PlatesWorkflowMixin,
     RecommendationsUIMixin,
     PartEditingMixin,
@@ -114,6 +116,7 @@ class HandDriveToolApp(
         self.detail_var = tk.StringVar(value="")
         self.filter_var = tk.StringVar()
         self.slot_filter_var = tk.StringVar()
+        self.trigger_filter_var = tk.StringVar()
         self.auto_delta_var = tk.StringVar(value="")
         self.manual_delta_enabled = tk.BooleanVar(value=False)
         self.manual_delta_var = tk.StringVar(value="")
@@ -154,23 +157,33 @@ class HandDriveToolApp(
         self.part_instance_rows: dict[str, dict[str, object]] = {}
         self.part_row_labels: dict[str, str] = {}
         self.part_child_overrides: dict[str, dict[str, str]] = {}
+        # Armed on every vehicle load and spent on the first refresh that has
+        # rows, so the column widths fit the vehicle on screen and then stay
+        # wherever the user drags them.
+        self.part_columns_need_fit = True
         self.mesh_instance_numbering_key: tuple[object, str] | None = None
         self.mesh_instance_numbering_cache: dict[str, dict[str, int]] = {}
+        self.mesh_instance_keys_cache: dict[str, list[str]] = {}
         self.current_slot_ids: list[str] = []
         self.slot_usage_key: tuple[str, ...] | None = None
         self.slot_usage_cache: dict[str, object] | None = None
         self.side_pair_pick_target: dict[str, str] | None = None
+        self.trigger_rows_by_iid: dict[str, dict[str, object]] = {}
+        self.trigger_owner_cache: tuple[object, object] | None = None
+        self._trigger_box_cache: tuple[object, list] | None = None
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._configure_theme()
         self._build_ui()
         self.bind("<KeyPress-h>", self._toggle_selected_parts_visibility_shortcut)
         self.bind("<KeyPress-H>", self._toggle_selected_parts_visibility_shortcut)
+        self.bind("<Control-t>", self._focus_trigger_table_shortcut)
+        self.bind("<Control-T>", self._focus_trigger_table_shortcut)
         self.bind("<Control-p>", self._focus_side_pair_table_shortcut)
         self.bind("<Control-P>", self._focus_side_pair_table_shortcut)
         for hotkey, hotkey_mode in MODE_HOTKEYS.items():
-            self.bind(f"<KeyPress-{hotkey}>", lambda event, m=hotkey_mode: self._set_selected_part_mode_shortcut(event, m))
-            self.bind(f"<KeyPress-{hotkey.upper()}>", lambda event, m=hotkey_mode: self._set_selected_part_mode_shortcut(event, m))
+            self.bind(f"<KeyPress-{hotkey}>", lambda event, m=hotkey_mode: self._set_selected_mode_shortcut(event, m))
+            self.bind(f"<KeyPress-{hotkey.upper()}>", lambda event, m=hotkey_mode: self._set_selected_mode_shortcut(event, m))
         self.bind_all("<Button-1>", self._clear_part_filter_focus_on_click, add="+")
         self._refresh_folder_buttons()
         self._rebuild_model_combo()

@@ -151,6 +151,7 @@ class VehicleWorkflowMixin:
             if force_reload:
                 core.clear_parts_cache(context)
                 core.clear_variant_hands_cache(context)
+                core.clear_part_table_caches(context)
             conversion, loaded = core.load_or_create_conversion(context)
             self.worker_queue.put(
                 ("vehicle_load_success", (seq, source_zip, vehicle_id, context, conversion, loaded))
@@ -166,6 +167,8 @@ class VehicleWorkflowMixin:
         self.new_side_pair_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.remove_side_pair_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.clear_slot_pairs_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.reset_trigger_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.clear_triggers_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.show_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.hide_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.active_only_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
@@ -196,8 +199,11 @@ class VehicleWorkflowMixin:
         self.part_refresh_seq += 1
         self.resolved_part_ids = []
         self.current_part_ids = []
+        self.part_columns_need_fit = True
         self.mesh_instance_numbering_key = None
         self.mesh_instance_numbering_cache = {}
+        self.mesh_instance_keys_cache = {}
+        self._clear_mesh_instance_cache()
         self.mesh_scene_hash = None
         self.mesh_scene_reset_pending = True
         self._set_load_busy(False)

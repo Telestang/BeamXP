@@ -589,15 +589,7 @@ class PartEditingMixin:
 
     def _toggle_selected_parts_visibility_shortcut(self, event: tk.Event) -> str | None:
         focus = self.focus_get()
-        if focus is not None and focus.winfo_class() in {
-            "Entry",
-            "TEntry",
-            "Text",
-            "Combobox",
-            "TCombobox",
-            "Spinbox",
-            "TSpinbox",
-        }:
+        if focus is not None and focus.winfo_class() in TYPING_WIDGET_CLASSES:
             return None
         if self.context is None:
             return None
@@ -629,15 +621,7 @@ class PartEditingMixin:
         focus = self.focus_get()
         # Only typing targets swallow the hotkeys; buttons and other focusable
         # widgets don't react to letter keys, so mode setting stays live.
-        if focus is not None and focus.winfo_class() in {
-            "Entry",
-            "TEntry",
-            "Text",
-            "Combobox",
-            "TCombobox",
-            "Spinbox",
-            "TSpinbox",
-        }:
+        if focus is not None and focus.winfo_class() in TYPING_WIDGET_CLASSES:
             return None
         if self.context is None:
             return None
@@ -670,6 +654,15 @@ class PartEditingMixin:
                 return "break"
             self._set_part_mode(targets[0], mode)
             return "break"
+        if mode == core.MODE_REPLACE_SOURCE:
+            # Replace Source is a pairing, so it goes through _set_part_mode --
+            # which picks the partner and refuses the mode when the slot holds
+            # no other part -- rather than being written straight onto the row.
+            if len(targets) != 1:
+                self.status_var.set("Select one part to set Replace Source; it needs a source part")
+                return "break"
+            self._set_part_mode(targets[0], mode, row_id=target_rows[0])
+            return "break"
         for object_id in targets:
             self._cancel_structural_prompt(object_id)
             self._apply_single_part_mode(object_id, mode)
@@ -695,14 +688,7 @@ class PartEditingMixin:
         return settings
 
     def _mode_values_for_part_row(self, row_id: str) -> list[str]:
-        return [
-            core.MODE_SKIP,
-            core.MODE_TRANSLATE,
-            core.MODE_MIRROR_POSITION,
-            core.MODE_MIRROR,
-            core.MODE_MIRROR_STRUCTURAL,
-            core.MODE_REPLACE_SOURCE,
-        ]
+        return list(MODE_CYCLE_VALUES)
 
     def _slot_def_for_part_row(self, row_id: str) -> core.SlotDef | None:
         if self.context is None:
@@ -1028,6 +1014,8 @@ class PartEditingMixin:
         self._update_detail()
 
     def _part_selection_changed(self) -> None:
+        if self.part_tree.selection():
+            self._claim_selection("parts")
         self._refresh_viewer()
         self._update_detail()
 
@@ -1046,10 +1034,22 @@ class PartEditingMixin:
                 self._refresh_slots()
                 self.status_var.set("Equivalent part picker cancelled")
                 return
-            if self.part_tree.selection():
-                self.part_tree.selection_set([])  # empty click -> deselect
+            self._clear_all_selection()  # empty click -> deselect everything
             return
         object_id = str(object_id)
+        # A trigger box is scene geometry with no part row behind it, so it
+        # answers to the Triggers table instead.
+        if mesh_preview is not None and object_id.startswith(
+            f"{mesh_preview.TRIGGER_SCENE_PREFIX}|"
+        ):
+            self._select_trigger_row(object_id)
+            row = getattr(self, "trigger_rows_by_iid", {}).get(object_id)
+            if row is not None:
+                self.trigger_tree.focus_set()
+                self.status_var.set(
+                    f"{row['label']} -- {self._trigger_mode_label(row)}"
+                )
+            return
         # The clicked part is rendered but may be filtered out of the table;
         # clear the filter so its row exists and can be selected. The filter_var
         # write-trace rebuilds the table synchronously.
