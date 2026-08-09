@@ -115,13 +115,25 @@ def part_translate_magnitude(
     conversion: dict[str, object],
     object_id: str,
 ) -> float:
+    """How far this part's Move travels, measured along the conversion direction.
+
+    Signed, not absolute: positive is whichever way this trim's conversion
+    already runs (toward the target hand's side), so a negative per-part
+    offset walks the part back the other way -- useful when a mesh sits
+    off-centre and the shared delta overshoots it. ``signed_delta_for_target``
+    turns this into the world-space X delta, and it is the target hand there
+    that decides which way "positive" points, so the same saved number does
+    the right thing on an LHD->RHD trim and on an RHD->LHD one.
+
+    The global delta stays unsigned; only the per-part override carries a sign.
+    """
     parts = conversion.get("parts", {})
     settings = parts.get(object_id, {}) if isinstance(parts, dict) else {}
     if isinstance(settings, dict):
         raw = settings.get("translateOffset")
         if raw not in (None, ""):
             try:
-                return abs(float(raw))
+                return float(raw)
             except (TypeError, ValueError):
                 return 0.0
     return delta_magnitude(context, conversion)

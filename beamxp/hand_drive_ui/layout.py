@@ -393,12 +393,12 @@ class LayoutMixin:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        columns = ("trigger", "mode")
+        columns = ("trigger", "mode", "offset")
         self.trigger_tree = ttk.Treeview(
             frame, columns=columns, show="headings", height=8, selectmode="browse"
         )
-        headings = {"trigger": "Trigger", "mode": "Transform"}
-        widths = {"trigger": 330, "mode": 130}
+        headings = {"trigger": "Trigger", "mode": "Transform", "offset": "Move X"}
+        widths = {"trigger": 330, "mode": 130, "offset": 82}
         for col in columns:
             self.trigger_tree.heading(col, text=headings[col], anchor="w")
             self.trigger_tree.column(

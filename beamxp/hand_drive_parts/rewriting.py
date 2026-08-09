@@ -105,7 +105,16 @@ def suffix_for_hand(hand: str) -> str:
 
 
 def signed_delta_for_target(hand: str, magnitude: float) -> float:
-    return -abs(magnitude) if hand == HAND_RHD else abs(magnitude)
+    """World-space X delta for a Move of ``magnitude`` toward ``hand``.
+
+    An RHD target sits at negative X and an LHD target at positive X, so the
+    target hand alone fixes which way a positive magnitude travels -- and
+    because the target hand is resolved per trim, one saved offset converts
+    correctly whichever way each config runs. A negative magnitude (a per-part
+    override asking for the opposite direction) rides through with its sign
+    flipped to match, rather than being flattened by ``abs``.
+    """
+    return -magnitude if hand == HAND_RHD else magnitude
 
 
 def generated_mesh_name(source_mesh: str, target_hand: str) -> str:

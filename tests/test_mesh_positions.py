@@ -304,6 +304,39 @@ class SteeringDeltaGuardTests(unittest.TestCase):
         self.assertAlmostEqual(core.auto_delta_magnitude(context, conversion), 0.6852, places=4)
 
 
+class SignedPartOffsetTests(unittest.TestCase):
+    """A per-part Move X may be negative, meaning "move it back the other way".
+
+    The sign is read against the conversion, not against world X: the target
+    hand -- resolved per trim -- decides which way positive points, so one
+    saved offset behaves the same on an LHD->RHD config and an RHD->LHD one.
+    """
+
+    def conversion(self, offset: object) -> dict[str, object]:
+        return {"parts": {"dash_dial": {"translateOffset": offset}}, "delta": {}}
+
+    def magnitude(self, offset: object) -> float:
+        return core.part_translate_magnitude(None, self.conversion(offset), "dash_dial")
+
+    def test_offset_keeps_its_sign(self) -> None:
+        self.assertAlmostEqual(self.magnitude(0.7), 0.7, places=6)
+        self.assertAlmostEqual(self.magnitude(-0.7), -0.7, places=6)
+        self.assertAlmostEqual(self.magnitude("-0.7"), -0.7, places=6)
+
+    def test_positive_offset_moves_toward_the_target_side(self) -> None:
+        # RHD sits at negative x, LHD at positive x.
+        self.assertAlmostEqual(core.signed_delta_for_target(core.HAND_RHD, 0.7), -0.7, places=6)
+        self.assertAlmostEqual(core.signed_delta_for_target(core.HAND_LHD, 0.7), 0.7, places=6)
+
+    def test_negative_offset_reverses_per_target_hand(self) -> None:
+        self.assertAlmostEqual(core.signed_delta_for_target(core.HAND_RHD, -0.7), 0.7, places=6)
+        self.assertAlmostEqual(core.signed_delta_for_target(core.HAND_LHD, -0.7), -0.7, places=6)
+
+    def test_global_delta_stays_unsigned(self) -> None:
+        conversion = {"parts": {}, "delta": {"manual": True, "magnitude": -0.7}}
+        self.assertAlmostEqual(core.delta_magnitude(None, conversion), 0.7, places=6)
+
+
 class VectorFromRowExpressionTests(unittest.TestCase):
     """A pos/rot/scale vector with a jbeam $= expression component (e.g. the
     D-Series heavy hub's spacer, "x":"$=-$trackoffset_F-0.885") used to lose

@@ -1005,9 +1005,15 @@ class PartEditingMixin:
             settings["translateOffset"] = None
         else:
             try:
-                settings["translateOffset"] = abs(float(cleaned))
+                # Signed: positive follows the trim's own conversion direction,
+                # negative walks the part back the other way.
+                settings["translateOffset"] = float(cleaned)
             except ValueError:
-                self._show_error("Invalid offset", "Part offset must be blank or a number.")
+                self._show_error(
+                    "Invalid offset",
+                    "Part offset must be blank or a number. Positive moves the part the way this "
+                    "trim converts; negative moves it the opposite way.",
+                )
                 return
         self._refresh_parts()
         self._refresh_delta_label()

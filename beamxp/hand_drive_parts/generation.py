@@ -893,6 +893,7 @@ def trigger_modes_for_part(
     if not chosen:
         return {}
     magnitude = delta_magnitude(context, conversion)
+    offsets = trigger_offset_map(conversion)
     resolved: dict[str, tuple[str, float, list[list[float]] | None] | None] = {}
     for trigger_id, centre in authored_trigger_positions(part_body, node_positions).items():
         key = trigger_position_key(trigger_id, centre)
@@ -900,9 +901,12 @@ def trigger_modes_for_part(
         if mode is None:
             continue
         if mode == MODE_TRANSLATE:
+            # The box's own Move X wins over the shared delta, and carries a
+            # sign: signed_delta_for_target reads it against this trim's target
+            # hand, so one saved number converts correctly either way round.
             resolved[trigger_id] = (
                 "translate",
-                signed_delta_for_target(target_hand, magnitude),
+                signed_delta_for_target(target_hand, offsets.get(key, magnitude)),
                 None,
             )
         elif mode == MODE_MIRROR:
@@ -2699,7 +2703,8 @@ def preview_trigger_boxes(
     node_positions = context.node_positions
     chosen = trigger_mode_map(conversion)
     actions = trigger_actions or {}
-    delta = signed_delta_for_target(target_hand, delta_magnitude(context, conversion))
+    offsets = trigger_offset_map(conversion)
+    magnitude = delta_magnitude(context, conversion)
     mode_actions = {
         MODE_SKIP: "skip",
         MODE_TRANSLATE: "translate",
@@ -2742,6 +2747,9 @@ def preview_trigger_boxes(
                 if mode
                 else str(actions.get(key, ""))
             )
+            # Drawn where the build will put it, so a Move X override has to be
+            # read per box rather than sharing one delta across the whole trim.
+            delta = signed_delta_for_target(target_hand, offsets.get(key, magnitude))
             axes = trigger_box_axes(
                 frame,
                 _trigger_row_vector(row, spans, index_of, "baseRotation"),

@@ -140,11 +140,10 @@ MODE_CYCLE_VALUES = [
     core.MODE_TRANSLATE,
     core.MODE_MIRROR,
     core.MODE_MIRROR_STRUCTURAL,
-    core.MODE_MIRROR_POSITION,
     core.MODE_REPLACE_SOURCE,
 ]
 MODE_VALUES_BY_LABEL = {mode_label(mode): mode for mode in MODE_CYCLE_VALUES}
-MODE_HOTKEYS = dict(zip("qwerty", MODE_CYCLE_VALUES))
+MODE_HOTKEYS = dict(zip("qwery", MODE_CYCLE_VALUES))
 
 # Widgets that are being typed into. A letter key belongs to whatever is
 # being typed, so the transform hotkeys stand down for these.
@@ -173,7 +172,7 @@ def offset_label(value: object) -> str:
     if value in (None, ""):
         return ""
     try:
-        return fmt_float(abs(float(value)))
+        return fmt_float(float(value))
     except (TypeError, ValueError):
         return ""
 

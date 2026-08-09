@@ -842,6 +842,10 @@ class GLRenderer:
         self._vao_pick_stock = None
         self._vao_pick_trigger_conv = None
         self._vao_pick_trigger_stock = None
+        self._vao_trigger_outline_conv = None
+        self._vao_trigger_outline_stock = None
+        self._ibo_trigger_outline = None
+        self._trigger_outline_index_count = 0
         self._pick_names: list[str] = []
         self._pick_fbo = None
         self._pick_size = (0, 0)
@@ -993,8 +997,20 @@ class GLRenderer:
                 [(self._vbo_stock, "3f", "in_pos"), (self._vbo_pickid, "1f", "in_id")],
                 index_buffer=self._ibo_trigger,
             )
+            self._ibo_trigger_outline = self.ctx.buffer(reserve=4)
+            self._vao_trigger_outline_conv = self.ctx.vertex_array(
+                self.outline_prog,
+                [(self._vbo_conv, "3f", "in_pos")],
+                index_buffer=self._ibo_trigger_outline,
+            )
+            self._vao_trigger_outline_stock = self.ctx.vertex_array(
+                self.outline_prog,
+                [(self._vbo_stock, "3f", "in_pos")],
+                index_buffer=self._ibo_trigger_outline,
+            )
             self._index_count = scene.triangle_count * 3
             self._outline_index_count = 0
+            self._trigger_outline_index_count = 0
             self._selected_names = set()
             self._visible_names = None
 
@@ -1061,9 +1077,13 @@ class GLRenderer:
                 gather(triggers) if self._triggers_visible
                 else np.zeros((0, 3), dtype=np.int32)
             )
+            trigger_lines = np.zeros((0,), dtype=np.int32)
+            if trigger_triangles.size:
+                trigger_lines = trigger_triangles[:, [0, 1, 1, 2, 2, 0]].reshape(-1).astype(np.int32)
             for buffer, data, attr in (
                 (self._ibo, triangles, "_index_count"),
                 (self._ibo_trigger, trigger_triangles, "_trigger_index_count"),
+                (self._ibo_trigger_outline, trigger_lines, "_trigger_outline_index_count"),
             ):
                 buffer.orphan(max(data.nbytes, 4))
                 if data.nbytes:
@@ -1207,6 +1227,18 @@ class GLRenderer:
             trigger_vao.render(mode=self._moderngl.TRIANGLES, vertices=self._trigger_index_count)
             fbo.depth_mask = True
             self.prog["alpha_scale"].value = 1.0
+            trigger_outline_vao = self._vao_trigger_outline_stock if show_stock else self._vao_trigger_outline_conv
+            if trigger_outline_vao is not None and self._trigger_outline_index_count:
+                self.ctx.disable(self._moderngl.DEPTH_TEST)
+                try:
+                    self.ctx.line_width = 1.5
+                except Exception:
+                    pass
+                self.outline_prog["color"].write(np.asarray((1.0, 0.0, 0.0), dtype=np.float32).tobytes())
+                self.outline_prog["mvp"].write(mvp.T.copy().tobytes())
+                trigger_outline_vao.render(mode=self._moderngl.LINES, vertices=self._trigger_outline_index_count)
+                self.outline_prog["color"].write(np.asarray(OUTLINE_COLOR, dtype=np.float32).tobytes())
+                self.ctx.enable(self._moderngl.DEPTH_TEST)
 
         outline_vao = self._vao_outline_stock if show_stock else self._vao_outline_conv
         if outline_vao is not None and self._outline_index_count:

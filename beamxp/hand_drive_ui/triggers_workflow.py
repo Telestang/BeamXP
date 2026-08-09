@@ -155,6 +155,7 @@ class TriggersWorkflowMixin:
         if not boxes:
             return []
         chosen = core.trigger_mode_map(self.conversion)
+        offsets = core.trigger_offset_map(self.conversion)
         owners = self._trigger_auto_owners()
         node_transforms = owners[1] if owners else {}
         rows: list[dict[str, object]] = []
@@ -163,6 +164,7 @@ class TriggersWorkflowMixin:
             rows.append({
                 **box,
                 "mode": chosen.get(box["key"]),
+                "offset": offsets.get(box["key"]),
                 "auto_action": action,
                 "auto": self._auto_label(action, bool(box.get("twinned"))),
             })
@@ -199,6 +201,21 @@ class TriggersWorkflowMixin:
         if mode is None:
             return f"(auto: {row.get('auto') or 'unattributed'})"
         return TRIGGER_MODE_LABELS.get(str(mode), "Skip")
+
+    def _trigger_offset_display(self, row: dict[str, object]) -> str:
+        """The box's Move X cell.
+
+        Only a Move has a distance to override. An auto row is left as "N/A"
+        even where the ladder resolved a move, because the distance it travels
+        is the owning mesh's, and overriding it here would quietly detach the
+        box from the mesh it was attributed to -- pick Move first and the
+        column opens up.
+        """
+        return offset_display(
+            core.MODE_TRANSLATE if row.get("mode") == core.MODE_TRANSLATE else core.MODE_SKIP,
+            row.get("offset"),
+            manual_delta=self.manual_delta_enabled.get(),
+        )
 
     def _trigger_auto_owners(self):
         """The cheap half of the attribution ladder, cached per selection.
@@ -258,7 +275,7 @@ class TriggersWorkflowMixin:
                     "end",
                     iid=row_id,
                     tags=self._row_tags(index),
-                    values=(label, mode),
+                    values=(label, mode, self._trigger_offset_display(row)),
                 )
             visible_keep = [item for item in keep if self.trigger_tree.exists(item)]
             if visible_keep:
@@ -342,14 +359,45 @@ class TriggersWorkflowMixin:
             self._edit_tree_combo(
                 self.trigger_tree, item, column, TRIGGER_MODE_OPTIONS, current, commit
             )
+        elif name == "offset":
+            if row.get("mode") != core.MODE_TRANSLATE:
+                self.status_var.set("Move X only applies to a box set to Move")
+                return "break"
+            self._edit_tree_entry(
+                self.trigger_tree,
+                item,
+                column,
+                offset_label(row.get("offset")),
+                lambda value: self._set_trigger_offset(row, value),
+            )
         return "break"
 
     def _set_trigger_mode(self, row: dict[str, object], mode: str) -> None:
         core.set_trigger_mode(self.conversion, str(row["trigger"]), row["at"], mode)
         self._refresh_triggers()
         self._select_trigger_row(str(row["id"]))
+        self._update_detail()
         self.status_var.set(
             f"{row['label']} set to {TRIGGER_MODE_LABELS.get(mode, mode)}"
+        )
+
+    def _set_trigger_offset(self, row: dict[str, object], value: str) -> None:
+        cleaned = value.strip()
+        if cleaned and core.trigger_offset_value(cleaned) is None:
+            self._show_error(
+                "Invalid offset",
+                "Move X must be blank or a non-zero number. Positive moves the box the way this "
+                "trim converts; negative moves it the opposite way. To leave a box exactly where "
+                "it is, set its transform to Skip.",
+            )
+            return
+        core.set_trigger_offset(self.conversion, str(row["trigger"]), row["at"], cleaned or None)
+        self._refresh_triggers()
+        self._select_trigger_row(str(row["id"]))
+        self._update_detail()
+        self.status_var.set(
+            f"{row['label']} moves {offset_label(cleaned)}" if cleaned
+            else f"{row['label']} back to the conversion delta"
         )
 
     def _set_selected_mode_shortcut(self, event: tk.Event, mode: str) -> str | None:
@@ -419,11 +467,13 @@ class TriggersWorkflowMixin:
         core.clear_trigger_mode(self.conversion, str(row["trigger"]), row["at"])
         self._refresh_triggers()
         self._select_trigger_row(str(row["id"]))
+        self._update_detail()
         self.status_var.set(f"{row['label']} back to the recommendation")
 
     def _clear_trigger_modes(self) -> None:
         core.clear_trigger_modes(self.conversion)
         self._refresh_triggers()
+        self._update_detail()
         self.status_var.set("Cleared every trigger override")
 
     def _focus_trigger_table_shortcut(self, event: tk.Event) -> str | None:

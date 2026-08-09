@@ -69,12 +69,22 @@ class Harness(TriggersWorkflowMixin):
         self.focused = None
         self.part_mode_calls: list[str] = []
         self.trigger_refreshes = 0
+        self.detail_updates = 0
+        self.errors: list[tuple[str, str]] = []
 
     def focus_get(self):
         return self.focused
 
     def _refresh_triggers(self) -> None:
         self.trigger_refreshes += 1
+
+    # the real one reschedules the 3D scene; here it only has to record that a
+    # mutation asked for the preview to catch up
+    def _update_detail(self) -> None:
+        self.detail_updates += 1
+
+    def _show_error(self, title: str, message: str) -> None:
+        self.errors.append((title, message))
 
     # the real one lives in PartEditingMixin; here it only has to record that
     # the key made it through to the parts table
@@ -97,9 +107,9 @@ class HotkeyOrderTests(unittest.TestCase):
     def test_the_keys_run_along_the_dropdown_in_order(self) -> None:
         self.assertEqual(
             [mode_label(mode) for mode in MODE_CYCLE_VALUES],
-            ["Skip", "Move", "Mirror", "Swap Mesh", "Mirror Move", "Replace Source"],
+            ["Skip", "Move", "Mirror", "Swap Mesh", "Replace Source"],
         )
-        self.assertEqual(list(MODE_HOTKEYS), list("qwerty"))
+        self.assertEqual(list(MODE_HOTKEYS), list("qwery"))
         self.assertEqual(list(MODE_HOTKEYS.values()), MODE_CYCLE_VALUES)
 
 
@@ -151,6 +161,62 @@ class TriggerHotkeyTests(unittest.TestCase):
         self.app._set_selected_mode_shortcut(None, core.MODE_MIRROR)
         self.assertEqual(self.chosen(), {})
         self.assertEqual(self.app.status_var.get(), "")
+
+
+class TriggerOffsetTests(unittest.TestCase):
+    """The Triggers table's Move X: a per-box override of how far it travels."""
+
+    def setUp(self) -> None:
+        self.app = Harness()
+        self.row = self.app.add_trigger(ROW_ID, "hood_int", AT)
+        self.app.trigger_tree.selection_set([ROW_ID])
+        self.app._set_trigger_mode(self.row, core.MODE_TRANSLATE)
+
+    def offsets(self):
+        return core.trigger_offset_map(self.app.conversion)
+
+    def test_an_offset_is_stored_signed_against_the_box(self) -> None:
+        self.app._set_trigger_offset(self.row, "-0.42")
+        self.assertEqual(self.offsets(), {("hood_int", AT): -0.42})
+        self.assertEqual(self.app.errors, [])
+
+    def test_blanking_it_hands_the_box_back_to_the_conversion_delta(self) -> None:
+        self.app._set_trigger_offset(self.row, "0.42")
+        self.app._set_trigger_offset(self.row, "  ")
+        self.assertEqual(self.offsets(), {})
+        self.assertEqual(list(self.chosen_modes()), [("hood_int", AT)])  # still Move
+
+    def chosen_modes(self):
+        return core.trigger_mode_map(self.app.conversion)
+
+    def test_junk_is_refused_and_changes_nothing(self) -> None:
+        self.app._set_trigger_offset(self.row, "0.42")
+        self.app._set_trigger_offset(self.row, "half a metre")
+        self.assertEqual(self.offsets(), {("hood_int", AT): 0.42})
+        self.assertEqual(len(self.app.errors), 1)
+
+    def test_zero_is_refused_because_skip_is_what_that_means(self) -> None:
+        self.app._set_trigger_offset(self.row, "0")
+        self.assertEqual(self.offsets(), {})
+        self.assertEqual(len(self.app.errors), 1)
+
+    def test_leaving_move_drops_the_offset(self) -> None:
+        self.app._set_trigger_offset(self.row, "0.42")
+        self.app._set_trigger_mode(self.row, core.MODE_MIRROR)
+        self.assertEqual(self.offsets(), {})
+        # ...and it does not come back when the box returns to Move
+        self.app._set_trigger_mode(self.row, core.MODE_TRANSLATE)
+        self.assertEqual(self.offsets(), {})
+
+    def test_re_picking_move_keeps_the_offset(self) -> None:
+        self.app._set_trigger_offset(self.row, "0.42")
+        self.app._set_trigger_mode(self.row, core.MODE_TRANSLATE)
+        self.assertEqual(self.offsets(), {("hood_int", AT): 0.42})
+
+    def test_every_edit_asks_the_preview_to_catch_up(self) -> None:
+        before = self.app.detail_updates
+        self.app._set_trigger_offset(self.row, "0.42")
+        self.assertEqual(self.app.detail_updates, before + 1)
 
 
 if __name__ == "__main__":

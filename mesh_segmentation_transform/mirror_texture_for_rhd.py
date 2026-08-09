@@ -3872,7 +3872,13 @@ def build_rhd_texture(
     )
 
     companion_results: list[CompanionResult] = []
-    if companions and config.rebuild_companion_maps:
+    rebuild_companion_maps = (
+        bool(companions)
+        and config.rebuild_companion_maps
+        and config.detect_on_normal_map
+        and relief_added > 0
+    )
+    if rebuild_companion_maps:
         phase_started = time.perf_counter()
         emit_progress(
             progress,

@@ -240,6 +240,25 @@ def trigger_position_key(
     return name, rounded
 
 
+def trigger_offset_value(value: object) -> float | None:
+    """A per-box Move X override, or None for "use the global delta".
+
+    Signed, exactly like a part's ``translateOffset``: positive travels the way
+    the trim converts, negative walks the box back the other way. Zero is not
+    an override -- a box that moves nowhere is what Skip is for -- so it reads
+    as absent rather than pinning the box at the origin of its own frame.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        offset = float(value)
+    except (TypeError, ValueError):
+        return None
+    if offset != offset or offset in (float("inf"), float("-inf")) or offset == 0:
+        return None
+    return offset
+
+
 def normalized_trigger_modes(value: object) -> list[dict[str, object]]:
     """Clean saved per-trigger transform records, last entry per key winning."""
     if not isinstance(value, (list, tuple)):
@@ -254,7 +273,14 @@ def normalized_trigger_modes(value: object) -> list[dict[str, object]]:
         mode = str(entry.get("mode") or MODE_SKIP)
         if mode not in TRIGGER_MODES:
             continue
-        by_key[key] = {"id": key[0], "at": list(key[1]), "mode": mode}
+        record: dict[str, object] = {"id": key[0], "at": list(key[1]), "mode": mode}
+        # Only a Move has a distance to override, so an offset left over from a
+        # row that has since become Skip or Mirror is dropped rather than kept
+        # waiting to reappear the next time the row goes back to Move.
+        offset = trigger_offset_value(entry.get("offset")) if mode == MODE_TRANSLATE else None
+        if offset is not None:
+            record["offset"] = offset
+        by_key[key] = record
     return [by_key[key] for key in sorted(by_key)]
 
 
@@ -272,23 +298,75 @@ def trigger_mode_map(
     }
 
 
+def trigger_offset_map(
+    conversion: dict[str, object],
+) -> dict[tuple[str, tuple[float, float, float]], float]:
+    """(trigger id, authored position) -> the Move X the user typed for it.
+
+    An absent key means the box travels the shared conversion delta.
+    """
+    offsets: dict[tuple[str, tuple[float, float, float]], float] = {}
+    for entry in normalized_trigger_modes(conversion.get("triggers")):
+        offset = trigger_offset_value(entry.get("offset"))
+        key = trigger_position_key(entry["id"], entry["at"])
+        if offset is not None and key is not None:
+            offsets[key] = offset
+    return offsets
+
+
 def set_trigger_mode(
     conversion: dict[str, object],
     trigger_id: str,
     position: object,
     mode: str,
 ) -> None:
-    """Record the transform for the box of this id at this position."""
+    """Record the transform for the box of this id at this position.
+
+    A Move X already typed for this box survives a re-pick of Move, and is
+    dropped by ``normalized_trigger_modes`` on any other mode.
+    """
     key = trigger_position_key(trigger_id, position)
     if key is None or mode not in TRIGGER_MODES:
         return
-    records = [
-        entry
+    existing = {
+        trigger_position_key(entry["id"], entry["at"]): entry
         for entry in normalized_trigger_modes(conversion.get("triggers"))
-        if trigger_position_key(entry["id"], entry["at"]) != key
-    ]
-    records.append({"id": key[0], "at": list(key[1]), "mode": mode})
+    }
+    records = [entry for entry_key, entry in existing.items() if entry_key != key]
+    record: dict[str, object] = {"id": key[0], "at": list(key[1]), "mode": mode}
+    previous = existing.get(key)
+    if previous is not None and previous.get("offset") is not None:
+        record["offset"] = previous["offset"]
+    records.append(record)
     conversion["triggers"] = normalized_trigger_modes(records)
+
+
+def set_trigger_offset(
+    conversion: dict[str, object],
+    trigger_id: str,
+    position: object,
+    offset: object,
+) -> None:
+    """Set (or clear, with None/blank) one box's Move X override.
+
+    A box with no transform record has nothing to override -- the Triggers
+    table only offers the column on a row already set to Move -- so this does
+    nothing rather than inventing a mode the user did not choose.
+    """
+    key = trigger_position_key(trigger_id, position)
+    if key is None:
+        return
+    records = normalized_trigger_modes(conversion.get("triggers"))
+    for entry in records:
+        if trigger_position_key(entry["id"], entry["at"]) != key:
+            continue
+        cleaned = trigger_offset_value(offset)
+        if cleaned is None:
+            entry.pop("offset", None)
+        else:
+            entry["offset"] = cleaned
+        conversion["triggers"] = normalized_trigger_modes(records)
+        return
 
 
 def clear_trigger_mode(conversion: dict[str, object], trigger_id: str, position: object) -> None:
@@ -663,4 +741,4 @@ def set_slot_pair(conversion: dict[str, object], slot_type: str, partner: str) -
     conversion["slotPairs"] = normalized_slot_pairs(pairs)
 
 
-__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'trigger_position_key', 'normalized_trigger_modes', 'trigger_mode_map', 'set_trigger_mode', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
+__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'trigger_position_key', 'trigger_offset_value', 'normalized_trigger_modes', 'trigger_mode_map', 'trigger_offset_map', 'set_trigger_mode', 'set_trigger_offset', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']

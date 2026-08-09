@@ -10,13 +10,19 @@ import unittest
 
 from beamxp import transform_helpers
 from beamxp.core import sjson
-from beamxp.core.constants import HAND_RHD, MODE_MIRROR, MODE_SKIP, MODE_TRANSLATE
+from beamxp.core.constants import HAND_LHD, HAND_RHD, MODE_MIRROR, MODE_SKIP, MODE_TRANSLATE
 from beamxp.hand_drive_parts.configuration import (
     clear_trigger_mode,
     set_trigger_mode,
+    set_trigger_offset,
     trigger_mode_map,
+    trigger_offset_map,
 )
 from beamxp.hand_drive_parts.generation import converted_trigger_corners
+# Wires the implementation slices together: authored_trigger_positions and
+# trigger_modes_for_part call across slice boundaries, so reaching for them on
+# the module directly finds the names still unbound.
+from beamxp.hand_drive_core import authored_trigger_positions, trigger_modes_for_part
 from beamxp.hand_drive_parts.rewriting import (
     TRIGGER_BOX_TRIANGLES,
     _mirror_euler,
@@ -1252,6 +1258,100 @@ class TriggerModeRecordTests(unittest.TestCase):
             ]
         }
         self.assertEqual(trigger_mode_map(conversion), {})
+
+
+class TriggerOffsetRecordTests(unittest.TestCase):
+    """A box's Move X rides on the same position-keyed record as its mode."""
+
+    AT = (0.691, -0.756, 0.513)
+
+    def moved(self) -> dict:
+        conversion: dict = {}
+        set_trigger_mode(conversion, "hood_int", self.AT, MODE_TRANSLATE)
+        return conversion
+
+    def test_an_offset_needs_a_box_to_attach_to(self) -> None:
+        conversion: dict = {}
+        set_trigger_offset(conversion, "hood_int", self.AT, 0.42)
+        self.assertEqual(trigger_offset_map(conversion), {})
+
+    def test_setting_and_clearing_one_offset(self) -> None:
+        conversion = self.moved()
+        set_trigger_offset(conversion, "hood_int", self.AT, -0.42)
+        self.assertEqual(trigger_offset_map(conversion), {("hood_int", self.AT): -0.42})
+        set_trigger_offset(conversion, "hood_int", self.AT, None)
+        self.assertEqual(trigger_offset_map(conversion), {})
+        # clearing the distance must not disturb the transform
+        self.assertEqual(trigger_mode_map(conversion), {("hood_int", self.AT): MODE_TRANSLATE})
+
+    def test_an_offset_survives_a_save_and_reload(self) -> None:
+        conversion = self.moved()
+        set_trigger_offset(conversion, "hood_int", self.AT, -0.42)
+        reloaded = json.loads(json.dumps(conversion))
+        self.assertEqual(trigger_offset_map(reloaded), {("hood_int", self.AT): -0.42})
+
+    def test_a_stale_offset_on_a_non_move_row_is_dropped_on_load(self) -> None:
+        # hand-edited, or written before the row was changed to Mirror
+        conversion = {"triggers": [{"id": "t", "at": [0, 0, 0], "mode": MODE_MIRROR, "offset": 0.4}]}
+        self.assertEqual(trigger_offset_map(conversion), {})
+
+    def test_junk_and_zero_offsets_read_as_no_override(self) -> None:
+        for value in ("", None, "half a metre", 0, 0.0, float("nan"), float("inf")):
+            conversion = self.moved()
+            set_trigger_offset(conversion, "hood_int", self.AT, value)
+            self.assertEqual(trigger_offset_map(conversion), {}, repr(value))
+
+
+class TriggerOffsetDeltaTests(unittest.TestCase):
+    """What the build actually slides a box by, once a Move X is set.
+
+    The sign is read against the trim's target hand, so the same saved number
+    converts correctly whichever way round the config runs.
+    """
+
+    PART = """"ardente_hood": {
+    "slotType": "ardente_hood",
+    "triggers2":[
+      ["id", "idRef:", "idX:", "idY:", "type", "size", "baseRotation", "rotation", "translation", "baseTranslation"],
+      ["hood_int", "f5ll","f5l","f6ll", "box", {"x":0.04, "y":0.08, "z":0.08}, {"x":-14, "y":-6, "z":-9}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0.13, "y":0.0, "z":-0.15}],
+    ],
+}"""
+    NODES = {
+        "f5l": (0.316, -0.943, 0.599),
+        "f5ll": (0.8592, -0.883, 0.5209),
+        "f6ll": (0.7539, -0.8056, 0.8997),
+    }
+
+    def conversion(self, offset: object = None) -> dict:
+        at = authored_trigger_positions(self.PART, self.NODES)["hood_int"]
+        conversion: dict = {"delta": {"manual": True, "magnitude": 0.7}}
+        set_trigger_mode(conversion, "hood_int", at, MODE_TRANSLATE)
+        if offset is not None:
+            set_trigger_offset(conversion, "hood_int", at, offset)
+        return conversion
+
+    def delta(self, conversion: dict, target_hand: str) -> float:
+        follows = trigger_modes_for_part(
+            conversion, None, self.PART, self.NODES, target_hand
+        )
+        action, delta, _matrix = follows["hood_int"]
+        self.assertEqual(action, "translate")
+        return delta
+
+    def test_without_an_override_the_box_travels_the_shared_delta(self) -> None:
+        conversion = self.conversion()
+        self.assertAlmostEqual(self.delta(conversion, HAND_RHD), -0.7, places=9)
+        self.assertAlmostEqual(self.delta(conversion, HAND_LHD), 0.7, places=9)
+
+    def test_a_positive_override_replaces_the_distance_not_the_direction(self) -> None:
+        conversion = self.conversion(0.25)
+        self.assertAlmostEqual(self.delta(conversion, HAND_RHD), -0.25, places=9)
+        self.assertAlmostEqual(self.delta(conversion, HAND_LHD), 0.25, places=9)
+
+    def test_a_negative_override_sends_the_box_the_other_way(self) -> None:
+        conversion = self.conversion(-0.25)
+        self.assertAlmostEqual(self.delta(conversion, HAND_RHD), 0.25, places=9)
+        self.assertAlmostEqual(self.delta(conversion, HAND_LHD), -0.25, places=9)
 
 
 class EngineGroundTruthTests(unittest.TestCase):

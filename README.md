@@ -46,7 +46,7 @@ If Defender (or anything else) flags a release for you, please [open an issue](#
 - Selects front and rear plate meshes independently from BeamNG's shared vanilla physical-plate library; each trim's stock part is labelled `(default)` and `None` is available per side.
 - Shows a live in-app 3D preview of the conversion that updates as you work.
 - Builds one output mod zip containing all selected XP trim outputs and installs it into your BeamNG mods folder.
-- Lets each part be set to `Skip`, `Move`, `Mirror`, `Swap Mesh`, `Mirror Move`, or `Replace Source` — via an in-table dropdown or the `Q`/`W`/`E`/`R`/`T`/`Y` hotkeys.
+- Lets each part be set to `Skip`, `Move`, `Mirror`, `Swap Mesh`, or `Replace Source` — via an in-table dropdown or the `Q`/`W`/`E`/`R`/`Y` hotkeys.
 - Recommends part modes automatically (`Recommend Modes`): left/right structural pairs, driver controls, screens, and asymmetric interior parts, with rules tuned against hand-verified conversions.
 - Un-mirrors the texture on mirrored display screens (`Flip Tex`) so satnav and infotainment content keeps its left/right reading.
 - Detects steering side where possible.
@@ -63,7 +63,7 @@ If Defender (or anything else) flags a release for you, please [open an issue](#
 2. Select a source BeamNG vehicle `.zip`.
 3. If prompted, choose the vehicle model ID.
 4. Select the variants/trims you want to convert.
-5. Click `Recommend Modes` to auto-fill the common cases, then set the rest by hand — click a part's `Mode` cell for a dropdown, or select part(s) and press `Q` (Skip), `W` (Move), `E` (Mirror), `R` (Swap Mesh), `T` (Mirror Move), or `Y` (Replace Source):
+5. Click `Recommend Modes` to auto-fill the common cases, then set the rest by hand — click a part's `Mode` cell for a dropdown, or select part(s) and press `Q` (Skip), `W` (Move), `E` (Mirror), `R` (Swap Mesh), or `Y` (Replace Source):
    - `Move` for steering wheels, pedals, gauges, stalks, screens, and other driver-specific interior items.
    - `Mirror` for parts that only need visual mirroring.
    - `Swap Mesh` for paired parts where you want the opposite-side mesh on the existing structure, such as door cards or mirrors.
@@ -173,6 +173,8 @@ Moves the visual mesh laterally without mirroring it. Use this for parts that sh
 - Driver-specific controls
 
 For translated props, the tool keeps the original `idRef`, `idX`, `idY`, rotations, and animation values, and adds `baseTranslationGlobal` so animated props rotate around the translated visual position.
+
+The `Move X` column overrides how far one part travels. It is signed and relative to the conversion, not to the world: a positive value moves the part the way that trim converts, and a negative value moves it the opposite way, back toward the side it started on. Because the direction comes from each trim's own target hand, one saved value stays correct across a mixed set of configs — the same `Move X` on an LHD→RHD trim and on an RHD→LHD trim each moves toward the new driver's side. Leave it blank to use the global delta.
 
 ### Mirror Aesthetic
 

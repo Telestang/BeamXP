@@ -1820,10 +1820,12 @@ def build_batch(
             if mode == MODE_MIRROR_POSITION and mesh in flexbody_meshes and mesh not in mirror_position_prop_meshes
         }
         translate_magnitudes = part_translate_magnitudes(context, conversion, object_modes)
+        # Zero only -- a negative offset is a deliberate "move it the other
+        # way" override, not a missing delta.
         zero_translate = sorted(
             object_id
             for object_id, mode in object_modes.items()
-            if mode == MODE_TRANSLATE and translate_magnitudes.get(object_id, 0.0) <= 0
+            if mode == MODE_TRANSLATE and translate_magnitudes.get(object_id, 0.0) == 0
         )
         if zero_translate:
             raise RuntimeError(

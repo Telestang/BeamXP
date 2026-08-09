@@ -1160,7 +1160,6 @@ class PartsWorkflowMixin:
             return
         modes = core.active_part_modes(self.conversion)
         move = sum(1 for mode in modes.values() if mode == core.MODE_TRANSLATE)
-        mirror_move = sum(1 for mode in modes.values() if mode == core.MODE_MIRROR_POSITION)
         mirror = sum(1 for mode in modes.values() if mode == core.MODE_MIRROR)
         swap = sum(1 for mode in modes.values() if mode == core.MODE_MIRROR_STRUCTURAL)
         replace = sum(1 for mode in modes.values() if mode == core.MODE_REPLACE_SOURCE)
@@ -1174,7 +1173,7 @@ class PartsWorkflowMixin:
         )
         selected = len(self._selected_variant_names())
         self.derived_output_var.set(
-            f"{selected} config(s); Move {move}, Mirror Move {mirror_move}, Mirror {mirror}, "
+            f"{selected} config(s); Move {move}, Mirror {mirror}, "
             f"Swap Mesh {swap}, Replace Source {replace}, Texture Fix {texture}; "
             f"{pairs} equivalent pair(s); auto fixes: lights, cameras, bridge parts"
         )
