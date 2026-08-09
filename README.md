@@ -26,6 +26,29 @@ The old **39 trims in 4 minutes 30 seconds** figure is no longer used as a bench
 
 ---
 
+## Quick Start
+
+1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.0-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
+2. Open the app settings and configure:
+   - your BeamNG vehicle-content folder;
+   - your BeamNG mods folder.
+3. Select a vehicle from the vehicle browser.
+4. Select the configurations/trims you want to convert.
+5. Run **Recommend Transforms** to fill the common cases.
+6. Review the result in the live 3D preview.
+7. Adjust parts using **Move**, **Mirror**, **Swap Mesh**, `Move X`, Equivalent Parts, or an existing authored opposite-hand-drive part where appropriate.
+8. Select and transform any triggers that need to follow moved controls.
+9. Optionally configure custom front/rear licence plates.
+10. Use the in-app preview, or the optional Blender preview, to inspect the result.
+11. Click **Build + Install** to generate the conversion and install it into the configured BeamNG mods folder.
+12. Launch BeamNG.drive and select the generated configuration.
+
+The goal is not to make every vehicle completely automatic. BeamXP handles the repetitive conversion work and provides a fast visual workflow for the vehicle-specific decisions that remain.
+
+Enjoying driving from the other side? Star the repo to help other people find it, or support development on [Ko-fi](https://ko-fi.com/telestang).
+
+---
+
 ## What's New in This Release
 
 This release is a major conversion-quality and workflow overhaul.
@@ -204,30 +227,6 @@ The current rear plate still does not reproduce the same emboss effect as the fr
 The recommendation system has returned to a name-based heuristic approach. The previous release's spatial recommendation logic was slower and less accurate in practice.
 
 Spatial classification may be revisited in the future, but the current priority is fast, predictable recommendations that the user can review before applying.
-
----
-
-## Quick Start
-
-1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.0-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
-2. Open the app settings and configure:
-   - your BeamNG vehicle-content folder;
-   - your BeamNG mods folder.
-3. Select a vehicle from the vehicle browser.
-4. Select the configurations/trims you want to convert.
-5. Choose the conversion direction: **LHD -> RHD** or **RHD -> LHD**.
-6. Run **Recommend Transforms** to fill the common cases.
-7. Review the result in the live 3D preview.
-8. Adjust parts using **Move**, **Mirror**, **Swap Mesh**, `Move X`, Equivalent Parts, or an existing authored opposite-hand-drive part where appropriate.
-9. Select and transform any triggers that need to follow moved controls.
-10. Optionally configure custom front/rear licence plates.
-11. Use the in-app preview, or the optional Blender preview, to inspect the result.
-12. Click **Build + Install** to generate the conversion and install it into the configured BeamNG mods folder.
-13. Launch BeamNG.drive and select the generated configuration.
-
-The goal is not to make every vehicle completely automatic. BeamXP handles the repetitive conversion work and provides a fast visual workflow for the vehicle-specific decisions that remain.
-
-Enjoying driving from the other side? Star the repo to help other people find it, or support development on [Ko-fi](https://ko-fi.com/telestang).
 
 ---
 
