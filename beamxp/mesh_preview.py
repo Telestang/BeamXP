@@ -1581,9 +1581,11 @@ class MeshPreview:
             or abs(event.y - press[1]) > PICK_MOVE_THRESHOLD
         ):
             return
-        self._do_pick(event.x, event.y)
+        # Ctrl/Shift held means "add this to what I have", the same as in the
+        # tables. Tk reports the modifiers as bits on the release event.
+        self._do_pick(event.x, event.y, bool(int(getattr(event, "state", 0) or 0) & 0x0005))
 
-    def _do_pick(self, x: int, y: int) -> None:
+    def _do_pick(self, x: int, y: int, accumulate: bool = False) -> None:
         if self.on_pick is None or self.scene is None:
             return
         try:
@@ -1601,7 +1603,7 @@ class MeshPreview:
         except Exception as exc:  # keep the GUI alive on driver hiccups
             self.set_message(f"pick failed: {exc}")
             return
-        self.on_pick(mesh)
+        self.on_pick(mesh, accumulate)
 
     def _mouse_wheel(self, event) -> None:
         self._zoom(1 / 1.15 if event.delta > 0 else 1.15)

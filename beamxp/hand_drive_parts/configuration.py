@@ -277,16 +277,12 @@ def normalized_trigger_modes(value: object) -> list[dict[str, object]]:
         if mode not in TRIGGER_MODES:
             continue
         record: dict[str, object] = {"id": key[0], "at": list(key[1]), "mode": mode}
-        # A Move X means something on the modes that move the box -- the whole
-        # distance for a Move, a nudge on top of the reflection for a Mirror --
-        # and nothing on Skip, which is the one mode that leaves the box alone.
-        # An offset left over from a row since set to Skip is dropped rather
-        # than kept waiting to reappear.
-        offset = (
-            trigger_offset_value(entry.get("offset"))
-            if mode in TRIGGER_OFFSET_MODES
-            else None
-        )
+        # The Move X is kept whatever the transform, exactly as a mesh keeps
+        # its translateOffset: flipping a box to Skip to see what it looks like
+        # without it, and back, must not silently cost the distance that was
+        # dialled in. Only TRIGGER_OFFSET_MODES ever read the number, so one
+        # parked on a Skip row does nothing until that row can use it again.
+        offset = trigger_offset_value(entry.get("offset"))
         if offset is not None:
             record["offset"] = offset
         by_key[key] = record
@@ -313,6 +309,10 @@ def trigger_offset_map(
     """(trigger id, authored position) -> the Move X the user typed for it.
 
     An absent key means the box travels the shared conversion delta.
+
+    A box parked on Skip keeps its number here so it is still there when the
+    box goes back to a transform that moves it. Nothing reads it meanwhile:
+    the resolver only consults this map on the Move and Mirror branches.
     """
     offsets: dict[tuple[str, tuple[float, float, float]], float] = {}
     for entry in normalized_trigger_modes(conversion.get("triggers")):
@@ -331,8 +331,8 @@ def set_trigger_mode(
 ) -> None:
     """Record the transform for the box of this id at this position.
 
-    A Move X already typed for this box survives a move between the modes that
-    can carry one, and is dropped by ``normalized_trigger_modes`` on Skip.
+    A Move X already typed for this box survives every change of transform,
+    including a round trip through Skip.
     """
     key = trigger_position_key(trigger_id, position)
     if key is None or mode not in TRIGGER_MODES:

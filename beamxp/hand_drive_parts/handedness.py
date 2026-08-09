@@ -117,6 +117,12 @@ def delta_magnitude(context: VehicleContext, conversion: dict[str, object]) -> f
 # what an off-centre mod needs; with none typed the nudge is zero and the
 # reflection is exactly what it always was. Swap Mesh and Replace Source are
 # deliberately absent: those adopt another mesh whole, pivot included.
+#
+# MODE_MIRROR_POSITION stays here although the UI no longer offers it. It is
+# unreachable going forward -- it is out of MODE_CYCLE_VALUES, so out of both
+# the dropdown and the hotkeys -- but a project saved while it was still
+# offered can still carry it, and dropping it here would silently move that
+# project's geometry the next time it was built.
 NUDGE_MODES = frozenset({MODE_MIRROR, MODE_MIRROR_POSITION})
 
 

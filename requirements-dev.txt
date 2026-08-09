@@ -1,0 +1,12 @@
+# On top of requirements.txt, for running the test suite:
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Everything the app itself needs at runtime lives in requirements.txt, which
+# is what packaging/build_windows.ps1 installs before PyInstaller runs.
+pytest>=8
+
+# Not installable from PyPI, and deliberately absent: bpy and mathutils. The
+# Blender preview and the .blend build scripts run inside Blender's own
+# interpreter, which supplies both; beamxp shells out to Blender rather than
+# importing them in-process.

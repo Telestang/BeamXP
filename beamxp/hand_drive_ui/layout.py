@@ -394,8 +394,10 @@ class LayoutMixin:
         frame.rowconfigure(0, weight=1)
 
         columns = ("trigger", "mode", "offset")
+        # extended, like the parts table: a shifter's boxes and the meshes they
+        # label are one edit, so a Ctrl-click has to be able to gather them.
         self.trigger_tree = ttk.Treeview(
-            frame, columns=columns, show="headings", height=8, selectmode="browse"
+            frame, columns=columns, show="headings", height=8, selectmode="extended"
         )
         headings = {"trigger": "Trigger", "mode": "Transform", "offset": "Move X"}
         widths = {"trigger": 330, "mode": 130, "offset": 82}

@@ -18,6 +18,9 @@ from __future__ import annotations
 from .shared import *
 
 TRIGGER_ROW_PREFIX = "trig"
+# Tk reports keyboard modifiers as bits in event.state.
+SHIFT_MASK = 0x0001
+CONTROL_MASK = 0x0004
 TRIGGER_MODE_LABELS = {
     core.MODE_SKIP: "Skip",
     core.MODE_TRANSLATE: "Move",
@@ -283,50 +286,79 @@ class TriggersWorkflowMixin:
             if visible_keep:
                 self.trigger_tree.selection_set(visible_keep)
 
-    def _claim_selection(self, owner: str) -> None:
-        """Give the selection to one table and take it from the other.
+    @staticmethod
+    def _toggle_tree_selection(tree, item: str) -> None:
+        """Ctrl-click semantics for a row picked in the 3D preview: add it to
+        the selection, or drop it if it was already there, so a mis-pick is
+        undone by picking it again rather than by starting over."""
+        current = list(tree.selection())
+        if item in current:
+            tree.selection_set([row for row in current if row != item])
+        else:
+            tree.selection_add(item)
 
-        A mesh and a trigger are different kinds of thing with different
-        detail panels and different hotkeys, so holding both at once leaves
-        it ambiguous which one a keystroke is about. Clearing a treeview
-        fires <<TreeviewSelect>>, which lands back here, so the guard stops
-        the two tables handing the selection to each other forever.
+    def _note_selection_modifier(self, event: tk.Event) -> None:
+        """Record whether the click about to land is holding Ctrl or Shift.
+
+        Bound ahead of the Treeview's own class binding, so the flag is set
+        before <<TreeviewSelect>> fires and ``_claim_selection`` reads it.
         """
-        if getattr(self, "_selection_sync", False):
-            return
-        self._selection_sync = True
         try:
-            if owner != "parts" and hasattr(self, "part_tree"):
-                if self.part_tree.selection():
-                    self.part_tree.selection_set([])
-            if owner != "triggers" and hasattr(self, "trigger_tree"):
-                if self.trigger_tree.selection():
-                    self.trigger_tree.selection_set([])
-        finally:
-            self._selection_sync = False
+            state = int(getattr(event, "state", 0) or 0)
+        except (TypeError, ValueError):
+            state = 0
+        self._selection_accumulating = bool(state & (SHIFT_MASK | CONTROL_MASK))
+
+    def _claim_selection(self, owner: str, item: str = "") -> None:
+        """Give the selection to the table being clicked, at click time.
+
+        Deliberately driven by the click and NOT by <<TreeviewSelect>>. Tk
+        *queues* that event rather than sending it: a handler runs after the
+        call that changed the selection has returned, so any "we are only
+        rebuilding" flag set around the change is already back off by the time
+        the handler reads it. A rebuild's own re-selection is then
+        indistinguishable from a click, and clearing from the handler took the
+        other table down with every refresh. Deciding here removes the timing
+        question rather than trying to win it.
+
+        A plain click starts fresh, so the other table is cleared: a transform
+        must never land on rows still selected in a table the user has stopped
+        looking at. Ctrl- and Shift-click say "add to what I have", so both
+        tables keep their rows -- which is the point, because a shifter's
+        meshes and the boxes that label them want the same Move and the same
+        Move X in one edit.
+
+        A click that lands *inside* a selection this table already holds is an
+        edit of that selection, not a new one, so it leaves the other table
+        alone. That is what lets Move X be typed into one row of a gathered
+        set without dropping the rest of it.
+        """
+        if getattr(self, "_selection_accumulating", False):
+            return
+        own = getattr(self, "part_tree" if owner == "parts" else "trigger_tree", None)
+        if own is not None and item and own.exists(item) and item in own.selection():
+            return
+        other = getattr(self, "trigger_tree" if owner == "parts" else "part_tree", None)
+        if other is not None and other.selection():
+            other.selection_set([])
 
     def _clear_all_selection(self) -> None:
-        """Nothing selected in either table -- an empty click in the preview."""
-        if getattr(self, "_selection_sync", False):
-            return
-        self._selection_sync = True
-        try:
-            if hasattr(self, "part_tree") and self.part_tree.selection():
-                self.part_tree.selection_set([])
-            if hasattr(self, "trigger_tree") and self.trigger_tree.selection():
-                self.trigger_tree.selection_set([])
-        finally:
-            self._selection_sync = False
+        """Nothing selected in either table -- an empty click in the preview.
+
+        No re-entrancy guard needed: neither table's <<TreeviewSelect>> handler
+        changes a selection any more, so clearing one cannot come back here.
+        """
+        if hasattr(self, "part_tree") and self.part_tree.selection():
+            self.part_tree.selection_set([])
+        if hasattr(self, "trigger_tree") and self.trigger_tree.selection():
+            self.trigger_tree.selection_set([])
         self._refresh_trigger_highlight()
         self._update_detail()
 
     def _trigger_selection_changed(self) -> None:
-        # Only a table that actually holds a selection may claim it. Deleting
-        # a selected row fires this event with an empty selection, so claiming
-        # unconditionally let a rebuild of this table steal the selection off
-        # whatever the user had just clicked in the other one.
-        if self.trigger_tree.selection():
-            self._claim_selection("triggers")
+        # Nothing here decides who owns the selection. Tk queues this event, so
+        # it arrives indistinguishable from the one a rebuild's re-selection
+        # produces; _claim_selection runs from the click instead.
         self._refresh_trigger_highlight()
 
     def _refresh_trigger_highlight(self) -> None:
@@ -341,6 +373,7 @@ class TriggersWorkflowMixin:
         )
 
     def _trigger_click(self, event: tk.Event) -> str | None:
+        self._note_selection_modifier(event)
         self._close_tree_combo_editor()
         if not self._tree_body_click(self.trigger_tree, event):
             return None
@@ -348,10 +381,22 @@ class TriggersWorkflowMixin:
         row = getattr(self, "trigger_rows_by_iid", {}).get(item)
         if not item or row is None:
             return None
+        self._claim_selection("triggers", item)
         column = self.trigger_tree.identify_column(event.x)
         name = self._tree_column_name(self.trigger_tree, column)
+        if name not in {"mode", "offset"}:
+            # The Trigger column is the one you gather rows by, so the click has
+            # to reach the Treeview's own class binding -- that binding is what
+            # gives Ctrl- and Shift-click their meaning. Returning "break" here
+            # swallowed it and left the table single-select whatever its
+            # selectmode said.
+            return None
         self.trigger_tree.focus(item)
-        self.trigger_tree.selection_set([item])
+        # An editor opening on a row that is already part of a gathered
+        # selection must not throw the rest of it away -- that edit is meant for
+        # all of them. Only a click on an unselected row starts fresh.
+        if item not in self.trigger_tree.selection():
+            self.trigger_tree.selection_set([item])
         if name == "mode":
             current = TRIGGER_MODE_LABELS.get(str(row.get("mode") or ""), "")
 
@@ -375,68 +420,186 @@ class TriggersWorkflowMixin:
         return "break"
 
     def _set_trigger_mode(self, row: dict[str, object], mode: str) -> None:
-        core.set_trigger_mode(self.conversion, str(row["trigger"]), row["at"], mode)
-        self._refresh_triggers()
-        self._select_trigger_row(str(row["id"]))
-        self._update_detail()
-        self.status_var.set(
-            f"{row['label']} set to {TRIGGER_MODE_LABELS.get(mode, mode)}"
-        )
+        """The Triggers dropdown. Speaks for the whole selection, as the parts
+        one does; the row it was opened on is one of the rows it applies to."""
+        self._apply_mode_to_selection(mode)
 
     def _set_trigger_offset(self, row: dict[str, object], value: str) -> None:
+        self._apply_offset_to_selection(value)
+
+    def _apply_offset_to_selection(self, value: str) -> None:
+        """Set one Move X on everything selected, in both tables at once.
+
+        Rows whose transform has no distance to take -- a Skip, or a box left
+        on the automatic attribution -- are passed over rather than being
+        quietly given a mode they were never set to, and counted in the
+        message so a silent no-op cannot look like a change.
+        """
         cleaned = value.strip()
-        if cleaned and core.trigger_offset_value(cleaned) is None:
-            self._show_error(
-                "Invalid offset",
-                "Move X must be blank or a non-zero number. Positive moves the box the way this "
-                "trim converts; negative moves it the opposite way. To leave a box exactly where "
-                "it is, set its transform to Skip.",
-            )
+        if cleaned:
+            try:
+                parsed = float(cleaned)
+            except ValueError:
+                parsed = None
+            if parsed is None or parsed != parsed or parsed in (float("inf"), float("-inf")):
+                self._show_error(
+                    "Invalid offset",
+                    "Move X must be blank or a number. Positive moves the way this trim converts; "
+                    "negative moves it the opposite way.",
+                )
+                return
+            if parsed == 0:
+                # Stored on a mesh this fails the build later with "Delta X
+                # magnitude is zero"; on a box it is silently no override. Say
+                # so now instead, and point at the two things that mean it.
+                self._show_error(
+                    "Invalid offset",
+                    "Move X cannot be zero. Leave it blank to use the conversion delta, or set "
+                    "the transform to Skip to leave the part exactly where it is.",
+                )
+                return
+
+        stored = float(cleaned) if cleaned else None
+        targets, _rows = self._selected_part_mode_targets()
+        meshes = [
+            object_id
+            for object_id in targets
+            if str(self._get_part_setting(object_id, "mode", core.MODE_SKIP)) in OFFSET_MODES
+        ]
+        trigger_rows = self._selected_trigger_rows()
+        boxes = [
+            row for row in trigger_rows
+            if str(row.get("mode") or "") in core.TRIGGER_OFFSET_MODES
+        ]
+        if not meshes and not boxes:
+            self.status_var.set("Move X applies only to rows set to Move or Mirror")
             return
-        core.set_trigger_offset(self.conversion, str(row["trigger"]), row["at"], cleaned or None)
-        self._refresh_triggers()
-        self._select_trigger_row(str(row["id"]))
+
+        for object_id in meshes:
+            self._part_settings(object_id)["translateOffset"] = stored
+        for row in boxes:
+            core.set_trigger_offset(self.conversion, str(row["trigger"]), row["at"], stored)
+        if boxes:
+            self._refresh_triggers()
+            self._reselect_trigger_rows(boxes)
+        if meshes:
+            self._refresh_parts()
+            self._refresh_delta_label()
         self._update_detail()
+        what = f"Move X {offset_label(cleaned)}" if cleaned else "Move X cleared"
         self.status_var.set(
-            f"{row['label']} moves {offset_label(cleaned)}" if cleaned
-            else f"{row['label']} back to the conversion delta"
+            self._selection_change_message(
+                what, len(meshes), len(boxes), len(trigger_rows) - len(boxes)
+            )
         )
 
-    def _set_selected_mode_shortcut(self, event: tk.Event, mode: str) -> str | None:
-        """Send a transform hotkey to whichever table holds the selection.
-
-        Q/W/E/R/T/Y run along the parts dropdown; the triggers table answers
-        the first three of them, since a box only takes Skip, Move or Mirror.
-        Exactly one table holds the selection at a time, so the trigger table
-        gets first refusal and the parts table takes everything it declines.
-        """
-        handled = self._set_selected_trigger_mode_shortcut(event, mode)
-        if handled is not None:
-            return handled
-        return self._set_selected_part_mode_shortcut(event, mode)
-
-    def _set_selected_trigger_mode_shortcut(self, _event: tk.Event, mode: str) -> str | None:
-        """Apply a transform hotkey to the selected box, or decline it.
-
-        None means "not mine": either something is being typed into, or the
-        trigger table holds no selection, and the parts table should answer.
-        The selection is read rather than the focus, because the table keeps a
-        focused row after the parts table has taken the selection off it.
-        """
+    def _selected_trigger_rows(self) -> list[dict[str, object]]:
+        """Every selected trigger row, in table order."""
         if not hasattr(self, "trigger_tree"):
-            return None
+            return []
+        by_iid = getattr(self, "trigger_rows_by_iid", {})
+        return [row for item in self.trigger_tree.selection() if (row := by_iid.get(item))]
+
+    def _set_selected_mode_shortcut(self, _event: tk.Event, mode: str) -> str | None:
+        """The Q/W/E/R/T/Y entry point. Stands down for whatever is being typed
+        into; the dropdowns reach ``_apply_mode_to_selection`` directly, since
+        the combobox committing the edit is itself a typing widget."""
         focus = self.focus_get()
+        # Only typing targets swallow the hotkeys; buttons and other focusable
+        # widgets don't react to letter keys, so mode setting stays live.
         if focus is not None and focus.winfo_class() in TYPING_WIDGET_CLASSES:
             return None
-        selection = self.trigger_tree.selection()
-        row = getattr(self, "trigger_rows_by_iid", {}).get(selection[0]) if selection else None
-        if row is None:
+        return self._apply_mode_to_selection(mode)
+
+    def _apply_mode_to_selection(self, mode: str) -> str | None:
+        """Set one transform on everything selected, in both tables at once.
+
+        Q/W/E/R/T/Y run along the parts dropdown. The two tables no longer take
+        turns: a Ctrl-click can gather a shifter's meshes and the trigger boxes
+        that label them, and one keystroke moves the lot. Where the two
+        disagree about a mode -- a box takes only Skip, Move or Mirror -- the
+        rows that can take it still do, and the message says what stood out.
+        """
+        if self.context is None:
             return None
-        if mode not in TRIGGER_MODE_LABELS:
+        targets, target_rows = self._selected_part_mode_targets()
+        trigger_rows = self._selected_trigger_rows()
+        if not targets and not trigger_rows:
+            if hasattr(self, "part_tree") and any(
+                self._part_child_override(row_id) for row_id in self.part_tree.selection()
+            ):
+                self.status_var.set(
+                    "Effective source/replaced rows are controlled by their Replace Source parent"
+                )
+                return "break"
+            return None
+
+        # Swap Mesh and Replace Source are pairings rather than settings: each
+        # needs a partner picked for the one row it is set on, so they stay
+        # single-target and never reach a trigger box.
+        if mode in {core.MODE_MIRROR_STRUCTURAL, core.MODE_REPLACE_SOURCE}:
+            noun = "mesh" if mode == core.MODE_MIRROR_STRUCTURAL else "part"
+            if len(targets) != 1 or trigger_rows:
+                self.status_var.set(
+                    f"Select one {noun} to set {mode_label(mode)}; it needs a source {noun}"
+                )
+                return "break"
+            if mode == core.MODE_MIRROR_STRUCTURAL:
+                self._set_part_mode(targets[0], mode)
+            else:
+                self._set_part_mode(targets[0], mode, row_id=target_rows[0])
+            return "break"
+
+        takeable = [row for row in trigger_rows if mode in TRIGGER_MODE_LABELS]
+        if not targets and not takeable:
             self.status_var.set("A trigger box takes only Skip (Q), Move (W) or Mirror (E)")
             return "break"
-        self._set_trigger_mode(row, mode)
+
+        if targets:
+            self._apply_part_modes(targets, mode)
+        for row in takeable:
+            core.set_trigger_mode(self.conversion, str(row["trigger"]), row["at"], mode)
+        if takeable:
+            self._refresh_triggers()
+            self._reselect_trigger_rows(takeable)
+        if targets:
+            self._refresh_parts()
+            self._refresh_delta_label()
+        self._update_detail()
+        self.status_var.set(
+            self._selection_change_message(
+                mode_label(mode), len(targets), len(takeable), len(trigger_rows) - len(takeable)
+            )
+        )
         return "break"
+
+    @staticmethod
+    def _selection_change_message(
+        what: str,
+        meshes: int,
+        triggers: int,
+        refused_triggers: int = 0,
+    ) -> str:
+        parts = []
+        if meshes:
+            parts.append(f"{meshes} mesh(es)")
+        if triggers:
+            parts.append(f"{triggers} trigger(s)")
+        message = f"{what} on {' and '.join(parts)}" if parts else f"{what}: nothing to change"
+        if refused_triggers:
+            message += f"; {refused_triggers} trigger(s) cannot take it"
+        return message
+
+    def _reselect_trigger_rows(self, rows: list[dict[str, object]]) -> None:
+        """Put the selection back after a refresh rebuilt the table's rows."""
+        if not hasattr(self, "trigger_tree"):
+            return
+        wanted = [str(row["id"]) for row in rows if self.trigger_tree.exists(str(row["id"]))]
+        if not wanted:
+            return
+        self.trigger_tree.selection_set(wanted)
+        self.trigger_tree.focus(wanted[0])
+        self.trigger_tree.see(wanted[0])
 
     def _selected_trigger_scene_ids(self) -> set[str]:
         """The scene group names of the currently selected trigger rows."""

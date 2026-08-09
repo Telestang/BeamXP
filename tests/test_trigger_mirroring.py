@@ -1305,10 +1305,21 @@ class TriggerOffsetRecordTests(unittest.TestCase):
         conversion = {"triggers": [{"id": "t", "at": [0, 0, 0], "mode": MODE_MIRROR, "offset": 0.4}]}
         self.assertEqual(trigger_offset_map(conversion), {("t", (0.0, 0.0, 0.0)): 0.4})
 
-    def test_a_stale_offset_on_a_skipped_row_is_dropped_on_load(self) -> None:
-        # hand-edited, or written before the row was changed to Skip
+    def test_a_skipped_row_parks_its_offset_rather_than_losing_it(self) -> None:
+        # Skip is routinely a "what does it look like without this" toggle, so
+        # the number has to be there when the row comes back. Nothing reads it
+        # meanwhile -- the resolver only asks on the Move and Mirror branches.
         conversion = {"triggers": [{"id": "t", "at": [0, 0, 0], "mode": MODE_SKIP, "offset": 0.4}]}
-        self.assertEqual(trigger_offset_map(conversion), {})
+        self.assertEqual(trigger_offset_map(conversion), {("t", (0.0, 0.0, 0.0)): 0.4})
+
+    def test_a_round_trip_through_skip_keeps_the_offset(self) -> None:
+        conversion = self.moved()
+        set_trigger_offset(conversion, "hood_int", self.AT, -0.42)
+        for mode in (MODE_SKIP, MODE_MIRROR, MODE_TRANSLATE):
+            set_trigger_mode(conversion, "hood_int", self.AT, mode)
+            self.assertEqual(
+                trigger_offset_map(conversion), {("hood_int", self.AT): -0.42}, mode
+            )
 
     def test_junk_and_zero_offsets_read_as_no_override(self) -> None:
         for value in ("", None, "half a metre", 0, 0.0, float("nan"), float("inf")):

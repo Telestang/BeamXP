@@ -16,7 +16,17 @@ a = Analysis(
         # for it in sys._MEIPASS in frozen builds.
         (str(ROOT / "assets" / "xp_sticker.png"), "assets"),
     ],
-    hiddenimports=[],
+    hiddenimports=[
+        # Texture Fix is reached through a function-level import wrapped in a
+        # try/except (build_pipeline.texture_correction_report), and
+        # ispc_texcomp through another one inside the DDS writer. A module the
+        # graph failed to follow would not break the build -- it would ship an
+        # exe whose Texture Fix raises the moment anyone ticks the column. Name
+        # them so that cannot happen quietly.
+        "mesh_segmentation_transform.mirror_texture_for_rhd",
+        "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC",
+        "ispc_texcomp",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

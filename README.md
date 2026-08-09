@@ -47,6 +47,7 @@ If Defender (or anything else) flags a release for you, please [open an issue](#
 - Shows a live in-app 3D preview of the conversion that updates as you work.
 - Builds one output mod zip containing all selected XP trim outputs and installs it into your BeamNG mods folder.
 - Lets each part be set to `Skip`, `Move`, `Mirror`, `Swap Mesh`, or `Replace Source` — via an in-table dropdown or the `Q`/`W`/`E`/`R`/`Y` hotkeys.
+- Applies a transform to a whole selection at once, meshes and trigger boxes together: Ctrl- or Shift-click to gather rows across both tables, then set them with a hotkey, either dropdown, or the `Move X` field. Related parts — a shifter's meshes and the boxes that label them — move as one edit instead of several that have to agree.
 - Recommends part modes automatically (`Recommend Modes`): left/right structural pairs, driver controls, screens, and asymmetric interior parts, with rules tuned against hand-verified conversions.
 - Un-mirrors the texture on mirrored display screens (`Flip Tex`) so satnav and infotainment content keeps its left/right reading.
 - Detects steering side where possible.
@@ -102,7 +103,15 @@ Install Python packages:
 pip install -r requirements.txt
 ```
 
-`requirements.txt` covers the in-app preview (numpy, moderngl) and preview image handling (Pillow). PyInstaller is only installed by the packaging script if you build the Windows exe yourself.
+`requirements.txt` covers the in-app preview (numpy, moderngl), preview image handling (Pillow), and Texture Fix (OpenCV for region detection, `ispc_texcomp` for the DDS block encoder). All of it ships in the exe. PyInstaller is only installed by the packaging script if you build the Windows exe yourself.
+
+To run the test suite as well:
+
+```powershell
+pip install -r requirements.txt -r requirements-dev.txt
+```
+
+`bpy` and `mathutils` are in neither file: the Blender preview runs inside Blender's own interpreter, which supplies them, and the tool shells out to Blender rather than importing them in-process.
 
 Recommend Modes reads part names and the mesh placements already cached for
 the preview, so it needs no GPU and finishes in well under a second. The

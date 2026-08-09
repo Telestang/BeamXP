@@ -7,6 +7,7 @@ class PartEditingMixin:
     """Part-table interaction, inline editors, modes, offsets, visibility, and manual delta editing."""
 
     def _part_click(self, event: tk.Event) -> None:
+        self._note_selection_modifier(event)
         self._close_tree_combo_editor()
         if not self._tree_body_click(self.part_tree, event):
             return None
@@ -14,6 +15,7 @@ class PartEditingMixin:
         column = self.part_tree.identify_column(event.x)
         if not item:
             return None
+        self._claim_selection("parts", item)
         if isinstance(getattr(self, "side_pair_pick_target", None), dict):
             self.part_tree.selection_set([item])
             self.part_tree.focus(item)
@@ -34,7 +36,10 @@ class PartEditingMixin:
             return "break"
         if name == "mode":
             self.part_tree.focus(item)
-            self.part_tree.selection_set(item)
+            # Keep a gathered selection intact: the dropdown on one of its rows
+            # sets the mode for all of them. Only an unselected row starts fresh.
+            if item not in self.part_tree.selection():
+                self.part_tree.selection_set(item)
             current = mode_label(str(self._get_part_setting(object_id, "mode", core.MODE_SKIP)))
             replace_label = mode_label(core.MODE_REPLACE_SOURCE)
             disabled = set()
@@ -94,7 +99,7 @@ class PartEditingMixin:
             return "break"
         if name == "offset":
             if self._get_part_setting(object_id, "mode", core.MODE_SKIP) not in OFFSET_MODES:
-                self.status_var.set("Move X only applies to Move, Mirror and Mirror Move")
+                self.status_var.set("Move X only applies to Move and Mirror")
                 return "break"
             self._edit_tree_entry(
                 self.part_tree,
@@ -127,7 +132,7 @@ class PartEditingMixin:
             return "break"
         elif name == "offset":
             if self._get_part_setting(object_id, "mode", core.MODE_SKIP) not in OFFSET_MODES:
-                self.status_var.set("Move X only applies to Move, Mirror and Mirror Move")
+                self.status_var.set("Move X only applies to Move and Mirror")
                 return
             self._edit_tree_entry(
                 self.part_tree,
@@ -153,9 +158,9 @@ class PartEditingMixin:
         if mode == core.MODE_REPLACE_SOURCE and not self._replace_source_candidate_ids(object_id, row_id):
             self.status_var.set("Replace Source needs another part that fits this slot")
             return
-        self._set_part_mode(object_id, mode, row_id=row_id)
-        if mode not in {core.MODE_MIRROR_STRUCTURAL, core.MODE_REPLACE_SOURCE}:
-            self.status_var.set(f"{self._part_display_name(object_id)}: {mode_label(mode)}")
+        # The dropdown speaks for the whole selection, exactly as the hotkey
+        # does -- the row it was opened on is one of the rows it applies to.
+        self._apply_mode_to_selection(mode)
 
     def _cancel_structural_prompt(self, object_id: str | None = None) -> None:
         if object_id is not None and self.structural_prompt_part_id != object_id:
@@ -248,7 +253,10 @@ class PartEditingMixin:
         combo.set(current)
         combo.place(x=x, y=y, width=width, height=height)
         tree.focus(item)
-        tree.selection_set(item)
+        # Editing a row that is already part of a gathered selection keeps that
+        # selection: the commit is meant for all of it, not just this row.
+        if item not in tree.selection():
+            tree.selection_set(item)
         self._tree_combo_editor = combo
         combo.focus_set()
 
@@ -617,14 +625,15 @@ class PartEditingMixin:
             self.status_var.set(f"Toggled visibility for {len(selected)} selected part(s)")
         return "break"
 
-    def _set_selected_part_mode_shortcut(self, _event: tk.Event, mode: str) -> str | None:
-        focus = self.focus_get()
-        # Only typing targets swallow the hotkeys; buttons and other focusable
-        # widgets don't react to letter keys, so mode setting stays live.
-        if focus is not None and focus.winfo_class() in TYPING_WIDGET_CLASSES:
-            return None
-        if self.context is None:
-            return None
+    def _selected_part_mode_targets(self) -> tuple[list[str], list[str]]:
+        """(mesh ids, row ids) the parts table would apply a transform to.
+
+        Falls back to the focused row so a keystroke still lands right after a
+        click that moved the focus without settling a selection. Rows driven by
+        a Replace Source parent are left out; they answer to that parent.
+        """
+        if self.context is None or not hasattr(self, "part_tree"):
+            return [], []
         target_rows = [
             row_id
             for row_id in self.part_tree.selection()
@@ -641,39 +650,18 @@ class PartEditingMixin:
                 and not self._part_child_override(item)
             ):
                 target_rows = [item]
-        targets = [self._part_row_mesh_id(row_id) for row_id in target_rows]
-        targets = sorted(set(targets))
-        if not targets:
-            if any(self._part_child_override(row_id) for row_id in self.part_tree.selection()):
-                self.status_var.set("Effective source/replaced rows are controlled by their Replace Source parent")
-                return "break"
-            return None
-        if mode == core.MODE_MIRROR_STRUCTURAL:
-            if len(targets) != 1:
-                self.status_var.set("Select one mesh to set Swap Mesh; it needs a source mesh")
-                return "break"
-            self._set_part_mode(targets[0], mode)
-            return "break"
-        if mode == core.MODE_REPLACE_SOURCE:
-            # Replace Source is a pairing, so it goes through _set_part_mode --
-            # which picks the partner and refuses the mode when the slot holds
-            # no other part -- rather than being written straight onto the row.
-            if len(targets) != 1:
-                self.status_var.set("Select one part to set Replace Source; it needs a source part")
-                return "break"
-            self._set_part_mode(targets[0], mode, row_id=target_rows[0])
-            return "break"
+        seen: dict[str, str] = {}
+        for row_id in target_rows:
+            seen.setdefault(self._part_row_mesh_id(row_id), row_id)
+        targets = sorted(seen)
+        return targets, [seen[object_id] for object_id in targets]
+
+    def _apply_part_modes(self, targets: list[str], mode: str) -> None:
+        """Write one transform onto every listed mesh. No status, no refresh."""
         for object_id in targets:
             self._cancel_structural_prompt(object_id)
             self._apply_single_part_mode(object_id, mode)
-        self._refresh_parts()
-        self._refresh_delta_label()
-        self._update_detail()
-        if len(targets) == 1:
-            self.status_var.set(f"{self._part_display_name(targets[0])}: {mode_label(mode)}")
-        else:
-            self.status_var.set(f"Set {mode_label(mode)} on {len(targets)} part(s)")
-        return "break"
+
 
     def _part_settings(self, object_id: str) -> dict[str, object]:
         object_id = self._part_row_mesh_id(object_id)
@@ -995,42 +983,31 @@ class PartEditingMixin:
         self._update_detail()
 
     def _set_part_offset(self, object_id: str, value: str) -> None:
-        object_id = self._part_row_mesh_id(object_id)
-        parts = self.conversion.setdefault("parts", {})
-        settings = parts.setdefault(object_id, {})
-        if not isinstance(settings, dict):
-            return
-        cleaned = value.strip()
-        if not cleaned:
-            settings["translateOffset"] = None
-        else:
-            try:
-                # Signed: positive follows the trim's own conversion direction,
-                # negative walks the part back the other way.
-                settings["translateOffset"] = float(cleaned)
-            except ValueError:
-                self._show_error(
-                    "Invalid offset",
-                    "Part offset must be blank or a number. Positive moves the part the way this "
-                    "trim converts; negative moves it the opposite way.",
-                )
-                return
-        self._refresh_parts()
-        self._refresh_delta_label()
-        self._update_detail()
+        # Signed, and applied to everything selected: positive follows the
+        # trim's own conversion direction, negative walks it back the other way.
+        self._apply_offset_to_selection(value)
 
     def _part_selection_changed(self) -> None:
-        if self.part_tree.selection():
-            self._claim_selection("parts")
+        # As in _trigger_selection_changed: ownership is decided at click time,
+        # because Tk queues this event and a rebuild's re-selection arrives
+        # here looking exactly like a user's.
         self._refresh_viewer()
         self._update_detail()
 
-    def _on_preview_pick(self, object_id: object) -> None:
+    def _on_preview_pick(self, object_id: object, accumulate: bool = False) -> None:
         """A part was clicked in the GPU preview. object_id is the picked mesh
         name (== a part_tree iid) or None for empty space. Setting the tree
-        selection fires <<TreeviewSelect>> which refreshes the highlight+detail."""
+        selection fires <<TreeviewSelect>> which refreshes the highlight+detail.
+
+        ``accumulate`` is the viewer's Ctrl/Shift-click. It both adds to the
+        clicked table's selection and, through ``_selection_accumulating``,
+        stops the other table's selection being cleared -- so meshes and
+        trigger boxes can be gathered by picking them in the preview, exactly
+        as they can in the tables.
+        """
         if self.context is None:
             return
+        self._selection_accumulating = bool(accumulate)
         # A viewer click means the user is working with parts: pull keyboard
         # focus onto the table so the mode/visibility hotkeys apply directly.
         self.part_tree.focus_set()
@@ -1048,7 +1025,13 @@ class PartEditingMixin:
         if mesh_preview is not None and object_id.startswith(
             f"{mesh_preview.TRIGGER_SCENE_PREFIX}|"
         ):
-            self._select_trigger_row(object_id)
+            self._claim_selection("triggers", object_id)
+            if accumulate and self.trigger_tree.exists(object_id):
+                self._toggle_tree_selection(self.trigger_tree, object_id)
+                self.trigger_tree.focus(object_id)
+                self.trigger_tree.see(object_id)
+            else:
+                self._select_trigger_row(object_id)
             row = getattr(self, "trigger_rows_by_iid", {}).get(object_id)
             if row is not None:
                 self.trigger_tree.focus_set()
@@ -1082,7 +1065,11 @@ class PartEditingMixin:
             if isinstance(getattr(self, "side_pair_pick_target", None), dict):
                 self._commit_side_pair_part_pick_from_row(object_id)
                 return
-            self.part_tree.selection_set([object_id])
+            self._claim_selection("parts", object_id)
+            if accumulate:
+                self._toggle_tree_selection(self.part_tree, object_id)
+            else:
+                self.part_tree.selection_set([object_id])
             self.part_tree.focus(object_id)
             self.part_tree.see(object_id)
         elif isinstance(getattr(self, "side_pair_pick_target", None), dict):

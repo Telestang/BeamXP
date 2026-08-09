@@ -1,3 +1,16 @@
 Pillow>=10.0.0
 numpy>=1.24
 moderngl>=5.10
+
+# Texture Fix. build_pipeline reaches into mesh_segmentation_transform for it,
+# which needs OpenCV for region detection and relief-from-normals, and
+# ispc_texcomp for the BC1/BC4/BC5/BC7 blocks its DDS writer emits. Both ship
+# in the exe: the feature is part of the app, not an optional extra.
+#
+# Held below OpenCV 5 because the textures checked into rhd_textures/ and
+# mesh_segmentation_transform/segmentation_outputs/ were produced on the 4.x
+# line, and an image pipeline can shift its output across a major version
+# without any test noticing. Nothing here uses a contrib-only namespace, so
+# the base wheel is enough.
+opencv-python>=4.12,<5
+ispc_texcomp>=1.0.1
