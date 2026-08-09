@@ -1,337 +1,818 @@
-# BeamXP - BeamNG Vehicle eXPort Services
+# BeamXP — BeamNG LHD/RHD Vehicle Converter
 
-Convert any BeamNG.drive vehicle — vanilla or mod — between left-hand drive and right-hand drive, and generate custom licence plates.
+**BeamXP (BeamNG Vehicle eXPort Services)** converts BeamNG.drive vehicles between left-hand drive and right-hand drive, with automatic correction of meshes, textures, controls, cameras, mirrors, lighting, configuration parts, and licence plates.
 
-**[Download BeamXP 0.2.6-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.2.6-alpha-windows.zip)** — extract it anywhere and run the exe.
+**[Download BeamXP 0.3.0-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.0-alpha-windows.zip)** — extract it anywhere and run the exe.
 
-*BeamXP was previously named BeamHDC (BeamNG Hand Drive Converter).*
+> BeamXP was previously named **BeamHDC (BeamNG Hand Drive Converter)**.
 
-![One car, three BeamXP configs: Cypriot, Japanese, and British RHD builds with their generated plates](Screenshots/beamxp_poster.png)
+![Automatic texture correction on a converted interior](Screenshots/interior_reveal_720_orange_pingpong.gif)
 
-The aim is practical gameplay use: convert a car into the driver's preferred handedness with as little manual work as possible. The tool keeps the source vehicle physics, drivetrain, suspension, tires, handling, and damage model intact. It changes the visible driver environment by mirroring, translating, and remapping selected meshes and visual JBeam references.
+BeamXP is designed to turn an existing vehicle into a convincing opposite-hand-drive version rather than simply mirror the whole interior. Where possible it preserves existing geometry, reuses opposite-side meshes or authored parts, and only mirrors the parts that actually need mirroring. The remaining directional texture and relief detail is then corrected automatically.
 
-| Stock LHD | Converted RHD |
-| --- | --- |
-| ![Stock LHD interior](Screenshots/sunburst2_lhd.jpg) | ![Converted RHD interior](Screenshots/sunburst2_rhd.jpg) |
+The source vehicle's drivetrain, suspension, tyres, handling, and core vehicle structure are left alone unless a configured opposite-side or authored part is deliberately substituted.
+
+---
 
 ## Demo
 
-All 39 vanilla ETK 800-Series trims converted to RHD in 4 minutes 30 seconds — under 7 seconds per trim. Click to watch:
+A new end-to-end tutorial/demo is planned for this release.
 
-<a href="https://www.youtube.com/shorts/5jT2sWg6tlI"><img src="https://img.youtube.com/vi/5jT2sWg6tlI/oardefault.jpg" width="300" alt="BeamXP demo: converting all 39 ETK 800-Series trims to RHD in 4 minutes 30 seconds"></a>
+Until then, the previous ETK 800-Series conversion video remains available:
 
-## Status
+<a href="https://www.youtube.com/shorts/5jT2sWg6tlI"><img src="https://img.youtube.com/vi/5jT2sWg6tlI/oardefault.jpg" width="300" alt="Previous BeamXP ETK 800-Series conversion demo"></a>
 
-The tool is new. It has been working well in my own testing, but there may be issues I am not aware of yet. If you find something, please take the time to report it.
+The old **39 trims in 4 minutes 30 seconds** figure is no longer used as a benchmark. Automatic texture correction adds a significant analysis step, and a new end-to-end timing will be published after measuring the current workflow from starting a conversion to driving the finished vehicle in game.
 
-### Windows Defender false positive
+---
 
-Windows Defender (and possibly other antivirus software) may flag the release exe as `Trojan:Script/Wacatac.B!ml` or similar. This is a **false positive** — [Microsoft's own page for this detection](https://www.microsoft.com/en-us/wdsi/threats/malware-encyclopedia-description?Name=Trojan:Script/Wacatac.B!ml) notes it is a broad heuristic label that can misfire.
+## What's New in This Release
 
-BeamXP does several things that look suspicious to an automated heuristic despite being legitimate: it reads, creates, and overwrites files in BeamNG's AppData directory and other user-selected locations; it extracts, modifies, and repackages vehicle mod archives; it creates files intended to be loaded by another application (BeamNG.drive); and it is a new, unsigned application from a small developer. Unsigned executables built with PyInstaller are a well-known common source of this specific false positive.
+This release is a major conversion-quality and workflow overhaul.
 
-BeamXP is source-available under the MIT license (see [License](#license)) — you can read every line that runs, or build the exe yourself from source instead of using the release download.
+### Automatic mesh and texture correction
 
-BeamXP is currently changing fast enough that submitting a build to Microsoft for review is only useful once a version has settled, since the review applies to that exact file and each release replaces the last. Once development slows toward a stable release, I will submit a build for review to clear this for everyone on that version. In the meantime, releases are built without UPX compression, which removes one common trigger for this kind of heuristic flag.
+Previously, large parts such as dashboards and centre consoles could be converted by mirroring the complete mesh. That moved the geometry to the correct side, but also mirrored text, symbols, directional trim, and normal-map relief.
 
-If Defender (or anything else) flags a release for you, please [open an issue](#reporting-issues) with the version number and a screenshot — that helps track which builds are affected.
+BeamXP now segments these meshes first.
 
-## What It Does
+- Symmetric sub-meshes are detected so they can be **rotated and translated instead of mirrored**.
+- The remaining asymmetric portion of the mesh — referred to internally as the **husk** — is mirrored.
+- Symmetric UV islands on the husk are detected automatically.
+- Remaining candidate regions are detected with **MSER on the colour map** and **edge detection on the normal/relief map**.
+- The texture flip axis is chosen according to whether the associated surface normal is parallel to the **XY plane** or the **Z plane**.
+- Colour and relief information can therefore be corrected without reverting the whole part to a simple mirrored texture.
 
-- Converts in both directions: LHD to RHD and RHD to LHD.
-- Lists `.pc` variants/trims and batch converts all selected variants in one build.
-- Can export a converted trim, a Plates Only copy of the original trim, or both in one vehicle mod.
-- Generates custom EU, US, and JP licence plate designs: fonts, colours, borders, side bands, background images, emboss, and registration patterns, with a live front/rear preview.
-- Keeps reusable licence-plate sets in a global library and exports them as one universal plates mod, so every design is selectable on any vehicle — refreshed automatically on each install.
-- Selects front and rear plate meshes independently from BeamNG's shared vanilla physical-plate library; each trim's stock part is labelled `(default)` and `None` is available per side.
-- Shows a live in-app 3D preview of the conversion that updates as you work.
-- Builds one output mod zip containing all selected XP trim outputs and installs it into your BeamNG mods folder.
-- Lets each part be set to `Skip`, `Move`, `Mirror`, `Swap Mesh`, or `Replace Source` — via an in-table dropdown or the `Q`/`W`/`E`/`R`/`Y` hotkeys.
-- Applies a transform to a whole selection at once, meshes and trigger boxes together: Ctrl- or Shift-click to gather rows across both tables, then set them with a hotkey, either dropdown, or the `Move X` field. Related parts — a shifter's meshes and the boxes that label them — move as one edit instead of several that have to agree.
-- Recommends part modes automatically (`Recommend Modes`): left/right structural pairs, driver controls, screens, and asymmetric interior parts, with rules tuned against hand-verified conversions.
-- Un-mirrors the texture on mirrored display screens (`Flip Tex`) so satnav and infotainment content keeps its left/right reading.
-- Detects steering side where possible.
-- Estimates the translate distance from an auto-detected steering-wheel reference part; detection re-runs on load whenever a project has no reference set.
-- Allows per-part translate offsets.
-- Converts internal camera positions automatically.
-- Filters the part list to parts used by the selected variants.
-- Loads any BeamNG vehicle `.zip`, including zips with multiple vehicle IDs.
-- Optionally opens a Blender preview.
+The aim is to preserve text orientation, symbols, embossed or recessed details, and other directional surface features while still converting the overall geometry.
+
+### Vanilla-quality mirror reflections
+
+Converted wing mirrors now produce the same class of reflection as vanilla BeamNG mirrors, including the vehicle itself in the reflection.
+
+Older BeamXP conversions could produce the rather conspicuous effect of the car being invisible in its own mirrors.
+
+### Correct LHD/RHD headlight patterns
+
+BeamXP now converts the headlight pattern to the appropriate LHD/RHD version **when the source vehicle implements headlight patterns using BeamNG's vanilla method**.
+
+Vehicles using a custom headlight implementation may still require vehicle-specific handling.
+
+### Equivalent Parts
+
+A new **Equivalent Parts** system allows BeamXP to swap actual left/right configuration parts instead of relying on visual mirroring.
+
+For example, a single-seat LHD race configuration might contain:
+
+```text
+raceseat_FL
+<empty FR seat slot>
+```
+
+With this configured pair:
+
+```text
+raceseat_FL <-> raceseat_FR
+```
+
+an LHD -> RHD conversion can leave the left slot empty and place the authored right-hand race seat in the right slot.
+
+Equivalent Parts also preserves mixed configurations. Given:
+
+```text
+Before:
+raceseat_FL + seat_FR
+
+Configured pairs:
+raceseat_FL <-> raceseat_FR
+seat_FL     <-> seat_FR
+
+After LHD -> RHD:
+seat_FL + raceseat_FR
+```
+
+the seat types move to the opposite sides instead of being replaced by visually mirrored copies.
+
+### Existing authored LHD/RHD parts
+
+A conversion no longer has to generate a new transformed part when the vehicle already contains an authored opposite-hand-drive version.
+
+BeamXP can select an existing part from the configuration, walk down its slot tree, find the associated LHD/RHD parts and placements, and apply them as part of the conversion.
+
+This is distinct from a mesh transform: BeamXP is using the vehicle author's own opposite-hand-drive configuration where one already exists.
+
+### Trigger transforms
+
+BeamNG trigger boxes are used for interactions such as:
+
+- Doors
+- Ignition
+- Traction/stability-control buttons
+- Hood releases
+- Other clickable vehicle controls
+
+Triggers can now use **Move** and **Mirror** transforms so the interaction point follows the converted control.
+
+In the 3D preview, triggers are displayed as semi-transparent wire meshes at **0.5 opacity**. Their base display is red and transformed triggers use the same transform colour coding as vehicle meshes.
+
+### Multi-selection
+
+`Ctrl+Click` can now be used to select multiple meshes, parts, or triggers and apply a transform to the group.
+
+Selection works from the relevant tables and directly in the 3D preview.
+
+This is useful for assemblies made from several separate objects. A shifter, for example, may contain a knob, stick, base, trim, and related pieces that all need the same transform.
+
+### Clearer transform names
+
+The old transform names have been replaced:
+
+| Previous name | New name |
+| --- | --- |
+| `Translate` | **Move** |
+| `Mirror Aesthetic` | **Mirror** |
+| `Mirror Structural` | **Swap Mesh** |
+
+The new names describe the operation more directly and are used throughout the UI and this README.
+
+### More flexible Move X adjustment
+
+`Move X` is no longer limited to **Move**.
+
+It can now be used with:
+
+- **Move** — controls the lateral translation.
+- **Mirror** — applies an additional lateral translation *after* the mirror operation.
+
+`Move X` can also be negative, so the result can be adjusted in either direction along the vehicle X axis.
+
+The meaning of the positive direction follows the conversion direction:
+
+- LHD -> RHD: positive moves toward the RHD destination side.
+- RHD -> LHD: positive moves toward the LHD destination side.
+
+This keeps the control meaningful regardless of which direction the vehicle is being converted.
+
+### Swap Mesh for more paired components
+
+**Swap Mesh** can be used anywhere the vehicle already provides a suitable opposite-side mesh, including parts such as:
+
+- Door cards
+- Wing mirrors
+- Wing-mirror indicators/signals
+- Other paired left/right components
+
+### Installed-vehicle browser
+
+BeamXP no longer starts by asking the user to locate and open a vehicle ZIP manually.
+
+Instead, configure the BeamNG vehicle-content folder and the user's mods folder once. For example:
+
+```text
+<SteamLibrary>\steamapps\common\BeamNG.drive\content\vehicles
+%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods
+```
+
+BeamXP parses those locations and builds a vehicle selector using vehicle display information and the default vehicle preview image.
+
+Vanilla and mod sources are identified separately. When several sources expose the same vehicle, labels such as `[mod]`, `#1`, and `#2` are used to distinguish them.
+
+### JBeam parser improvements
+
+The JBeam parser and writer have received general robustness improvements.
+
+BeamNG vehicle files in the wild are not always perfectly consistent, so unusual write cases may still expose edge cases. Please report any vehicle that produces malformed or incorrect output.
+
+### BeamNG 0.39 compatibility
+
+General compatibility changes have been made for the BeamNG.drive 0.39 series.
+
+The RHD driver-camera bug previously documented by BeamXP was officially fixed by BeamNG in **0.39.3**:
+
+- [Original BeamNG forum report](https://www.beamng.com/threads/rhd-driver-camera-bug.110306/)
+- [BeamNG.drive v0.39.3 patch notes](https://www.beamng.com/game/news/patch/beamng-drive-v0-39-3/#:~:text=Fixed%20driver%20camera%20not%20moving%20correctly%20when%20looking%20back%20in%20RHD%20vehicles)
+
+### Licence-plate reliability fixes
+
+Several bugs affecting custom plates have been fixed and front/rear plate generation now behaves reliably in normal use.
+
+The current rear plate still does not reproduce the same emboss effect as the front plate. The rear relies on BeamNG's existing plate material properties, and adding a separate normal map would conflict with that setup. Replicating the required plate material properties independently is planned for a later update.
+
+### Recommend Transforms
+
+`Recommend Modes` has been renamed to **Recommend Transforms**.
+
+The recommendation system has returned to a name-based heuristic approach. The previous release's spatial recommendation logic was slower and less accurate in practice.
+
+Spatial classification may be revisited in the future, but the current priority is fast, predictable recommendations that the user can review before applying.
+
+---
 
 ## Quick Start
 
-1. [Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.2.6-alpha-windows.zip), extract it, and run the exe (or run from source — see Requirements).
-2. Select a source BeamNG vehicle `.zip`.
-3. If prompted, choose the vehicle model ID.
-4. Select the variants/trims you want to convert.
-5. Click `Recommend Modes` to auto-fill the common cases, then set the rest by hand — click a part's `Mode` cell for a dropdown, or select part(s) and press `Q` (Skip), `W` (Move), `E` (Mirror), `R` (Swap Mesh), or `Y` (Replace Source):
-   - `Move` for steering wheels, pedals, gauges, stalks, screens, and other driver-specific interior items.
-   - `Mirror` for parts that only need visual mirroring.
-   - `Swap Mesh` for paired parts where you want the opposite-side mesh on the existing structure, such as door cards or mirrors.
-6. Mark the steering wheel part as `Steering Ref` if automatic delta detection needs help.
-7. Optionally set `Licence plates` to a custom design or a saved set — see Licence Plates below.
-8. Use the in-app preview or Blender preview to inspect alignment.
-9. When the preview looks right, set the BeamNG mods folder and click `Build + Install`.
+1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.0-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
+2. Open the app settings and configure:
+   - your BeamNG vehicle-content folder;
+   - your BeamNG mods folder.
+3. Select a vehicle from the vehicle browser.
+4. Select the configurations/trims you want to convert.
+5. Choose the conversion direction: **LHD -> RHD** or **RHD -> LHD**.
+6. Run **Recommend Transforms** to fill the common cases.
+7. Review the result in the live 3D preview.
+8. Adjust parts using **Move**, **Mirror**, **Swap Mesh**, `Move X`, Equivalent Parts, or an existing authored opposite-hand-drive part where appropriate.
+9. Select and transform any triggers that need to follow moved controls.
+10. Optionally configure custom front/rear licence plates.
+11. Use the in-app preview, or the optional Blender preview, to inspect the result.
+12. Click **Build + Install** to generate the conversion and install it into the configured BeamNG mods folder.
+13. Launch BeamNG.drive and select the generated configuration.
+
+The goal is not to make every vehicle completely automatic. BeamXP handles the repetitive conversion work and provides a fast visual workflow for the vehicle-specific decisions that remain.
 
 Enjoying driving from the other side? Star the repo to help other people find it, or support development on [Ko-fi](https://ko-fi.com/telestang).
 
-## Requirements
+---
 
-### Windows Build (Recommended)
+## Vehicle Discovery
 
-This is the intended way to run the tool. Download the release zip, extract it anywhere, and run:
+BeamXP scans the configured BeamNG vehicle and mod locations instead of requiring individual ZIP selection.
 
-```text
-BeamXP.exe
-```
+The browser is designed to make large collections manageable:
 
-No Python install is required. Blender is optional and external; set the path to `blender.exe` inside the tool if you want Blender previews.
+- Vehicles are presented using their display information rather than requiring the user to recognise archive filenames.
+- The default BeamNG vehicle preview image is shown to make a source easier to identify.
+- Vanilla and mod sources are differentiated.
+- Duplicate vehicle sources are disambiguated using markers such as `[mod]`, `#1`, and `#2`.
 
-The tool itself does not need to live in the BeamNG `mods` folder. Configure the BeamNG mods folder inside the app so `Build + Install` can copy generated conversion zips there.
+This means a vanilla vehicle and several mods based on the same vehicle ID can coexist in the selector without the user having to manually browse the filesystem for each conversion.
 
-### Running From Source
+---
 
-- Windows
-- Python 3.11 or newer recommended
-- Tkinter, normally included with the standard Windows Python installer
-- BeamNG.drive source vehicle zips
-- Optional: Blender 4.2+ for the Blender preview
+## Conversion Model
 
-Install Python packages:
+BeamXP follows a simple preference:
 
-```powershell
-pip install -r requirements.txt
-```
+> **Preserve or reuse correct geometry first; mirror only what actually needs mirroring.**
 
-`requirements.txt` covers the in-app preview (numpy, moderngl), preview image handling (Pillow), and Texture Fix (OpenCV for region detection, `ispc_texcomp` for the DDS block encoder). All of it ships in the exe. PyInstaller is only installed by the packaging script if you build the Windows exe yourself.
+A conversion can therefore combine several approaches in the same vehicle:
 
-To run the test suite as well:
+1. Use an existing authored LHD/RHD part when the vehicle already provides one.
+2. Swap configured left/right equivalent parts where the correct opposite-side JBeam part exists.
+3. Use **Swap Mesh** where the opposite-side visual mesh already exists.
+4. Use **Move** where the original orientation should be preserved.
+5. Segment large parts so symmetric components can be moved or rotated without reflection.
+6. Use **Mirror** for the remaining asymmetric geometry.
+7. Correct directional colour-map and normal-map regions after the mirror.
 
-```powershell
-pip install -r requirements.txt -r requirements-dev.txt
-```
+This mixed approach is what allows a converted cockpit to retain the source vehicle's design instead of looking like a simple reflection.
 
-`bpy` and `mathutils` are in neither file: the Blender preview runs inside Blender's own interpreter, which supplies them, and the tool shells out to Blender rather than importing them in-process.
+---
 
-Recommend Modes reads part names and the mesh placements already cached for
-the preview, so it needs no GPU and finishes in well under a second. The
-OpenGL 4.3 compute kernels in `spatial_visibility_backend` remain for the
-standalone classifier sandbox in `spatial_classifier/`; set
-`BEAMXP_SPATIAL_BACKEND=cpu` to force the reference CPU path there.
+## Transforms
 
-The tool can still build conversions without Blender configured.
+### Move
 
-### Linux
+**Move** relocates the visual geometry laterally without reflecting it.
 
-A user has reported the Windows build running on Linux under Wine without issue.
-
-BeamNG itself runs through Proton on Linux, so point the mods folder at the Proton prefix, for example:
-
-```text
-~/.steam/steam/steamapps/compatdata/284160/pfx/drive_c/users/steamuser/AppData/Local/BeamNG.drive/current/mods
-```
-
-Running from source natively should also work - nothing in the tool is Windows-only - but I haven't tested it. If you try it, let me know how it goes.
-
-## In-App Preview
-
-![The tool with a conversion in progress: parts coloured by mode in the live 3D preview](Screenshots/sunburst2_tool.png)
-
-The main window includes a live 3D preview of the selected `Config` trim. Feedback is instant: changing a part mode, offset, plate mesh, or any other conversion setting updates the preview immediately, with no build step.
-
-- Left-drag orbits, right- or middle-drag pans, and the mouse wheel zooms.
-- Click a part in the viewport to select it in the parts table.
-- `H` (or `Shift+H`) hides/unhides the selected parts.
-- The `Opacity` slider makes the vehicle see-through so you can check buried interior parts.
-- The `Original layout` checkbox removes the hand-drive mesh/prop transforms while retaining the selected replacement plates.
-- Parts are coloured by mode: grey for non-transformed parts, blue for `Translate`, orange for `Mirror Aesthetic`, and pink for `Mirror Structural`.
-
-![Lowering the opacity reveals the converted interior through the bodywork](Screenshots/sunburst2_transparent_tool.png)
-
-The in-app preview shows one trim/variant at a time.
-
-## Blender Preview
-
-The Blender preview is optional. Use it when you want to inspect the complete generated trim with full Blender tooling; the in-app preview is the quicker feedback loop for day-to-day tuning.
-
-The preview:
-
-- Builds the current unpacked output first.
-- Uses the selected `Config` entry.
-- Imports the final resolved vehicle for that output, including generated converted meshes and unchanged context meshes.
-- Does not require the BeamNG Blender JBeam Editor add-on.
-- Opens as a new unsaved Blender instance; nothing is written to disk unless you save it yourself from Blender.
-
-If Blender is not configured, zip generation still works.
-
-For fine offset tuning, select the part that needs adjustment in a Blender preview, move it on Blender's X axis until it lines up, then copy that X movement into the tool as a manual global or per-part offset.
-
-## Part Modes
-
-`Recommend Modes` scans the used-parts list and proposes a mode per part from its name: left/right pairs of door cards and wing mirrors become `Mirror Structural`, seats become an `Equivalent Parts` row instead (their slot takes either side's part, so the mesh is left alone), driver controls and instruments become `Translate`, asymmetric interior parts become `Mirror Aesthetic`, and one-sided seat or mirror hardware with no opposite counterpart is mirrored across. A name pair is only believed when the two meshes really do sit on opposite sides of the centreline. Review the list and apply the rows you agree with; nothing is changed until you apply.
-
-### Translate
-
-Moves the visual mesh laterally without mirroring it. Use this for parts that should stay oriented the same relative to the driver:
+Typical uses include:
 
 - Steering wheel
 - Gauge cluster
 - Needles and screens
 - Pedals
 - Stalks
+- Gear selectors
 - Driver-specific controls
 
-For translated props, the tool keeps the original `idRef`, `idX`, `idY`, rotations, and animation values, and adds `baseTranslationGlobal` so animated props rotate around the translated visual position.
+For animated props, BeamXP preserves the original animation references and adds the required global translation so the visual object continues to animate around its translated position.
 
-The `Move X` column sets how far one part slides along x. It is signed and relative to the conversion, not to the world: a positive value moves the part the way that trim converts, and a negative value moves it the opposite way, back toward the side it started on. Because the direction comes from each trim's own target hand, one saved value stays correct across a mixed set of configs — the same `Move X` on an LHD→RHD trim and on an RHD→LHD trim each moves toward the new driver's side.
+`Move X` can be used to tune the lateral placement in either direction.
 
-What the column means depends on the transform, because the two kinds of mode start from different places:
+### Mirror
 
-| Transform | `Move X` | Blank means |
-| --- | --- | --- |
-| `Translate` | The whole distance the part travels, replacing the conversion delta | `Auto` — the shared delta |
-| `Mirror Aesthetic`, `Mirror Move` | A correction applied after the reflection | `None` — the reflection is used exactly |
-| `Swap Mesh`, `Replace Source` | Not offered — these adopt another mesh whole, pivot included | — |
+**Mirror** reflects the geometry across the vehicle centreline.
 
-A `Translate` is nothing but its delta, so the column replaces that delta outright. A reflection already knows where it is going, so the column nudges that landing point instead. Reach for it when a mod's centreline is not at x=0, or its object origins are inconsistent: mirroring such a part lands it slightly off, and a few centimetres of `Move X` puts it right without touching anything else.
+It is appropriate for geometry that genuinely needs to exchange handedness rather than simply move across the cabin.
 
-The Triggers table carries the same column on the same terms, for boxes set to `Move` or `Mirror`. A box left on the automatic attribution shows `N/A`: what it travels belongs to the mesh it was attributed to, so choose its transform outright to open the column.
+Large mirrored parts can also pass through BeamXP's automatic segmentation and texture-correction pipeline so directional text, symbols, trim, and relief information do not have to remain backwards.
 
-### Mirror Aesthetic
+`Move X` can be applied after the reflection when the mirrored result needs an additional lateral offset.
 
-Mirrors the generated mesh visually. For large symmetric interior parts such as dashboards, centre consoles, and headliners, this is a non-issue: the result deforms on par with the stock vehicle.
+### Swap Mesh
 
-Where mirroring creates a significant visual asymmetry — a vehicle with only a driver-side wing mirror, a race car with a single front seat — the deformation will follow the original physical side and won't look right in severe crashes. That is a trade-off of using this tool; use `Mirror Aesthetic` where you need it.
+**Swap Mesh** uses the corresponding opposite-side mesh on the existing source-side structure rather than geometrically reflecting the original mesh.
 
-### Mirror Structural
+Typical uses include:
 
-Swaps an opposite-side mirrored mesh onto the existing source-side JBeam structure. This is useful for paired parts like door cards or mirrors where you want the visual side to change but still deform with the existing door/mirror structure.
+- Door cards
+- Wing mirrors
+- Wing-mirror signals
+- Other paired left/right visual parts
 
-### Flip Tex
+Because the opposite-side mesh is already authored in the source vehicle, it can preserve details that would otherwise be unnecessarily mirrored.
 
-Mirroring a mesh also mirror-images its texture. That is correct for most trim, but wrong for parts that display readable content — a satnav/infotainment screen, badges, decals with text. Toggle `Flip Tex` on a `Mirror Aesthetic` part to reflect its texture coordinates horizontally along with the geometry, so the image keeps its normal left/right reading. The reflection happens within the part's own UV footprint, so it keeps sampling the same region of a shared texture atlas. `Mirror Structural` deliberately does not offer it: that mode swaps in the opposite-side mesh, which already carries its own correct texture mapping. It is not a recommendation: the build derives the flip from the vehicle's own navigator controllers, glowMaps and emissive screen-like materials, so a cluster that groups its satnav and instrument displays into one mesh is covered as well.
+### Move X
+
+`Move X` is a lateral adjustment available to **Move** and **Mirror**.
+
+For **Move**, it controls the translation itself.
+
+For **Mirror**, it is an extra translation applied after the reflection.
+
+Positive and negative values are supported. The positive direction follows the selected conversion direction rather than being hard-coded to one absolute side of the vehicle.
+
+---
+
+## Equivalent Parts
+
+Equivalent Parts operate at the configuration/slot level rather than merely changing a mesh.
+
+The user defines left/right pairs, for example:
+
+```text
+seat_FL      <-> seat_FR
+raceseat_FL  <-> raceseat_FR
+```
+
+BeamXP can then exchange occupied and empty slots, or preserve mixed part types while moving them to the appropriate side.
+
+This is particularly useful for:
+
+- Single-seat race configurations
+- Different driver/passenger seat types
+- Left/right hardware that already exists as separate JBeam parts
+- Configurations where visual mirroring would leave the physical part on the wrong side
+
+---
+
+## Existing Authored Hand-Drive Parts
+
+Some vehicles already contain separate LHD and RHD parts.
+
+BeamXP can use those authored parts instead of generating another transformed version.
+
+When such a part is selected, BeamXP walks down the relevant slot tree, finds the associated handed parts and placements, and applies the existing vehicle configuration.
+
+Where the source vehicle already contains the correct solution, reusing it is preferable to recreating it.
+
+---
+
+## Automatic Mesh and Texture Correction
+
+This pipeline is primarily intended for large interior components such as dashboards and centre consoles.
+
+A simplified view is:
+
+```text
+Source mesh
+    |
+    v
+Mesh segmentation
+    |
+    +--> Symmetric sub-meshes
+    |        |
+    |        +--> rotate / translate without reflection
+    |
+    +--> Remaining asymmetric geometry ("husk")
+             |
+             +--> mirror geometry
+                     |
+                     v
+              UV-region analysis
+                     |
+                     +--> symmetric UV-island detection
+                     +--> MSER on colour map
+                     +--> edge detection on normal map
+                     |
+                     v
+              choose correction axis
+                     |
+                     v
+          corrected colour + relief mapping
+```
+
+### Why segmentation matters
+
+A centre console may contain a mixture of:
+
+- symmetric trim;
+- buttons with readable symbols;
+- asymmetric controls;
+- display panels;
+- decorative relief;
+- geometry that only needs to move rather than reflect.
+
+Mirroring the entire object treats all of those features as though they have the same handedness.
+
+Segmentation lets BeamXP preserve the orientation of symmetric components and restrict mirroring to the geometry that actually needs it.
+
+### UV and texture correction
+
+After the asymmetric husk is mirrored, BeamXP analyses its UV mapping.
+
+It uses:
+
+- symmetry testing on UV islands;
+- MSER features in the colour map;
+- edge information in the normal/relief map.
+
+Candidate regions can then be reflected independently so the geometry changes side without forcing text, icons, or relief features to read backwards.
+
+The selected correction axis depends on the orientation of the associated surface normal relative to the XY and Z planes.
+
+---
+
+## Triggers and Interactive Controls
+
+BeamNG uses trigger boxes for many clickable interactions.
+
+BeamXP exposes those triggers in the preview so they can follow converted controls.
+
+Supported trigger transforms currently include:
+
+- **Move**
+- **Mirror**
+
+The trigger wireframes are semi-transparent and use the same transform colour scheme as normal meshes.
+
+Multiple triggers can be selected with `Ctrl+Click`, which is useful when several interactions belong to one transformed control assembly.
+
+---
+
+## Mirrors and Lighting
+
+### Wing-mirror reflections
+
+BeamXP now generates mirror setups that show the vehicle correctly in the reflection, matching the expected visual behaviour of vanilla BeamNG mirrors.
+
+### Headlight handedness
+
+When the source vehicle uses BeamNG's standard headlight-pattern system, BeamXP converts the pattern for the destination handedness automatically.
+
+This is conditional on the source implementation. Custom vehicle-specific lighting systems may not expose the same vanilla data for BeamXP to transform.
+
+---
+
+## In-App Preview
+
+![The tool with a conversion in progress: parts coloured by transform in the live 3D preview](Screenshots/sunburst2_tool.png)
+
+The main window includes a live 3D preview of the selected configuration.
+
+Changes are intended to be inspectable before building the mod.
+
+- Left-drag orbits.
+- Right- or middle-drag pans.
+- Mouse wheel zooms.
+- Click a part in the viewport to select it.
+- `Ctrl+Click` adds/removes parts, meshes, or triggers from the current selection.
+- `H` / `Shift+H` hides or unhides selected parts.
+- The opacity control can make the vehicle body transparent for inspecting buried interior parts.
+- The original-layout option removes the hand-drive transforms while keeping the currently selected configuration context.
+- Meshes are colour-coded by transform:
+  - grey — unchanged;
+  - blue — **Move**;
+  - orange — **Mirror**;
+  - pink — **Swap Mesh**.
+- Trigger boxes are shown as semi-transparent wire meshes and use the same transform colour coding.
+
+![Lowering the opacity reveals the converted interior through the bodywork](Screenshots/sunburst2_transparent_tool.png)
+
+---
+
+## Blender Preview
+
+The Blender preview remains optional.
+
+Use it when you want to inspect the complete generated configuration using normal Blender tools; the in-app preview is the faster feedback loop for routine conversion work.
+
+The preview:
+
+- builds the current unpacked output first;
+- uses the currently selected configuration;
+- imports the resolved vehicle, including generated meshes and unchanged context meshes;
+- does not require the BeamNG Blender JBeam Editor add-on;
+- opens as a new unsaved Blender instance.
+
+Nothing is written from Blender unless you save it manually.
+
+BeamXP can still build and install conversions without Blender configured.
+
+---
 
 ## Licence Plates
 
-Each trim can carry its own plate setup. Pick `Off`, `Custom`, or a saved plate set in the `Licence plates` dropdown (or per trim in the `Plates` column of the variants table), then `Configure...` opens the plate editor. A trim's converted and Plates Only outputs deliberately share one plate selection.
+BeamXP can generate reusable custom plate designs and apply front/rear plate configurations per trim.
+
+A trim can use:
+
+- `Off`
+- `Custom`
+- a saved plate set from the global library
+
+Front and rear physical plate meshes can be selected independently.
 
 ### Plate designs
 
-Three plate families are supported: `EU` (wide), and `US` and `JP` (both 2:1). Every design has:
+Three plate families are supported:
 
-- **Font** — plate fonts are not bundled, because most plate-style fonts are not licensed for redistribution. The default uses a plain system font; for authentic lettering, drop `.ttf`/`.otf` files into the BeamXP fonts folder (`Folder` opens it). `Links...` lists plate-style fonts advertised as free for personal use — UK, German/EU DIN and FE-Schrift, Dutch, and more. Combined with the EU template's colours and bands, the right font can reproduce pretty much any country's plate.
-- **Registration pattern** — `@` = letter, `#` = digit, `~` = letter or digit, `.` = centre dot. Exported trims get a generated registration from the pattern; on unexported stock vehicles BeamNG keeps supplying its own text.
-- **Background images** — optional separate front and rear uploads, for any family, sitting beside the matching colour controls. Images scale to fill the plate and centre-crop the overflowing dimension, overriding that side's background colour; a side without an image keeps its solid colour. Like a distinct rear colour, a front/rear image mismatch needs a converted or Plates Only trim. Ideal upload sizes match the rendered texture canvases: **1024×196** for the wide EU plate (52-11) and **512×256** for the squarish US/JP plate (30-15) — clean multiples (2048×392, 1024×512, ...) also map exactly; any other aspect ratio gets centre-cropped. Note that an enabled side band is drawn opaquely over the left 11% of the EU image, so either leave that strip as throwaway background or paint your own band and set the side band to `None`.
-- **Emboss strength** and an optional **border** (colour, offset, thickness, corner radius).
-- A **live preview** with a front/rear toggle and a `Regenerate` button for the sample registration.
+- **EU** — wide format
+- **US** — 2:1 format
+- **JP** — 2:1 format
 
-Family-specific options:
+Design options include:
 
-- `EU`: front and rear background colours (the rear colour applies to exported trims; stock vehicles use the front colour on both sides), font colour, horizontal text offset, character spacing, and a side band — the EU band with a country code, or a fully custom band with its own colour, code text, emblem, or full band image. The text offset shifts the registration left or right of its band-aware centre, e.g. to clear a centre emblem in a background image.
-- `US`: background colour, font colour, text scale, horizontal/vertical text offsets, and character spacing.
-- `JP`: plate style (Private white, Kei yellow, Commercial green, Kei commercial black), region, classification, and kana; the registration pattern fills the main number (e.g. `##-##`).
+- fonts;
+- colours;
+- borders;
+- side bands;
+- background images;
+- registration patterns;
+- front/rear configuration;
+- live preview.
+
+Plate-style fonts are not bundled because many are not licensed for redistribution. User-supplied `.ttf` and `.otf` fonts can be placed in the BeamXP fonts folder.
+
+Registration patterns use:
+
+```text
+@ = letter
+# = digit
+~ = letter or digit
+. = centre dot
+```
+
+### Background images
+
+Separate front and rear images can be supplied.
+
+Recommended texture sizes:
+
+```text
+EU: 1024 x 196
+US/JP: 512 x 256
+```
+
+Clean multiples of those sizes also map well. Other aspect ratios are centre-cropped.
+
+### EU plates
+
+EU-format controls include:
+
+- separate front and rear background colours;
+- font colour;
+- horizontal text offset;
+- character spacing;
+- side band;
+- country code;
+- custom band colour;
+- emblem or complete band image.
+
+### US plates
+
+US-format controls include:
+
+- background colour;
+- font colour;
+- text scale;
+- horizontal/vertical text offset;
+- character spacing.
+
+### JP plates
+
+JP-format controls include:
+
+- plate style;
+- region;
+- classification;
+- kana;
+- main registration number pattern.
+
+### Rear emboss limitation
+
+The front plate can reproduce the intended embossed appearance.
+
+The rear plate currently cannot use the same emboss setup while retaining the material properties inherited from BeamNG's default plate system. A future implementation may recreate those material properties independently so the rear can use its own normal map without conflict.
 
 ### Plate library
 
-`Library...` manages reusable plate sets: `New`, `Duplicate`, `Rename`, `Delete`, `Edit`. Set references are live — editing a set updates every conversion that references it, and builds embed a snapshot as a fallback. `Export plates mod...` writes any selection of sets into one universal `BeamXP_plates.zip` that works from the parts menu on all supported vehicles, and can install it straight into the configured mods folder. Every `Build + Install` also refreshes this mod automatically with the entire library, so all library designs stay selectable on any vehicle — not just the sets bound to the installed conversion. On XP-converted trims, switching between library designs in-game keeps the correct rear texture (every design carries rear-format variants); on stock vehicles, plate-set designs use the front colour on both sides.
+The global library manages reusable sets with:
 
-### Physical plate meshes
+- New
+- Duplicate
+- Rename
+- Delete
+- Edit
 
-Independently of the design, each trim's front and rear physical plate parts can be swapped using BeamNG's shared vanilla plate meshes. The trim's stock part is labelled `(default)` and `None` removes the plate on that side. Different front/rear background colours need a converted or Plates Only trim because the tool must clone a rear plate part to carry the second texture.
+Projects can reference saved sets rather than duplicating their contents.
 
-## Physics And Deformation Notes
+`Export plates mod...` writes selected designs into a universal BeamXP plates mod so they can be selected on supported vehicles.
 
-The tool does not move the physical JBeam structure for driver controls. The physical steering wheel, pedals, handbrake, and similar interior structures remain where they are in the source vehicle. The generated mod moves their visual representation.
+Each **Build + Install** also refreshes the exported plate library in the configured mods folder.
 
-Visual deformation is still driven by the source vehicle's physical deformation. For `Translate` parts, this can mean severe crash damage deforms the visual part according to its original physical side. For example, a heavy left-side impact that would deform the driver's side of a LHD car may visibly affect a translated RHD driver's visual part even though that visual part is now on the right.
+---
 
-`Mirror Aesthetic` on symmetric parts such as headliners, dashboards, and centre consoles deforms on par with the original base vehicle. The original-physical-side caveat only applies when `Mirror Aesthetic` results in visual asymmetry — for example, a vehicle that only has a driver-side wing mirror, or a race car with a single front seat.
+## Physics and Deformation Notes
 
-`Mirror Structural` swaps an opposite-side mesh onto an existing opposite-side structure, so deformation behaves on par with the original base vehicle.
+BeamXP uses several different conversion mechanisms, so their physical behaviour is not identical.
+
+### Visual mesh transforms
+
+**Move** and **Mirror** operate primarily on visual geometry. They do not automatically relocate the source vehicle's underlying node/beam structure.
+
+As a result, severe crash deformation can still follow the original physical side even when the visible control has moved to the opposite side.
+
+### Swap Mesh
+
+**Swap Mesh** places an authored opposite-side mesh onto the existing structure.
+
+For paired components this can produce a better visual/deformation match than reflecting the original mesh.
+
+### Equivalent Parts and authored parts
+
+Equivalent Parts and existing authored LHD/RHD parts operate at the slot/configuration level.
+
+Where the source vehicle provides a real opposite-side JBeam part, BeamXP can select that part rather than leaving the original physical component in place.
+
+### Triggers
+
+Trigger locations are handled separately from the vehicle's node/beam structure and can be moved or mirrored so interactive areas continue to align with converted controls.
+
+BeamXP remains a conversion tool rather than a complete vehicle re-authoring system. Extremely vehicle-specific structures or unusual deformation setups may still require manual authoring for perfect crash behaviour.
+
+---
 
 ## Output
 
-Projects are saved under:
+Projects are stored under:
 
 ```text
 %LOCALAPPDATA%/BeamXP/handedness_conversion_projects/<projectName>/
 ```
 
-The app settings file is saved beside the projects under `%LOCALAPPDATA%/BeamXP/`. (Data from BeamHDC-era builds under `%LOCALAPPDATA%/BeamHDC/` is moved there automatically the first time BeamXP runs.) This keeps user work stable even if the app folder or exe is replaced during an update.
-
-Each project contains:
-
-- `conversion.json`: saved tool settings for that source zip name and vehicle ID
-- `unpacked_output/`: generated mod folder
-- `build/`: generated mod zip
-- `blender_preview/`: Blender preview working files (payloads and extracted DAE caches), if used
-
-The configured BeamNG mods folder is only used as the install target for generated conversion zips.
-
-Vehicle builds use the filename `<source>_XP_conversion.zip`. Each trim's `Build` cell can be `Off`,
-`Converted`, `Plates Only`, or `Both`, so a converted and a Plates Only copy of the same source trim can
-live in that one archive. The in-app `Config` dropdown still lists that source trim only once; `Original
-layout` changes the previewed transform state without changing its selected plates.
-
-Reusable plate sets are stored separately under `%LOCALAPPDATA%/BeamXP/plates/`. Renaming a set is
-safe because projects reference its fixed ID. Builds resolve the latest set contents and embed a
-snapshot; if a referenced set is later deleted, the snapshot is used with a build warning.
-
-Model-local custom designs are labelled `Custom (<vehicle ID>)` and `Custom (<config name>)`. Once a
-trim custom exists, other trims can select it and share the same live definition without adding it to
-the global library. BeamNG's parts menu can still switch either vehicle to any generated custom or
-library design in game.
-
-The output mod zip also embeds a copy of the conversion settings at:
+The app settings file is stored under:
 
 ```text
-handedness_conversion/conversion.json
+%LOCALAPPDATA%/BeamXP/
 ```
 
-`projectName` is normally the vehicle ID when the zip name matches it, such as `sunburst2`. If a zip contains a differently named vehicle folder, the project name includes both the zip name and vehicle ID.
+BeamHDC-era data under `%LOCALAPPDATA%/BeamHDC/` is migrated when required so replacing the application itself does not discard project data.
+
+A project contains generated settings and build data such as:
+
+```text
+conversion.json
+unpacked_output/
+build/
+blender_preview/
+```
+
+The configured BeamNG mods folder is used as the install target for generated output.
+
+Vehicle conversion archives use the existing BeamXP conversion naming scheme, and generated conversion settings are embedded in the output so the attempted conversion can be reproduced later.
+
+Reusable plate sets are stored separately under:
+
+```text
+%LOCALAPPDATA%/BeamXP/plates/
+```
+
+---
 
 ## Example Configs
 
-The `examples/conversion_configs/` folder contains example conversion settings:
+The `examples/conversion_configs/` folder contains sample conversion settings, including existing vanilla-vehicle examples.
 
-- `sunburst2_batch_conversion.json`: Hirochi Sunburst, all 39 variants LHD to RHD
-- `bx_batch_conversion.json`: Ibishu 200BX, all 36 variants RHD to LHD
+These are settings only, not redistributed BeamNG vehicle assets.
 
-These are settings examples, not source vehicles. To use one:
+To use an example:
 
-1. Load your own matching source vehicle zip.
-2. Use `Import Config`.
-3. Select the example config.
-4. The tool imports only matching variants and part names.
+1. Make sure the matching vehicle is available in the configured vehicle/mod folders.
+2. Select the vehicle in BeamXP.
+3. Use `Import Config`.
+4. Select the example configuration file.
+5. Review the imported transforms against the current vehicle before building.
 
-Converted vehicle zips are not included because this repository is MIT licensed and cannot include BeamNG source vehicle files under that license. The example configs use vanilla BeamNG vehicles and contain settings only.
+Converted vanilla vehicle archives are not distributed with BeamXP.
+
+---
+
+## Requirements
+
+### Windows Build — Recommended
+
+Download the Windows release, extract it anywhere, and run:
+
+```text
+BeamXP.exe
+```
+
+No Python installation is required.
+
+Blender is optional and external.
+
+The application itself does not need to be placed in the BeamNG mods folder. Configure the game vehicle folder and mods folder from inside BeamXP.
+
+### Running From Source
+
+- Windows
+- Python 3.11 or newer recommended
+- Tkinter
+- BeamNG.drive installation/source vehicle content
+- Blender 4.2+ optional
+
+Install dependencies with:
+
+```powershell
+pip install -r requirements.txt
+```
+
+Then run BeamXP from source using the repository entry point.
+
+### Linux
+
+A user has reported the Windows build working under Wine.
+
+BeamNG.drive itself commonly runs through Proton, so the configured mods directory can point at the BeamNG AppData path inside the relevant Proton prefix, for example:
+
+```text
+~/.steam/steam/steamapps/compatdata/284160/pfx/drive_c/users/steamuser/AppData/Local/BeamNG.drive/current/mods
+```
+
+Native source execution should also be possible where the Python/OpenGL dependencies are available, but it is not the primary tested environment.
+
+---
+
+## Status
+
+BeamXP is still under active development.
+
+The current release performs substantially more analysis than earlier builds, especially during automatic mesh and texture correction. That improves the visual result but also increases conversion time.
+
+No replacement for the old 39-trim timing benchmark is published yet. A new benchmark will be based on the real end-to-end workflow rather than only the previous build stage.
+
+If you encounter a vehicle that does not convert correctly, please report it. Real vehicle edge cases are particularly useful for improving the JBeam writer, authored-part resolution, texture correction, and transform heuristics.
+
+---
 
 ## Known Limitations
 
-- Some vehicles use sloppy, inconsistent JBeam syntax. The parser handles several known quirks, but more may appear.
-- Some community mods have off-center geometry or inconsistent object origins. Use manual global or per-part offsets.
-- Some animated props may need vehicle-specific attention.
+- Unusual or inconsistent JBeam syntax may still expose parser/writer edge cases.
+- Some community vehicles have off-centre geometry or inconsistent object origins and may require manual `Move X` adjustment.
+- Some animated props may still need vehicle-specific attention.
 - Texture paths in Blender preview may not resolve exactly like BeamNG's material system.
-- Wheel-attached meshes (road wheels, hubcaps, tires) may not be positioned correctly in previews. The game places them at runtime on wheel node groups generated by the wheel system, which the previews do not model. Generated output zips are unaffected; the game positions them correctly.
-- Severe crash deformation of translated or asymmetrically mirrored interior visuals may not perfectly match a hand-authored conversion.
-- In the first-person driver camera, the "lean head out of the window" movement is clamped on right-hand-drive vehicles: the head barely exits the window when looking toward the driver's side. This is a BeamNG engine bug (a frame mismatch in the driver camera's window-margin calculation in `lua/ge/extensions/core/cameraModes/driver.lua`), not a conversion defect — official RHD vehicles such as the vanilla 200BX are affected identically, and it has been [reported to BeamNG along with a fix](https://www.beamng.com/threads/rhd-driver-camera-bug.110306/). Converted cameras match the official RHD camera setup exactly, so please don't report this one here.
+- Wheel-attached meshes such as wheels, hubcaps, and tyres may not appear in their final runtime positions in the preview because BeamNG places them using generated wheel node groups in game.
+- Severe crash deformation of purely visual **Move** or **Mirror** conversions may still follow the original physical structure.
+- Automatic headlight handedness conversion depends on the source vehicle using BeamNG's vanilla headlight-pattern implementation.
+- Rear custom plates do not currently reproduce the same emboss treatment as the front plate.
+- Automatic texture correction is computationally more expensive than the old whole-mesh mirroring path.
+
+The previous RHD driver-camera lean bug is **not** a current BeamXP limitation: BeamNG fixed it officially in version 0.39.3.
+
+---
+
+## Windows Defender False Positive
+
+Windows Defender, and potentially other antivirus software, may flag a BeamXP Windows build with a broad heuristic detection such as `Trojan:Script/Wacatac.B!ml`.
+
+BeamXP performs several operations that can look suspicious to automated heuristics despite being legitimate:
+
+- reads and writes files in BeamNG's AppData directories;
+- extracts and modifies vehicle archives;
+- creates new mod archives;
+- writes files intended to be loaded by another application;
+- is distributed as a small unsigned PyInstaller application.
+
+BeamXP is source-available under the MIT licence. You can inspect the code or build the executable yourself instead of using the packaged Windows build.
+
+If a release is flagged, please open an issue with the exact BeamXP version and a screenshot of the detection.
+
+---
 
 ## Reporting Issues
 
-Open a GitHub issue with three things:
+Open a GitHub issue with enough information to reproduce the conversion.
 
-- The source vehicle zip (or where to get it)
-- The conversion settings: your project `conversion.json`, or the `handedness_conversion/conversion.json` embedded in the built zip
-- A description of what is going wrong
+Ideally include:
 
-With the zip and the config file, the attempted conversion can be reproduced exactly in the app via `Import Config`.
+- the source vehicle or a link to where it can legally be obtained;
+- the BeamXP `conversion.json`;
+- the generated output/configuration involved;
+- a description of the incorrect behaviour;
+- screenshots where the problem is visual.
+
+Generated mods also embed conversion settings so an attempted conversion can be reproduced without manually reconstructing every transform.
+
+---
 
 ## Support
 
-If this tool saved you from doing a conversion by hand, consider [buying me a coffee on Ko-fi](https://ko-fi.com/telestang). It keeps the project going.
+If BeamXP saved you from converting a vehicle by hand, consider supporting development on [Ko-fi](https://ko-fi.com/telestang).
 
-Starring the repo helps too - it's free and it makes the tool easier for others to find.
+Starring the repository also helps other BeamNG users find the project.
+
+---
 
 ## License
 
-Tool code is MIT licensed. Generated output zips are not automatically MIT licensed; they may include or derive from the source vehicle's assets and remain subject to the source asset licenses.
+BeamXP source code is licensed under the **MIT License**.
+
+Generated conversion archives are **not automatically MIT licensed**. They may include or derive from the source vehicle's assets and remain subject to the licences and permissions that apply to those assets.
