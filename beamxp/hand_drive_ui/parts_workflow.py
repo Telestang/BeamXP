@@ -1222,7 +1222,7 @@ class PartsWorkflowMixin:
                             settings.get("translateOffset") if isinstance(settings, dict) else None,
                             manual_delta=self.manual_delta_enabled.get(),
                         )
-                        if mode == core.MODE_TRANSLATE and not child_override
+                        if mode in OFFSET_MODES and not child_override
                         else "N/A"
                     )
                     position, varies = self._table_position(row_id)

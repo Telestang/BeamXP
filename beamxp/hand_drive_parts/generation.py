@@ -644,6 +644,16 @@ _MESH_ACTION_FOR_MODE = {
 }
 
 
+def _nudged(
+    position: tuple[float, float, float] | None,
+    delta: float,
+) -> tuple[float, float, float] | None:
+    """Slide a resolved world position along x by a Move X nudge."""
+    if position is None or not delta:
+        return position
+    return (position[0] + delta, position[1], position[2])
+
+
 def _mesh_world_transform(
     mesh: str,
     object_modes: dict[str, str],
@@ -653,9 +663,12 @@ def _mesh_world_transform(
     action = _MESH_ACTION_FOR_MODE.get(object_modes.get(mesh, ""))
     if action is None:
         return None
+    # Every action that moves geometry now carries an x delta: the whole move
+    # for a translate, the Move X nudge on top of the reflection for the
+    # mirrors. Anything with no entry in the map contributes 0.0.
     delta = (
         signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0))
-        if action == "translate"
+        if action in ("translate", "mirror", "mirrorPosition")
         else 0.0
     )
     return action, delta
@@ -666,15 +679,20 @@ def _owner_transform_matrix(
     action: str,
     delta: float,
 ) -> list[list[float]] | None:
+    # The mirrors take the same world-space x slide on top of their reflection
+    # that the geometry they own does, so a trigger keeps following its mesh.
     if action == "translate":
         target_matrix = multiply_matrix(translation_matrix((delta, 0.0, 0.0)), source_matrix)
     elif action == "mirrorPosition":
         target_matrix = multiply_matrix(
-            translation_matrix((-2.0 * source_matrix[0][3], 0.0, 0.0)),
+            translation_matrix((-2.0 * source_matrix[0][3] + delta, 0.0, 0.0)),
             source_matrix,
         )
     elif action == "mirror":
-        target_matrix = multiply_matrix(mirror_x_matrix4(), source_matrix)
+        target_matrix = multiply_matrix(
+            multiply_matrix(translation_matrix((delta, 0.0, 0.0)), mirror_x_matrix4()),
+            source_matrix,
+        )
     else:
         return None
     return multiply_matrix(target_matrix, inverse_affine_matrix(source_matrix))
@@ -910,7 +928,12 @@ def trigger_modes_for_part(
                 None,
             )
         elif mode == MODE_MIRROR:
-            resolved[trigger_id] = ("mirror", 0.0, None)
+            # A box's Move X nudges the reflection; blank leaves it exact.
+            resolved[trigger_id] = (
+                "mirror",
+                signed_delta_for_target(target_hand, offsets.get(key, 0.0)),
+                None,
+            )
         else:
             resolved[trigger_id] = None  # Skip: leave the box where it was
     return resolved
@@ -1536,20 +1559,27 @@ def write_generated_jbeam_and_configs(
                 source_mesh = structural_sources.get(mesh, mesh)
                 source_obj = context.objects.get(source_mesh)
                 mesh_map[mesh] = f"{mesh}{suffix}" if source_obj is not None and source_obj.dae_path else mesh
+            def mesh_nudge(mesh: str) -> float:
+                """The Move X a reflecting mesh carries, as a world-space x delta.
+
+                Zero for anything the user left blank, and for Swap Mesh and
+                Replace Source, which are not in the map at all.
+                """
+                return signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0))
+
             flexbody_row_transforms: dict[str, tuple[str, float]] = {}
             for mesh in mesh_hits:
                 if object_modes.get(mesh) == MODE_TRANSLATE and mesh in translated_flexbody_meshes:
-                    flexbody_row_transforms[mesh] = (
-                        "translate",
-                        signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0)),
-                    )
+                    flexbody_row_transforms[mesh] = ("translate", mesh_nudge(mesh))
                 elif object_modes.get(mesh) == MODE_MIRROR_POSITION and mesh in mirror_position_flexbody_meshes:
-                    flexbody_row_transforms[mesh] = ("mirrorPosition", 0.0)
-                elif object_modes.get(mesh) in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
-                    # Mirrored flexbodies must carry the mirror in the jbeam
-                    # pos/rot: the engine drops the DAE node translation, so a
-                    # side-swap baked into the copy's node matrix never reaches
-                    # the screen.
+                    flexbody_row_transforms[mesh] = ("mirrorPosition", mesh_nudge(mesh))
+                # Mirrored flexbodies must carry the mirror in the jbeam
+                # pos/rot: the engine drops the DAE node translation, so a
+                # side-swap baked into the copy's node matrix never reaches
+                # the screen.
+                elif object_modes.get(mesh) == MODE_MIRROR:
+                    flexbody_row_transforms[mesh] = ("mirror", mesh_nudge(mesh))
+                elif object_modes.get(mesh) in {MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
                     flexbody_row_transforms[mesh] = ("mirror", 0.0)
             # A mirror's reflection plane belongs to its glass. Whatever the
             # part ends up rendering is the mesh named here reflected across the
@@ -1575,29 +1605,21 @@ def write_generated_jbeam_and_configs(
             prop_row_transforms: dict[str, tuple[str, float]] = {}
             for mesh in mesh_hits:
                 if object_modes.get(mesh) == MODE_TRANSLATE and mesh in translated_prop_meshes:
-                    prop_row_transforms[mesh] = (
-                        "translate",
-                        signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0)),
-                    )
+                    prop_row_transforms[mesh] = ("translate", mesh_nudge(mesh))
                 elif object_modes.get(mesh) == MODE_MIRROR_POSITION and mesh in mirror_position_prop_meshes:
-                    prop_row_transforms[mesh] = ("mirrorPosition", 0.0)
+                    prop_row_transforms[mesh] = ("mirrorPosition", mesh_nudge(mesh))
                 elif object_modes.get(mesh) == MODE_MIRROR and mesh in mirrored_prop_meshes:
-                    prop_row_transforms[mesh] = ("mirror", 0.0)
+                    prop_row_transforms[mesh] = ("mirror", mesh_nudge(mesh))
             # config_name: these positions are written into ONE trim's jbeam,
             # so they must be that trim's, not the cross-trim representative.
             prop_globals = {
-                mesh: target_object_position(
-                    context,
-                    mesh,
-                    signed_delta_for_target(target_hand, translate_magnitudes.get(mesh, 0.0)),
-                    config_name,
-                )
+                mesh: target_object_position(context, mesh, mesh_nudge(mesh), config_name)
                 for mesh in mesh_hits
                 if mesh in translated_prop_meshes and object_modes.get(mesh) == MODE_TRANSLATE
             }
             prop_globals.update(
                 {
-                    mesh: mirrored_object_position(context, mesh, config_name)
+                    mesh: _nudged(mirrored_object_position(context, mesh, config_name), mesh_nudge(mesh))
                     for mesh in mesh_hits
                     if mesh in mirrored_prop_meshes and object_modes.get(mesh) == MODE_MIRROR
                 }
@@ -2159,14 +2181,17 @@ def full_vehicle_preview_payload(
     ) -> list[list[float]]:
         if target_hand is None or mode not in convertible:
             return world
+        # Signed against this trim's target hand, exactly as the build does it.
+        # Zero for the modes that take no nudge, which leaves their matrices
+        # identical to what they were before Move X reached them.
+        delta = signed_delta_for_target(
+            target_hand,
+            part_translate_magnitude(context, conversion, mesh, mode),
+        )
         if mode == MODE_TRANSLATE:
-            delta = signed_delta_for_target(
-                target_hand,
-                part_translate_magnitude(context, conversion, mesh),
-            )
             return multiply_matrix(translation_matrix((delta, 0.0, 0.0)), world)
         if mode == MODE_MIRROR_POSITION:
-            return multiply_matrix(translation_matrix((-2.0 * world[0][3], 0.0, 0.0)), world)
+            return multiply_matrix(translation_matrix((-2.0 * world[0][3] + delta, 0.0, 0.0)), world)
         if mode == MODE_REPLACE_SOURCE:
             # Replace Source renders another mesh where this row stands, and
             # the child-preview pass forces this mode onto rows that keep their
@@ -2188,7 +2213,9 @@ def full_vehicle_preview_payload(
         # what lands on screen is this row's placement reflected. Without it a
         # swapped pair merely trades geometry across two rows that are already
         # each other's reflection, and the render does not change at all.
-        return multiply_matrix(mirror, world)
+        return multiply_matrix(
+            multiply_matrix(translation_matrix((delta, 0.0, 0.0)), mirror), world
+        )
 
     def preview_part_array(part_id: str, array_key: str) -> str | None:
         body = generated_plate_parts.get(part_id)
@@ -2674,9 +2701,13 @@ def converted_trigger_corners(
     ref triple at the mirrored nodes, which lands the box on the reflection of
     its authored point (see the door-pair regression). A move slides it along
     x by the conversion delta. Skip leaves it exactly where it was.
+
+    ``delta`` is the whole move for a translate and the Move X nudge on top of
+    the reflection for a mirror, matching ``_owner_transform_point``. A box
+    with no Move X of its own passes 0.0 here and reflects exactly.
     """
     if action == "mirror":
-        return [(-x, y, z) for x, y, z in corners]
+        return [(-x + delta, y, z) for x, y, z in corners]
     if action == "translate":
         return [(x + delta, y, z) for x, y, z in corners]
     return list(corners)
@@ -2749,7 +2780,12 @@ def preview_trigger_boxes(
             )
             # Drawn where the build will put it, so a Move X override has to be
             # read per box rather than sharing one delta across the whole trim.
-            delta = signed_delta_for_target(target_hand, offsets.get(key, magnitude))
+            # A move with none set falls back to the shared delta; a mirror
+            # falls back to zero, which is a plain reflection.
+            delta = signed_delta_for_target(
+                target_hand,
+                offsets.get(key, 0.0 if action == "mirror" else magnitude),
+            )
             axes = trigger_box_axes(
                 frame,
                 _trigger_row_vector(row, spans, index_of, "baseRotation"),

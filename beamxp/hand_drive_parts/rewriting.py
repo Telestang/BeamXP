@@ -275,7 +275,8 @@ def transform_flexbody_row(
         if pos is None:
             return row
         source_pos = pos_after_node_transforms(row, pos, inherited_options)
-        target_pos = (-source_pos[0], source_pos[1], source_pos[2])
+        # delta_x is the Move X nudge on top of the reflection, zero by default.
+        target_pos = (-source_pos[0] + delta_x, source_pos[1], source_pos[2])
         return replace_inline_vector(row, "pos", pos_before_node_transforms(row, target_pos, inherited_options))
 
     if action == "mirror":
@@ -283,7 +284,7 @@ def transform_flexbody_row(
         pos = vector_from_row(out, "pos")
         if pos is not None:
             source_pos = pos_after_node_transforms(out, pos, inherited_options)
-            target_pos = (-source_pos[0], source_pos[1], source_pos[2])
+            target_pos = (-source_pos[0] + delta_x, source_pos[1], source_pos[2])
         else:
             target_pos = None
         rot = vector_from_row(out, "rot")
@@ -307,12 +308,17 @@ def transform_flexbody_row(
     return row
 
 
-def flexbody_row_can_carry_transform(row: str, action: str) -> bool:
+def flexbody_row_can_carry_transform(row: str, action: str, delta_x: float = 0.0) -> bool:
     if action == "translate":
         return vector_from_row(row, "pos") is not None
     if action == "mirrorPosition":
         return vector_from_row(row, "pos") is not None
     if action == "mirror":
+        # A rot-only row can carry a plain reflection, but it has nowhere to put
+        # a Move X nudge -- there is no pos to add it to. Bake that case into
+        # the DAE copy instead of silently dropping the offset the user typed.
+        if delta_x and vector_from_row(row, "pos") is None:
+            return False
         return vector_from_row(row, "pos") is not None or vector_from_row(row, "rot") is not None
     return False
 
@@ -347,7 +353,9 @@ def rewrite_flexbody_meshes_with_transforms(
         row_transform: tuple[str, float] | None = row_transforms.get(mesh) if mesh else None
         bake_transform_into_dae = True
         if row_transform is not None:
-            bake_transform_into_dae = not flexbody_row_can_carry_transform(row, row_transform[0])
+            bake_transform_into_dae = not flexbody_row_can_carry_transform(
+                row, row_transform[0], row_transform[1]
+            )
         if mesh and mesh in mesh_map and shared_bake is not None:
             baked_mesh = add_baked_shared_mesh(
                 shared_bake,
@@ -466,10 +474,9 @@ def rewrite_prop_meshes_with_globals(
             action, delta_x = prop_row_transforms[matched_old_mesh]
             if action == "translate":
                 target_position = (row_position[0] + delta_x, row_position[1], row_position[2])
-            elif action == "mirrorPosition":
-                target_position = (-row_position[0], row_position[1], row_position[2])
-            elif action == "mirror":
-                target_position = (-row_position[0], row_position[1], row_position[2])
+            elif action in ("mirrorPosition", "mirror"):
+                # Reflected, then nudged by Move X (zero unless one was typed).
+                target_position = (-row_position[0] + delta_x, row_position[1], row_position[2])
             else:
                 target_position = None
             if target_position is not None:
@@ -1369,7 +1376,9 @@ def _owner_transform_point(
     if matrix is not None:
         return transform_helpers.transform_point(matrix, point)
     if action in _REFLECTING_ACTIONS:
-        return (-point[0], point[1], point[2])
+        # The reflection lands the point on the far side; the delta is the
+        # Move X nudge laid on top of it, and is zero unless one was typed.
+        return (-point[0] + delta, point[1], point[2])
     if action == "translate":
         return (point[0] + delta, point[1], point[2])
     return point

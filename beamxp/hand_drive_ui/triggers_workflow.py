@@ -205,14 +205,16 @@ class TriggersWorkflowMixin:
     def _trigger_offset_display(self, row: dict[str, object]) -> str:
         """The box's Move X cell.
 
-        Only a Move has a distance to override. An auto row is left as "N/A"
-        even where the ladder resolved a move, because the distance it travels
-        is the owning mesh's, and overriding it here would quietly detach the
-        box from the mesh it was attributed to -- pick Move first and the
-        column opens up.
+        Open on the transforms that move the box -- the whole distance for a
+        Move, a nudge over the reflection for a Mirror. An auto row is left as
+        "N/A" even where the ladder resolved one of those, because what it
+        travels is the owning mesh's, and overriding it here would quietly
+        detach the box from the mesh it was attributed to; choose the transform
+        outright and the column opens up.
         """
+        mode = str(row.get("mode") or "")
         return offset_display(
-            core.MODE_TRANSLATE if row.get("mode") == core.MODE_TRANSLATE else core.MODE_SKIP,
+            mode if mode in core.TRIGGER_OFFSET_MODES else core.MODE_SKIP,
             row.get("offset"),
             manual_delta=self.manual_delta_enabled.get(),
         )
@@ -360,8 +362,8 @@ class TriggersWorkflowMixin:
                 self.trigger_tree, item, column, TRIGGER_MODE_OPTIONS, current, commit
             )
         elif name == "offset":
-            if row.get("mode") != core.MODE_TRANSLATE:
-                self.status_var.set("Move X only applies to a box set to Move")
+            if str(row.get("mode") or "") not in core.TRIGGER_OFFSET_MODES:
+                self.status_var.set("Move X only applies to a box set to Move or Mirror")
                 return "break"
             self._edit_tree_entry(
                 self.trigger_tree,

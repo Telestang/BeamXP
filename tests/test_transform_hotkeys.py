@@ -200,18 +200,19 @@ class TriggerOffsetTests(unittest.TestCase):
         self.assertEqual(self.offsets(), {})
         self.assertEqual(len(self.app.errors), 1)
 
-    def test_leaving_move_drops_the_offset(self) -> None:
+    def test_skipping_the_box_drops_the_offset(self) -> None:
         self.app._set_trigger_offset(self.row, "0.42")
-        self.app._set_trigger_mode(self.row, core.MODE_MIRROR)
+        self.app._set_trigger_mode(self.row, core.MODE_SKIP)
         self.assertEqual(self.offsets(), {})
         # ...and it does not come back when the box returns to Move
         self.app._set_trigger_mode(self.row, core.MODE_TRANSLATE)
         self.assertEqual(self.offsets(), {})
 
-    def test_re_picking_move_keeps_the_offset(self) -> None:
+    def test_the_offset_survives_a_move_between_transforms_that_use_it(self) -> None:
         self.app._set_trigger_offset(self.row, "0.42")
-        self.app._set_trigger_mode(self.row, core.MODE_TRANSLATE)
-        self.assertEqual(self.offsets(), {("hood_int", AT): 0.42})
+        for mode in (core.MODE_MIRROR, core.MODE_TRANSLATE):
+            self.app._set_trigger_mode(self.row, mode)
+            self.assertEqual(self.offsets(), {("hood_int", AT): 0.42}, mode)
 
     def test_every_edit_asks_the_preview_to_catch_up(self) -> None:
         before = self.app.detail_updates

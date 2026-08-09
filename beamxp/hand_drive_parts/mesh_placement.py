@@ -225,10 +225,19 @@ def baked_dae_matrix(
             ),
             source_node_matrix,
         )
+    # Mirror, baked. The reflection alone wants node matrix P^-1*S*P*M paired
+    # with locally mirrored geometry S*g, giving world = S*(P*M*g). A Move X
+    # nudge is a world-space slide laid on top of that, so T(d) goes between
+    # the placement inverse and the reflection: P^-1*T(d)*S*P*M*S then renders
+    # T(d)*S*(P*M*g). With no nudge typed d is 0 and this is the matrix that
+    # every validated conversion already produces.
+    nudge = translation_matrix(
+        (signed_delta_for_target(spec.target_hand, translate_magnitudes.get(spec.configured_mesh, 0.0)), 0.0, 0.0)
+    )
     return multiply_matrix(
         multiply_matrix(
             multiply_matrix(
-                multiply_matrix(placement_inverse, mirror),
+                multiply_matrix(multiply_matrix(placement_inverse, nudge), mirror),
                 spec.placement_matrix,
             ),
             source_node_matrix,

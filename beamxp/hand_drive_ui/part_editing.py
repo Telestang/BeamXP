@@ -93,8 +93,8 @@ class PartEditingMixin:
             self._toggle_include_children(object_id)
             return "break"
         if name == "offset":
-            if self._get_part_setting(object_id, "mode", core.MODE_SKIP) != core.MODE_TRANSLATE:
-                self.status_var.set("Offset X only applies to Move mode")
+            if self._get_part_setting(object_id, "mode", core.MODE_SKIP) not in OFFSET_MODES:
+                self.status_var.set("Move X only applies to Move, Mirror and Mirror Move")
                 return "break"
             self._edit_tree_entry(
                 self.part_tree,
@@ -126,8 +126,8 @@ class PartEditingMixin:
         if name == "mode":
             return "break"
         elif name == "offset":
-            if self._get_part_setting(object_id, "mode", core.MODE_SKIP) != core.MODE_TRANSLATE:
-                self.status_var.set("Offset X only applies to Move mode")
+            if self._get_part_setting(object_id, "mode", core.MODE_SKIP) not in OFFSET_MODES:
+                self.status_var.set("Move X only applies to Move, Mirror and Mirror Move")
                 return
             self._edit_tree_entry(
                 self.part_tree,

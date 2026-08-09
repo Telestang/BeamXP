@@ -1174,8 +1174,17 @@ class ConvertedBoxPlacementTests(unittest.TestCase):
     CORNERS = [(0.7, -0.5, 0.9), (0.8, -0.4, 1.0)]
 
     def test_mirror_reflects_across_the_centreline(self) -> None:
-        moved = converted_trigger_corners(self.CORNERS, "mirror", -0.71)
+        moved = converted_trigger_corners(self.CORNERS, "mirror", 0.0)
         self.assertEqual(moved, [(-0.7, -0.5, 0.9), (-0.8, -0.4, 1.0)])
+
+    def test_a_mirror_delta_nudges_the_reflection_rather_than_replacing_it(self) -> None:
+        # A box given a Move X reflects first and then slides; the reflection
+        # is still the thing being corrected.
+        moved = converted_trigger_corners(self.CORNERS, "mirror", -0.05)
+        for (x, y, z), (sx, sy, sz) in zip(moved, self.CORNERS):
+            self.assertAlmostEqual(x, -sx - 0.05, places=9)
+            self.assertAlmostEqual(y, sy, places=9)
+            self.assertAlmostEqual(z, sz, places=9)
 
     def test_move_slides_along_x_by_the_conversion_delta(self) -> None:
         moved = converted_trigger_corners(self.CORNERS, "translate", -0.71)
@@ -1290,9 +1299,15 @@ class TriggerOffsetRecordTests(unittest.TestCase):
         reloaded = json.loads(json.dumps(conversion))
         self.assertEqual(trigger_offset_map(reloaded), {("hood_int", self.AT): -0.42})
 
-    def test_a_stale_offset_on_a_non_move_row_is_dropped_on_load(self) -> None:
-        # hand-edited, or written before the row was changed to Mirror
+    def test_a_mirror_keeps_its_offset(self) -> None:
+        # Mirror spends the column on a nudge over the reflection, so unlike
+        # Skip it has something to do with the number.
         conversion = {"triggers": [{"id": "t", "at": [0, 0, 0], "mode": MODE_MIRROR, "offset": 0.4}]}
+        self.assertEqual(trigger_offset_map(conversion), {("t", (0.0, 0.0, 0.0)): 0.4})
+
+    def test_a_stale_offset_on_a_skipped_row_is_dropped_on_load(self) -> None:
+        # hand-edited, or written before the row was changed to Skip
+        conversion = {"triggers": [{"id": "t", "at": [0, 0, 0], "mode": MODE_SKIP, "offset": 0.4}]}
         self.assertEqual(trigger_offset_map(conversion), {})
 
     def test_junk_and_zero_offsets_read_as_no_override(self) -> None:

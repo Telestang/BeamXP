@@ -409,6 +409,117 @@ class MirrorPositionTransformTests(unittest.TestCase):
         self.assertEqual(core.vector_from_row(row, "baseRotationGlobal"), (10.0, 20.0, 30.0))
 
 
+class ReflectingNudgeTests(unittest.TestCase):
+    """Move X on a reflecting mode is a correction, not the transform.
+
+    The reflection still decides where the mesh lands; the column slides it
+    from there, which is what a mod whose centreline is not x=0 needs. With
+    nothing typed the nudge is zero and every one of these paths produces the
+    geometry it produced before the column existed -- that is the property
+    each of these tests is really pinning down.
+    """
+
+    FLEX = (
+        '["gearlever", ["grp"], '
+        '{"pos":{"x":0.42,"y":1.1,"z":0.3}, "rot":{"x":10,"y":20,"z":30}}]'
+    )
+
+    def test_a_blank_column_leaves_a_flexbody_reflection_exact(self) -> None:
+        for action in ("mirror", "mirrorPosition"):
+            rewritten = core.transform_flexbody_row(self.FLEX, action, 0.0)
+            self.assertEqual(core.vector_from_row(rewritten, "pos"), (-0.42, 1.1, 0.3), action)
+
+    def test_a_nudge_slides_a_flexbody_reflection_along_x(self) -> None:
+        for action in ("mirror", "mirrorPosition"):
+            rewritten = core.transform_flexbody_row(self.FLEX, action, -0.05)
+            pos = core.vector_from_row(rewritten, "pos")
+            self.assertAlmostEqual(pos[0], -0.42 - 0.05, places=9, msg=action)
+            self.assertEqual(pos[1:], (1.1, 0.3), action)
+
+    def test_a_rot_only_row_bakes_rather_than_dropping_the_nudge(self) -> None:
+        # There is no pos to add the offset to, so the row cannot carry it and
+        # the DAE copy has to. Without the delta it is still row-carryable.
+        rot_only = '["gearlever", ["grp"], {"rot":{"x":10,"y":20,"z":30}}]'
+        self.assertTrue(core.flexbody_row_can_carry_transform(rot_only, "mirror", 0.0))
+        self.assertFalse(core.flexbody_row_can_carry_transform(rot_only, "mirror", -0.05))
+
+    def test_a_nudge_slides_a_mirrored_prop_anchor(self) -> None:
+        props = (
+            "[\n"
+            '  ["func", "mesh", "idRef:"],\n'
+            '  ["gear", "gearlever", "n1", '
+            '{"baseTranslationGlobal":{"x":0.42,"y":1.1,"z":0.3}}]\n'
+            "]"
+        )
+        rewritten = core.rewrite_prop_meshes_with_globals(
+            props,
+            {"gearlever": "gearlever_xp_rhd"},
+            {},
+            {"gearlever": ("mirror", -0.05)},
+            {},
+        )
+        row = next(row for row in core.iter_top_level_rows(rewritten) if "gearlever_xp_rhd" in row)
+        position = core.vector_from_row(row, "baseTranslationGlobal")
+        self.assertAlmostEqual(position[0], -0.42 - 0.05, places=9)
+        self.assertEqual(position[1:], (1.1, 0.3))
+
+    def test_a_trigger_following_a_nudged_mirror_goes_with_it(self) -> None:
+        from beamxp.hand_drive_parts.rewriting import _owner_transform_point
+
+        point = (0.7, -0.5, 0.9)
+        self.assertEqual(_owner_transform_point(point, "mirror", 0.0), (-0.7, -0.5, 0.9))
+        nudged = _owner_transform_point(point, "mirror", -0.05)
+        self.assertAlmostEqual(nudged[0], -0.75, places=9)
+
+    def test_an_unset_column_falls_back_per_mode(self) -> None:
+        # A Move inherits the shared delta; a reflection inherits nothing,
+        # because there is no shared distance behind a reflection.
+        conversion = {"parts": {"dash": {}}, "delta": {"manual": True, "magnitude": 0.7}}
+        self.assertAlmostEqual(
+            core.part_translate_magnitude(None, conversion, "dash", core.MODE_TRANSLATE), 0.7
+        )
+        for mode in core.NUDGE_MODES:
+            self.assertEqual(
+                core.part_translate_magnitude(None, conversion, "dash", mode), 0.0, mode
+            )
+
+    def test_swap_mesh_and_replace_source_take_no_nudge(self) -> None:
+        # They adopt another mesh whole, pivot included, so they stay out of
+        # the map entirely and their consumers keep reading 0.0.
+        conversion = {
+            "parts": {mesh: {"mode": mode, "translateOffset": 0.4} for mesh, mode in (
+                ("swapped", core.MODE_MIRROR_STRUCTURAL),
+                ("replaced", core.MODE_REPLACE_SOURCE),
+                ("mirrored", core.MODE_MIRROR),
+            )},
+            "delta": {"manual": True, "magnitude": 0.7},
+        }
+        modes = {mesh: settings["mode"] for mesh, settings in conversion["parts"].items()}
+        magnitudes = core.part_translate_magnitudes(None, conversion, modes)
+        self.assertEqual(sorted(magnitudes), ["mirrored"])
+
+    def test_a_mode_with_no_move_x_never_falls_back_to_the_shared_delta(self) -> None:
+        """Swap Mesh shares the mirror path, so a non-zero answer here slid it.
+
+        Asking per mode is what made this reachable: the moment the callers
+        stopped asking only about Move, a Swap Mesh answering with the global
+        delta started sliding the swapped flexbody a whole conversion across
+        the car in the preview. A stale offset from a spell on Move must not
+        leak in either, so both are pinned here.
+        """
+        conversion = {
+            "parts": {"stale": {"translateOffset": 0.4}, "clean": {}},
+            "delta": {"manual": True, "magnitude": 0.7},
+        }
+        for mode in (core.MODE_MIRROR_STRUCTURAL, core.MODE_REPLACE_SOURCE, core.MODE_SKIP):
+            for mesh in ("stale", "clean"):
+                self.assertEqual(
+                    core.part_translate_magnitude(None, conversion, mesh, mode),
+                    0.0,
+                    f"{mode} / {mesh}",
+                )
+
+
 class NodeMergeOrderTests(unittest.TestCase):
     def test_iter_node_rows_skips_commented_and_is_last_wins_ready(self) -> None:
         arr = (

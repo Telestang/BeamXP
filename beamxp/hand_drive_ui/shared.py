@@ -177,12 +177,23 @@ def offset_label(value: object) -> str:
         return ""
 
 
+# Every transform that moves geometry along x, and so has a Move X to take.
+# Move spends the column on the whole distance it travels; the reflecting
+# modes spend it on a nudge laid over a landing point they already know.
+OFFSET_MODES = frozenset({core.MODE_TRANSLATE}) | set(core.NUDGE_MODES)
+
+
 def offset_display(mode: str, value: object, *, manual_delta: bool) -> str:
-    if mode != core.MODE_TRANSLATE:
+    if mode not in OFFSET_MODES:
         return "N/A"
     explicit = offset_label(value)
     if explicit:
         return explicit
+    # A reflection with nothing typed is exact, not inherited: there is no
+    # shared delta behind it to fall back to, so say so rather than claiming
+    # the global "Auto"/"Manual" that only a Move answers to.
+    if mode != core.MODE_TRANSLATE:
+        return "None"
     return "Manual" if manual_delta else "Auto"
 
 
@@ -237,6 +248,7 @@ __all__ = [
     "mesh_preview",
     "messagebox",
     "mode_label",
+    "OFFSET_MODES",
     "offset_display",
     "offset_label",
     "os",

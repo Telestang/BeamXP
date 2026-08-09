@@ -174,7 +174,19 @@ Moves the visual mesh laterally without mirroring it. Use this for parts that sh
 
 For translated props, the tool keeps the original `idRef`, `idX`, `idY`, rotations, and animation values, and adds `baseTranslationGlobal` so animated props rotate around the translated visual position.
 
-The `Move X` column overrides how far one part travels. It is signed and relative to the conversion, not to the world: a positive value moves the part the way that trim converts, and a negative value moves it the opposite way, back toward the side it started on. Because the direction comes from each trim's own target hand, one saved value stays correct across a mixed set of configs — the same `Move X` on an LHD→RHD trim and on an RHD→LHD trim each moves toward the new driver's side. Leave it blank to use the global delta.
+The `Move X` column sets how far one part slides along x. It is signed and relative to the conversion, not to the world: a positive value moves the part the way that trim converts, and a negative value moves it the opposite way, back toward the side it started on. Because the direction comes from each trim's own target hand, one saved value stays correct across a mixed set of configs — the same `Move X` on an LHD→RHD trim and on an RHD→LHD trim each moves toward the new driver's side.
+
+What the column means depends on the transform, because the two kinds of mode start from different places:
+
+| Transform | `Move X` | Blank means |
+| --- | --- | --- |
+| `Translate` | The whole distance the part travels, replacing the conversion delta | `Auto` — the shared delta |
+| `Mirror Aesthetic`, `Mirror Move` | A correction applied after the reflection | `None` — the reflection is used exactly |
+| `Swap Mesh`, `Replace Source` | Not offered — these adopt another mesh whole, pivot included | — |
+
+A `Translate` is nothing but its delta, so the column replaces that delta outright. A reflection already knows where it is going, so the column nudges that landing point instead. Reach for it when a mod's centreline is not at x=0, or its object origins are inconsistent: mirroring such a part lands it slightly off, and a few centimetres of `Move X` puts it right without touching anything else.
+
+The Triggers table carries the same column on the same terms, for boxes set to `Move` or `Mirror`. A box left on the automatic attribution shows `N/A`: what it travels belongs to the mesh it was attributed to, so choose its transform outright to open the column.
 
 ### Mirror Aesthetic
 

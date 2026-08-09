@@ -26,6 +26,7 @@ from beamxp.core.constants import (
     HAND_UNKNOWN,
     MODE_CHOICES,
     MODE_MIRROR,
+    MODE_MIRROR_POSITION,
     MODE_MIRROR_STRUCTURAL,
     MODE_SKIP,
     MODE_TRANSLATE,
@@ -110,23 +111,47 @@ def delta_magnitude(context: VehicleContext, conversion: dict[str, object]) -> f
     return auto_delta_magnitude(context, conversion)
 
 
+# Modes whose Move X is a nudge laid on top of the transform rather than the
+# transform itself. A Mirror already knows where it is going -- the reflection
+# of where it started -- so the column corrects that landing point, which is
+# what an off-centre mod needs; with none typed the nudge is zero and the
+# reflection is exactly what it always was. Swap Mesh and Replace Source are
+# deliberately absent: those adopt another mesh whole, pivot included.
+NUDGE_MODES = frozenset({MODE_MIRROR, MODE_MIRROR_POSITION})
+
+
 def part_translate_magnitude(
     context: VehicleContext,
     conversion: dict[str, object],
     object_id: str,
+    mode: str = MODE_TRANSLATE,
 ) -> float:
-    """How far this part's Move travels, measured along the conversion direction.
+    """This part's Move X, measured along the conversion direction.
 
     Signed, not absolute: positive is whichever way this trim's conversion
-    already runs (toward the target hand's side), so a negative per-part
-    offset walks the part back the other way -- useful when a mesh sits
-    off-centre and the shared delta overshoots it. ``signed_delta_for_target``
-    turns this into the world-space X delta, and it is the target hand there
-    that decides which way "positive" points, so the same saved number does
-    the right thing on an LHD->RHD trim and on an RHD->LHD one.
+    already runs (toward the target hand's side), so a negative offset walks
+    the part back the other way -- useful when a mesh sits off-centre and the
+    shared delta overshoots it. ``signed_delta_for_target`` turns this into the
+    world-space X delta, and it is the target hand there that decides which way
+    "positive" points, so the same saved number does the right thing on an
+    LHD->RHD trim and on an RHD->LHD one.
+
+    What an unset column falls back to is the whole difference between the two
+    kinds of mode. A Move is nothing but its delta, so it inherits the shared
+    conversion delta. A Mirror carries the column as a correction on top of a
+    reflection that already stands on its own, so it falls back to zero and
+    leaves that reflection untouched.
+
+    A mode that takes no Move X at all answers 0.0 outright. Swap Mesh and
+    Replace Source adopt another mesh whole, pivot included, so there is
+    nothing here to correct -- and a value left over from a spell on Move must
+    not leak into their placement now that the callers ask about every mode
+    rather than only the moving ones.
 
     The global delta stays unsigned; only the per-part override carries a sign.
     """
+    if mode != MODE_TRANSLATE and mode not in NUDGE_MODES:
+        return 0.0
     parts = conversion.get("parts", {})
     settings = parts.get(object_id, {}) if isinstance(parts, dict) else {}
     if isinstance(settings, dict):
@@ -136,7 +161,7 @@ def part_translate_magnitude(
                 return float(raw)
             except (TypeError, ValueError):
                 return 0.0
-    return delta_magnitude(context, conversion)
+    return 0.0 if mode in NUDGE_MODES else delta_magnitude(context, conversion)
 
 
 def part_translate_magnitudes(
@@ -144,10 +169,17 @@ def part_translate_magnitudes(
     conversion: dict[str, object],
     object_modes: dict[str, str],
 ) -> dict[str, float]:
+    """Each convertible mesh's Move X, keyed by mesh.
+
+    Covers the nudge modes as well as Move, so callers hold one map of "how far
+    this mesh slides along x". Every reader is already mode-guarded, and the
+    fallbacks differ per mode (see ``part_translate_magnitude``), so a Mirror
+    that was never given a Move X contributes a harmless 0.0.
+    """
     return {
-        object_id: part_translate_magnitude(context, conversion, object_id)
+        object_id: part_translate_magnitude(context, conversion, object_id, mode)
         for object_id, mode in object_modes.items()
-        if mode == MODE_TRANSLATE
+        if mode == MODE_TRANSLATE or mode in NUDGE_MODES
     }
 
 
@@ -251,4 +283,4 @@ def effective_source_hand(
         return override
     return cached_hand_for_variant(context, conversion, config_name)
 
-__all__ = ['steering_column_axis_offsets', 'auto_delta_magnitude', 'delta_magnitude', 'part_translate_magnitude', 'part_translate_magnitudes', 'detect_hand_for_variant', 'detect_hands_for_variants', 'cached_hand_for_variant', 'effective_source_hand']
+__all__ = ['NUDGE_MODES', 'steering_column_axis_offsets', 'auto_delta_magnitude', 'delta_magnitude', 'part_translate_magnitude', 'part_translate_magnitudes', 'detect_hand_for_variant', 'detect_hands_for_variants', 'cached_hand_for_variant', 'effective_source_hand']

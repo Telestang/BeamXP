@@ -223,6 +223,9 @@ def clear_side_pairs(conversion: dict[str, object]) -> None:
 # way the answer travels with the box rather than with a trim's part list.
 TRIGGER_POSITION_PLACES = 3  # a millimetre; finer than any authored offset
 TRIGGER_MODES = (MODE_SKIP, MODE_TRANSLATE, MODE_MIRROR)
+# The trigger transforms that actually move the box, and so have a Move X to
+# take. Skip is deliberately absent: it is the mode for leaving a box alone.
+TRIGGER_OFFSET_MODES = frozenset({MODE_TRANSLATE, MODE_MIRROR})
 
 
 def trigger_position_key(
@@ -274,10 +277,16 @@ def normalized_trigger_modes(value: object) -> list[dict[str, object]]:
         if mode not in TRIGGER_MODES:
             continue
         record: dict[str, object] = {"id": key[0], "at": list(key[1]), "mode": mode}
-        # Only a Move has a distance to override, so an offset left over from a
-        # row that has since become Skip or Mirror is dropped rather than kept
-        # waiting to reappear the next time the row goes back to Move.
-        offset = trigger_offset_value(entry.get("offset")) if mode == MODE_TRANSLATE else None
+        # A Move X means something on the modes that move the box -- the whole
+        # distance for a Move, a nudge on top of the reflection for a Mirror --
+        # and nothing on Skip, which is the one mode that leaves the box alone.
+        # An offset left over from a row since set to Skip is dropped rather
+        # than kept waiting to reappear.
+        offset = (
+            trigger_offset_value(entry.get("offset"))
+            if mode in TRIGGER_OFFSET_MODES
+            else None
+        )
         if offset is not None:
             record["offset"] = offset
         by_key[key] = record
@@ -322,8 +331,8 @@ def set_trigger_mode(
 ) -> None:
     """Record the transform for the box of this id at this position.
 
-    A Move X already typed for this box survives a re-pick of Move, and is
-    dropped by ``normalized_trigger_modes`` on any other mode.
+    A Move X already typed for this box survives a move between the modes that
+    can carry one, and is dropped by ``normalized_trigger_modes`` on Skip.
     """
     key = trigger_position_key(trigger_id, position)
     if key is None or mode not in TRIGGER_MODES:
@@ -741,4 +750,4 @@ def set_slot_pair(conversion: dict[str, object], slot_type: str, partner: str) -
     conversion["slotPairs"] = normalized_slot_pairs(pairs)
 
 
-__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'trigger_position_key', 'trigger_offset_value', 'normalized_trigger_modes', 'trigger_mode_map', 'trigger_offset_map', 'set_trigger_mode', 'set_trigger_offset', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
+__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'TRIGGER_OFFSET_MODES', 'trigger_position_key', 'trigger_offset_value', 'normalized_trigger_modes', 'trigger_mode_map', 'trigger_offset_map', 'set_trigger_mode', 'set_trigger_offset', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
