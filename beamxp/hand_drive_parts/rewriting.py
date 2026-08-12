@@ -2856,26 +2856,39 @@ def part_has_relocatable_trigger(
     part_body: str,
     node_positions: dict[str, Vec3],
     owners: TriggerOwners | None,
+    follows: TriggerFollowMap | None = None,
 ) -> bool:
-    """True when a box in this part labels geometry the config is moving.
+    """True when a box in this part has to move for the target hand.
 
     A trigger is filed inside whichever part its author found convenient, and
     for every stock hood release that is the hood -- a panel a hand conversion
     never touches, whose own geometry sits a metre away at the front of the
     car. So "does this part hold a box that has to move" is a separate question
     from "does this part hold geometry that moves", and a part can need cloning
-    for the first reason alone. Resolved through the same ladder the rewrite
-    uses, so the decision to clone and the decision to move cannot disagree.
+    for the first reason alone.
+
+    Decided exactly as ``_mirror_trigger_row`` decides, so the decision to clone
+    and the decision to move cannot disagree: the Triggers table's answer where
+    the user gave one, the attribution ladder otherwise. Reading only the ladder
+    left the part uncloned whenever the answer was the sole reason to move a box
+    -- which is precisely the unattributed case the table exists for, so a
+    Mirror set on the scintilla's hood release reached no output at all.
     """
-    if not owners:
-        return False
-    for _trigger_id, row, spans, index_of, source_ids in _iter_trigger_rows(part_body):
+    for trigger_id, row, spans, index_of, source_ids in _iter_trigger_rows(part_body):
         if any(node_id not in node_positions for node_id in source_ids):
             continue
         frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
         if frame is None:
             continue
-        owner = _trigger_row_owner(row, spans, index_of, source_ids, frame, owners)
+        if follows is not None and trigger_id in follows:
+            # The user answered this one, so the ladder does not get a vote --
+            # including when the answer is Skip, which must not be overruled
+            # into a clone by an owner the box was told to ignore.
+            owner = follows[trigger_id]
+        elif owners:
+            owner = _trigger_row_owner(row, spans, index_of, source_ids, frame, owners)
+        else:
+            continue
         if owner is not None and owner[0] in _FRAME_TRANSFORMING_ACTIONS:
             return True
     return False

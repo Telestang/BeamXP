@@ -906,14 +906,26 @@ def trigger_modes_for_part(
     place in a road dash and a race dash takes one answer, and two boxes that
     merely share a name do not. Only answered triggers appear here; the rest
     fall through to the attribution ladder.
+
+    The identity is read off the vehicle-wide node positions, never the trim's,
+    because that is what the Triggers table keys its rows on. A trim that moves
+    a ref node moves the authored point with it -- the scintilla's spider roof
+    drops f6l by 2 cm, which walks the hood release's anchor 6 mm sideways --
+    and matching on the trim's own number then missed the saved answer in
+    fourteen of sixteen trims, silently handing the box back to a ladder that
+    has no owner for it. Trim positions still fill in any node the vehicle-wide
+    map lacks, so nothing that used to resolve stops resolving.
     """
     chosen = trigger_mode_map(conversion)
     if not chosen:
         return {}
     magnitude = delta_magnitude(context, conversion)
     offsets = trigger_offset_map(conversion)
+    identity_positions = {**node_positions, **getattr(context, "node_positions", {})}
     resolved: dict[str, tuple[str, float, list[list[float]] | None] | None] = {}
-    for trigger_id, centre in authored_trigger_positions(part_body, node_positions).items():
+    for trigger_id, centre in authored_trigger_positions(
+        part_body, identity_positions
+    ).items():
         key = trigger_position_key(trigger_id, centre)
         mode = chosen.get(key) if key is not None else None
         if mode is None:
@@ -1319,13 +1331,16 @@ def _part_needs_generated_clone(
     part_meshes: set[str] | None = None,
     node_positions: dict[str, tuple[float, float, float]] | None = None,
     owners: TriggerOwners | None = None,
+    trigger_follows: TriggerFollowMap | None = None,
 ) -> bool:
     part_meshes = part_meshes if part_meshes is not None else part_mesh_names_for_context(context, source_part_id)
     return (
         any(mesh in object_modes for mesh in part_meshes)
         or part_has_transformable_internal_camera(part_body, node_mirror_map)
         or _part_has_handed_light_slots(part_body)
-        or part_has_relocatable_trigger(part_body, node_positions or {}, owners)
+        or part_has_relocatable_trigger(
+            part_body, node_positions or {}, owners, trigger_follows
+        )
     )
 
 
@@ -1349,13 +1364,19 @@ def _generated_clone_plan(
     authored_parts: set[str],
     node_positions: dict[str, tuple[float, float, float]] | None = None,
     owners: TriggerOwners | None = None,
+    conversion: dict[str, object] | None = None,
 ) -> dict[str, str]:
     """Generated source part -> output part id for one config.
 
     Seed the plan from parts with actual handed content: mesh transforms,
-    internal cameras, or semantic rewrites such as ``$lightPattern``. Then add
-    bridge ancestors from the resolved slot tree so selecting a generated root
-    carries its handed child-slot namespace down to those leaves.
+    internal cameras, semantic rewrites such as ``$lightPattern``, or a trigger
+    box that has to move. Then add bridge ancestors from the resolved slot tree
+    so selecting a generated root carries its handed child-slot namespace down
+    to those leaves.
+
+    ``conversion`` is here for the Triggers table alone: a box the user answered
+    can be the only handed thing in a part, so the answer has to reach the
+    clone decision or it never reaches the output.
     """
     generated_parts: dict[str, str] = {}
     bridge_required_parts: set[str] = set()
@@ -1410,6 +1431,21 @@ def _generated_clone_plan(
         # triggers against the selected trim's geometry moves them to match a
         # dashboard that is not installed alongside them.
         in_trim = source_part_id in selected_part_ids
+        # An answered box, unlike an attributed one, says nothing about the trim
+        # it is read against -- the table keys on authored position precisely so
+        # it does not -- but it is gated the same way regardless: a part this
+        # config never selects contributes nothing to this config's output.
+        trigger_follows = (
+            trigger_modes_for_part(
+                conversion,
+                context,
+                part_body,
+                node_positions or {},
+                target_hand,
+            )
+            if conversion is not None and in_trim
+            else None
+        )
         if _part_needs_generated_clone(
             context,
             source_part_id,
@@ -1419,6 +1455,7 @@ def _generated_clone_plan(
             part_mesh_names_for_context(context, source_part_id),
             node_positions if in_trim else None,
             owners if in_trim else None,
+            trigger_follows,
         ):
             generated_parts[source_part_id] = generated_variant_part_name(
                 source_part_id, target_hand, config_name
@@ -1517,6 +1554,7 @@ def write_generated_jbeam_and_configs(
             authored_parts,
             prop_node_positions,
             config_trigger_owners,
+            conversion,
         )
 
         clone_source_part_ids = selected_part_ids | set(generated_parts_for_source)

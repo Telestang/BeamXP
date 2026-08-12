@@ -1380,6 +1380,116 @@ class TriggerOffsetDeltaTests(unittest.TestCase):
         self.assertAlmostEqual(self.delta(conversion, HAND_LHD), -0.25, places=9)
 
 
+class _StubContext:
+    """Just the vehicle-wide node map trigger identity is resolved against."""
+
+    def __init__(self, node_positions: dict) -> None:
+        self.node_positions = dict(node_positions)
+
+
+class SavedAnswerSurvivesTrimNodeMovesTest(unittest.TestCase):
+    """One answer, every trim -- even the trims that move the ref nodes.
+
+    The Triggers table is keyed on authored position, and it reads that position
+    off the vehicle-wide node map because that is the only frame every trim
+    shares. A trim that repositions a ref node moves the authored point with it:
+    the scintilla's spider roof drops f6l by 2 cm, walking the hood release's
+    anchor from (0.685, -0.764, 0.510) to (0.691, -0.756, 0.513) -- past the
+    millimetre the key rounds to, so the build stopped recognising its own saved
+    answer in fourteen of the sixteen trims and quietly handed the box back to a
+    ladder that has no owner for it.
+    """
+
+    PART = """"scintilla_hood": {
+    "slotType": "scintilla_hood",
+    "triggers2":[
+      ["id", "idRef:", "idX:", "idY:", "type", "size", "baseRotation", "rotation", "translation", "baseTranslation"],
+      ["hood_int", "f6ll","f6l","f5ll", "box", {"x":0.08, "y":0.08, "z":0.08}, {"x":-35, "y":20, "z":-40}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":-0.05, "y":0.22, "z":0.2}],
+    ],
+}"""
+    # Vehicle-wide, as loaded from the jbeam.
+    NODES = {
+        "f6ll": (0.695, -0.847, 0.8),
+        "f6l": (0.285, -1.238, 0.8),
+        "f5ll": (0.874, -0.915, 0.49),
+    }
+    # The spider trims resolve f6l 2 cm lower.
+    TRIM_NODES = {**NODES, "f6l": (0.285, -1.238, 0.78)}
+
+    def follows(self, trim_nodes: dict) -> dict:
+        conversion: dict = {"delta": {"manual": True, "magnitude": 0.7}}
+        at = authored_trigger_positions(self.PART, self.NODES)["hood_int"]
+        set_trigger_mode(conversion, "hood_int", at, MODE_MIRROR)
+        return trigger_modes_for_part(
+            conversion, _StubContext(self.NODES), self.PART, trim_nodes, HAND_RHD
+        )
+
+    def test_the_trim_that_moved_the_node_still_matches_the_answer(self) -> None:
+        anchors = {
+            name: authored_trigger_positions(self.PART, nodes)["hood_int"]
+            for name, nodes in (("vehicle", self.NODES), ("trim", self.TRIM_NODES))
+        }
+        # The premise: the two anchors really are further apart than the key's
+        # rounding, so matching on the trim's own number cannot work.
+        self.assertNotEqual(
+            [round(value, 3) for value in anchors["vehicle"]],
+            [round(value, 3) for value in anchors["trim"]],
+        )
+        self.assertEqual(self.follows(self.TRIM_NODES)["hood_int"][0], "mirror")
+
+    def test_the_trims_that_leave_the_nodes_alone_are_unaffected(self) -> None:
+        self.assertEqual(self.follows(self.NODES)["hood_int"][0], "mirror")
+
+    def test_a_ref_node_only_the_trim_knows_still_resolves(self) -> None:
+        # The vehicle-wide map is authoritative where it has an answer, not a
+        # gate on being asked: a node it never loaded still comes from the trim.
+        vehicle_nodes = {key: value for key, value in self.NODES.items() if key != "f5ll"}
+        conversion: dict = {"delta": {"manual": True, "magnitude": 0.7}}
+        at = authored_trigger_positions(self.PART, self.NODES)["hood_int"]
+        set_trigger_mode(conversion, "hood_int", at, MODE_MIRROR)
+        follows = trigger_modes_for_part(
+            conversion, _StubContext(vehicle_nodes), self.PART, self.NODES, HAND_RHD
+        )
+        self.assertEqual(follows["hood_int"][0], "mirror")
+
+
+class AnsweredTriggerJustifiesACloneTest(unittest.TestCase):
+    """The clone decision has to hear the Triggers table too.
+
+    A part is cloned when it holds something handed, and for the scintilla hood
+    the only handed thing is the release box -- the bonnet itself never moves.
+    Deciding that on the attribution ladder alone meant the answer could not
+    reach the output in exactly the case the table exists for: a box with no
+    owner, which is why the user had to answer it in the first place.
+    """
+
+    PART = RelocatableTriggerTest.PART
+    NODES = RelocatableTriggerTest.NODES
+
+    def test_an_answered_mirror_needs_the_clone_the_ladder_never_asked_for(self):
+        follows = {"hood_int": ("mirror", 0.0, None)}
+        self.assertTrue(
+            part_has_relocatable_trigger(self.PART, self.NODES, ([], {}, []), follows)
+        )
+        # No ladder at all is the real scintilla case: six of sixteen boxes.
+        self.assertTrue(part_has_relocatable_trigger(self.PART, self.NODES, None, follows))
+
+    def test_an_answered_skip_is_not_overruled_into_a_clone(self):
+        owners = ([], {"f5ll": ("mirror", 0.0)}, [])
+        self.assertFalse(
+            part_has_relocatable_trigger(
+                self.PART, self.NODES, owners, {"hood_int": None}
+            )
+        )
+
+    def test_an_unanswered_box_still_takes_the_ladder(self):
+        owners = ([], {"f5ll": ("mirror", 0.0)}, [])
+        # Answering the bonnet toggle says nothing about the release beside it.
+        self.assertTrue(
+            part_has_relocatable_trigger(self.PART, self.NODES, owners, {"hood": None})
+        )
+
+
 class EngineGroundTruthTests(unittest.TestCase):
     """Placements measured from the running game, not inferred from jbeam.
 
