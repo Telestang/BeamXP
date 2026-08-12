@@ -62,7 +62,7 @@ BeamXP now segments these meshes first.
 - Symmetric sub-meshes are detected so they can be **rotated and translated instead of mirrored**.
 - The remaining asymmetric portion of the mesh — referred to internally as the **husk** — is mirrored.
 - Symmetric UV islands on the husk are detected automatically.
-- Remaining candidate regions are detected with **MSER on the colour map** and **edge detection on the normal/relief map**.
+- Remaining candidate regions are detected with a **dominant-background foreground mask on each archive-backed colour/emissive layer**, independently inside each topological UV island; **MSER remains available for comparison**, and edge detection handles normal/relief maps.
 - The texture flip axis is chosen according to whether the associated surface normal is parallel to the **XY plane** or the **Z plane**.
 - Colour and relief information can therefore be corrected without reverting the whole part to a simple mirrored texture.
 
@@ -378,7 +378,7 @@ Mesh segmentation
               UV-region analysis
                      |
                      +--> symmetric UV-island detection
-                     +--> MSER on colour map
+                     +--> foreground mask on colour/emissive layers (MSER comparison mode available)
                      +--> edge detection on normal map
                      |
                      v
@@ -410,7 +410,7 @@ After the asymmetric husk is mirrored, BeamXP analyses its UV mapping.
 It uses:
 
 - symmetry testing on UV islands;
-- MSER features in the colour map;
+- dominant-background foreground components in colour/emissive layers (with MSER available for comparison);
 - edge information in the normal/relief map.
 
 Candidate regions can then be reflected independently so the geometry changes side without forcing text, icons, or relief features to read backwards.

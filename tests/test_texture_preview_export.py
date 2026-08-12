@@ -1,22 +1,27 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
-import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from xml.etree import ElementTree as ET
 
 import numpy as np
 from PIL import Image
 
+from mesh_segmentation_transform import mirror_texture_for_rhd as rhd
+from mesh_segmentation_transform import beamxp_transform_sym_mesh_POC as sym_mesh
 from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
+    ArchiveMaterialRecord,
+    ArchiveMaterialSwitchState,
     ArchiveTextureBinding,
     DaePart,
     GeometryInstance,
+    SourceFaceRef,
 )
-from mesh_segmentation_transform import mirror_texture_for_rhd as rhd
 
 
 def part(key: str) -> DaePart:
@@ -30,7 +35,140 @@ def part(key: str) -> DaePart:
     )
 
 
+class RuntimeDisplayUvFlipTests(unittest.TestCase):
+    def test_selected_runtime_material_resolves_to_dae_bound_aliases(self) -> None:
+        archive = SimpleNamespace(
+            runtime_material_aliases=("lc500_gps", "lc500_gauges_screen"),
+            material_switch_states={
+                "lc500_centralscreen": (
+                    ArchiveMaterialSwitchState("on_intense", "lc500_gps"),
+                )
+            },
+        )
+        with patch.object(
+            rhd,
+            "material_aliases_for_parts",
+            return_value={"lc500_centralscreen", "lc500_gauges_screen"},
+        ):
+            aliases = rhd.runtime_display_dae_aliases_for_parts(
+                archive, SimpleNamespace(), []
+            )
+
+        self.assertEqual(aliases, {"lc500_centralscreen", "lc500_gauges_screen"})
+
+    def test_production_opacity_layers_use_direct_foreground_detection(self) -> None:
+        colour = rhd._production_layer_detection_config(
+            rhd.DEFAULT_CONFIG, True, ("baseColorMap", "emissiveMap")
+        )
+        opacity = rhd._production_layer_detection_config(
+            rhd.DEFAULT_CONFIG, True, ("opacityMap",)
+        )
+        authoritative = rhd._production_layer_detection_config(
+            rhd.DEFAULT_CONFIG,
+            True,
+            ("baseColorMap",),
+            authoritative_opacity_mask=True,
+        )
+
+        self.assertEqual(colour.box_source, "contrast_gpu")
+        self.assertTrue(colour.enable_feature_extension_filter)
+        self.assertEqual(colour.feature_extension_context_px, 12)
+        self.assertEqual(colour.feature_extension_min_ratio, 0.25)
+        self.assertEqual(opacity.box_source, "opacity_mask")
+        self.assertEqual(authoritative.box_source, "opacity_mask")
+        self.assertFalse(opacity.enable_region_domain_filter)
+        self.assertFalse(authoritative.enable_region_domain_filter)
+        self.assertFalse(opacity.enable_feature_extension_filter)
+        self.assertFalse(authoritative.enable_feature_extension_filter)
+
+    def test_runtime_display_uv_flip_is_material_scoped(self) -> None:
+        namespace = "http://www.collada.org/2005/11/COLLADASchema"
+        geometry = ET.fromstring(
+            f"""<geometry xmlns="{namespace}" id="screen">
+              <mesh>
+                <source id="screen-uv">
+                  <float_array id="screen-uv-array" count="8">
+                    0.1 0.0 0.4 0.0 0.7 0.0 0.9 0.0
+                  </float_array>
+                  <technique_common>
+                    <accessor source="#screen-uv-array" count="4" stride="2">
+                      <param name="S" type="float"/>
+                      <param name="T" type="float"/>
+                    </accessor>
+                  </technique_common>
+                </source>
+                <triangles material="lc500_centralscreen-material" count="1">
+                  <input semantic="TEXCOORD" source="#screen-uv" offset="0"/>
+                  <p>0 1 0</p>
+                </triangles>
+                <triangles material="lc500_trim-material" count="1">
+                  <input semantic="TEXCOORD" source="#screen-uv" offset="0"/>
+                  <p>2 3 2</p>
+                </triangles>
+              </mesh>
+            </geometry>"""
+        )
+
+        result = sym_mesh._flip_material_texcoord_islands(
+            geometry,
+            namespace,
+            {"lc500_centralscreen"},
+        )
+
+        values = [
+            float(value)
+            for value in geometry.find(
+                f"{{{namespace}}}mesh/{{{namespace}}}source/"
+                f"{{{namespace}}}float_array"
+            ).text.split()
+        ]
+        self.assertEqual(values[0::2], [0.4, 0.1, 0.7, 0.9])
+        self.assertEqual(result["matched_materials"], ["lc500_centralscreen"])
+        self.assertEqual(result["modified_texcoords"], 2)
+
+
+
 class SurfaceFlipAxisTests(unittest.TestCase):
+    def test_forced_mirror_domain_ignores_symmetric_candidate_labels(self) -> None:
+        selected = part("door_source")
+        uv = np.asarray(((0.1, 0.1), (0.2, 0.1), (0.1, 0.2)), dtype=float)
+        topology = SimpleNamespace(
+            vertices=np.asarray(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))),
+            triangles=np.asarray(((0, 1, 2),)),
+            source_faces=(SourceFaceRef(0, "door-mesh", 0, 0),),
+        )
+        sweep = SimpleNamespace(
+            topology=topology,
+            candidates=(SimpleNamespace(candidate_id=7, faces=(0,)),),
+        )
+        with (
+            patch.object(
+                rhd,
+                "uv_triangles_by_source",
+                return_value={(0, 0, 0): uv},
+            ),
+            patch.object(rhd, "sweep_part", return_value=sweep),
+        ):
+            mirrored, rigid, _surfaces = rhd.split_mirrored_and_rigid(
+                SimpleNamespace(),
+                selected,
+                {"door-material"},
+                rhd.RhdTextureConfig(),
+            )
+            forced, forced_rigid, forced_surfaces = rhd.split_mirrored_and_rigid(
+                SimpleNamespace(),
+                selected,
+                {"door-material"},
+                rhd.RhdTextureConfig(),
+                force_mirrored=True,
+            )
+
+        self.assertEqual(mirrored, [])
+        self.assertEqual(len(rigid), 1)
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(forced_rigid, [])
+        self.assertEqual(len(forced_surfaces), 1)
+
     def test_side_surface_horizontal_flip_when_image_vertical_plane_matches_z(self) -> None:
         uv = np.asarray([[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]])
         xyz = np.asarray(
@@ -303,8 +441,1392 @@ class CroppedDetectionTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[1].args[0].shape[:2], (4, 4))
         self.assertEqual(result.regions, [(6, 0, 4, 4)])
 
+    def test_foreground_detection_never_groups_touching_uv_islands(self) -> None:
+        bgr = np.zeros((8, 12, 3), dtype=np.uint8)
+        first = np.zeros((8, 12), dtype=bool)
+        second = np.zeros((8, 12), dtype=bool)
+        # The raster masks touch, but they are separate topological islands.
+        first[0:4, 0:4] = True
+        second[0:4, 4:8] = True
+        runs = [
+            rhd.RegionDetection(source="first", detected=1, regions=[(0, 0, 4, 4)], rotations=[None]),
+            rhd.RegionDetection(source="second", detected=1, regions=[(4, 0, 4, 4)], rotations=[None]),
+        ]
+        config = rhd.RhdTextureConfig(
+            enable_containment_filter=False,
+            enable_blob_filter=False,
+            detection_crop_padding_px=0,
+        )
+
+        with patch.object(rhd, "detect_flip_regions", side_effect=runs) as detect:
+            result = rhd.detect_flip_regions_by_uv_island(
+                bgr,
+                (first, second),
+                config,
+                rhd.DEFAULT_CONFIG,
+                log=lambda *_a: None,
+            )
+
+        self.assertEqual(detect.call_count, 2)
+        self.assertTrue(np.array_equal(detect.call_args_list[0].args[1], first))
+        self.assertTrue(np.array_equal(detect.call_args_list[1].args[1], second))
+        self.assertEqual(result.regions, [(0, 0, 4, 4), (4, 0, 4, 4)])
+
+    def test_near_duplicate_uv_consumers_are_coalesced_before_detection(self) -> None:
+        first = np.zeros((24, 32), dtype=bool)
+        second = np.zeros((24, 32), dtype=bool)
+        first[2:22, 4:24] = True
+        second[2:22, 5:25] = True
+
+        merged = rhd._coalesce_overlapping_uv_consumers((first, second))
+
+        self.assertEqual(len(merged), 1)
+        self.assertIsInstance(merged[0], rhd.UvIslandCrop)
+        assert isinstance(merged[0], rhd.UvIslandCrop)
+        self.assertEqual(merged[0].bounds, (4, 2, 25, 22))
+        self.assertTrue(merged[0].mask.all())
+
+    def test_topological_islands_do_not_use_raster_connectivity(self) -> None:
+        # The almost-coincident boundary rasterises as a shared edge, but the
+        # UV vertices are not shared, so these remain independent islands.
+        triangles = (
+            np.asarray([(0.0, 0.0), (0.4999999, 0.0), (0.0, 1.0)]),
+            np.asarray([(0.5000001, 0.0), (1.0, 0.0), (1.0, 1.0)]),
+        )
+        mirror = rhd.rasterise_uv_triangles(list(triangles), 8, 8)
+        islands = rhd.mirrored_uv_island_masks(triangles, mirror)
+
+        self.assertEqual(len(islands), 2)
+
+    def test_compact_uv_island_crops_reconstruct_full_masks_exactly(self) -> None:
+        triangles = (
+            np.asarray([(0.1, 0.1), (0.4, 0.1), (0.1, 0.4)]),
+            np.asarray([(0.6, 0.6), (0.9, 0.6), (0.9, 0.9)]),
+        )
+        mirror = rhd.rasterise_uv_triangles(list(triangles), 32, 24)
+        full = rhd.mirrored_uv_island_masks(triangles, mirror)
+        crops = rhd.mirrored_uv_island_crops(triangles, mirror, padding_px=3)
+
+        rebuilt = []
+        for crop in crops:
+            mask = np.zeros_like(mirror)
+            x0, y0, x1, y1 = crop.bounds
+            mask[y0:y1, x0:x1] = crop.mask
+            rebuilt.append(mask)
+
+        self.assertEqual(len(rebuilt), len(full))
+        for actual, expected in zip(rebuilt, full):
+            self.assertTrue(np.array_equal(actual, expected))
+
+    def test_cropped_uv_raster_matches_full_atlas_for_wrapped_triangles(self) -> None:
+        triangles = [
+            np.asarray([(0.10, 0.15), (0.55, 0.20), (0.20, 0.70)]),
+            np.asarray([(0.85, 0.25), (1.15, 0.30), (1.05, 0.80)]),
+            np.asarray([(-0.10, 0.65), (0.15, 0.55), (0.05, 1.10)]),
+        ]
+        mirror = np.ones((47, 61), dtype=bool)
+        mirror[8:14, 20:34] = False
+        expected = rhd.rasterise_uv_triangles(triangles, 61, 47) & mirror
+
+        compact = rhd.rasterise_uv_triangles_crop(triangles, mirror, padding_px=4)
+
+        self.assertIsNotNone(compact)
+        assert compact is not None
+        actual = np.zeros_like(mirror)
+        x0, y0, x1, y1 = compact.bounds
+        actual[y0:y1, x0:x1] = compact.mask
+        self.assertTrue(np.array_equal(actual, expected))
+
+    def test_gpu_contrast_islands_are_dispatched_as_one_batch(self) -> None:
+        bgr = np.zeros((12, 32, 3), dtype=np.uint8)
+        first = rhd.UvIslandCrop((2, 2, 8, 8), np.ones((6, 6), dtype=bool))
+        second = rhd.UvIslandCrop((20, 2, 26, 8), np.ones((6, 6), dtype=bool))
+        detections = [
+            rhd.LocalContrastDetection(
+                np.empty((0, 4), dtype=np.int32),
+                np.zeros((6, 6), dtype=np.float32),
+                4.0,
+            ),
+            rhd.LocalContrastDetection(
+                np.asarray([(1, 1, 2, 2)], dtype=np.int32),
+                np.zeros((6, 6), dtype=np.float32),
+                4.0,
+            ),
+        ]
+        config = rhd.RhdTextureConfig(
+            enable_containment_filter=False,
+            enable_blob_filter=False,
+            detection_crop_padding_px=0,
+        )
+        detector = replace(rhd.DEFAULT_CONFIG, box_source="contrast_gpu")
+
+        def fake_run(_image, _mask, _config, **kwargs):
+            kept = [tuple(int(value) for value in box) for box in kwargs["initial_boxes"]]
+            return SimpleNamespace(
+                stages=[SimpleNamespace(kept=kept, rotations=[None] * len(kept))]
+            )
+
+        with (
+            patch.object(
+                rhd, "detect_local_contrast_gpu_batch", return_value=detections
+            ) as batch,
+            patch.object(rhd, "run_detection", side_effect=fake_run) as run,
+        ):
+            result = rhd.detect_flip_regions_by_uv_island(
+                bgr,
+                (first, second),
+                config,
+                detector,
+                log=lambda *_a: None,
+            )
+
+        self.assertEqual(batch.call_count, 1)
+        self.assertEqual(len(batch.call_args.args[0]), 2)
+        self.assertEqual(run.call_count, 2)
+        responses = {
+            id(call.kwargs["initial_contrast_response"])
+            for call in run.call_args_list
+        }
+        self.assertEqual(responses, {id(item.response) for item in detections})
+        self.assertEqual(result.regions, [(21, 3, 2, 2)])
+
 
 class MultiPartPreviewTests(unittest.TestCase):
+    def test_manifest_reassembles_independently_corrected_material_layers(self) -> None:
+        source = {
+            "key": "lc500_screen_on",
+            "aliases": ["lc500_screen_on"],
+            "materialsMember": "vehicles/lc500/main.materials.json",
+            "material": {"Stages": [{}]},
+        }
+
+        def result(member: str, stage_key: str, kind: str) -> rhd.RhdTextureResult:
+            stem = Path(member).stem
+            png = Path(f"{stem}_rhd.png")
+            return rhd.RhdTextureResult(
+                texture_member=member,
+                size=(4, 4),
+                parts_analysed=1,
+                mirrored_triangles=1,
+                rigid_triangles=0,
+                mirror_coverage=1.0,
+                rigid_coverage=0.0,
+                conflict_coverage=0.0,
+                glyph_regions=1,
+                mirrored_glyph_regions=1,
+                material_aliases=("lc500_screen", "lc500_screen_on"),
+                png_path=png,
+                dds_path=Path(f"{stem}_rhd.dds"),
+                report={
+                    "layer_bindings": [
+                        {
+                            "dae_material": "lc500_screen",
+                            "material_key": "lc500_screen_on",
+                            "materials_member": source["materialsMember"],
+                            "stage_key": stage_key,
+                            "kind": kind,
+                        }
+                    ],
+                    "source_materials": [source],
+                    "switch_base_aliases": ["lc500_screen"],
+                    "outputs": {"preview": None},
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            rhd.write_blender_preview(
+                output,
+                [
+                    result("vehicles/lc500/screen.png", "baseColorMap", "colour"),
+                    result("vehicles/lc500/screen_glow.png", "emissiveMap", "scalar"),
+                ],
+                log=lambda *_a: None,
+            )
+            manifest = json.loads((output / "rhd_materials.json").read_text())
+
+        self.assertEqual(len(manifest["materials"]), 1)
+        entry = manifest["materials"][0]
+        self.assertEqual(set(entry["maps"]), {"baseColorMap", "emissiveMap"})
+        self.assertEqual(len(entry["outputMaps"]), 2)
+
+    def test_same_texture_material_states_are_kept_as_distinct_bindings(self) -> None:
+        dash = part("dash")
+        off = ArchiveTextureBinding(
+            dae_material="ardente_interior",
+            material_key="ardente_interior",
+            materials_member="vehicles/vivace/ardente/main.materials.json",
+            texture_reference="/vehicles/vivace/ardente/ardente_interior_b.color.png",
+            texture_member="vehicles/vivace/ardente/ardente_interior_b.color.png",
+        )
+        on = ArchiveTextureBinding(
+            dae_material="ardente_interior",
+            material_key="ardente_interior_on",
+            materials_member="vehicles/vivace/ardente/main.materials.json",
+            texture_reference="/vehicles/vivace/ardente/ardente_interior_b.color.png",
+            texture_member="vehicles/vivace/ardente/ardente_interior_b.color.png",
+        )
+
+        with patch.object(
+            rhd,
+            "archive_texture_choices_for_part",
+            return_value=(off, on),
+        ):
+            grouped = rhd.texture_bindings_for_parts(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                [dash],
+            )
+
+        bindings = grouped["vehicles/vivace/ardente/ardente_interior_b.color.png"]
+        self.assertEqual([binding.material_key for _part, binding in bindings], [
+            "ardente_interior",
+            "ardente_interior_on",
+        ])
+
+    def test_same_texture_target_keeps_distinct_dae_source_materials(self) -> None:
+        dash = part("dash")
+        member = "vehicles/lc500/textures/dashlights.png"
+        left = ArchiveTextureBinding(
+            dae_material="lc500_intsignal_L",
+            material_key="lc500_dashlights",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference=f"/{member}",
+            texture_member=member,
+        )
+        right = ArchiveTextureBinding(
+            dae_material="lc500_intsignal_R",
+            material_key="lc500_dashlights",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference=f"/{member}",
+            texture_member=member,
+        )
+
+        with patch.object(
+            rhd,
+            "archive_texture_choices_for_part",
+            return_value=(left, right),
+        ):
+            grouped = rhd.texture_bindings_for_parts(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                [dash],
+            )
+
+        bindings = grouped[member]
+        self.assertEqual(
+            [binding.dae_material for _part, binding in bindings],
+            ["lc500_intsignal_L", "lc500_intsignal_R"],
+        )
+
+    def test_every_archive_backed_material_layer_becomes_its_own_binding(self) -> None:
+        dash = part("dash")
+        materials_member = "vehicles/lc500/main.materials.json"
+        base_member = "vehicles/lc500/textures/screen.png"
+        glow_member = "vehicles/lc500/textures/screen_glow.png"
+        normal_member = "vehicles/lc500/textures/screen_n.png"
+        record = ArchiveMaterialRecord(
+            key="lc500_screen_on",
+            name="lc500_screen_on",
+            map_to="",
+            materials_member=materials_member,
+            base_colour_reference=f"/{base_member}",
+            source_material={
+                "Stages": [
+                    {
+                        "baseColorMap": f"/{base_member}",
+                        "emissiveMap": f"/{glow_member}",
+                        "normalMap": f"/{normal_member}",
+                    },
+                    {
+                        # A duplicate reference is one physical job but retains
+                        # both material slots for final wiring.
+                        "baseColorMap": f"/{glow_member}",
+                    },
+                ]
+            },
+        )
+        binding = ArchiveTextureBinding(
+            dae_material="lc500_screen",
+            material_key=record.key,
+            materials_member=materials_member,
+            texture_reference=f"/{base_member}",
+            texture_member=base_member,
+        )
+        members = (base_member, glow_member, normal_member)
+        archive = SimpleNamespace(
+            materials=(record,),
+            members=members,
+            member_by_lower={member.lower(): member for member in members},
+            member_archive_indices={},
+        )
+
+        with patch.object(
+            rhd,
+            "archive_texture_choices_for_part",
+            return_value=(binding,),
+        ):
+            grouped = rhd.texture_bindings_for_parts(archive, SimpleNamespace(), [dash])
+
+        self.assertEqual(set(grouped), set(members))
+        self.assertEqual(
+            [layer.stage_key for _part, layer in grouped[glow_member]],
+            ["emissiveMap", "baseColorMap"],
+        )
+        self.assertEqual(grouped[normal_member][0][1].kind, "normal")
+
+    def test_layer_resolves_the_normal_from_its_own_material_stage(self) -> None:
+        dash = part("dash")
+        materials_member = "vehicles/lc500/main.materials.json"
+        base_member = "vehicles/lc500/textures/screen.png"
+        normal_member = "vehicles/lc500/textures/screen_n.png"
+        other_normal_member = "vehicles/lc500/textures/trim_n.png"
+        record = ArchiveMaterialRecord(
+            key="lc500_screen",
+            name="lc500_screen",
+            map_to="",
+            materials_member=materials_member,
+            base_colour_reference=f"/{base_member}",
+            source_material={
+                "Stages": [
+                    {
+                        "baseColorMap": f"/{base_member}",
+                        "normalMap": f"/{normal_member}",
+                    },
+                    {
+                        "baseColorMap": "/vehicles/lc500/textures/trim.png",
+                        "normalMap": f"/{other_normal_member}",
+                    },
+                ]
+            },
+        )
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="lc500_screen",
+            material_key=record.key,
+            materials_member=materials_member,
+            texture_reference=f"/{base_member}",
+            texture_member=base_member,
+            stage_key="baseColorMap",
+            kind="colour",
+        )
+        members = (
+            base_member,
+            normal_member,
+            "vehicles/lc500/textures/trim.png",
+            other_normal_member,
+        )
+        archive = SimpleNamespace(
+            materials=(record,),
+            members=members,
+            member_by_lower={member.lower(): member for member in members},
+            member_archive_indices={},
+        )
+
+        normals = rhd.normal_maps_for_layer_bindings(
+            archive, [(dash, binding)], base_member
+        )
+
+        self.assertEqual(
+            normals,
+            (rhd.CompanionMap(normal_member, "normalMap", "normal"),),
+        )
+
+    def test_opacity_map_is_authoritative_only_when_every_binding_is_masked(self) -> None:
+        dash = part("dash")
+        materials_member = "vehicles/lc500/main.materials.json"
+        base_member = "vehicles/lc500/textures/intemis.dds"
+        mask_member = "vehicles/lc500/textures/intemis_opmap.png"
+        masked = ArchiveMaterialRecord(
+            key="lc500_intemis_on",
+            name="lc500_intemis_on",
+            map_to="",
+            materials_member=materials_member,
+            base_colour_reference=f"/{base_member}",
+            source_material={
+                "Stages": [{
+                    "baseColorMap": f"/{base_member}",
+                    "opacityMap": f"/{mask_member}",
+                }]
+            },
+        )
+        unmasked = ArchiveMaterialRecord(
+            key="lc500_trim",
+            name="lc500_trim",
+            map_to="",
+            materials_member=materials_member,
+            base_colour_reference=f"/{base_member}",
+            source_material={"Stages": [{"baseColorMap": f"/{base_member}"}]},
+        )
+        members = (base_member, mask_member)
+        archive = SimpleNamespace(
+            materials=(masked,),
+            members=members,
+            member_by_lower={member.lower(): member for member in members},
+            member_archive_indices={},
+        )
+
+        def binding(material_key: str) -> rhd.MaterialTextureLayerBinding:
+            return rhd.MaterialTextureLayerBinding(
+                dae_material=material_key,
+                material_key=material_key,
+                materials_member=materials_member,
+                texture_reference=f"/{base_member}",
+                texture_member=base_member,
+                stage_key="baseColorMap",
+                kind="colour",
+            )
+
+        self.assertEqual(
+            rhd.authoritative_visibility_masks_for_layer_bindings(
+                archive, [(dash, binding(masked.key))], base_member
+            ),
+            (rhd.CompanionMap(mask_member, "opacityMap", "scalar"),),
+        )
+
+        archive.materials = (masked, unmasked)
+        self.assertEqual(
+            rhd.authoritative_visibility_masks_for_layer_bindings(
+                archive,
+                [(dash, binding(masked.key)), (dash, binding(unmasked.key))],
+                base_member,
+            ),
+            (),
+        )
+
+    def test_masked_layer_uses_only_opacity_detection_regions(self) -> None:
+        dash = part("dash")
+        materials_member = "vehicles/lc500/main.materials.json"
+        base_member = "vehicles/lc500/textures/intemis.dds"
+        mask_member = "vehicles/lc500/textures/intemis_opmap.png"
+        record = ArchiveMaterialRecord(
+            key="lc500_intemis_on",
+            name="lc500_intemis_on",
+            map_to="",
+            materials_member=materials_member,
+            base_colour_reference=f"/{base_member}",
+            source_material={
+                "Stages": [{
+                    "baseColorMap": f"/{base_member}",
+                    "opacityMap": f"/{mask_member}",
+                }]
+            },
+        )
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="lc500_intemissive",
+            material_key=record.key,
+            materials_member=materials_member,
+            texture_reference=f"/{base_member}",
+            texture_member=base_member,
+            stage_key="baseColorMap",
+            kind="colour",
+        )
+        archive = SimpleNamespace(
+            materials=(record,),
+            members=(base_member, mask_member),
+            member_by_lower={
+                base_member.lower(): base_member,
+                mask_member.lower(): mask_member,
+            },
+            member_archive_indices={},
+            material_switch_targets={},
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            base_path = workspace / "intemis.dds"
+            mask_path = workspace / "intemis_opmap.png"
+            Image.new("RGBA", (8, 8), (255, 0, 255, 255)).save(
+                base_path, format="PNG"
+            )
+            Image.new("RGBA", (8, 8), (0, 0, 0, 255)).save(mask_path)
+            mirror = np.zeros((8, 8), dtype=bool)
+            mirror[:, :4] = True
+            masks = rhd.DomainMasks(
+                mirror=mirror,
+                rigid=~mirror,
+                conflict_coverage=0.0,
+                mirrored_triangles=1,
+                rigid_triangles=1,
+                parts_analysed=1,
+            )
+            planned_regions: list[tuple[int, int, int, int]] = []
+
+            def extracted(_archive, member):
+                return mask_path if member == mask_member else base_path
+
+            def detect(
+                _image,
+                _islands,
+                _config,
+                detector_config,
+                source,
+                _log,
+                relief_bridge_response=None,
+            ):
+                self.assertTrue(str(source).startswith("opacityMap:"))
+                self.assertEqual(detector_config.box_source, "opacity_mask")
+                self.assertIsNone(relief_bridge_response)
+                return rhd.RegionDetection(
+                    source=str(source),
+                    detected=1,
+                    regions=[(0, 1, 4, 3)],
+                    rotations=[None],
+                )
+
+            def plan(_mirror, regions, _config, _axis_map, _components=None):
+                planned_regions.extend(regions)
+                return [], np.zeros((8, 8), dtype=bool)
+
+            with (
+                patch.object(
+                    rhd,
+                    "scoped_parts_using_material",
+                    return_value=[(dash, binding)],
+                ),
+                patch.object(
+                    rhd,
+                    "material_symbols_for_binding",
+                    return_value=("lc500_intemissive-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", side_effect=extracted),
+                patch.object(
+                    rhd,
+                    "detect_flip_regions_by_uv_island",
+                    side_effect=detect,
+                ),
+                patch.object(rhd, "plan_island_flips", side_effect=plan),
+                patch.object(
+                    rhd,
+                    "skew_delta_for_region",
+                    side_effect=AssertionError(
+                        "authoritative opacity regions must bypass inferred UV skew"
+                    ),
+                ),
+                patch.object(
+                    rhd,
+                    "normal_maps_for_layer_bindings",
+                    side_effect=AssertionError("masked layers must not inspect normals"),
+                ),
+            ):
+                result = rhd.build_rhd_texture(
+                    archive,
+                    SimpleNamespace(),
+                    base_member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(
+                        detect_on_normal_map=True,
+                        write_debug_overlays=False,
+                    ),
+                    part_scope=[dash],
+                    masks=masks,
+                    log=lambda *_a: None,
+                )
+
+        self.assertEqual(planned_regions, [(0, 1, 4, 3)])
+        self.assertEqual(result.report["detection_authority"], "opacity_mask")
+        self.assertFalse(result.report["skewed_region_filter_applied"])
+        self.assertEqual(
+            [(step["x"], step["y"], step["w"], step["h"])
+             for step in result.report["in_place_flips"]],
+            [(0, 1, 4, 3)],
+        )
+        self.assertEqual(
+            result.report["in_place_flips"][0]["stencil"],
+            rhd.STENCIL_REGION,
+        )
+        self.assertEqual(result.report["authoritative_mask_sources"], [mask_member])
+        self.assertEqual(
+            result.report["detection"][0]["pipeline"],
+            "authoritative_opacity_mask",
+        )
+
+    def _capture_production_detector(
+        self, *, with_normal: bool
+    ) -> tuple[dict[str, object], rhd.RhdTextureResult]:
+        dash = part("dash")
+        base_member = "vehicles/lc500/textures/screen.png"
+        normal_member = "vehicles/lc500/textures/screen_n.png"
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="lc500_screen",
+            material_key="lc500_screen",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference=f"/{base_member}",
+            texture_member=base_member,
+            stage_key="baseColorMap",
+            kind="colour",
+        )
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            base = workspace / "screen.png"
+            normal = workspace / "screen_n.png"
+            Image.new("RGBA", (4, 4), (0, 0, 0, 255)).save(base)
+            Image.new("RGB", (4, 4), (128, 128, 255)).save(normal)
+            mirror = np.zeros((4, 4), dtype=bool)
+            mirror[:, :2] = True
+            rigid = ~mirror
+            masks = rhd.DomainMasks(
+                mirror=mirror,
+                rigid=rigid,
+                conflict_coverage=0.0,
+                mirrored_triangles=1,
+                rigid_triangles=1,
+                parts_analysed=1,
+            )
+            response = np.full((4, 4), 23.0, dtype=np.float32)
+            edge_data = SimpleNamespace(
+                edge_response=response,
+                render_seconds=0.1,
+                edge_seconds=0.2,
+            )
+            session = rhd.ProductionDetectionSession()
+
+            def detect(
+                _image,
+                _islands,
+                _config,
+                detector,
+                source,
+                _log,
+                relief_bridge_response=None,
+            ):
+                captured["box_source"] = detector.box_source
+                captured["source"] = source
+                captured["relief_bridge_response"] = relief_bridge_response
+                return rhd.RegionDetection(source=str(source), detected=0)
+
+            def extracted(_archive, member):
+                return normal if member == normal_member else base
+
+            normal_maps = (
+                (rhd.CompanionMap(normal_member, "normalMap", "normal"),)
+                if with_normal
+                else ()
+            )
+            with (
+                patch.object(rhd, "scoped_parts_using_material", return_value=[(dash, binding)]),
+                patch.object(rhd, "material_symbols_for_binding", return_value=("lc500_screen-material",)),
+                patch.object(rhd, "extract_archive_member", side_effect=extracted),
+                patch.object(rhd, "build_domain_masks", return_value=masks),
+                patch.object(rhd, "normal_maps_for_layer_bindings", return_value=normal_maps),
+                patch.object(session, "normal_edge_data", return_value=(edge_data, False)),
+                patch.object(rhd, "detect_flip_regions_by_uv_island", side_effect=detect),
+                patch.object(rhd, "plan_island_flips", return_value=([], np.zeros((4, 4), dtype=bool))),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    base_member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(
+                        detect_on_normal_map=True,
+                        write_debug_overlays=False,
+                    ),
+                    part_scope=[dash],
+                    masks=masks,
+                    detection_session=session,
+                    log=lambda *_a: None,
+                )
+        return captured, result
+
+    def test_production_uses_colour_glyphs_with_cached_relief_edges(self) -> None:
+        captured, result = self._capture_production_detector(with_normal=True)
+
+        self.assertEqual(captured["box_source"], "contrast_gpu")
+        self.assertIsNotNone(captured["relief_bridge_response"])
+        self.assertEqual(
+            result.report["detection"][0]["pipeline"],
+            "colour_glyphs_relief_edge_grouping",
+        )
+
+    def test_production_falls_back_to_gpu_colour_without_a_normal(self) -> None:
+        captured, result = self._capture_production_detector(with_normal=False)
+
+        self.assertEqual(captured["box_source"], "contrast_gpu")
+        self.assertIsNone(captured["relief_bridge_response"])
+        self.assertEqual(
+            result.report["detection"][0]["pipeline"],
+            "colour_local_contrast_gpu",
+        )
+
+    def test_normal_layer_uses_island_scoped_gpu_relief_detection(self) -> None:
+        dash = part("dash")
+        normal_member = "vehicles/vivace/ardente/ardente_interior_nm.normal.png"
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="ardente_interior",
+            material_key="ardente_interior",
+            materials_member="vehicles/vivace/ardente/main.materials.json",
+            texture_reference=f"/{normal_member}",
+            texture_member=normal_member,
+            stage_key="normalMap",
+            kind="normal",
+        )
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            normal = workspace / "ardente_interior_nm.normal.png"
+            Image.new("RGB", (4, 4), (128, 128, 255)).save(normal)
+            mirror = np.zeros((4, 4), dtype=bool)
+            mirror[:, :2] = True
+            masks = rhd.DomainMasks(
+                mirror=mirror,
+                rigid=~mirror,
+                conflict_coverage=0.0,
+                mirrored_triangles=1,
+                rigid_triangles=1,
+                parts_analysed=1,
+            )
+            relief = np.full((4, 4, 3), 71, dtype=np.uint8)
+            response = np.full((4, 4), 29.0, dtype=np.float32)
+            edge_data = SimpleNamespace(
+                relief_bgr=relief,
+                edge_response=response,
+                render_seconds=0.1,
+                edge_seconds=0.2,
+            )
+            session = rhd.ProductionDetectionSession()
+
+            def detect(
+                image,
+                islands,
+                _config,
+                detector,
+                source,
+                _log,
+                relief_bridge_response=None,
+            ):
+                captured["image"] = image
+                captured["box_source"] = detector.box_source
+                captured["detector"] = detector
+                captured["source"] = source
+                captured["relief_bridge_response"] = relief_bridge_response
+                captured["islands"] = islands
+                return rhd.RegionDetection(source=str(source), detected=0)
+
+            with (
+                patch.object(
+                    rhd,
+                    "scoped_parts_using_material",
+                    return_value=[(dash, binding)],
+                ),
+                patch.object(
+                    rhd,
+                    "material_symbols_for_binding",
+                    return_value=("ardente_interior-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=normal),
+                patch.object(
+                    rhd,
+                    "normal_maps_for_layer_bindings",
+                    side_effect=AssertionError(
+                        "a physical normal layer must use its own pixels"
+                    ),
+                ),
+                patch.object(session, "normal_edge_data", return_value=(edge_data, False)),
+                patch.object(
+                    rhd,
+                    "detect_flip_regions_by_uv_island",
+                    side_effect=detect,
+                ),
+                patch.object(
+                    rhd,
+                    "detect_flip_regions",
+                    side_effect=AssertionError(
+                        "normal relief must match the tuning harness's UV scope"
+                    ),
+                ),
+                patch.object(
+                    rhd,
+                    "plan_island_flips",
+                    return_value=([], np.zeros((4, 4), dtype=bool)),
+                ),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    normal_member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(write_debug_overlays=False),
+                    part_scope=[dash],
+                    masks=masks,
+                    detection_session=session,
+                    log=lambda *_a: None,
+                )
+
+        self.assertIs(captured["image"], relief)
+        self.assertEqual(captured["box_source"], "edge_gpu")
+        self.assertEqual(captured["source"], "relief")
+        self.assertIs(captured["relief_bridge_response"], response)
+        self.assertGreater(len(captured["islands"]), 0)
+        self.assertEqual(
+            captured["detector"],
+            replace(rhd.DEFAULT_RELIEF_DETECTION_CONFIG, box_source="edge_gpu"),
+        )
+        self.assertEqual(result.report["detection"][0]["source"], "relief")
+        self.assertEqual(
+            result.report["detection"][0]["pipeline"],
+            "relief_edge_gpu",
+        )
+        self.assertFalse(result.report["normal_region_detail_gate"])
+
+    def test_companion_maps_do_not_replay_the_colour_plan(self) -> None:
+        dash = part("dash")
+        binding = ArchiveTextureBinding(
+            dae_material="ardente_interior",
+            material_key="ardente_interior_on",
+            materials_member="vehicles/vivace/ardente/main.materials.json",
+            texture_reference="/vehicles/vivace/ardente/ardente_interior_b.color.png",
+            texture_member="vehicles/vivace/ardente/ardente_interior_b.color.png",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            base = workspace / "ardente_interior_b.color.png"
+            Image.new("RGBA", (4, 4), (0, 0, 0, 255)).save(base)
+            mask = np.ones((4, 4), dtype=bool)
+            masks = rhd.DomainMasks(
+                mirror=mask,
+                rigid=np.zeros((4, 4), dtype=bool),
+                conflict_coverage=0.0,
+                mirrored_triangles=1,
+                rigid_triangles=0,
+                parts_analysed=1,
+            )
+            companion_result = rhd.CompanionResult(
+                member="vehicles/vivace/ardente/ardente_interior_g.color.png",
+                stage_key="emissiveMap",
+                kind="scalar",
+                codec="rgba",
+                texels_moved=16,
+                png_path=workspace / "ardente_interior_g.color_rhd.png",
+                dds_path=workspace / "ardente_interior_g.color_rhd.dds",
+            )
+
+            with (
+                patch.object(rhd, "scoped_parts_using_material", return_value=[(dash, binding)]),
+                patch.object(rhd, "material_symbols_for_binding", return_value=("ardente_interior-material",)),
+                patch.object(rhd, "extract_archive_member", return_value=base),
+                patch.object(rhd, "build_domain_masks", return_value=masks),
+                patch.object(
+                    rhd,
+                    "companion_maps_for_binding",
+                    return_value=(
+                        rhd.CompanionMap(
+                            member="vehicles/vivace/ardente/ardente_interior_g.color.png",
+                            stage_key="emissiveMap",
+                            kind="scalar",
+                        ),
+                    ),
+                ),
+                patch.object(
+                    rhd,
+                    "detect_flip_regions",
+                    return_value=rhd.RegionDetection(
+                        source="colour",
+                        detected=1,
+                        regions=[(0, 0, 4, 4)],
+                        rotations=[None],
+                    ),
+                ),
+                patch.object(
+                    rhd,
+                    "plan_island_flips",
+                    return_value=(
+                        [
+                            rhd.IslandFlip(
+                                label=1,
+                                bounds=(0, 0, 4, 4),
+                                area_px=16,
+                                axis="horizontal",
+                                horizontal_similarity=1.0,
+                                vertical_similarity=1.0,
+                                glyph_count=1,
+                            )
+                        ],
+                        mask,
+                    ),
+                ),
+                patch.object(rhd, "rebuild_companion_map", return_value=companion_result) as rebuild,
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    binding.texture_member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(
+                        rebuild_companion_maps=True,
+                        detect_on_normal_map=False,
+                    ),
+                    part_scope=[dash],
+                    log=lambda *_a: None,
+                )
+
+        rebuild.assert_not_called()
+        self.assertEqual(result.companions, [])
+
+    def test_emissive_companion_regions_do_not_join_base_flip_plan(self) -> None:
+        dash = part("dash")
+        binding = ArchiveTextureBinding(
+            dae_material="lc500_door_buttons",
+            material_key="lc500_door_buttons_on",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference="/vehicles/lc500/textures/buttons.dds",
+            texture_member="vehicles/lc500/textures/buttons.dds",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            base = workspace / "buttons.dds"
+            glow = workspace / "buttons_glow.png"
+            Image.new("RGBA", (4, 4), (0, 0, 0, 255)).save(base, format="PNG")
+            Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(glow)
+            mask = np.ones((4, 4), dtype=bool)
+            masks = rhd.DomainMasks(
+                mirror=mask,
+                rigid=np.zeros((4, 4), dtype=bool),
+                conflict_coverage=0.0,
+                mirrored_triangles=1,
+                rigid_triangles=0,
+                parts_analysed=1,
+            )
+            planned_regions: list[tuple[int, int, int, int]] = []
+
+            def detection(
+                _image,
+                _mirror,
+                _domain,
+                _config,
+                _mser_config,
+                source,
+                _log,
+            ) -> rhd.RegionDetection:
+                if str(source).startswith("emissiveMap:"):
+                    return rhd.RegionDetection(
+                        source=str(source),
+                        detected=1,
+                        regions=[(0, 0, 4, 4)],
+                        rotations=[None],
+                    )
+                return rhd.RegionDetection(source=str(source), detected=0)
+
+            def plan(
+                _mirror,
+                regions,
+                _config,
+                _axis_map,
+                _components=None,
+            ):
+                planned_regions.extend(regions)
+                return (
+                    [
+                        rhd.IslandFlip(
+                            label=1,
+                            bounds=(0, 0, 4, 4),
+                            area_px=16,
+                            axis="horizontal",
+                            horizontal_similarity=1.0,
+                            vertical_similarity=1.0,
+                            glyph_count=1,
+                        )
+                    ],
+                    mask,
+                )
+
+            with (
+                patch.object(rhd, "scoped_parts_using_material", return_value=[(dash, binding)]),
+                patch.object(rhd, "material_symbols_for_binding", return_value=("lc500_door_buttons-material",)),
+                patch.object(rhd, "extract_archive_member", side_effect=[base, glow]),
+                patch.object(rhd, "build_domain_masks", return_value=masks),
+                patch.object(
+                    rhd,
+                    "companion_maps_for_binding",
+                    return_value=(
+                        rhd.CompanionMap(
+                            member="vehicles/lc500/textures/buttons_glow.png",
+                            stage_key="emissiveMap",
+                            kind="scalar",
+                        ),
+                    ),
+                ),
+                patch.object(rhd, "detect_flip_regions", side_effect=detection),
+                patch.object(rhd, "plan_island_flips", side_effect=plan),
+                patch.object(rhd, "rebuild_companion_map", return_value=None),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    binding.texture_member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(
+                        rebuild_companion_maps=True,
+                        detect_on_normal_map=False,
+                    ),
+                    part_scope=[dash],
+                    log=lambda *_a: None,
+                )
+
+        self.assertEqual(planned_regions, [(0, 0, 4, 4)])
+        self.assertEqual(result.report["companion_regions_added"], 0)
+
+    def test_switch_group_state_regions_do_not_join_base_flip_plan(self) -> None:
+        dash = part("dash")
+        binding = ArchiveTextureBinding(
+            dae_material="lc500_screen_off",
+            material_key="lc500_screen_off_off",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference="/vehicles/lc500/LEX_LC5.dds",
+            texture_member="vehicles/lc500/LEX_LC5.dds",
+        )
+        on_record = ArchiveMaterialRecord(
+            key="lc500_screen_off_on",
+            name="lc500_screen_off_on",
+            map_to="",
+            materials_member="vehicles/lc500/main.materials.json",
+            base_colour_reference="/vehicles/lc500/textures/screen_on.png",
+            source_material={
+                "Stages": [
+                    {
+                        "baseColorMap": "/vehicles/lc500/textures/screen_on.png",
+                        "emissiveMap": "/vehicles/lc500/textures/screen_on.png",
+                    }
+                ]
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            base = workspace / "LEX_LC5.dds"
+            on = workspace / "screen_on.png"
+            Image.new("RGBA", (8, 8), (0, 0, 0, 255)).save(base, format="PNG")
+            Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(on)
+            mask = np.ones((8, 8), dtype=bool)
+            masks = rhd.DomainMasks(
+                mirror=mask,
+                rigid=np.zeros((8, 8), dtype=bool),
+                conflict_coverage=0.0,
+                mirrored_triangles=1,
+                rigid_triangles=0,
+                parts_analysed=1,
+            )
+            archive = SimpleNamespace(
+                materials=(on_record,),
+                material_switch_targets={
+                    "lc500_screen_off": ("lc500_screen_off_off", "lc500_screen_off_on")
+                },
+                material_switch_states={
+                    "lc500_screen_off": (
+                        ArchiveMaterialSwitchState("off", "lc500_screen_off_off"),
+                        ArchiveMaterialSwitchState("on", "lc500_screen_off_on"),
+                    )
+                },
+                member_by_lower={
+                    "vehicles/lc500/lex_lc5.dds": "vehicles/lc500/LEX_LC5.dds",
+                    "vehicles/lc500/textures/screen_on.png": (
+                        "vehicles/lc500/textures/screen_on.png"
+                    ),
+                },
+                members=(
+                    "vehicles/lc500/LEX_LC5.dds",
+                    "vehicles/lc500/textures/screen_on.png",
+                ),
+                member_archive_indices={},
+            )
+            planned_regions: list[tuple[int, int, int, int]] = []
+
+            def detection(
+                _image,
+                _mirror,
+                _domain,
+                _config,
+                _mser_config,
+                source,
+                _log,
+            ) -> rhd.RegionDetection:
+                if str(source).startswith("state:"):
+                    return rhd.RegionDetection(
+                        source=str(source),
+                        detected=1,
+                        regions=[(1, 1, 2, 2)],
+                        rotations=[None],
+                    )
+                return rhd.RegionDetection(source=str(source), detected=0)
+
+            def plan(
+                _mirror,
+                regions,
+                _config,
+                _axis_map,
+                _components=None,
+            ):
+                planned_regions.extend(regions)
+                return (
+                    [
+                        rhd.IslandFlip(
+                            label=1,
+                            bounds=(2, 2, 4, 4),
+                            area_px=16,
+                            axis="horizontal",
+                            horizontal_similarity=1.0,
+                            vertical_similarity=1.0,
+                            glyph_count=1,
+                        )
+                    ],
+                    mask,
+                )
+
+            def member_path(_archive, member):
+                return {
+                    "vehicles/lc500/LEX_LC5.dds": base,
+                    "vehicles/lc500/textures/screen_on.png": on,
+                }[member]
+
+            with (
+                patch.object(rhd, "scoped_parts_using_material", return_value=[(dash, binding)]),
+                patch.object(rhd, "material_symbols_for_binding", return_value=("lc500_screen_off-material",)),
+                patch.object(rhd, "extract_archive_member", side_effect=member_path),
+                patch.object(rhd, "build_domain_masks", return_value=masks),
+                patch.object(rhd, "companion_maps_for_binding", return_value=()),
+                patch.object(rhd, "detect_flip_regions", side_effect=detection),
+                patch.object(rhd, "plan_island_flips", side_effect=plan),
+            ):
+                result = rhd.build_rhd_texture(
+                    archive,
+                    SimpleNamespace(),
+                    binding.texture_member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(
+                        rebuild_companion_maps=True,
+                        detect_on_normal_map=False,
+                    ),
+                    part_scope=[dash],
+                    log=lambda *_a: None,
+                )
+
+        self.assertEqual(planned_regions, [(0, 0, 8, 8)])
+        self.assertEqual(result.report["state_group_regions_added"], 0)
+        self.assertFalse(
+            any(
+                str(entry["source"]).startswith("state:")
+                for entry in result.report["detection"]
+            )
+        )
+
+    def test_switch_group_detection_does_not_merge_shared_off_states(self) -> None:
+        dash = part("dash")
+        binding = ArchiveTextureBinding(
+            dae_material="lc500_centralscreen",
+            material_key="lc500_screens_off",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference="/vehicles/lc500/textures/lc500_bootscreen.png",
+            texture_member="vehicles/lc500/textures/lc500_bootscreen.png",
+        )
+        own_on = ArchiveMaterialRecord(
+            key="lc500_centralscreen_on",
+            name="lc500_centralscreen_on",
+            map_to="",
+            materials_member="vehicles/lc500/main.materials.json",
+            base_colour_reference="/vehicles/lc500/textures/lc500_bootscreen_on.png",
+            source_material={
+                "Stages": [
+                    {"baseColorMap": "/vehicles/lc500/textures/lc500_bootscreen_on.png"}
+                ]
+            },
+        )
+        other_on = ArchiveMaterialRecord(
+            key="lc500_screens_on",
+            name="lc500_screens_on",
+            map_to="",
+            materials_member="vehicles/lc500/main.materials.json",
+            base_colour_reference="/vehicles/lc500/textures/screen.dds",
+            source_material={
+                "Stages": [
+                    {"baseColorMap": "/vehicles/lc500/textures/screen.dds"}
+                ]
+            },
+        )
+        archive = SimpleNamespace(
+            materials=(own_on, other_on),
+            material_switch_targets={
+                "lc500_centralscreen": (
+                    "lc500_screens_off",
+                    "lc500_centralscreen_on",
+                    "lc500_gps",
+                ),
+                "lc500_screens": ("lc500_screens_off", "lc500_screens_on"),
+            },
+            material_switch_states={
+                "lc500_centralscreen": (
+                    ArchiveMaterialSwitchState("off", "lc500_screens_off"),
+                    ArchiveMaterialSwitchState("on", "lc500_centralscreen_on"),
+                    ArchiveMaterialSwitchState("on_intense", "lc500_gps"),
+                ),
+                "lc500_screens": (
+                    ArchiveMaterialSwitchState("off", "lc500_screens_off"),
+                    ArchiveMaterialSwitchState("on", "lc500_screens_on"),
+                ),
+            },
+            material_switch_triggers={
+                "lc500_centralscreen": ("ignitionLevel",),
+                "lc500_screens": ("running",),
+            },
+            member_by_lower={
+                "vehicles/lc500/textures/lc500_bootscreen.png": (
+                    "vehicles/lc500/textures/lc500_bootscreen.png"
+                ),
+                "vehicles/lc500/textures/lc500_bootscreen_on.png": (
+                    "vehicles/lc500/textures/lc500_bootscreen_on.png"
+                ),
+                "vehicles/lc500/textures/screen.dds": (
+                    "vehicles/lc500/textures/screen.dds"
+                ),
+            },
+            members=(
+                "vehicles/lc500/textures/lc500_bootscreen.png",
+                "vehicles/lc500/textures/lc500_bootscreen_on.png",
+                "vehicles/lc500/textures/screen.dds",
+            ),
+            member_archive_indices={},
+        )
+
+        maps = rhd.switch_group_detection_maps_for_candidates(
+            archive,
+            [(dash, binding)],
+            binding.texture_member,
+        )
+
+        self.assertEqual(
+            [(item.material_key, item.switch_state, item.member) for item in maps],
+            [
+                (
+                    "lc500_centralscreen_on",
+                    "on",
+                    "vehicles/lc500/textures/lc500_bootscreen_on.png",
+                )
+            ],
+        )
+
+    def test_switch_group_detection_borrows_ignition_on_sibling_states(self) -> None:
+        dash = part("dash")
+        binding = ArchiveTextureBinding(
+            dae_material="lc500_centralscreen",
+            material_key="lc500_screens_off",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference="/vehicles/lc500/textures/lc500_bootscreen.png",
+            texture_member="vehicles/lc500/textures/lc500_bootscreen.png",
+        )
+        own_on = ArchiveMaterialRecord(
+            key="lc500_centralscreen_on",
+            name="lc500_centralscreen_on",
+            map_to="",
+            materials_member="vehicles/lc500/main.materials.json",
+            base_colour_reference="/vehicles/lc500/textures/lc500_bootscreen_on.png",
+            source_material={
+                "Stages": [
+                    {"baseColorMap": "/vehicles/lc500/textures/lc500_bootscreen_on.png"}
+                ]
+            },
+        )
+        sibling_on = ArchiveMaterialRecord(
+            key="lc500_screens_on",
+            name="lc500_screens_on",
+            map_to="",
+            materials_member="vehicles/lc500/main.materials.json",
+            base_colour_reference="/vehicles/lc500/textures/screen.dds",
+            source_material={
+                "Stages": [
+                    {"baseColorMap": "/vehicles/lc500/textures/screen.dds"}
+                ]
+            },
+        )
+        running_on = ArchiveMaterialRecord(
+            key="lc500_gauges_needle_on",
+            name="lc500_gauges_needle_on",
+            map_to="",
+            materials_member="vehicles/lc500/main.materials.json",
+            base_colour_reference="/vehicles/lc500/textures/needle.png",
+            source_material={
+                "Stages": [
+                    {"emissiveMap": "/vehicles/lc500/textures/needle.png"}
+                ]
+            },
+        )
+        archive = SimpleNamespace(
+            materials=(own_on, sibling_on, running_on),
+            material_switch_targets={
+                "lc500_centralscreen": (
+                    "lc500_screens_off",
+                    "lc500_centralscreen_on",
+                    "lc500_gps",
+                ),
+                "lc500_screens": ("lc500_screens_off", "lc500_screens_on"),
+                "lc500_gauges_needle": ("invis", "lc500_gauges_needle_on"),
+            },
+            material_switch_states={
+                "lc500_centralscreen": (
+                    ArchiveMaterialSwitchState("off", "lc500_screens_off"),
+                    ArchiveMaterialSwitchState("on", "lc500_centralscreen_on"),
+                    ArchiveMaterialSwitchState("on_intense", "lc500_gps"),
+                ),
+                "lc500_screens": (
+                    ArchiveMaterialSwitchState("off", "lc500_screens_off"),
+                    ArchiveMaterialSwitchState("on", "lc500_screens_on"),
+                    ArchiveMaterialSwitchState("on_intense", "lc500_screens_on"),
+                ),
+                "lc500_gauges_needle": (
+                    ArchiveMaterialSwitchState("off", "invis"),
+                    ArchiveMaterialSwitchState("on", "lc500_gauges_needle_on"),
+                ),
+            },
+            material_switch_triggers={
+                "lc500_centralscreen": ("ignitionLevel",),
+                "lc500_screens": ("ignitionLevel",),
+                "lc500_gauges_needle": ("running",),
+            },
+            member_by_lower={
+                "vehicles/lc500/textures/lc500_bootscreen.png": (
+                    "vehicles/lc500/textures/lc500_bootscreen.png"
+                ),
+                "vehicles/lc500/textures/lc500_bootscreen_on.png": (
+                    "vehicles/lc500/textures/lc500_bootscreen_on.png"
+                ),
+                "vehicles/lc500/textures/screen.dds": (
+                    "vehicles/lc500/textures/screen.dds"
+                ),
+                "vehicles/lc500/textures/needle.png": (
+                    "vehicles/lc500/textures/needle.png"
+                ),
+            },
+            members=(
+                "vehicles/lc500/textures/lc500_bootscreen.png",
+                "vehicles/lc500/textures/lc500_bootscreen_on.png",
+                "vehicles/lc500/textures/screen.dds",
+                "vehicles/lc500/textures/needle.png",
+            ),
+            member_archive_indices={},
+        )
+
+        maps = rhd.switch_group_detection_maps_for_candidates(
+            archive,
+            [(dash, binding)],
+            binding.texture_member,
+        )
+
+        self.assertEqual(
+            [(item.material_key, item.switch_state, item.member) for item in maps],
+            [
+                (
+                    "lc500_screens_on",
+                    "on_intense",
+                    "vehicles/lc500/textures/screen.dds",
+                ),
+                (
+                    "lc500_centralscreen_on",
+                    "on",
+                    "vehicles/lc500/textures/lc500_bootscreen_on.png",
+                ),
+            ],
+        )
+
     def test_shared_atlas_is_rebuilt_once_for_selected_parts(self) -> None:
         dash = part("dash")
         console = part("console")
@@ -394,6 +1916,14 @@ class MultiPartPreviewTests(unittest.TestCase):
         self.assertEqual(len(report["selected_parts"]), 2)
         self.assertEqual(len(report["texture_jobs"]), 1)
         self.assertEqual(len(report["dae_exports"]), 2)
+        self.assertEqual(
+            report["texture_detection_inventory"]["candidate_files"],
+            [binding.texture_member],
+        )
+        self.assertEqual(
+            report["texture_detection_inventory"]["detection_attempted_files"],
+            [binding.texture_member],
+        )
         self.assertEqual(
             report["dae_exports"][0]["generated_flexbody_rows"][0]["node_id"],
             "generated_carrier",

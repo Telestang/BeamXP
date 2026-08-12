@@ -216,8 +216,8 @@ def _rasterise_triangles(
         max_u = max(u for u, _ in triangle)
         min_v = min(v for _, v in triangle)
         max_v = max(v for _, v in triangle)
-        for shift_u in range(math.floor(min_u) - 1, math.floor(max_u) + 2):
-            for shift_v in range(math.floor(min_v) - 1, math.floor(max_v) + 2):
+        for shift_u in range(math.floor(min_u), math.floor(max_u) + 1):
+            for shift_v in range(math.floor(min_v), math.floor(max_v) + 1):
                 shifted = [(u - shift_u, v - shift_v) for u, v in triangle]
                 clipped = _clip_to_unit_tile(shifted)
                 if len(clipped) < 3:
@@ -372,6 +372,192 @@ def uv_island_mask(
     triangles, stats = _triangles_for_material(root, material)
     occupied, filled_polygons = _rasterise_triangles(triangles, width, height)
     return occupied > 0, {**stats, "filled_clipped_polygons": filled_polygons}
+
+
+@dataclass(frozen=True, slots=True)
+class UvIslandCrop:
+    """One topological island rasterised only in its tight atlas rectangle."""
+
+    x: int
+    y: int
+    mask: np.ndarray
+
+
+def overlapping_mask_crop_groups(
+    crops: tuple[tuple[int, int, np.ndarray], ...],
+    min_smaller_overlap: float = 0.0,
+) -> tuple[tuple[int, ...], ...]:
+    """Group atlas consumers that share actual occupied pixels.
+
+    Separate mesh surfaces can use the same UV area. Processing those surfaces
+    independently prevents their detector boxes from reaching overlap grouping.
+    Edge contact alone has zero common pixels and therefore remains separate.
+    """
+    if not crops:
+        return ()
+    threshold = min(max(float(min_smaller_overlap), 0.0), 1.0)
+    parent = list(range(len(crops)))
+    bounds = [
+        (x, y, x + mask.shape[1], y + mask.shape[0])
+        for x, y, mask in crops
+    ]
+    areas = [int(np.count_nonzero(mask)) for _x, _y, mask in crops]
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parent[right] = left
+
+    order = sorted(range(len(crops)), key=lambda index: bounds[index][0])
+    for position, left in enumerate(order):
+        lx0, ly0, lx1, ly1 = bounds[left]
+        if areas[left] <= 0:
+            continue
+        for right in order[position + 1 :]:
+            rx0, ry0, rx1, ry1 = bounds[right]
+            if rx0 >= lx1:
+                break
+            if areas[right] <= 0 or ry0 >= ly1 or ly0 >= ry1:
+                continue
+            x0, y0 = max(lx0, rx0), max(ly0, ry0)
+            x1, y1 = min(lx1, rx1), min(ly1, ry1)
+            left_mask = crops[left][2][y0 - ly0 : y1 - ly0, x0 - lx0 : x1 - lx0]
+            right_mask = crops[right][2][y0 - ry0 : y1 - ry0, x0 - rx0 : x1 - rx0]
+            overlap = int(np.count_nonzero(left_mask & right_mask))
+            if (
+                overlap > 0
+                and overlap / max(min(areas[left], areas[right]), 1) >= threshold
+            ):
+                union(left, right)
+
+    grouped: dict[int, list[int]] = {}
+    for index in range(len(crops)):
+        grouped.setdefault(find(index), []).append(index)
+    return tuple(
+        tuple(indices)
+        for _first, indices in sorted(
+            ((min(indices), indices) for indices in grouped.values()),
+            key=lambda item: item[0],
+        )
+    )
+
+
+def merge_overlapping_mask_crops(
+    crops: tuple[tuple[int, int, np.ndarray], ...],
+    min_smaller_overlap: float = 0.0,
+    *,
+    groups: tuple[tuple[int, ...], ...] | None = None,
+) -> tuple[tuple[int, int, np.ndarray], ...]:
+    """Union each near-duplicate crop group into one tight detection domain."""
+    merged: list[tuple[int, int, np.ndarray]] = []
+    if groups is None:
+        groups = overlapping_mask_crop_groups(crops, min_smaller_overlap)
+    for indices in groups:
+        x0 = min(crops[index][0] for index in indices)
+        y0 = min(crops[index][1] for index in indices)
+        x1 = max(crops[index][0] + crops[index][2].shape[1] for index in indices)
+        y1 = max(crops[index][1] + crops[index][2].shape[0] for index in indices)
+        mask = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+        for index in indices:
+            x, y, source = crops[index]
+            height, width = source.shape[:2]
+            mask[y - y0 : y - y0 + height, x - x0 : x - x0 + width] |= source
+        merged.append((x0, y0, np.ascontiguousarray(mask)))
+    return tuple(merged)
+
+
+def _rasterise_triangles_crop(
+    triangles: list[list[tuple[float, float]]],
+    width: int,
+    height: int,
+) -> UvIslandCrop | None:
+    """Exact ``_rasterise_triangles`` result, without allocating an atlas mask.
+
+    Polygon coordinates are first calculated in full-atlas pixels using the
+    same clipping and rounding as the full rasteriser.  Translating those
+    integer polygons into their tight bounding crop preserves every covered
+    texel while reducing per-island memory and scan work from O(atlas area) to
+    O(island bounding-box area).
+    """
+    polygons: list[np.ndarray] = []
+    for triangle in triangles:
+        min_u = min(u for u, _ in triangle)
+        max_u = max(u for u, _ in triangle)
+        min_v = min(v for _, v in triangle)
+        max_v = max(v for _, v in triangle)
+        for shift_u in range(math.floor(min_u), math.floor(max_u) + 1):
+            for shift_v in range(math.floor(min_v), math.floor(max_v) + 1):
+                shifted = [(u - shift_u, v - shift_v) for u, v in triangle]
+                clipped = _clip_to_unit_tile(shifted)
+                if len(clipped) < 3:
+                    continue
+                points = _uv_polygon_to_pixels(clipped, width, height)
+                if cv2.contourArea(points) <= 0.01:
+                    continue
+                polygons.append(points)
+    if not polygons:
+        return None
+    x0 = min(int(points[:, 0].min()) for points in polygons)
+    y0 = min(int(points[:, 1].min()) for points in polygons)
+    x1 = max(int(points[:, 0].max()) for points in polygons) + 1
+    y1 = max(int(points[:, 1].max()) for points in polygons) + 1
+    occupied = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    for points in polygons:
+        cv2.fillPoly(occupied, [points - (x0, y0)], 255, lineType=cv2.LINE_8)
+    return UvIslandCrop(x=x0, y=y0, mask=occupied > 0)
+
+
+def uv_island_masks(
+    root: ET.Element,
+    material: str,
+    size: tuple[int, int],
+) -> tuple[tuple[UvIslandCrop, ...], dict[str, object]]:
+    """Rasterise each topological UV island into its own tight crop.
+
+    Raster connected-components are deliberately not used: two islands can
+    touch in an atlas without sharing a UV vertex.  Region fitting callers need
+    this stricter separation so a box can never span those unrelated islands.
+    """
+    width, height = size
+    triangles, stats = _triangles_for_material(root, material)
+    parents = list(range(len(triangles)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parents[right] = left
+
+    owner: dict[tuple[int, int], int] = {}
+    for index, triangle in enumerate(triangles):
+        for u, v in triangle:
+            key = (int(round(u * 100_000_000)), int(round(v * 100_000_000)))
+            previous = owner.get(key)
+            if previous is None:
+                owner[key] = index
+            else:
+                union(index, previous)
+
+    groups: dict[int, list[list[tuple[float, float]]]] = {}
+    for index, triangle in enumerate(triangles):
+        groups.setdefault(find(index), []).append(triangle)
+    crops: list[UvIslandCrop] = []
+    for group in groups.values():
+        crop = _rasterise_triangles_crop(group, width, height)
+        if crop is not None:
+            crops.append(crop)
+    return tuple(crops), {**stats, "uv_islands": len(crops)}
 
 
 def extract(config: ExtractionConfig, root: ET.Element) -> dict[str, object]:

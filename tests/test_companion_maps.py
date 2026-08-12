@@ -37,6 +37,7 @@ from mesh_segmentation_transform.mirror_texture_for_rhd import (
     apply_masked_flip,
     apply_masked_rotated_flip,
     companion_boundary_blend_px,
+    deduplicate_region_detections,
     merge_region_sets,
     normal_map_relief,
     reconstruct_normal_z,
@@ -188,6 +189,25 @@ class NormalChannelNegationTests(unittest.TestCase):
         self.assertEqual(int(image[1, 8, 0]), 108)
         self.assertLess(int(image[7, 11, 0]), 80)
         self.assertNotEqual(int(image[7, 3, 0]), 220)
+
+    def test_default_normal_flip_does_not_recrop_shallow_detected_relief(self) -> None:
+        image = flat_normal(16, 16)
+        image[6:10, 3:5, 0] = 136
+        stencil = np.ones((16, 16), dtype=bool)
+
+        apply_masked_flip(
+            image,
+            stencil,
+            (0, 0, 16, 16),
+            "horizontal",
+            negate_channel=0,
+            normal_detail_gate=DEFAULT_RHD_CONFIG.normal_region_detail_gate,
+            normal_detail_floor=DEFAULT_RHD_CONFIG.normal_region_detail_floor,
+        )
+
+        self.assertFalse(DEFAULT_RHD_CONFIG.normal_region_detail_gate)
+        self.assertTrue((image[6:10, 11:13, 0] == 119).all())
+        self.assertTrue((image[6:10, 3:5, 0] == 127).all())
 
     def test_normal_background_correction_preserves_quiet_mean(self) -> None:
         image = flat_normal(16, 16)
@@ -539,6 +559,32 @@ class ReliefFieldTests(unittest.TestCase):
 
 
 class RegionMergeTests(unittest.TestCase):
+    def test_duplicate_atlas_regions_from_multiple_uv_domains_collapse(self) -> None:
+        regions, rotations, removed = deduplicate_region_detections(
+            [(163, 241, 58, 56), (162, 241, 59, 56), (320, 200, 20, 20)]
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(regions, [(320, 200, 20, 20), (162, 241, 59, 56)])
+        self.assertEqual(rotations, [None, None])
+
+    def test_distinct_overlapping_atlas_regions_are_collapsed(self) -> None:
+        regions, _rotations, removed = deduplicate_region_detections(
+            [(100, 100, 40, 20), (120, 100, 40, 20)]
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(regions, [(100, 100, 60, 20)])
+
+    def test_region_collapse_repeats_when_union_creates_new_overlap(self) -> None:
+        regions, rotations, removed = deduplicate_region_detections(
+            [(0, 0, 10, 10), (8, 8, 10, 10), (16, 0, 5, 7)]
+        )
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(regions, [(0, 0, 21, 18)])
+        self.assertEqual(rotations, [None])
+
     def test_a_relief_mark_of_its_own_is_added(self) -> None:
         merged, added = merge_region_sets(
             [(0, 0, 10, 10)], [(50, 50, 10, 10)], DEFAULT_RHD_CONFIG

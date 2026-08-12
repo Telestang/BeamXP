@@ -40,10 +40,11 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 import traceback
 from collections import defaultdict
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
 
@@ -65,7 +66,19 @@ from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     UvIslandSymmetryConfig,
     UvIslandSymmetryMatch,
     analyse_uv_island_symmetry,
+    detect_foreground_boxes,
+    detect_edge_boxes_from_response,
+    edge_mask_from_response,
+    edge_response,
+    edge_gpu_warm_state,
+    detect_local_contrast,
+    detect_local_contrast_boxes,
+    detect_local_contrast_gpu_batch,
+    local_contrast_gpu_warm_state,
+    prewarm_local_contrast_gpu,
+    prewarm_edge_gpu,
     load_image,
+    overlap_region_group_candidates,
     run_detection,
 )
 from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (  # noqa: E402
@@ -90,14 +103,19 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (  # noqa:
     scan_vehicle_archive,
 )
 from mesh_segmentation_transform.extract_uv_island_paths import (  # noqa: E402
-    uv_island_mask,
+    UvIslandCrop,
+    merge_overlapping_mask_crops,
+    uv_island_masks,
 )
 from mesh_segmentation_transform.relief_from_normals import (  # noqa: E402
     DEFAULT_RELIEF_CONFIG,
+    MODE_SLOPE,
     RELIEF_MODES,
     ReliefConfig,
     region_relief_report,
     render_relief,
+    slope_relief_edge_response,
+    slope_relief_edge_response_gpu,
 )
 from mesh_segmentation_transform.mirror_texture_for_rhd import (  # noqa: E402
     DEFAULT_RHD_CONFIG,
@@ -136,6 +154,7 @@ INITIAL_ZOOM = 1.0  # open at 1:1 on the middle of the atlas, not fitted
 ZOOM_STEP = 1.25
 MIN_SCALE = 0.02
 MAX_SCALE = 16.0
+FOREGROUND_PREFLIGHT_WORKERS = 4
 
 # Parameters are grouped in this order; anything MserConfig gains later that is
 # not listed here still appears, under "Other".
@@ -144,15 +163,138 @@ MAX_SCALE = 16.0
 # map, and exists for marks that are moulded but never printed -- the ardente's
 # AIRBAG and ARDENTE are both relief only, so nothing on the colour map can
 # find them and the mirrored geometry leaves them reading backwards.
-SOURCE_COLOUR = "Colour (base colour map)"
+SOURCE_COLOUR = "Colour (foreground mask)"
+SOURCE_COLOUR_CONTRAST = "Colour (local contrast - CPU)"
+SOURCE_COLOUR_CONTRAST_GPU = "Colour (local contrast - GPU)"
+SOURCE_COLOUR_RELIEF_CONTRAST = "Colour glyphs + relief-edge grouping"
+SOURCE_COLOUR_MSER = "Colour (MSER comparison)"
 SOURCE_RELIEF = "Relief (normal map)"
-DETECTION_SOURCES = (SOURCE_COLOUR, SOURCE_RELIEF)
+SOURCE_RELIEF_GPU = "Relief (normal map - GPU)"
+SOURCE_RELIEF_CONTRAST = "Relief slope (local contrast - CPU)"
 
-# The box source follows the detection source rather than being chosen.  MSER
-# finds regions of uniform intensity, which is what print is; relief has none,
-# only the edges where the surface steps.  Offering the wrong pairing only ever
-# produces an empty result and time spent working out why.
-BOX_SOURCE_FOR_SOURCE = {SOURCE_COLOUR: "mser", SOURCE_RELIEF: "edge"}
+
+class DetectionPipeline:
+    """One isolated "Detect on" path and its persisted parameter namespace."""
+
+    pipeline_id: str
+    label: str
+    box_source: str
+    requires_normal_map: bool = False
+    renders_relief: bool = False
+    uses_relief_edge_bridge: bool = False
+    force_slope_relief: bool = False
+
+    def __init__(self, pipeline_id: str, label: str, box_source: str) -> None:
+        self.pipeline_id = pipeline_id
+        self.label = label
+        self.box_source = box_source
+
+    def detector_defaults(self) -> MserConfig:
+        return DEFAULT_RELIEF_DETECTION_CONFIG if self.renders_relief else DEFAULT_COLOUR_CONFIG
+
+    def effective_relief_config(self, config: ReliefConfig) -> ReliefConfig:
+        return replace(config, mode=MODE_SLOPE) if self.force_slope_relief else config
+
+    def prepare_inputs(
+        self,
+        source: object,
+        relief_config: ReliefConfig,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Return detector image and optional cached grouping-barrier response."""
+        image = source.image  # type: ignore[attr-defined]
+        if self.uses_relief_edge_bridge:
+            return image, slope_relief_edge_response(
+                source.normal_rgb, relief_config  # type: ignore[attr-defined]
+            )
+        if self.renders_relief:
+            return render_relief(source.normal_rgb, relief_config), None  # type: ignore[attr-defined]
+        return image, None
+
+
+class ColourForegroundPipeline(DetectionPipeline):
+    def __init__(self) -> None:
+        super().__init__("colour_foreground", SOURCE_COLOUR, "foreground")
+
+
+class ColourLocalContrastCpuPipeline(DetectionPipeline):
+    def __init__(self) -> None:
+        super().__init__("colour_local_contrast_cpu", SOURCE_COLOUR_CONTRAST, "contrast")
+
+
+class ColourLocalContrastGpuPipeline(DetectionPipeline):
+    def __init__(self) -> None:
+        super().__init__("colour_local_contrast_gpu", SOURCE_COLOUR_CONTRAST_GPU, "contrast_gpu")
+
+
+class ColourReliefEdgeGroupingPipeline(DetectionPipeline):
+    requires_normal_map = True
+    uses_relief_edge_bridge = True
+
+    def __init__(self) -> None:
+        super().__init__("colour_relief_edge_grouping", SOURCE_COLOUR_RELIEF_CONTRAST, "contrast_gpu")
+
+    def prepare_inputs(
+        self,
+        source: object,
+        relief_config: ReliefConfig,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        # The two expensive front ends share the one ModernGL worker/context:
+        # local contrast finds colour glyphs and Scharr derives the cached
+        # normal-map barrier used only while grouping those glyphs.
+        return source.image, slope_relief_edge_response_gpu(  # type: ignore[attr-defined]
+            source.normal_rgb, relief_config,  # type: ignore[attr-defined]
+        )
+
+
+class ColourMserComparisonPipeline(DetectionPipeline):
+    def __init__(self) -> None:
+        super().__init__("colour_mser", SOURCE_COLOUR_MSER, "mser")
+
+
+class ReliefEdgePipeline(DetectionPipeline):
+    requires_normal_map = True
+    renders_relief = True
+
+    def __init__(self) -> None:
+        super().__init__("relief_edge", SOURCE_RELIEF, "edge")
+
+
+class ReliefEdgeGpuPipeline(ReliefEdgePipeline):
+    def __init__(self) -> None:
+        DetectionPipeline.__init__(
+            self, "relief_edge_gpu", SOURCE_RELIEF_GPU, "edge_gpu"
+        )
+
+
+class ReliefLocalContrastPipeline(ReliefEdgePipeline):
+    force_slope_relief = True
+
+    def __init__(self) -> None:
+        DetectionPipeline.__init__(
+            self, "relief_local_contrast_cpu", SOURCE_RELIEF_CONTRAST, "contrast"
+        )
+
+
+PIPELINES: tuple[DetectionPipeline, ...] = (
+    ColourForegroundPipeline(),
+    ColourLocalContrastCpuPipeline(),
+    ColourLocalContrastGpuPipeline(),
+    ColourReliefEdgeGroupingPipeline(),
+    ColourMserComparisonPipeline(),
+    ReliefEdgePipeline(),
+    ReliefEdgeGpuPipeline(),
+    ReliefLocalContrastPipeline(),
+)
+PIPELINE_BY_LABEL = {pipeline.label: pipeline for pipeline in PIPELINES}
+PIPELINE_BY_ID = {pipeline.pipeline_id: pipeline for pipeline in PIPELINES}
+DETECTION_SOURCES = tuple(pipeline.label for pipeline in PIPELINES)
+# Kept as a public mapping for tests and older callers; it is derived from the
+# pipeline classes rather than being a second hand-maintained routing table.
+BOX_SOURCE_FOR_SOURCE = {pipeline.label: pipeline.box_source for pipeline in PIPELINES}
+
+
+def pipeline_for_source(source: str) -> DetectionPipeline:
+    return PIPELINE_BY_LABEL.get(source, PIPELINE_BY_LABEL[SOURCE_COLOUR])
 
 # Where the harness remembers what was last open.  Deliberately not the POC's
 # settings file: save_dialog_directories rewrites that whole payload, so
@@ -168,7 +310,7 @@ SESSION_TEXT_KEYS = ("vehicle", "dae_member", "part_filter")
 
 
 def load_session() -> dict[str, object]:
-    """Recall the last vehicle, DAE, part filter and per-source parameters.
+    """Recall the last vehicle, DAE, part filter and per-pipeline parameters.
 
     Anything absent, malformed or unrecognised is dropped rather than raising:
     a settings file is a convenience, and a stale one must never stop the
@@ -185,16 +327,21 @@ def load_session() -> dict[str, object]:
         for key, value in payload.items()
         if key in SESSION_TEXT_KEYS and isinstance(value, str)
     }
-    parameters = payload.get("parameters")
-    if isinstance(parameters, dict):
-        session["parameters"] = {
-            source: {
+    pipelines = payload.get("pipelines")
+    # ``parameters`` was the pre-pipeline schema, keyed by a mutable display
+    # label.  Accept it once and normalise it below so an existing session is
+    # never silently discarded.
+    if not isinstance(pipelines, dict):
+        pipelines = payload.get("parameters")
+    if isinstance(pipelines, dict):
+        session["pipelines"] = {
+            pipeline: {
                 name: value
                 for name, value in values.items()
                 if isinstance(name, str) and isinstance(value, (str, bool, int, float))
             }
-            for source, values in parameters.items()
-            if isinstance(source, str) and isinstance(values, dict)
+            for pipeline, values in pipelines.items()
+            if isinstance(pipeline, str) and isinstance(values, dict)
         }
     return session
 
@@ -207,9 +354,9 @@ def save_session(session: dict[str, object]) -> None:
         for key, value in session.items()
         if key in SESSION_TEXT_KEYS and isinstance(value, str) and value.strip()
     }
-    parameters = session.get("parameters")
-    if isinstance(parameters, dict) and parameters:
-        payload["parameters"] = parameters
+    pipelines = session.get("pipelines")
+    if isinstance(pipelines, dict) and pipelines:
+        payload["pipelines"] = pipelines
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
@@ -240,11 +387,55 @@ RELIEF_CHOICE_PARAMETERS: dict[str, tuple[str, ...]] = {
 # section applies to; a section that applies to neither image is hidden rather
 # than shown inert, because a knob that cannot move the result is worse than no
 # knob at all.  None means it applies to both.
-PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
+PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | None], ...] = (
     (
-        "1. MSER detector",
-        ("delta", "min_area", "max_area", "max_variation", "min_diversity"),
+        "1. Foreground-mask detector",
+        (
+            "foreground_background_bins",
+            "foreground_background_distance",
+            "foreground_value_contrast",
+            "foreground_min_saturation",
+            "foreground_edge_threshold",
+            "foreground_open_px",
+            "foreground_close_px",
+            "foreground_min_component_px",
+            "foreground_merge_gap_px",
+            "foreground_max_coverage",
+            "foreground_refine_internal_details",
+            "foreground_detail_inset_px",
+            "foreground_detail_min_parent_px",
+            "foreground_detail_min_coverage",
+            "foreground_detail_min_component_px",
+            "foreground_detail_replace_area_ratio",
+            "foreground_detail_max_depth",
+            "foreground_detail_max_parent_px",
+            "foreground_detail_max_children",
+        ),
         SOURCE_COLOUR,
+    ),
+    (
+        "1. Local-contrast detector",
+        (
+            "contrast_kernel_px",
+            "contrast_min_response",
+            "contrast_percentile",
+            "contrast_open_px",
+            "contrast_close_px",
+            "contrast_min_component_px",
+            "contrast_merge_gap_px",
+            "contrast_max_coverage",
+        ),
+        (
+            SOURCE_COLOUR_CONTRAST,
+            SOURCE_COLOUR_CONTRAST_GPU,
+            SOURCE_COLOUR_RELIEF_CONTRAST,
+            SOURCE_RELIEF_CONTRAST,
+        ),
+    ),
+    (
+        "1. MSER detector (comparison)",
+        ("delta", "min_area", "max_area", "max_variation", "min_diversity"),
+        SOURCE_COLOUR_MSER,
     ),
     (
         "1. Edge detector",
@@ -260,7 +451,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
             "edge_dilate_px",
             "edge_min_component_px",
         ),
-        SOURCE_RELIEF,
+        (SOURCE_RELIEF, SOURCE_RELIEF_GPU),
     ),
     (
         "1. Box shape (both sources)",
@@ -296,32 +487,40 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         None,
     ),
     (
-        "4. Overlap grouping",
-        ("min_group_overlap_ratio",),
-        None,
-    ),
-    (
         "5. Initial grouping",
         (
             "merge_distance_px",
             "min_group_union_region_px",
+            "group_axis_center_tolerance",
             "enable_island_bounded_grouping",
             "enable_circular_groups",
             "circular_group_min_squareness",
-            "circular_group_padding_px",
             "circular_group_colour_tolerance",
             "circular_group_max_corner_content",
         ),
         None,
     ),
     (
-        "6. Domain recovery",
-        ("enable_region_domain_filter", "min_region_uv_coverage"),
-        None,
+        "5. Contrast bridge grouping",
+        (
+            "enable_contrast_continuity_grouping",
+            "contrast_bridge_min_response",
+            "contrast_bridge_max_high_coverage",
+        ),
+        (SOURCE_COLOUR_CONTRAST, SOURCE_COLOUR_CONTRAST_GPU, SOURCE_COLOUR_RELIEF_CONTRAST),
     ),
     (
-        "7. Post-circle forced merge",
-        ("enable_overlap_group_merge",),
+        "5. Relief-edge bridge grouping",
+        (
+            "enable_relief_edge_bridge_grouping",
+            "relief_bridge_min_response",
+            "relief_bridge_min_cross_axis_coverage",
+        ),
+        (SOURCE_COLOUR_RELIEF_CONTRAST, SOURCE_RELIEF),
+    ),
+    (
+        "6. Domain recovery",
+        ("enable_region_domain_filter", "min_region_uv_coverage"),
         None,
     ),
     (
@@ -365,6 +564,22 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
             "min_region_relief",
         ),
         None,
+    ),
+    (
+        "10. Relief glyph structure",
+        (
+            "enable_relief_glyph_filter",
+            "relief_glyph_min_component_px",
+            "relief_glyph_min_line_components",
+            "relief_glyph_max_line_scatter",
+            "relief_glyph_max_dominant_component_fraction",
+            "relief_glyph_min_compact_edge_coverage",
+            "relief_glyph_min_outline_components",
+            "relief_glyph_min_outline_edge_coverage",
+            "relief_glyph_max_outline_dominant_component_fraction",
+            "relief_glyph_min_outline_scatter",
+        ),
+        (SOURCE_RELIEF, SOURCE_RELIEF_GPU),
     ),
     (
         "11. Blob shape",
@@ -430,6 +645,17 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
         ("final_region_padding_px",),
         None,
     ),
+    (
+        "17. Relief text",
+        (
+            "enable_relief_text_filter",
+            "relief_text_response_percentile",
+            "relief_text_projection_min_coverage",
+            "relief_text_min_runs",
+            "relief_text_min_band_scale",
+        ),
+        (SOURCE_RELIEF, SOURCE_RELIEF_GPU),
+    ),
 )
 
 # Driven by the loaded part or irrelevant to detection.
@@ -438,6 +664,9 @@ HIDDEN_PARAMETERS = frozenset(
         # Follows the detection source; see BOX_SOURCE_FOR_SOURCE.  Listed here
         # as well as omitted from the sections, or it reappears under "Other".
         "box_source",
+        # Production-only semantic for authored visibility masks.  The tuning
+        # harness currently exposes colour, contrast and relief pipelines.
+        "opacity_mask_threshold",
         "uv_island_mask_path",
         "green_colour",
         "red_colour",
@@ -498,12 +727,367 @@ class TextureSource:
     uv_mask: np.ndarray
     uv_stats: dict[str, object]
     texture_path: Path
+    # Topological masks, not connected components of the raster atlas.  They
+    # are the domains used for the complete per-island fitting pipeline.
+    uv_islands: tuple[UvIslandCrop, ...] = ()
     material_symbols: tuple[str, ...] = ()
     # The material's normal map, decoded once.  Held raw rather than rendered
     # because the render is what is being tuned: every parameter change redraws
     # it, and decoding a 4k BC5 each time would make the harness unusable.
     normal_rgb: np.ndarray | None = None
     normal_member: str | None = None
+    normal_loaded: bool = False
+    uv_symmetry_cache: dict[UvIslandSymmetryConfig, tuple[UvIslandSymmetryMatch, ...]] = field(
+        default_factory=dict
+    )
+
+
+def _offset_stage(stage: DetectionStage, x_offset: int, y_offset: int) -> DetectionStage:
+    """Map one cropped island's complete stage back to atlas coordinates."""
+    def offset_box(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        x, y, width, height = box
+        return x + x_offset, y + y_offset, width, height
+
+    rotations = tuple(
+        None if rotation is None else tuple(
+            (x + x_offset, y + y_offset) for x, y in rotation
+        )
+        for rotation in stage.rotations
+    )
+    return replace(
+        stage,
+        kept=tuple(offset_box(box) for box in stage.kept),
+        rejected=tuple(offset_box(box) for box in stage.rejected),
+        rotations=rotations,
+    )
+
+
+def run_detection_by_uv_island(
+    image: np.ndarray,
+    uv_islands: tuple[UvIslandCrop | np.ndarray, ...],
+    config: MserConfig,
+    previous_runs: tuple[DetectionRun, ...] = (),
+    *,
+    relief_bridge_response: np.ndarray | None = None,
+    return_island_runs: bool = False,
+    return_timings: bool = False,
+) -> DetectionRun | tuple[DetectionRun, tuple[DetectionRun, ...]] | tuple[
+    DetectionRun, tuple[DetectionRun, ...], dict[str, object]
+]:
+    """Run every detector/filter/fitting stage independently per UV island.
+
+    This is deliberately not a post-detection partition.  Each island gets an
+    isolated cropped image and domain before foreground components are grouped,
+    rectangles are fitted, or a later filter can enlarge a candidate.  Only the
+    already-fitted stage results are combined for the tuning-app overlays.
+    """
+    started = time.perf_counter()
+    setup_started = time.perf_counter()
+    # New sources retain tight crop masks.  The ndarray fallback keeps this
+    # helper convenient for tests and older in-memory sessions.
+    valid: list[tuple[int, int, np.ndarray]] = []
+    for island in uv_islands:
+        if isinstance(island, UvIslandCrop):
+            if bool(island.mask.any()):
+                valid.append((island.x, island.y, island.mask))
+            continue
+        mask = island.astype(bool)
+        if not bool(mask.any()):
+            continue
+        ys, xs = np.nonzero(mask)
+        valid.append((int(xs.min()), int(ys.min()), mask[int(ys.min()):int(ys.max()) + 1, int(xs.min()):int(xs.max()) + 1]))
+    topological_islands = len(valid)
+    valid = list(merge_overlapping_mask_crops(tuple(valid)))
+    setup_seconds = time.perf_counter() - setup_started
+    if not valid:
+        result = run_detection(image, None, config)
+        timings: dict[str, object] = {
+            "islands": 0, "topological_islands": 0,
+            "coalesced_detection_domains": 0,
+            "active_islands": 1, "empty_islands": 0,
+            "island_setup_seconds": round(setup_seconds, 6),
+            "foreground_preflight_seconds": 0.0,
+            "foreground_unique_islands": 0,
+            "foreground_workers": 0,
+            "pipeline_seconds": round(time.perf_counter() - started, 6),
+            "aggregate_seconds": 0.0,
+            "total_seconds": round(time.perf_counter() - started, 6),
+        }
+        if return_timings:
+            return result, (result,), timings
+        return (result, (result,)) if return_island_runs else result
+
+    per_island: list[tuple[int, int, DetectionRun]] = []
+    # Most atlas islands are plain backing.  Vectorised foreground preflight
+    # lets them bypass the expensive grouping/fitting stages altogether; the
+    # complete pipeline still runs unchanged for every island that has content.
+    foreground_preflight = config.box_source in {"foreground", "contrast", "contrast_gpu"}
+    gpu_warm_state = (
+        (
+            local_contrast_gpu_warm_state()
+            if config.box_source == "contrast_gpu"
+            else edge_gpu_warm_state()
+        )
+        if config.box_source in {"contrast_gpu", "edge_gpu"} else ""
+    )
+    empty_template: DetectionRun | None = None
+    local_runs: list[DetectionRun] = []
+    preflight_seconds = 0.0
+    pipeline_seconds = 0.0
+    empty_islands = 0
+    raw_boxes_by_island: list[np.ndarray | None] = [None] * len(valid)
+    contrast_by_island: list[object | None] = [None] * len(valid)
+    edge_masks_by_island: list[np.ndarray | None] = [None] * len(valid)
+    unique_foregrounds = 0
+    if config.box_source == "edge_gpu" and relief_bridge_response is None:
+        # The response does not depend on a particular island.  Calculate it
+        # once on the complete atlas on the same ModernGL worker used by local
+        # contrast, then slice it for each island's CPU threshold/components.
+        # This removes hundreds of small dispatches without relaxing the
+        # per-island region fitting rule.
+        preflight_started = time.perf_counter()
+        relief_bridge_response = edge_response(
+            cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2GRAY), config,
+        )
+        preflight_seconds = time.perf_counter() - preflight_started
+        unique_foregrounds = 1
+    if config.box_source == "edge_gpu" and relief_bridge_response is not None:
+        # The GPU has already produced the only full-atlas operation.  Finish
+        # each *unique* UV crop's threshold/morphology/components once on CPU,
+        # retain its unclosed mask for the later relief filters, and let the
+        # normal empty-island fast path skip the rest of the pipeline.  This is
+        # byte-for-byte the same front-end work _step_mser would perform.
+        unique_edges: dict[
+            tuple[int, int, tuple[int, int], bytes],
+            tuple[int, int, np.ndarray, list[int]],
+        ] = {}
+        for island_index, (x0, y0, crop_mask) in enumerate(valid):
+            height, width = crop_mask.shape[:2]
+            key = (x0, y0, (height, width), crop_mask.tobytes())
+            entry = unique_edges.get(key)
+            if entry is None:
+                unique_edges[key] = (x0, y0, crop_mask, [island_index])
+            else:
+                entry[3].append(island_index)
+
+        edge_entries = list(unique_edges.values())
+        unique_foregrounds = len(edge_entries)
+
+        def edge_boxes_for_entry(
+            entry: tuple[int, int, np.ndarray, list[int]],
+        ) -> tuple[np.ndarray, np.ndarray]:
+            x0, y0, crop_mask, _indices = entry
+            height, width = crop_mask.shape[:2]
+            response = relief_bridge_response[y0:y0 + height, x0:x0 + width]
+            edge_mask, _response = edge_mask_from_response(response, crop_mask, config)
+            boxes, _response = detect_edge_boxes_from_response(
+                edge_mask, response, config,
+            )
+            return boxes, edge_mask
+
+        edge_started = time.perf_counter()
+        workers = min(FOREGROUND_PREFLIGHT_WORKERS, len(edge_entries))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                edge_detections = list(executor.map(edge_boxes_for_entry, edge_entries))
+        else:
+            edge_detections = [edge_boxes_for_entry(entry) for entry in edge_entries]
+        preflight_seconds += time.perf_counter() - edge_started
+        for entry, (boxes, edge_mask) in zip(edge_entries, edge_detections):
+            for island_index in entry[3]:
+                raw_boxes_by_island[island_index] = boxes
+                edge_masks_by_island[island_index] = edge_mask
+    if foreground_preflight:
+        # Identical UV placements appear in separate DAE primitives.  Detect
+        # each unique crop once, then retain its boxes for every original
+        # island so stage counts and overlays remain unchanged.  Independent
+        # crop work releases the GIL in NumPy/OpenCV, making four workers a
+        # measured win on the 4K Ardente atlas without crossing island bounds.
+        unique: dict[tuple[int, int, tuple[int, int], bytes], tuple[np.ndarray, np.ndarray, list[int]]] = {}
+        for island_index, (x0, y0, crop_mask) in enumerate(valid):
+            height, width = crop_mask.shape[:2]
+            key = (x0, y0, (height, width), crop_mask.tobytes())
+            entry = unique.get(key)
+            if entry is None:
+                crop = image[y0:y0 + height, x0:x0 + width]
+                unique[key] = (crop, crop_mask, [island_index])
+            else:
+                entry[2].append(island_index)
+        unique_foregrounds = len(unique)
+        preflight_started = time.perf_counter()
+        entries = list(unique.values())
+        workers = min(FOREGROUND_PREFLIGHT_WORKERS, len(entries))
+        if config.box_source == "contrast_gpu":
+            # One context owns one packed batch.  Dispatching every UV crop
+            # independently is functionally correct but transfer-bound.
+            boxes_by_unique = detect_local_contrast_gpu_batch(
+                [(crop, crop_mask) for crop, crop_mask, _indices in entries], config,
+            )
+        elif workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                detector = (
+                    detect_local_contrast
+                    if config.box_source == "contrast"
+                    else detect_foreground_boxes
+                )
+                boxes_by_unique = list(executor.map(
+                    lambda entry: detector(entry[0], entry[1], config),
+                    entries,
+                ))
+        else:
+            detector = (
+                detect_local_contrast
+                if config.box_source == "contrast"
+                else detect_foreground_boxes
+            )
+            boxes_by_unique = [
+                detector(crop, crop_mask, config)
+                for crop, crop_mask, _indices in entries
+            ]
+        preflight_seconds = time.perf_counter() - preflight_started
+        for entry, detection in zip(entries, boxes_by_unique):
+            boxes = detection.boxes if config.box_source in {"contrast", "contrast_gpu"} else detection
+            for island_index in entry[2]:
+                raw_boxes_by_island[island_index] = boxes
+                if config.box_source in {"contrast", "contrast_gpu"}:
+                    contrast_by_island[island_index] = detection
+
+    for island_index, (x0, y0, crop_mask) in enumerate(valid):
+        crop = image[y0:y0 + crop_mask.shape[0], x0:x0 + crop_mask.shape[1]]
+        raw_boxes = raw_boxes_by_island[island_index]
+        contrast = contrast_by_island[island_index]
+        relief_edge_mask = edge_masks_by_island[island_index]
+        relief_bridge = (
+            relief_bridge_response[
+                y0:y0 + crop_mask.shape[0], x0:x0 + crop_mask.shape[1]
+            ]
+            if relief_bridge_response is not None
+            else None
+        )
+        previous = (
+            previous_runs[island_index]
+            if island_index < len(previous_runs)
+            else None
+        )
+        if raw_boxes is not None and len(raw_boxes) == 0:
+            empty_islands += 1
+            if empty_template is None:
+                pipeline_started = time.perf_counter()
+                empty_template = run_detection(
+                    crop, crop_mask, config,
+                    previous=previous, initial_boxes=raw_boxes,
+                    initial_contrast_response=(
+                        contrast.response if contrast is not None else None
+                    ),
+                    initial_contrast_threshold=(
+                        contrast.threshold if contrast is not None else None
+                    ),
+                    initial_relief_bridge_response=relief_bridge,
+                    initial_relief_edge_mask=relief_edge_mask,
+                )
+                pipeline_seconds += time.perf_counter() - pipeline_started
+            run = empty_template
+        else:
+            pipeline_started = time.perf_counter()
+            run = run_detection(
+                crop, crop_mask, config,
+                previous=previous, initial_boxes=raw_boxes,
+                initial_contrast_response=(
+                    contrast.response if contrast is not None else None
+                ),
+                initial_contrast_threshold=(
+                    contrast.threshold if contrast is not None else None
+                ),
+                initial_relief_bridge_response=relief_bridge,
+                initial_relief_edge_mask=relief_edge_mask,
+            )
+            pipeline_seconds += time.perf_counter() - pipeline_started
+        per_island.append((x0, y0, run))
+        local_runs.append(run)
+
+    aggregate_started = time.perf_counter()
+    stages: list[DetectionStage] = []
+    stage_count = len(per_island[0][2].stages)
+    for index in range(stage_count):
+        members = [
+            _offset_stage(run.stages[index], x0, y0)
+            for x0, y0, run in per_island
+        ]
+        first = members[0]
+        adjusted = sum(stage.adjusted for stage in members)
+        kept = tuple(box for stage in members for box in stage.kept)
+        circles = tuple(circle for stage in members for circle in stage.circles)
+        rotations = tuple(rotation for stage in members for rotation in stage.rotations)
+        detail = first.detail
+        if first.key == "overlap_box_group":
+            candidates = overlap_region_group_candidates(
+                np.asarray(kept, dtype=np.int32),
+                image,
+                config,
+                None,
+                None,
+                defer_domain_validation=True,
+            )
+            collapsed = tuple(candidate.bounds for candidate in candidates)
+            adjusted += len(kept) - len(collapsed)
+            kept = collapsed
+            circles = ()
+            rotations = ()
+            detail = (
+                "every positive-area overlap, including one-texel raster "
+                "containment, is collapsed first; "
+                f"{adjusted} nested/overlapping box"
+                f"{'es' if adjusted != 1 else ''} absorbed"
+            )
+        elif first.key == "overlap_group":
+            detail = (
+                f"forced {adjusted} cardinal/cross fragment"
+                f"{'s' if adjusted != 1 else ''} into UV-valid inscribed circles; "
+                "ordinary rectangle proximity is not retried"
+                if adjusted
+                else "no UV-valid circular cardinal/cross cluster found; "
+                "ordinary rectangle proximity is not retried"
+            )
+        stages.append(replace(
+            first,
+            kept=kept,
+            rejected=tuple(box for stage in members for box in stage.rejected),
+            circles=circles,
+            rotations=rotations,
+            adjusted=adjusted,
+            detail=(
+                f"{detail}; fitted independently in {len(members)} atlas domain"
+                f"{'s' if len(members) != 1 else ''} coalesced from "
+                f"{topological_islands} topological UV island"
+                f"{'s' if topological_islands != 1 else ''}"
+            ),
+        ))
+    # Entry states are intentionally not combined: they are local cropped
+    # coordinate systems.  They are returned separately for the next tuning
+    # click, where each island can resume safely in its own coordinates.
+    result = DetectionRun(config=config, stages=stages, entry_states=[], resumed_from=0)
+    timings = {
+        "islands": len(valid),
+        "topological_islands": topological_islands,
+        "coalesced_detection_domains": len(valid),
+        "island_setup_seconds": round(setup_seconds, 6),
+        "active_islands": len(valid) - empty_islands,
+        "empty_islands": empty_islands,
+        "foreground_preflight_seconds": round(preflight_seconds, 6),
+        "foreground_unique_islands": unique_foregrounds,
+        "foreground_workers": min(FOREGROUND_PREFLIGHT_WORKERS, unique_foregrounds),
+        "frontend_workers": (
+            1 if config.box_source == "contrast_gpu"
+            else min(FOREGROUND_PREFLIGHT_WORKERS, unique_foregrounds)
+        ),
+        "gpu_warm_state": gpu_warm_state,
+        "pipeline_seconds": round(pipeline_seconds, 6),
+        "aggregate_seconds": round(time.perf_counter() - aggregate_started, 6),
+        "total_seconds": round(time.perf_counter() - started, 6),
+    }
+    if return_timings:
+        return result, tuple(local_runs), timings
+    return (result, tuple(local_runs)) if return_island_runs else result
 
 
 def material_symbols_for_binding(
@@ -563,6 +1147,10 @@ class RunResult:
     detect_image: np.ndarray | None = None
     source_kind: str = SOURCE_COLOUR
     relief_config: ReliefConfig | None = None
+    # Local-coordinate runs are retained so a late filter change can resume
+    # each island at the first affected stage.
+    island_runs: tuple[DetectionRun, ...] = ()
+    timings: dict[str, object] = field(default_factory=dict)
 
     @property
     def stages(self) -> list[DetectionStage]:
@@ -609,6 +1197,8 @@ def build_texture_source(
     archive: VehicleArchive,
     loaded: LoadedDae,
     binding: ArchiveTextureBinding,
+    *,
+    load_normal: bool = False,
 ) -> TextureSource:
     """Extract the trim texture and rasterise its UV islands.
 
@@ -628,25 +1218,32 @@ def build_texture_source(
 
     root = loaded.tree.getroot()
     mask = np.zeros((height, width), dtype=bool)
+    islands: list[UvIslandCrop] = []
     triangles = 0
     used: list[str] = []
     failures: list[str] = []
     for symbol in symbols:
         try:
-            symbol_mask, stats = uv_island_mask(root, symbol, (width, height))
+            symbol_masks, stats = uv_island_masks(root, symbol, (width, height))
         except ValueError as exc:  # a symbol with no triangle primitives
             failures.append(f"{symbol}: {exc}")
             continue
-        mask |= symbol_mask
+        for island in symbol_masks:
+            height_crop, width_crop = island.mask.shape[:2]
+            mask[island.y:island.y + height_crop, island.x:island.x + width_crop] |= island.mask
+            islands.append(island)
         triangles += int(stats.get("triangles", 0))
         used.append(symbol)
 
     if not used:
         raise ValueError("; ".join(failures) or "no UV triangles found")
 
-    normal_rgb, normal_member, normal_note = load_normal_map(
-        archive, binding, (width, height)
-    )
+    if load_normal:
+        normal_rgb, normal_member, normal_note = load_normal_map(
+            archive, binding, (width, height)
+        )
+    else:
+        normal_rgb, normal_member, normal_note = None, None, "deferred until Relief is selected"
 
     return TextureSource(
         key=(binding.texture_member, binding.dae_material),
@@ -655,12 +1252,15 @@ def build_texture_source(
         uv_stats={
             "triangles": triangles,
             "symbols": len(used),
+            "topological_islands": len(islands),
             "normal_note": normal_note,
         },
         texture_path=texture_path,
+        uv_islands=tuple(islands),
         material_symbols=tuple(used),
         normal_rgb=normal_rgb,
         normal_member=normal_member,
+        normal_loaded=load_normal,
     )
 
 
@@ -972,16 +1572,20 @@ class TuningApp(tk.Tk):
         self.relief_parameter_vars: dict[str, tk.Variable] = {}
         self.rhd_parameter_vars: dict[str, tk.Variable] = {}
         self.section_widgets: dict[str, list[tk.Widget]] = {}
-        self.section_source: dict[str, str | None] = {}
+        self.section_source: dict[str, str | tuple[str, ...] | None] = {}
         self.session = load_session()
-        # Colour and relief keep their own values for every parameter; the
-        # widgets show one set at a time and the other is held here.
-        stored = self.session.get("parameters")
-        self.mode_parameters: dict[str, dict[str, object]] = (
-            {source: dict(values) for source, values in stored.items()}
-            if isinstance(stored, dict)
-            else {}
-        )
+        # Each detector class owns one independent JSON object.  Migrate old
+        # display-label keys while loading; thereafter stable pipeline ids keep
+        # saved tuning separate even if a label is renamed.
+        stored = self.session.get("pipelines")
+        self.mode_parameters: dict[str, dict[str, object]] = {}
+        if isinstance(stored, dict):
+            for key, values in stored.items():
+                if not isinstance(values, dict):
+                    continue
+                pipeline = PIPELINE_BY_ID.get(key) or PIPELINE_BY_LABEL.get(key)
+                if pipeline is not None:
+                    self.mode_parameters[pipeline.pipeline_id] = dict(values)
         self.active_source = SOURCE_COLOUR
         # What the cached session still has to catch up on, consumed as each
         # load completes: the archive scan cannot pick a DAE, and the DAE load
@@ -1297,7 +1901,7 @@ class TuningApp(tk.Tk):
         self,
         parent: ttk.Frame,
         title: str,
-        applies_to: str | None,
+        applies_to: str | tuple[str, ...] | None,
         row: int,
     ) -> tuple[list[tk.Widget], int]:
         owned: list[tk.Widget] = []
@@ -1347,11 +1951,17 @@ class TuningApp(tk.Tk):
             row += 1
 
         owned, row = self._begin_section(
-            parent, "Relief from normals", SOURCE_RELIEF, row
+        parent,
+        "Relief from normals",
+        (SOURCE_RELIEF, SOURCE_RELIEF_GPU, SOURCE_RELIEF_CONTRAST, SOURCE_COLOUR_RELIEF_CONTRAST),
+        row,
         )
         note = ttk.Label(
             parent,
-            text="How the normal map is rendered before anything looks at it.",
+            text=(
+                "How the normal map is rendered before detection.  The colour-glyph "
+                "source uses slope edges only as grouping barriers."
+            ),
             wraplength=320,
             justify="left",
             foreground="#777777",
@@ -1403,11 +2013,7 @@ class TuningApp(tk.Tk):
 
     # -- per-source parameter sets ---------------------------------------
     def _mser_default_for_source(self, source: str | None = None) -> MserConfig:
-        return (
-            DEFAULT_RELIEF_DETECTION_CONFIG
-            if (source or self.active_source) == SOURCE_RELIEF
-            else DEFAULT_COLOUR_CONFIG
-        )
+        return pipeline_for_source(source or self.active_source).detector_defaults()
 
     def _parameter_stores(self) -> tuple[tuple[str, dict[str, tk.Variable]], ...]:
         return (
@@ -1445,7 +2051,13 @@ class TuningApp(tk.Tk):
     def _parameters_for_source(self, source: str) -> dict[str, object]:
         """Return source defaults overlaid with its remembered widget values."""
         values = self._default_parameters(source)
-        values.update(self.mode_parameters.get(source) or {})
+        # The label fallback is only for an in-memory legacy session during
+        # migration; all newly saved data uses the stable class id above.
+        values.update(
+            self.mode_parameters.get(pipeline_for_source(source).pipeline_id)
+            or self.mode_parameters.get(source)
+            or {}
+        )
         return values
 
     def _apply_parameters(self, values: dict[str, object]) -> None:
@@ -1457,9 +2069,11 @@ class TuningApp(tk.Tk):
                 variable.set(value if isinstance(value, bool) else str(value))
 
     def _remember_parameters(self) -> None:
-        """Store the visible values against the source they were tuned for."""
-        self.mode_parameters[self.active_source] = self._capture_parameters()
-        self.session["parameters"] = self.mode_parameters
+        """Store visible values in the active detector class's JSON object."""
+        pipeline = pipeline_for_source(self.active_source)
+        self.mode_parameters[pipeline.pipeline_id] = self._capture_parameters()
+        self.session["pipelines"] = self.mode_parameters
+        self.session.pop("parameters", None)
         save_session(self.session)
 
     def _switch_parameter_set(self, incoming: str) -> None:
@@ -1485,7 +2099,11 @@ class TuningApp(tk.Tk):
         current = self.detect_source_var.get()
         for title, widgets in self.section_widgets.items():
             applies_to = self.section_source.get(title)
-            visible = applies_to is None or applies_to == current
+            visible = applies_to is None or (
+                current in applies_to
+                if isinstance(applies_to, tuple)
+                else applies_to == current
+            )
             for widget in widgets:
                 if visible:
                     widget.grid()
@@ -1506,12 +2124,14 @@ class TuningApp(tk.Tk):
                 ("pattern_group", "Repeating pattern"),
                 ("rotated_bounds", "Rotated bounds"),
                 ("region_flatness", "Region flatness"),
+                ("relief_glyph_structure", "Relief glyph structure"),
                 ("blob_shape", "Blob shape"),
                 ("ring_smoothness", "Ring smoothness"),
                 ("feature_extension", "Feature extension"),
                 ("text_line", "Text lines"),
                 ("size", "Final size"),
                 ("final_padding", "Final padding"),
+                ("relief_text", "Relief text"),
             )
         ]
 
@@ -1568,7 +2188,7 @@ class TuningApp(tk.Tk):
             overrides[field.name] = self._coerce_config_value(
                 field.name, getattr(defaults, field.name), values[key]
             )
-        overrides["box_source"] = BOX_SOURCE_FOR_SOURCE.get(source, "mser")
+        overrides["box_source"] = pipeline_for_source(source).box_source
         return replace(defaults, **overrides)
 
     def current_config(self) -> MserConfig:
@@ -1584,9 +2204,9 @@ class TuningApp(tk.Tk):
             )
         # Not offered as a choice: only one front-end can work on each kind of
         # image, so it follows the detection source.
-        overrides["box_source"] = BOX_SOURCE_FOR_SOURCE.get(
-            self.detect_source_var.get(), "mser"
-        )
+        overrides["box_source"] = pipeline_for_source(
+            self.detect_source_var.get()
+        ).box_source
         return replace(self._mser_default_for_source(), **overrides)
 
     def current_uv_symmetry_config(self) -> UvIslandSymmetryConfig:
@@ -1970,7 +2590,23 @@ class TuningApp(tk.Tk):
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
-        if self.detect_source_var.get() == SOURCE_RELIEF:
+        if self.detect_source_var.get() == SOURCE_RELIEF_CONTRAST:
+            messagebox.showinfo(
+                APP_NAME,
+                "This detector pipeline is currently a harness experiment. "
+                "Inspect and tune it here first; preview export still uses the "
+                "separate production detection paths.",
+            )
+            return
+        if self.detect_source_var.get() == SOURCE_COLOUR_RELIEF_CONTRAST:
+            # Keep the user's cached hybrid colour parameters intact, and pair
+            # them with the GPU normal-edge front end used by production.
+            colour_mser_config = active_mser_config
+            relief_mser_config = self._mser_config_from_values(
+                self._parameters_for_source(SOURCE_RELIEF_GPU),
+                SOURCE_RELIEF_GPU,
+            )
+        elif self.detect_source_var.get() in {SOURCE_RELIEF, SOURCE_RELIEF_GPU}:
             colour_mser_config = self._mser_config_from_values(
                 self._parameters_for_source(SOURCE_COLOUR),
                 SOURCE_COLOUR,
@@ -1993,12 +2629,14 @@ class TuningApp(tk.Tk):
         self.dialog_directories["export"] = str(output)
         save_dialog_directories(self.dialog_directories)
 
-        # Relief detection is switched on only when that is the source being
-        # tuned; exporting from the colour side must reproduce a colour run.
+        # The hybrid source is a paired colour+normal production run: the
+        # normal GPU edge response is calculated once and reused by both.
         rhd_config = replace(
             export_config,
             relief=relief_config,
-            detect_on_normal_map=self.detect_source_var.get() == SOURCE_RELIEF,
+            detect_on_normal_map=self.detect_source_var.get() in {
+                SOURCE_RELIEF, SOURCE_RELIEF_GPU, SOURCE_COLOUR_RELIEF_CONTRAST,
+            },
         )
         self._set_busy(True, f"Exporting {part.label} for Blender…")
         lines: list[str] = []
@@ -2037,7 +2675,15 @@ class TuningApp(tk.Tk):
         self.run_button.configure(state=state)
         self.export_button.configure(state=state)
         self._apply_parameter_visibility()
-        if self.detect_source_var.get() != SOURCE_RELIEF:
+        if pipeline_for_source(self.detect_source_var.get()).box_source in {
+            "contrast_gpu", "edge_gpu",
+        }:
+            (
+                prewarm_local_contrast_gpu()
+                if pipeline_for_source(self.detect_source_var.get()).box_source == "contrast_gpu"
+                else prewarm_edge_gpu()
+            )
+        if not pipeline_for_source(self.detect_source_var.get()).requires_normal_map:
             self.relief_var.set("")
             return
         source = self.texture_source
@@ -2126,40 +2772,94 @@ class TuningApp(tk.Tk):
             binding.dae_material,
         )
         kind = self.detect_source_var.get()
+        pipeline = pipeline_for_source(kind)
+        relief_config = pipeline.effective_relief_config(relief_config)
         self._set_busy(
             True,
-            ("Rendering relief and detecting…" if kind == SOURCE_RELIEF else "Detecting…")
+            (
+                "Preparing relief-edge grouping…"
+                if pipeline.uses_relief_edge_bridge
+                else "Rendering relief and detecting…"
+                if pipeline.renders_relief
+                else "Detecting…"
+            )
             if reuse
             else "Extracting texture and rasterising UV islands…",
         )
 
-        # Stage resumption only holds when the image is the same one; a relief
-        # render is a different image entirely, so the run starts clean.
-        signature = (kind, relief_config if kind == SOURCE_RELIEF else None)
-        previous = (
-            self.result.run
+        # Stage resumption only holds when the detector input is unchanged; a
+        # relief render or relief-edge grouping map is rebuilt from normal data.
+        relief_image_source = pipeline.requires_normal_map
+        signature = (
+            pipeline.pipeline_id,
+            relief_config if relief_image_source else None,
+        )
+        previous_island_runs = (
+            self.result.island_runs
             if reuse and self.result is not None and self._displayed_signature == signature
-            else None
+            else ()
         )
 
         def job() -> tuple[str, object]:
+            source_started = time.perf_counter()
             source = cached if reuse and cached is not None else build_texture_source(
-                archive, loaded, binding
+                archive, loaded, binding, load_normal=relief_image_source
             )
+            source_seconds = time.perf_counter() - source_started
             image = source.image
-            if kind == SOURCE_RELIEF:
+            relief_bridge_response = None
+            relief_seconds = 0.0
+            if relief_image_source:
+                if not source.normal_loaded:
+                    normal_rgb, normal_member, normal_note = load_normal_map(
+                        archive, binding, (source.image.shape[1], source.image.shape[0])
+                    )
+                    source.normal_rgb = normal_rgb
+                    source.normal_member = normal_member
+                    source.normal_loaded = True
+                    source.uv_stats["normal_note"] = normal_note
                 if source.normal_rgb is None:
                     raise ValueError(
                         "No usable normal map for this material"
                         + (f": {source.uv_stats.get('normal_note')}"
                            if source.uv_stats.get("normal_note") else "")
                     )
-                image = render_relief(source.normal_rgb, relief_config)
+                relief_started = time.perf_counter()
+                image, relief_bridge_response = pipeline.prepare_inputs(
+                    source, relief_config,
+                )
+                relief_seconds = time.perf_counter() - relief_started
             started = time.perf_counter()
-            run = run_detection(image, source.uv_mask, config, previous)
-            symmetric_uv_islands = analyse_uv_island_symmetry(
-                source.uv_mask, symmetry_config
+            # Region fitting is part of detection, not a final display step:
+            # give every topological UV island its own complete pipeline so a
+            # fitted box can never enclose a group of unrelated atlas islands.
+            run, island_runs, island_timings = run_detection_by_uv_island(
+                image,
+                source.uv_islands,
+                config,
+                previous_island_runs,
+                relief_bridge_response=relief_bridge_response,
+                return_island_runs=True,
+                return_timings=True,
             )
+            symmetry_started = time.perf_counter()
+            symmetric_uv_islands = source.uv_symmetry_cache.get(symmetry_config)
+            symmetry_cached = symmetric_uv_islands is not None
+            if symmetric_uv_islands is None:
+                symmetric_uv_islands = analyse_uv_island_symmetry(
+                    source.uv_mask, symmetry_config
+                )
+                source.uv_symmetry_cache[symmetry_config] = symmetric_uv_islands
+            symmetry_seconds = time.perf_counter() - symmetry_started
+            timings: dict[str, object] = {
+                "source_seconds": round(source_seconds, 6),
+                "source_cached": reuse,
+                "relief_seconds": round(relief_seconds, 6),
+                "symmetry_seconds": round(symmetry_seconds, 6),
+                "symmetry_cached": symmetry_cached,
+                **island_timings,
+                "total_seconds": round(time.perf_counter() - source_started, 6),
+            }
             return "run", RunResult(
                 source=source,
                 run=run,
@@ -2168,7 +2868,9 @@ class TuningApp(tk.Tk):
                 seconds=time.perf_counter() - started,
                 detect_image=image,
                 source_kind=kind,
-                relief_config=relief_config if kind == SOURCE_RELIEF else None,
+                relief_config=relief_config if relief_image_source else None,
+                island_runs=island_runs,
+                timings=timings,
             )
 
         self._start_worker(job)
@@ -2177,7 +2879,10 @@ class TuningApp(tk.Tk):
         first_load = (
             self.texture_source is None or self.texture_source.key != result.source.key
         )
-        signature = (result.source_kind, result.relief_config)
+        signature = (
+            pipeline_for_source(result.source_kind).pipeline_id,
+            result.relief_config,
+        )
         self.texture_source = result.source
         self.result = result
         if first_load or signature != self._displayed_signature:
@@ -2195,6 +2900,45 @@ class TuningApp(tk.Tk):
             self.invalidate_views()
             self.render_active()
         height, width = result.image.shape[:2]
+        timings = result.timings
+        if timings:
+            front_end_workers = int(
+                timings.get("frontend_workers", timings.get("foreground_workers", 0))
+            )
+            front_end_execution = (
+                f"1 GPU response + {front_end_workers} CPU workers"
+                if result.run.config.box_source == "edge_gpu"
+                else "1 GPU worker (colour + relief edge)"
+                if (
+                    result.run.config.box_source == "contrast_gpu"
+                    and result.source_kind == SOURCE_COLOUR_RELIEF_CONTRAST
+                )
+                else "1 GPU worker"
+                if result.run.config.box_source == "contrast_gpu"
+                else f"{front_end_workers} workers"
+            )
+            print(
+                "[Texture tuning timings] "
+                f"source={'cached' if timings.get('source_cached') else 'cold'} "
+                f"{float(timings.get('source_seconds', 0.0)):.3f}s | "
+                f"relief render {float(timings.get('relief_seconds', 0.0)):.3f}s | "
+                f"island setup {float(timings.get('island_setup_seconds', 0.0)):.3f}s | "
+                f"front end {float(timings.get('foreground_preflight_seconds', 0.0)):.3f}s "
+                f"({int(timings.get('foreground_unique_islands', 0))} unique, "
+                f"{front_end_execution}"
+                + (
+                    f", GPU context {timings.get('gpu_warm_state')} at start"
+                    if result.run.config.box_source in {'contrast_gpu', 'edge_gpu'} else ""
+                ) + ") | "
+                f"island pipeline {float(timings.get('pipeline_seconds', 0.0)):.3f}s | "
+                f"aggregate {float(timings.get('aggregate_seconds', 0.0)):.3f}s | "
+                f"UV symmetry={'cached' if timings.get('symmetry_cached') else 'cold'} "
+                f"{float(timings.get('symmetry_seconds', 0.0)):.3f}s | "
+                f"total {float(timings.get('total_seconds', 0.0)):.3f}s | "
+                f"{int(timings.get('active_islands', 0))}/"
+                f"{int(timings.get('islands', 0))} islands active "
+                f"({int(timings.get('empty_islands', 0))} empty fast-path)"
+            )
         islands = int(result.source.uv_mask.sum())
         resumed = result.run.resumed_from
         reused = (
@@ -2208,8 +2952,15 @@ class TuningApp(tk.Tk):
         # is no way to tell a result that ignored a parameter change from one
         # that honoured it and simply looks similar.
         front_end = (
-            f"edge/{result.run.config.edge_operator}"
-            if result.run.config.box_source == "edge"
+            f"edge{'-gpu' if result.run.config.box_source == 'edge_gpu' else ''}/"
+            f"{result.run.config.edge_operator}"
+            if result.run.config.box_source in {"edge", "edge_gpu"}
+            else "foreground-mask"
+            if result.run.config.box_source == "foreground"
+            else "local-contrast-gpu"
+            if result.run.config.box_source == "contrast_gpu"
+            else "local-contrast"
+            if result.run.config.box_source == "contrast"
             else "mser"
         )
         if result.run.config.enable_stroke_width_filter:
@@ -2217,9 +2968,16 @@ class TuningApp(tk.Tk):
         # Name the render too, not just the source.  A flat-looking view is
         # otherwise unattributable: shaded, height and top-hat all arrive
         # through the same "relief" label and look nothing alike.
-        if result.source_kind == SOURCE_RELIEF and result.relief_config is not None:
+        result_pipeline = pipeline_for_source(result.source_kind)
+        if result_pipeline.requires_normal_map and result.relief_config is not None:
             relief = result.relief_config
-            source_name = f"relief:{relief.mode}/{relief.form_removal}"
+            source_name = (
+                f"colour-glyphs+relief-edges:slope/{relief.form_removal}"
+                if result.source_kind == SOURCE_COLOUR_RELIEF_CONTRAST
+                else f"relief:slope-contrast/{relief.form_removal}"
+                if result.source_kind == SOURCE_RELIEF_CONTRAST
+                else f"relief:{relief.mode}/{relief.form_removal}"
+            )
             if relief.form_removal == "tophat":
                 source_name += f" r{relief.tophat_radius_px}"
             else:
@@ -2231,6 +2989,7 @@ class TuningApp(tk.Tk):
             f"{result.source.texture_path.name}  {width}x{height}  "
             f"[{source_name} / {front_end}]  "
             f"UV domain {islands / (width * height):.1%}  "
+            f"{result.source.uv_stats.get('topological_islands', 0):,} fitted UV islands  "
             f"{len(result.symmetric_uv_islands):,} symmetric UV islands  "
             f"{result.source.uv_stats.get('triangles', 0):,} UV triangles from "
             f"{', '.join(result.source.material_symbols)}  "

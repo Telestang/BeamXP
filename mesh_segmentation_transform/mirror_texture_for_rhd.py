@@ -27,17 +27,17 @@ there.  The island's own outline only decides whether the whole island may be
 turned over on that axis, or whether its glyphs have to be done individually.
 Off-axis cases are resolved to the nearer axis and not otherwise corrected.
 
-The plan is then replayed onto the material's other maps, which are registered
-to the same UV layout: normal, roughness, metallic, AO and palette masks.  A
-mark is usually both printed and moulded, and correcting only the print leaves
-the relief behind it reading backwards.  A tangent-space normal map needs one
-thing more than a move: it stores a direction, so reflecting the surface it
-describes negates the component along the flipped axis -- x for a horizontal
-flip, y for a vertical one -- and without that the emboss comes out inverted.
+Every archive-backed material map is detected and corrected independently:
+base colour, emissive, opacity, overlay, normal, roughness, metallic, AO and
+palette maps.  They share only geometry-derived UV domains and surface axes.
+This matters for powered materials whose off, on and on-intense images contain
+different artwork; an empty off screen cannot define what should move on its
+lit layer.  Repeated references to one physical file are still processed once.
 
-The normal map is also detected on in its own right, rendered as slope
-magnitude so relief stands out of flat material.  A symbol moulded into bare
-trim exists nowhere in the colour map, and nothing else would ever find it.
+A tangent-space normal map is rendered as slope magnitude and cached as edge
+barriers for local-contrast glyph grouping.  When reflected it also negates
+the stored component along the flipped axis -- x for a horizontal flip, y for
+a vertical one -- or the emboss is inverted.
 
 Outputs a PNG for inspection in Blender and a DDS with a ``_rhd`` suffix for
 BeamNG, in the same block format the source used: BC7 for colour, BC5 for a
@@ -61,7 +61,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
@@ -75,11 +75,14 @@ if __package__ in (None, ""):
 from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     DEFAULT_CONFIG,
     DEFAULT_RELIEF_DETECTION_CONFIG,
+    LocalContrastDetection,
     MserConfig,
     SHAPE_ROTATED,
+    detect_local_contrast_gpu_batch,
     run_detection,
 )
 from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (  # noqa: E402
+    ArchiveMaterialRecord,
     ArchiveTextureBinding,
     DaePart,
     LoadedDae,
@@ -106,6 +109,14 @@ from mesh_segmentation_transform.relief_from_normals import (  # noqa: E402
     DEFAULT_RELIEF_CONFIG,
     ReliefConfig,
     render_relief,
+)
+from mesh_segmentation_transform.production_texture_detection import (  # noqa: E402
+    ProductionDetectionSession,
+    run_colour_and_relief_jobs,
+)
+from mesh_segmentation_transform.extract_uv_island_paths import (  # noqa: E402
+    merge_overlapping_mask_crops,
+    overlapping_mask_crop_groups,
 )
 
 ProgressCallback = Callable[[dict[str, object]], None]
@@ -169,9 +180,12 @@ class RhdTextureConfig:
     # least this much feather in their own texel units, otherwise a baked AO
     # rectangle gets an almost-hard edge after plan rescaling.
     companion_boundary_blend_min_px: float = 1.5
-    # Normal maps carry grain and panel form across the whole material.  For
-    # in-place glyph boxes, move only pronounced local normal detail so the
-    # surrounding grain is not copied/reflected as a visible rectangle.
+    # Normal-map detections already provide tight glyph bounds.  Do not apply a
+    # second high-pass crop by default: shallow authored relief can sit below
+    # the absolute activity floor even after the detector has found it, leaving
+    # the original emboss in place while only a few edge texels move.  The gate
+    # remains available for unusually noisy maps; background-normal correction
+    # handles the usual broad panel transition without discarding the glyph.
     normal_region_detail_gate: bool = False
     normal_region_detail_sigma_px: float = 1.5
     normal_region_detail_floor: float = 16.0
@@ -230,21 +244,10 @@ class RhdTextureConfig:
     # low-detail/background average back to the pre-flip patch.  This keeps the
     # broad panel normal direction continuous while still moving the glyph.
     correct_flipped_normal_background: bool = True
-    # A mark can be embossed without being printed -- a moulded symbol on
-    # unpainted trim -- and detection on the colour map cannot see it.  The
-    # normal map is rendered as slope magnitude, which puts flat material at
-    # zero and relief in the light, and detected on as a second source.
-    #
-    # Off by default, because the detector behind it expects what its own
-    # documentation says it expects: glyphs on a flat background.  An interior
-    # normal map is nothing of the kind -- leather grain, weave and carpet put
-    # the 90th percentile of slope at 78 levels across the scintilla interior,
-    # against 15-22 for a faint moulded edge -- so the ring-background model
-    # every downstream filter rests on has no background to find.  Measured
-    # there it offered 209 marks against the colour map's 18, and a sample of
-    # 48 was almost entirely grain, panel seams and stitching.  The switch is
-    # kept because the render and the plumbing are right and the shortfall is
-    # in tuning; turn it on to look, not to ship.
+    # Production detector selection.  When enabled, colour glyphs are found by
+    # GPU local contrast and a same-material normal map contributes cached
+    # relief edges only as grouping barriers.  If no usable normal exists, the
+    # same GPU colour detector runs without those barriers.
     detect_on_normal_map: bool = False
     # How the normal map is rendered before detection runs on it.  Tuned in the
     # harness, which drives the same module: run
@@ -411,6 +414,7 @@ class RhdTextureResult:
 # region of one would corrupt every other place it lands.  Cubemaps and
 # "@"-prefixed runtime aliases never name an archive member at all.
 NORMAL_MAP_STAGE_KEYS = ("normalMap", "bumpMap")
+COLOUR_MAP_STAGE_KEYS = ("baseColorMap", "colorMap", "diffuseMap")
 SCALAR_MAP_STAGE_KEYS = (
     "roughnessMap",
     "metallicMap",
@@ -421,7 +425,133 @@ SCALAR_MAP_STAGE_KEYS = (
     "clearCoatRoughnessMap",
     "emissiveMap",
     "colorPaletteMap",
+    "overlayMap",
 )
+MATERIAL_TEXTURE_STAGE_KINDS = {
+    **{key: "colour" for key in COLOUR_MAP_STAGE_KEYS},
+    **{key: "normal" for key in NORMAL_MAP_STAGE_KEYS},
+    **{key: "scalar" for key in SCALAR_MAP_STAGE_KEYS},
+}
+RASTER_TEXTURE_SUFFIXES = frozenset(
+    {".dds", ".png", ".jpg", ".jpeg", ".bmp", ".tga"}
+)
+REGION_DETECTION_COMPANION_STAGE_KEYS = frozenset(
+    {
+        "emissiveMap",
+        "opacityMap",
+        "overlayMap",
+    }
+)
+AUTHORITATIVE_VISIBILITY_MASK_STAGE_KEYS = frozenset({"opacityMap"})
+REGION_DETECTION_STATE_STAGE_KEYS = (
+    "baseColorMap",
+    "colorMap",
+    "diffuseMap",
+    "emissiveMap",
+    "opacityMap",
+    "overlayMap",
+)
+GENERIC_SWITCH_STATE_ALIASES = frozenset({"invis", "invisible", "none"})
+DISPLAY_POWER_TRIGGER_KEYS = frozenset({"ignitionLevel"})
+SWITCH_STATE_DETECTION_RANK = {
+    "on_intense": 0,
+    "on": 1,
+    "base": 2,
+    "off": 3,
+    "": 4,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class StateDetectionMap:
+    """One archive-backed material state/layer that can reveal missing marks."""
+
+    member: str
+    stage_key: str
+    material_key: str
+    switch_state: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialTextureLayerBinding:
+    """One concrete archive texture slot used by a resolved material.
+
+    The original archive binding identifies the material and DAE symbol.  This
+    wrapper adds the exact stage slot so every archive-backed layer can become
+    an independent correction job without changing the archive scanner's
+    public binding format.
+    """
+
+    dae_material: str
+    material_key: str
+    materials_member: str
+    texture_reference: str
+    texture_member: str
+    preview_layers: tuple[object, ...] = ()
+    stage_key: str = "baseColorMap"
+    kind: str = "colour"
+
+
+def material_texture_layers_for_binding(
+    archive: VehicleArchive,
+    binding: ArchiveTextureBinding | MaterialTextureLayerBinding,
+) -> tuple[MaterialTextureLayerBinding, ...]:
+    """Resolve every archive-backed map slot on the binding's material."""
+    records = [
+        record
+        for record in getattr(archive, "materials", ())
+        if record.materials_member == binding.materials_member
+        and record.key == binding.material_key
+    ]
+    found: list[MaterialTextureLayerBinding] = []
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        stages = record.source_material.get("Stages")
+        if not isinstance(stages, list):
+            continue
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            for stage_key, kind in MATERIAL_TEXTURE_STAGE_KINDS.items():
+                reference = stage.get(stage_key)
+                if not isinstance(reference, str) or not reference.strip():
+                    continue
+                reference = reference.strip()
+                if reference.lstrip().startswith("@"):
+                    continue
+                member = resolve_archive_texture_member(
+                    archive, reference, record.materials_member
+                )
+                if member is None:
+                    continue
+                signature = (stage_key, member.lower())
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                found.append(
+                    MaterialTextureLayerBinding(
+                        dae_material=binding.dae_material,
+                        material_key=binding.material_key,
+                        materials_member=binding.materials_member,
+                        texture_reference=reference,
+                        texture_member=member,
+                        preview_layers=binding.preview_layers,
+                        stage_key=stage_key,
+                        kind=kind,
+                    )
+                )
+    if found:
+        return tuple(found)
+    return (
+        MaterialTextureLayerBinding(
+            dae_material=binding.dae_material,
+            material_key=binding.material_key,
+            materials_member=binding.materials_member,
+            texture_reference=binding.texture_reference,
+            texture_member=binding.texture_member,
+            preview_layers=binding.preview_layers,
+        ),
+    )
 
 
 def companion_maps_for_binding(
@@ -477,7 +607,7 @@ def companion_maps_for_binding(
 
 def material_symbols_for_binding(
     loaded: LoadedDae,
-    binding: ArchiveTextureBinding,
+    binding: ArchiveTextureBinding | MaterialTextureLayerBinding,
 ) -> tuple[str, ...]:
     """Resolve which COLLADA primitive symbols a materials-JSON binding paints.
 
@@ -659,6 +789,73 @@ def rasterise_uv_triangles(
     return occupied > 0
 
 
+def rasterise_uv_triangles_crop(
+    triangles: list[np.ndarray],
+    mirror_mask: np.ndarray,
+    padding_px: int = 0,
+) -> UvIslandCrop | None:
+    """Rasterise triangles directly into their visible atlas bounding box.
+
+    Creating a full-atlas temporary for every topological island is expensive:
+    a 4K atlas with 60 islands writes almost a gigabyte of zeroes before any
+    detection begins.  Pixel coordinates are still calculated exactly as in
+    :func:`rasterise_uv_triangles`; only the destination origin changes.
+    """
+    height, width = mirror_mask.shape[:2]
+    polygons: list[np.ndarray] = []
+    min_x, min_y = width, height
+    max_x = max_y = -1
+    for triangle in triangles:
+        min_u, min_v = triangle.min(axis=0)
+        max_u, max_v = triangle.max(axis=0)
+        for shift_u in range(math.floor(min_u), math.floor(max_u) + 1):
+            for shift_v in range(math.floor(min_v), math.floor(max_v) + 1):
+                clipped = clip_to_unit_tile(triangle - (shift_u, shift_v))
+                if len(clipped) < 3:
+                    continue
+                points = np.empty((len(clipped), 2), dtype=np.int32)
+                points[:, 0] = np.clip(
+                    np.round(clipped[:, 0] * (width - 1)), 0, width - 1
+                )
+                points[:, 1] = np.clip(
+                    np.round((1.0 - clipped[:, 1]) * (height - 1)), 0, height - 1
+                )
+                if cv2.contourArea(points) <= 0.01:
+                    continue
+                polygons.append(points)
+                min_x = min(min_x, int(points[:, 0].min()))
+                min_y = min(min_y, int(points[:, 1].min()))
+                max_x = max(max_x, int(points[:, 0].max()))
+                max_y = max(max_y, int(points[:, 1].max()))
+
+    if not polygons:
+        return None
+
+    geometry = np.zeros((max_y - min_y + 1, max_x - min_x + 1), dtype=np.uint8)
+    shifted = [points - np.asarray((min_x, min_y), dtype=np.int32) for points in polygons]
+    for points in shifted:
+        cv2.fillPoly(geometry, [points], 255, lineType=cv2.LINE_8)
+    visible = (geometry > 0) & mirror_mask[min_y : max_y + 1, min_x : max_x + 1]
+    local_bounds = _mask_crop_bounds(visible, 0)
+    if local_bounds is None:
+        return None
+
+    lx0, ly0, lx1, ly1 = local_bounds
+    padding = max(int(padding_px), 0)
+    x0 = max(min_x + lx0 - padding, 0)
+    y0 = max(min_y + ly0 - padding, 0)
+    x1 = min(min_x + lx1 + padding, width)
+    y1 = min(min_y + ly1 + padding, height)
+    crop = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+    ix0, iy0 = max(x0, min_x), max(y0, min_y)
+    ix1, iy1 = min(x1, max_x + 1), min(y1, max_y + 1)
+    crop[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0] = visible[
+        iy0 - min_y : iy1 - min_y,
+        ix0 - min_x : ix1 - min_x,
+    ]
+    return UvIslandCrop((x0, y0, x1, y1), np.ascontiguousarray(crop))
+
+
 # ---------------------------------------------------------------------------
 # Mirror / rigid masks
 # ---------------------------------------------------------------------------
@@ -668,18 +865,18 @@ def parts_using_material(
     archive: VehicleArchive,
     loaded: LoadedDae,
     texture_member: str,
-) -> list[tuple[DaePart, ArchiveTextureBinding]]:
+) -> list[tuple[DaePart, MaterialTextureLayerBinding]]:
     """Every part in the DAE whose resolved base colour is this texture."""
-    matches: list[tuple[DaePart, ArchiveTextureBinding]] = []
+    matches: list[tuple[DaePart, MaterialTextureLayerBinding]] = []
     for part in loaded.parts:
         try:
             choices = archive_texture_choices_for_part(archive, loaded, part)
         except Exception:
             continue
         for binding in choices:
-            if binding.texture_member == texture_member:
-                matches.append((part, binding))
-                break
+            for layer in material_texture_layers_for_binding(archive, binding):
+                if layer.texture_member == texture_member:
+                    matches.append((part, layer))
     return matches
 
 
@@ -701,22 +898,698 @@ def texture_bindings_for_parts(
     archive: VehicleArchive,
     loaded: LoadedDae,
     parts: list[DaePart],
-) -> dict[str, list[tuple[DaePart, ArchiveTextureBinding]]]:
-    """Group exact selected parts by the archive texture they paint."""
-    by_texture: dict[str, list[tuple[DaePart, ArchiveTextureBinding]]] = {}
-    seen: set[tuple[str, str]] = set()
+) -> dict[str, list[tuple[DaePart, MaterialTextureLayerBinding]]]:
+    """Group every material layer on the selected parts by physical texture.
+
+    A member referenced by both base colour and emissive slots remains one
+    physical job, while both slot bindings are retained for material wiring.
+    """
+    by_texture: dict[str, list[tuple[DaePart, MaterialTextureLayerBinding]]] = {}
+    seen: set[tuple[str, str, str, str, str, str]] = set()
     for part in parts:
         try:
             choices = archive_texture_choices_for_part(archive, loaded, part)
         except Exception:
             continue
         for binding in choices:
-            key = (part.key, binding.texture_member)
-            if key in seen:
-                continue
-            seen.add(key)
-            by_texture.setdefault(binding.texture_member, []).append((part, binding))
+            for layer in material_texture_layers_for_binding(archive, binding):
+                key = (
+                    part.key,
+                    _normalise_material_alias(layer.dae_material),
+                    layer.materials_member,
+                    layer.material_key,
+                    layer.texture_member,
+                    layer.stage_key,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                by_texture.setdefault(layer.texture_member, []).append((part, layer))
     return by_texture
+
+
+def _unique_candidate_parts(
+    candidates: list[
+        tuple[DaePart, ArchiveTextureBinding | MaterialTextureLayerBinding]
+    ],
+) -> list[DaePart]:
+    parts: list[DaePart] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for part, _binding in candidates:
+        key = (
+            part.key,
+            part.node_id,
+            tuple(instance.geometry_id for instance in part.instances),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(part)
+    return parts
+
+
+def companion_maps_for_region_detection(
+    companions: tuple[CompanionMap, ...],
+    texture_member: str,
+) -> tuple[CompanionMap, ...]:
+    texture_key = texture_member.lower()
+    return tuple(
+        companion
+        for companion in companions
+        if companion.kind == "scalar"
+        and companion.stage_key in REGION_DETECTION_COMPANION_STAGE_KEYS
+        and companion.member.lower() != texture_key
+    )
+
+
+def companion_detection_bgr(image: Image.Image) -> np.ndarray:
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    return rgba_detection_bgr(rgba)
+
+
+def rgba_detection_bgr(rgba: np.ndarray) -> np.ndarray:
+    """Prepare colour or alpha evidence from an in-memory RGBA layer."""
+    rgb = rgba[:, :, :3]
+    alpha = rgba[:, :, 3]
+    if int(rgb.max()) == int(rgb.min()) and int(alpha.max()) != int(alpha.min()):
+        grey = alpha
+        return np.dstack([grey, grey, grey])
+    return rgb[:, :, ::-1].copy()
+
+
+def _production_layer_detection_config(
+    mser_config: MserConfig,
+    hybrid_gpu_detection: bool,
+    stage_keys: tuple[str, ...] = (),
+    *,
+    authoritative_opacity_mask: bool = False,
+) -> MserConfig:
+    """Select the production front end from the physical layer's semantics."""
+    opacity_layer = bool(stage_keys) and set(stage_keys).issubset(
+        AUTHORITATIVE_VISIBILITY_MASK_STAGE_KEYS
+    )
+    if authoritative_opacity_mask or opacity_layer:
+        return replace(
+            mser_config,
+            box_source="opacity_mask",
+            # Detection is already clipped to one topological UV island.  A
+            # second fitted-shape recovery rejects valid labels which fill a
+            # small island, such as the Lexus mirror-control AUTO/L/R marks.
+            enable_region_domain_filter=False,
+            # Visibility masks are already authoritative feature declarations;
+            # colour continuation outside a fitted box must not veto them.
+            enable_feature_extension_filter=False,
+        )
+    if hybrid_gpu_detection:
+        return replace(mser_config, box_source="contrast_gpu")
+    return mser_config
+
+
+def _switch_group_aliases_for_candidates(
+    archive: VehicleArchive,
+    candidates: list[tuple[DaePart, ArchiveTextureBinding]],
+) -> set[str]:
+    """Return every material alias in the BeamNG switch groups this job touches."""
+    switch_targets = getattr(archive, "material_switch_targets", {}) or {}
+    group_aliases: set[str] = set()
+    fallback_seeds: set[str] = set()
+    found_direct_group = False
+    for _part, binding in candidates:
+        dae_alias = _normalise_material_alias(binding.dae_material)
+        material_alias = _normalise_material_alias(binding.material_key)
+        if dae_alias:
+            fallback_seeds.add(dae_alias)
+        if material_alias:
+            fallback_seeds.add(material_alias)
+        if not dae_alias or dae_alias not in switch_targets:
+            continue
+        found_direct_group = True
+        group_aliases.add(dae_alias)
+        group_aliases.update(
+            _normalise_material_alias(alias) for alias in switch_targets[dae_alias]
+        )
+
+    if found_direct_group:
+        return {alias for alias in group_aliases if alias}
+
+    seeds = {
+        seed
+        for seed in fallback_seeds
+        if seed and seed not in GENERIC_SWITCH_STATE_ALIASES
+    }
+    for seed in seeds:
+        group_aliases.add(seed)
+        if seed in switch_targets:
+            group_aliases.update(_normalise_material_alias(alias) for alias in switch_targets[seed])
+        for base, targets in switch_targets.items():
+            normalised_targets = {_normalise_material_alias(alias) for alias in targets}
+            if seed not in normalised_targets:
+                continue
+            group_aliases.add(_normalise_material_alias(base))
+            group_aliases.update(normalised_targets)
+    return {alias for alias in group_aliases if alias}
+
+
+def _record_matches_aliases(
+    record: ArchiveMaterialRecord,
+    aliases: set[str],
+) -> bool:
+    return any(_normalise_material_alias(alias) in aliases for alias in record.aliases)
+
+
+def _records_by_normalised_alias(
+    archive: VehicleArchive,
+) -> dict[str, list[ArchiveMaterialRecord]]:
+    records: dict[str, list[ArchiveMaterialRecord]] = {}
+    for record in getattr(archive, "materials", ()):
+        for alias in record.aliases:
+            normalised = _normalise_material_alias(alias)
+            if not normalised:
+                continue
+            records.setdefault(normalised, []).append(record)
+    return records
+
+
+def material_aliases_for_parts(
+    loaded: LoadedDae,
+    parts: list[DaePart],
+) -> set[str]:
+    aliases: set[str] = set()
+    for part in parts:
+        for instance in part.instances:
+            raw = parse_geometry(loaded, instance.geometry_id)
+            for primitive in raw.primitives:
+                alias = _normalise_material_alias(
+                    primitive.attributes.get("material", "")
+                )
+                if alias:
+                    aliases.add(alias)
+    return aliases
+
+
+def runtime_display_dae_aliases_for_parts(
+    archive: VehicleArchive,
+    loaded: LoadedDae,
+    parts: list[DaePart],
+) -> set[str]:
+    """DAE-bound aliases whose content comes from a live runtime texture."""
+    runtime_aliases = {
+        _normalise_material_alias(alias)
+        for alias in (getattr(archive, "runtime_material_aliases", ()) or ())
+        if alias
+    }
+    if not runtime_aliases:
+        return set()
+    used_aliases = material_aliases_for_parts(loaded, parts)
+    selected = runtime_aliases.intersection(used_aliases)
+    for base in used_aliases:
+        if any(
+            _normalise_material_alias(state.material) in runtime_aliases
+            for state in (
+                getattr(archive, "material_switch_states", {}) or {}
+            ).get(base, ())
+        ):
+            selected.add(base)
+    return selected
+
+
+def _direct_switch_state_aliases_for_candidates(
+    archive: VehicleArchive,
+    candidates: list[tuple[DaePart, ArchiveTextureBinding]],
+) -> dict[str, str]:
+    switch_states = getattr(archive, "material_switch_states", {}) or {}
+    aliases: dict[str, str] = {}
+    for _part, binding in candidates:
+        dae_alias = _normalise_material_alias(binding.dae_material)
+        if not dae_alias or dae_alias not in switch_states:
+            continue
+        aliases.setdefault(dae_alias, "base")
+        for state in switch_states[dae_alias]:
+            material = _normalise_material_alias(state.material)
+            if not material:
+                continue
+            current = aliases.get(material)
+            if current is None or (
+                SWITCH_STATE_DETECTION_RANK.get(state.state, 99)
+                < SWITCH_STATE_DETECTION_RANK.get(current, 99)
+            ):
+                aliases[material] = state.state
+    return aliases
+
+
+def _trigger_sibling_switch_state_aliases_for_candidates(
+    archive: VehicleArchive,
+    candidates: list[tuple[DaePart, ArchiveTextureBinding]],
+) -> dict[str, str]:
+    switch_states = getattr(archive, "material_switch_states", {}) or {}
+    switch_triggers = getattr(archive, "material_switch_triggers", {}) or {}
+    requested_triggers: set[str] = set()
+    direct_bases: set[str] = set()
+    for _part, binding in candidates:
+        dae_alias = _normalise_material_alias(binding.dae_material)
+        if not dae_alias:
+            continue
+        direct_bases.add(dae_alias)
+        requested_triggers.update(switch_triggers.get(dae_alias, ()))
+    if not requested_triggers:
+        return {}
+    trigger_group_keys = requested_triggers.intersection(DISPLAY_POWER_TRIGGER_KEYS)
+    if not trigger_group_keys:
+        return {}
+
+    aliases: dict[str, str] = {}
+    for base, triggers in switch_triggers.items():
+        if base in direct_bases:
+            continue
+        if not trigger_group_keys.intersection(triggers):
+            continue
+        for state in switch_states.get(base, ()):
+            if state.state not in {"on", "on_intense"}:
+                continue
+            material = _normalise_material_alias(state.material)
+            if not material or material in GENERIC_SWITCH_STATE_ALIASES:
+                continue
+            current = aliases.get(material)
+            if current is None or (
+                SWITCH_STATE_DETECTION_RANK.get(state.state, 99)
+                < SWITCH_STATE_DETECTION_RANK.get(current, 99)
+            ):
+                aliases[material] = state.state
+    return aliases
+
+
+def _state_detection_map_sort_key(
+    state_map: StateDetectionMap,
+) -> tuple[int, str, str, str]:
+    return (
+        SWITCH_STATE_DETECTION_RANK.get(state_map.switch_state, 99),
+        state_map.member.lower(),
+        state_map.material_key.lower(),
+        state_map.stage_key,
+    )
+
+
+def _material_state_detection_maps(
+    archive: VehicleArchive,
+    records: list[ArchiveMaterialRecord],
+    switch_state: str,
+    texture_member: str,
+    seen: set[str],
+) -> list[StateDetectionMap]:
+    texture_key = texture_member.lower()
+    found: list[StateDetectionMap] = []
+    for record in records:
+        stages = record.source_material.get("Stages")
+        if not isinstance(stages, list):
+            continue
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            for stage_key in REGION_DETECTION_STATE_STAGE_KEYS:
+                reference = stage.get(stage_key)
+                if not isinstance(reference, str) or not reference.strip():
+                    continue
+                if reference.lstrip().startswith("@"):
+                    continue
+                member = resolve_archive_texture_member(
+                    archive, reference.strip(), record.materials_member
+                )
+                if member is None or member.lower() == texture_key:
+                    continue
+                key = member.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(
+                    StateDetectionMap(
+                        member=member,
+                        stage_key=stage_key,
+                        material_key=record.key,
+                        switch_state=switch_state,
+                    )
+                )
+    return found
+
+
+def switch_group_detection_maps_for_candidates(
+    archive: VehicleArchive,
+    candidates: list[tuple[DaePart, ArchiveTextureBinding]],
+    texture_member: str,
+) -> tuple[StateDetectionMap, ...]:
+    """Archive-backed maps from every state in the same BeamNG material switch.
+
+    BeamNG's ``glowMap`` swaps the material attached to a mesh at runtime.  A
+    dashboard can therefore have text that exists only on an ``on`` or
+    ``on_intense`` state, while the base/off texture is mostly blank.  These
+    sibling maps are detection sources only; each texture job still writes its
+    own corrected image.
+    """
+    direct_state_aliases = _direct_switch_state_aliases_for_candidates(
+        archive,
+        candidates,
+    )
+    if direct_state_aliases:
+        direct_state_aliases.update(
+            {
+                alias: state
+                for alias, state in (
+                    _trigger_sibling_switch_state_aliases_for_candidates(
+                        archive,
+                        candidates,
+                    )
+                ).items()
+                if alias not in direct_state_aliases
+                or SWITCH_STATE_DETECTION_RANK.get(state, 99)
+                < SWITCH_STATE_DETECTION_RANK.get(direct_state_aliases[alias], 99)
+            }
+        )
+        records_by_alias = _records_by_normalised_alias(archive)
+        found: list[StateDetectionMap] = []
+        seen: set[str] = set()
+        ordered_aliases = sorted(
+            direct_state_aliases.items(),
+            key=lambda item: (
+                SWITCH_STATE_DETECTION_RANK.get(item[1], 99),
+                item[0],
+            ),
+        )
+        for alias, state in ordered_aliases:
+            found.extend(
+                _material_state_detection_maps(
+                    archive,
+                    records_by_alias.get(alias, []),
+                    state,
+                    texture_member,
+                    seen,
+                )
+            )
+        powered = [
+            state_map
+            for state_map in found
+            if state_map.switch_state in {"on", "on_intense"}
+        ]
+        if powered:
+            found = powered
+        return tuple(sorted(found, key=_state_detection_map_sort_key))
+
+    group_aliases = _switch_group_aliases_for_candidates(archive, candidates)
+    if not group_aliases:
+        return ()
+
+    texture_key = texture_member.lower()
+    found: list[StateDetectionMap] = []
+    seen: set[str] = set()
+    for record in getattr(archive, "materials", ()):
+        if not _record_matches_aliases(record, group_aliases):
+            continue
+        stages = record.source_material.get("Stages")
+        if not isinstance(stages, list):
+            continue
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            for stage_key in REGION_DETECTION_STATE_STAGE_KEYS:
+                reference = stage.get(stage_key)
+                if not isinstance(reference, str) or not reference.strip():
+                    continue
+                if reference.lstrip().startswith("@"):
+                    continue
+                member = resolve_archive_texture_member(
+                    archive, reference.strip(), record.materials_member
+                )
+                if member is None or member.lower() == texture_key:
+                    continue
+                key = member.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(
+                    StateDetectionMap(
+                        member=member,
+                        stage_key=stage_key,
+                        material_key=record.key,
+                    )
+                )
+    return tuple(found)
+
+
+def normal_maps_for_layer_bindings(
+    archive: VehicleArchive,
+    candidates: list[
+        tuple[DaePart, ArchiveTextureBinding | MaterialTextureLayerBinding]
+    ],
+    texture_member: str,
+) -> tuple[CompanionMap, ...]:
+    """Resolve normal maps which accompany this physical material layer.
+
+    Prefer the normal declared in the same material stage as the current map.
+    Some older materials put one shared normal in another stage; accept that
+    only when the material declares a single unambiguous normal map.  Results
+    are deduplicated because one texture is commonly referenced by several
+    parts or by both base-colour and emissive slots.
+    """
+    texture_key = texture_member.lower()
+    found: list[CompanionMap] = []
+    seen: set[str] = set()
+
+    def add(member: str, stage_key: str) -> None:
+        key = member.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(CompanionMap(member, stage_key, "normal"))
+
+    for _part, binding in candidates:
+        binding_kind = getattr(binding, "kind", "colour")
+        binding_stage_key = getattr(binding, "stage_key", "baseColorMap")
+        if binding_kind == "normal" or binding_stage_key in NORMAL_MAP_STAGE_KEYS:
+            add(texture_member, binding_stage_key)
+            continue
+
+        records = [
+            record
+            for record in getattr(archive, "materials", ())
+            if record.materials_member == binding.materials_member
+            and record.key == binding.material_key
+        ]
+        material_normals: list[CompanionMap] = []
+        exact_stage_normals: list[CompanionMap] = []
+        for record in records:
+            stages = record.source_material.get("Stages")
+            if not isinstance(stages, list):
+                continue
+            for stage in stages:
+                if not isinstance(stage, dict):
+                    continue
+                stage_member: str | None = None
+                reference = stage.get(binding_stage_key)
+                if isinstance(reference, str) and reference.strip():
+                    stage_member = resolve_archive_texture_member(
+                        archive, reference.strip(), record.materials_member
+                    )
+                stage_normals: list[CompanionMap] = []
+                for normal_stage_key in NORMAL_MAP_STAGE_KEYS:
+                    normal_reference = stage.get(normal_stage_key)
+                    if not isinstance(normal_reference, str) or not normal_reference.strip():
+                        continue
+                    if normal_reference.lstrip().startswith("@"):
+                        continue
+                    normal_member = resolve_archive_texture_member(
+                        archive, normal_reference.strip(), record.materials_member
+                    )
+                    if normal_member is None:
+                        continue
+                    normal = CompanionMap(normal_member, normal_stage_key, "normal")
+                    stage_normals.append(normal)
+                    material_normals.append(normal)
+                if stage_member is not None and stage_member.lower() == texture_key:
+                    exact_stage_normals.extend(stage_normals)
+
+        selected = exact_stage_normals
+        if not selected:
+            unique_material_normals = {
+                normal.member.lower(): normal for normal in material_normals
+            }
+            if len(unique_material_normals) == 1:
+                selected = list(unique_material_normals.values())
+        if not selected and not records:
+            selected = [
+                normal
+                for normal in companion_maps_for_binding(archive, binding)
+                if normal.kind == "normal"
+            ]
+            if len({normal.member.lower() for normal in selected}) > 1:
+                selected = []
+        for normal in selected:
+            add(normal.member, normal.stage_key)
+    return tuple(found)
+
+
+def authoritative_visibility_masks_for_layer_bindings(
+    archive: VehicleArchive,
+    candidates: list[
+        tuple[DaePart, ArchiveTextureBinding | MaterialTextureLayerBinding]
+    ],
+    texture_member: str,
+) -> tuple[CompanionMap, ...]:
+    """Return archive-backed opacity maps which fully govern this layer.
+
+    A visibility mask is authoritative only when every concrete use of the
+    physical texture has an opacity map in the same material stage.  This
+    avoids suppressing valid colour evidence when a texture is shared by one
+    masked and one unmasked material.  The opacity texture's own job remains
+    self-authoritative and therefore never resolves back to itself here.
+    """
+    texture_key = texture_member.lower()
+    found: list[CompanionMap] = []
+    seen_masks: set[str] = set()
+    seen_bindings: set[tuple[str, str, str]] = set()
+
+    for _part, binding in candidates:
+        stage_key = getattr(binding, "stage_key", "baseColorMap")
+        if stage_key in AUTHORITATIVE_VISIBILITY_MASK_STAGE_KEYS:
+            return ()
+        binding_key = (
+            binding.materials_member,
+            binding.material_key,
+            stage_key,
+        )
+        if binding_key in seen_bindings:
+            continue
+        seen_bindings.add(binding_key)
+
+        records = [
+            record
+            for record in getattr(archive, "materials", ())
+            if record.materials_member == binding.materials_member
+            and record.key == binding.material_key
+        ]
+        matching_stages: list[tuple[ArchiveMaterialRecord, dict[str, object]]] = []
+        for record in records:
+            stages = record.source_material.get("Stages")
+            if not isinstance(stages, list):
+                continue
+            for stage in stages:
+                if not isinstance(stage, dict):
+                    continue
+                reference = stage.get(stage_key)
+                if not isinstance(reference, str) or not reference.strip():
+                    continue
+                member = resolve_archive_texture_member(
+                    archive, reference.strip(), record.materials_member
+                )
+                if member is not None and member.lower() == texture_key:
+                    matching_stages.append((record, stage))
+
+        if not matching_stages:
+            return ()
+        for record, stage in matching_stages:
+            reference = stage.get("opacityMap")
+            if (
+                not isinstance(reference, str)
+                or not reference.strip()
+                or reference.lstrip().startswith("@")
+            ):
+                return ()
+            member = resolve_archive_texture_member(
+                archive, reference.strip(), record.materials_member
+            )
+            if member is None or member.lower() == texture_key:
+                return ()
+            key = member.lower()
+            if key not in seen_masks:
+                seen_masks.add(key)
+                found.append(CompanionMap(member, "opacityMap", "scalar"))
+
+    return tuple(found)
+
+
+def _resize_bool_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    width, height = size
+    if mask.shape[:2] == (height, width):
+        return mask
+    resized = cv2.resize(
+        mask.astype(np.uint8),
+        (width, height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return resized.astype(bool)
+
+
+def _scale_detection_box(
+    box: tuple[int, int, int, int],
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    x, y, w, h = box
+    x0 = max(0, min(round(x * target_width / max(source_width, 1)), target_width))
+    y0 = max(0, min(round(y * target_height / max(source_height, 1)), target_height))
+    x1 = max(0, min(round((x + w) * target_width / max(source_width, 1)), target_width))
+    y1 = max(0, min(round((y + h) * target_height / max(source_height, 1)), target_height))
+    if x1 <= x0:
+        x0 = max(min(x0, target_width - 1), 0)
+        x1 = min(x0 + 1, target_width)
+    if y1 <= y0:
+        y0 = max(min(y0, target_height - 1), 0)
+        y1 = min(y0 + 1, target_height)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _scale_detection_rotation(
+    corners: tuple[tuple[float, float], ...] | None,
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> tuple[tuple[float, float], ...] | None:
+    if corners is None:
+        return None
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    return tuple(
+        (
+            x * target_width / max(source_width, 1),
+            y * target_height / max(source_height, 1),
+        )
+        for x, y in corners
+    )
+
+
+def _scale_detection_to_texture(
+    detection: RegionDetection,
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> RegionDetection:
+    if source_size == target_size:
+        return detection
+    return RegionDetection(
+        source=detection.source,
+        detected=detection.detected,
+        regions=[
+            _scale_detection_box(region, source_size, target_size)
+            for region in detection.regions
+        ],
+        rotations=[
+            _scale_detection_rotation(rotation, source_size, target_size)
+            for rotation in detection.rotations
+        ],
+        uncontained=[
+            (
+                *_scale_detection_box((x, y, w, h), source_size, target_size),
+                share,
+            )
+            for x, y, w, h, share in detection.uncontained
+        ],
+        blobs=[
+            (
+                *_scale_detection_box((x, y, w, h), source_size, target_size),
+                share,
+            )
+            for x, y, w, h, share in detection.blobs
+        ],
+        work_views=detection.work_views,
+        seconds=detection.seconds,
+    )
 
 
 def scoped_parts_using_material(
@@ -767,6 +1640,7 @@ def split_mirrored_and_rigid(
     symbols: set[str],
     config: RhdTextureConfig,
     sweep_cache: dict[str, object] | None = None,
+    force_mirrored: bool = False,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """Split this part's UV triangles by the fate the exporter gives them.
 
@@ -801,7 +1675,7 @@ def split_mirrored_and_rigid(
         )
         if triangle is None:
             continue
-        if candidate_id < 0:
+        if force_mirrored or candidate_id < 0:
             mirrored.append(triangle)
             mirrored_xyz.append(vertices[triangles[face_index]])
         else:
@@ -983,6 +1857,9 @@ def skew_delta_for_region(
     width: int,
     height: int,
     config: RhdTextureConfig,
+    frames: tuple[
+        tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...
+    ] | None = None,
 ) -> float | None:
     """Return how far the mesh-derived reflection differs from a flat flip.
 
@@ -990,7 +1867,7 @@ def skew_delta_for_region(
     do not commute.  When the local mesh reflection differs materially from the
     flat texture-space flip, the region is treated as unsafe and left unchanged.
     """
-    if not triangles or len(triangles) != len(surfaces):
+    if frames is None and (not triangles or len(triangles) != len(surfaces)):
         return None
 
     x, y, w, h = bounds
@@ -999,36 +1876,16 @@ def skew_delta_for_region(
     weighted_y = np.zeros(3, dtype=np.float64)
     total_weight = 0.0
 
-    for triangle, surface in zip(triangles, surfaces):
-        min_u, min_v = triangle.min(axis=0)
-        max_u, max_v = triangle.max(axis=0)
-        for shift_u in range(math.floor(min_u), math.floor(max_u) + 1):
-            for shift_v in range(math.floor(min_v), math.floor(max_v) + 1):
-                shifted = triangle - (shift_u, shift_v)
-                clipped = clip_to_unit_tile(shifted)
-                if len(clipped) < 3:
-                    continue
-                points = _triangle_pixel_points(clipped, width, height)
-                tri_box = (
-                    float(points[:, 0].min()),
-                    float(points[:, 1].min()),
-                    float(points[:, 0].max() + 1.0),
-                    float(points[:, 1].max() + 1.0),
-                )
-                weight = _box_overlap_area(region_box, tri_box)
-                if weight <= 0.0:
-                    continue
-                image_x, image_y, _normal, usable = _surface_pixel_frame(
-                    np.asarray([shifted], dtype=float),
-                    np.asarray([surface], dtype=float),
-                    width,
-                    height,
-                )
-                if not bool(usable[0]):
-                    continue
-                weighted_x += image_x[0] * weight
-                weighted_y += image_y[0] * weight
-                total_weight += weight
+    if frames is None:
+        frames = skew_triangle_frames(triangles, surfaces, width, height)
+
+    for tri_box, image_x, image_y in frames:
+        weight = _box_overlap_area(region_box, tri_box)
+        if weight <= 0.0:
+            continue
+        weighted_x += image_x * weight
+        weighted_y += image_y * weight
+        total_weight += weight
 
     if total_weight <= 0.0:
         return None
@@ -1073,6 +1930,44 @@ def skew_delta_for_region(
     return delta
 
 
+def skew_triangle_frames(
+    triangles: tuple[np.ndarray, ...],
+    surfaces: tuple[np.ndarray, ...],
+    width: int,
+    height: int,
+) -> tuple[tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...]:
+    """Precompute wrapped UV bounds and surface frames for skew checks."""
+    frames: list[
+        tuple[tuple[float, float, float, float], np.ndarray, np.ndarray]
+    ] = []
+    for triangle, surface in zip(triangles, surfaces):
+        image_x, image_y, _normal, usable = _surface_pixel_frame(
+            np.asarray([triangle], dtype=float),
+            np.asarray([surface], dtype=float),
+            width,
+            height,
+        )
+        if not bool(usable[0]):
+            continue
+        min_u, min_v = triangle.min(axis=0)
+        max_u, max_v = triangle.max(axis=0)
+        for shift_u in range(math.floor(min_u), math.floor(max_u) + 1):
+            for shift_v in range(math.floor(min_v), math.floor(max_v) + 1):
+                shifted = triangle - (shift_u, shift_v)
+                clipped = clip_to_unit_tile(shifted)
+                if len(clipped) < 3:
+                    continue
+                points = _triangle_pixel_points(clipped, width, height)
+                tri_box = (
+                    float(points[:, 0].min()),
+                    float(points[:, 1].min()),
+                    float(points[:, 0].max() + 1.0),
+                    float(points[:, 1].max() + 1.0),
+                )
+                frames.append((tri_box, image_x[0].copy(), image_y[0].copy()))
+    return tuple(frames)
+
+
 def region_flip_axis(
     axis_map: np.ndarray,
     stencil: np.ndarray,
@@ -1103,6 +1998,14 @@ def region_flip_axis(
 
 
 @dataclass(slots=True)
+class UvIslandCrop:
+    """One topological UV island retained as a compact atlas-aligned mask."""
+
+    bounds: tuple[int, int, int, int]
+    mask: np.ndarray
+
+
+@dataclass(slots=True)
 class DomainMasks:
     """Which texels the exporter mirrors, and which it leaves to a rotation."""
 
@@ -1115,6 +2018,157 @@ class DomainMasks:
     axis_map: np.ndarray | None = None
     mirrored_uv: tuple[np.ndarray, ...] = ()
     mirrored_xyz: tuple[np.ndarray, ...] = ()
+    foreground_islands: tuple[UvIslandCrop, ...] | None = None
+    foreground_island_padding_px: int = -1
+    component_count: int = 0
+    component_labels: np.ndarray | None = None
+    component_stats: np.ndarray | None = None
+    skew_frames: tuple[
+        tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...
+    ] | None = None
+    skew_frame_size: tuple[int, int] | None = None
+
+
+def domain_mask_components(
+    masks: DomainMasks,
+) -> tuple[int, np.ndarray, np.ndarray]:
+    """Return connected mirror-domain components, computing them only once."""
+    if masks.component_labels is None or masks.component_stats is None:
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            masks.mirror.astype(np.uint8), connectivity=8
+        )
+        masks.component_count = int(count)
+        masks.component_labels = labels
+        masks.component_stats = stats
+    return masks.component_count, masks.component_labels, masks.component_stats
+
+
+def domain_skew_frames(
+    masks: DomainMasks,
+    size: tuple[int, int],
+) -> tuple[tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...]:
+    """Return reusable UV/surface frames for region skew checks."""
+    if masks.skew_frames is None or masks.skew_frame_size != size:
+        masks.skew_frames = skew_triangle_frames(
+            masks.mirrored_uv,
+            masks.mirrored_xyz,
+            size[0],
+            size[1],
+        )
+        masks.skew_frame_size = size
+    return masks.skew_frames
+
+
+def mirrored_uv_island_crops(
+    triangles: tuple[np.ndarray, ...],
+    mirror_mask: np.ndarray,
+    padding_px: int = 0,
+) -> tuple[UvIslandCrop, ...]:
+    """Rasterise topological islands once and retain only their padded crops."""
+    height, width = mirror_mask.shape[:2]
+    padding = max(int(padding_px), 0)
+    if not triangles:
+        bounds = _mask_crop_bounds(mirror_mask, padding)
+        if bounds is None:
+            return ()
+        x0, y0, x1, y1 = bounds
+        return (UvIslandCrop(bounds, mirror_mask[y0:y1, x0:x1].copy()),)
+
+    parents = list(range(len(triangles)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parents[right] = left
+
+    owner: dict[tuple[int, int], int] = {}
+    for index, triangle in enumerate(triangles):
+        points = np.asarray(triangle, dtype=float).reshape(-1, 2)
+        for u, v in points:
+            key = (
+                int(round(float(u) * 100_000_000)),
+                int(round(float(v) * 100_000_000)),
+            )
+            previous = owner.get(key)
+            if previous is None:
+                owner[key] = index
+            else:
+                union(index, previous)
+
+    groups: dict[int, list[np.ndarray]] = {}
+    for index, triangle in enumerate(triangles):
+        groups.setdefault(find(index), []).append(triangle)
+
+    crops: list[UvIslandCrop] = []
+    seen: set[tuple[tuple[int, int, int, int], bytes]] = set()
+    for group in groups.values():
+        island = rasterise_uv_triangles_crop(group, mirror_mask, padding)
+        if island is None:
+            continue
+        signature = (island.bounds, island.mask.tobytes())
+        if signature in seen:
+            continue
+        seen.add(signature)
+        crops.append(island)
+    return tuple(crops)
+
+
+def mirrored_uv_island_masks(
+    triangles: tuple[np.ndarray, ...],
+    mirror_mask: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    """Rasterise topological UV islands separately for foreground detection.
+
+    Connected pixels are not a sufficient island definition: distinct atlas
+    islands can touch at an edge (or after rasterisation) while still carrying
+    unrelated controls.  Build components from shared UV vertices instead,
+    then clip each result to the already conflict-filtered mirror mask.
+    """
+    height, width = mirror_mask.shape[:2]
+    masks: list[np.ndarray] = []
+    for crop in mirrored_uv_island_crops(triangles, mirror_mask):
+        island = np.zeros((height, width), dtype=bool)
+        x0, y0, x1, y1 = crop.bounds
+        island[y0:y1, x0:x1] = crop.mask
+        masks.append(island)
+    return tuple(masks)
+
+
+def resize_uv_island_crops(
+    islands: tuple[UvIslandCrop, ...],
+    source_shape: tuple[int, int],
+    target_size: tuple[int, int],
+    padding_px: int = 0,
+) -> tuple[UvIslandCrop, ...]:
+    """Resize compact islands with the same nearest sampling as a full mask."""
+    source_height, source_width = source_shape
+    target_width, target_height = target_size
+    if (source_width, source_height) == target_size:
+        return islands
+
+    resized_islands: list[UvIslandCrop] = []
+    for island in islands:
+        full = np.zeros((source_height, source_width), dtype=bool)
+        x0, y0, x1, y1 = island.bounds
+        full[y0:y1, x0:x1] = island.mask
+        resized = _resize_bool_mask(full, target_size)
+        bounds = _mask_crop_bounds(resized, padding_px)
+        if bounds is None:
+            continue
+        rx0, ry0, rx1, ry1 = bounds
+        resized_islands.append(
+            UvIslandCrop(
+                bounds,
+                np.ascontiguousarray(resized[ry0:ry1, rx0:rx1]),
+            )
+        )
+    return tuple(resized_islands)
 
 
 def build_domain_masks(
@@ -1125,6 +2179,7 @@ def build_domain_masks(
     config: RhdTextureConfig,
     sweep_cache: dict[str, object] | None = None,
     log=print,
+    force_mirrored_part_keys: set[str] | None = None,
 ) -> DomainMasks:
     """Rasterise the mirrored and rigid domains over every part sharing a layout.
 
@@ -1136,10 +2191,21 @@ def build_domain_masks(
     mirrored_surfaces: list[np.ndarray] = []
     rigid_triangles: list[np.ndarray] = []
     analysed = 0
+    forced_keys = force_mirrored_part_keys or set()
     for part in parts:
         try:
+            part_aliases = {
+                str(part.key or ""),
+                str(part.node_id or ""),
+                str(part.node_name or ""),
+            }
             mirrored, rigid, surfaces = split_mirrored_and_rigid(
-                loaded, part, symbols, config, sweep_cache
+                loaded,
+                part,
+                symbols,
+                config,
+                sweep_cache,
+                force_mirrored=bool(part_aliases.intersection(forced_keys)),
             )
         except Exception as exc:  # a part the sweep cannot handle is not fatal
             log(f"    ! {part.label}: {type(exc).__name__}: {exc}")
@@ -1382,6 +2448,7 @@ def plan_island_flips(
     regions: list[tuple[int, int, int, int]],
     config: RhdTextureConfig,
     axis_map: np.ndarray | None = None,
+    components: tuple[int, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[list[IslandFlip], np.ndarray]:
     """Choose which whole islands to turn over, and on which axis.
 
@@ -1398,9 +2465,12 @@ def plan_island_flips(
     axis within their own bounds.  Never both axes: together they are a 180
     degree rotation, which leaves the glyphs mirrored again.
     """
-    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
-        mirror_mask.astype(np.uint8), connectivity=8
-    )
+    if components is None:
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            mirror_mask.astype(np.uint8), connectivity=8
+        )
+    else:
+        count, labels, stats = components
     glyph_counts: dict[int, int] = {}
     for x, y, w, h in regions:
         centre = labels[
@@ -1430,10 +2500,13 @@ def plan_island_flips(
         horizontal = _reflection_similarity(component, np.fliplr(component))
         vertical = _reflection_similarity(component, np.flipud(component))
         if axis_map is not None:
-            island_stencil = np.zeros_like(mirror_mask)
-            island_stencil[y : y + h, x : x + w] = component
-            axis, _share = region_flip_axis(
-                axis_map, island_stencil, (x, y, w, h)
+            axis_values = axis_map[y : y + h, x : x + w][component]
+            horizontal_axes = int((axis_values == AXIS_HORIZONTAL).sum())
+            vertical_axes = int((axis_values == AXIS_VERTICAL).sum())
+            axis = (
+                "horizontal"
+                if horizontal_axes >= vertical_axes
+                else "vertical"
             )
         else:
             axis = "horizontal" if horizontal >= threshold else "vertical"
@@ -2025,7 +3098,9 @@ class FlipStep:
     rotated_axis: str | None = None
     # In-place flips normally write only through the mirrored UV domain.  Some
     # embossed marks straddle a mirrored/rigid split inside one visual glyph;
-    # those need the whole material-domain footprint or the word is torn.
+    # those need the whole material-domain footprint or the word is torn.  An
+    # authoritative opacity-mask component can instead use its tight region:
+    # texels outside the authored visibility mask are not rendered.
     stencil: str = "mirror"
 
 
@@ -2035,6 +3110,7 @@ class FlipStep:
 NORMAL_AXIS_CHANNEL = {"horizontal": 0, "vertical": 1}
 STENCIL_MIRROR = "mirror"
 STENCIL_DOMAIN = "domain"
+STENCIL_REGION = "region"
 
 
 def apply_flip_plan(
@@ -2064,17 +3140,21 @@ def apply_flip_plan(
     """
     negate = NORMAL_AXIS_CHANNEL if kind == "normal" and reflect_normal_vectors else {}
     moved = 0
+    region_stencil: np.ndarray | None = None
     for step in steps:
         in_place = step.island_label is None
         gate_normals = kind == "normal" and in_place and normal_detail_gate
         gate_scalars = kind == "scalar" and in_place and scalar_detail_gate
         correct_normals = kind == "normal" and in_place and correct_normal_background
         if step.island_label is None:
-            stencil = (
-                domain_mask
-                if step.stencil == STENCIL_DOMAIN and domain_mask is not None
-                else mirror_mask
-            )
+            if step.stencil == STENCIL_REGION:
+                if region_stencil is None:
+                    region_stencil = np.ones(mirror_mask.shape, dtype=bool)
+                stencil = region_stencil
+            elif step.stencil == STENCIL_DOMAIN and domain_mask is not None:
+                stencil = domain_mask
+            else:
+                stencil = mirror_mask
         elif label_image is None:
             continue
         else:
@@ -2145,6 +3225,90 @@ def _union_rectangle(
     x1 = max(x + w for x, _y, w, _h in rectangles)
     y1 = max(y + h for _x, y, _w, h in rectangles)
     return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _near_duplicate_rectangles(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+    edge_tolerance_px: int = 2,
+) -> bool:
+    """Return whether two detections describe the same atlas component.
+
+    Shared atlases can expose the same authored mark through several mesh UV
+    domains.  Island-scoped detection then reports the component more than once,
+    sometimes with a one-pixel crop difference.  Applying both flips restores
+    the original pixels, so these duplicates must collapse before planning.
+    """
+    ax, ay, aw, ah = first
+    bx, by, bw, bh = second
+    first_edges = (ax, ay, ax + aw, ay + ah)
+    second_edges = (bx, by, bx + bw, by + bh)
+    if all(
+        abs(first_edge - second_edge) <= edge_tolerance_px
+        for first_edge, second_edge in zip(first_edges, second_edges)
+    ):
+        return True
+
+    overlap = _box_overlap_area(first, second)
+    smaller_area = min(aw * ah, bw * bh)
+    larger_area = max(aw * ah, bw * bh)
+    return (
+        smaller_area > 0
+        and overlap / smaller_area >= 0.95
+        and smaller_area / larger_area >= 0.90
+    )
+
+
+def deduplicate_region_detections(
+    regions: list[tuple[int, int, int, int]],
+    rotations: list[tuple[tuple[float, float], ...] | None] | None = None,
+) -> tuple[
+    list[tuple[int, int, int, int]],
+    list[tuple[tuple[float, float], ...] | None],
+    int,
+]:
+    """Collapse intersecting or repeated detections to a fixed point."""
+    incoming_rotations = rotations or [None] * len(regions)
+    deduplicated = list(regions)
+    deduplicated_rotations = list(incoming_rotations)
+    removed = 0
+
+    # Union bounds can create a new intersection with an earlier region, so a
+    # single streaming pass is insufficient.  Keep merging until no pair has
+    # positive-area overlap (while retaining the near-duplicate tolerance used
+    # for one-pixel differences between atlas consumers).
+    while True:
+        merged = False
+        for left in range(len(deduplicated)):
+            for right in range(left + 1, len(deduplicated)):
+                first = deduplicated[left]
+                second = deduplicated[right]
+                if not (
+                    _rectangles_overlap(first, second)
+                    or _near_duplicate_rectangles(first, second)
+                ):
+                    continue
+                deduplicated[left] = _union_rectangle([first, second])
+                if deduplicated_rotations[left] != deduplicated_rotations[right]:
+                    deduplicated_rotations[left] = None
+                del deduplicated[right]
+                del deduplicated_rotations[right]
+                removed += 1
+                merged = True
+                break
+            if merged:
+                break
+        if not merged:
+            break
+
+    ordered = sorted(
+        zip(deduplicated, deduplicated_rotations),
+        key=lambda item: (item[0][1], item[0][0]),
+    )
+    if not ordered:
+        return [], [], removed
+    ordered_regions, ordered_rotations = zip(*ordered)
+    return list(ordered_regions), list(ordered_rotations), removed
 
 
 def merge_region_sets(
@@ -2232,6 +3396,16 @@ DDPF_FOURCC = 0x4
 DDSCAPS_COMPLEX, DDSCAPS_TEXTURE, DDSCAPS_MIPMAP = 0x8, 0x1000, 0x400000
 DDS_DIMENSION_TEXTURE2D = 3
 DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB = 98, 99
+
+
+def beamng_compressed_texture_size_supported(width: int, height: int) -> bool:
+    """Whether BeamNG accepts a block-compressed DDS at this resolution."""
+    return (
+        width > 0
+        and height > 0
+        and width & (width - 1) == 0
+        and height & (height - 1) == 0
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2505,6 +3679,45 @@ class RegionDetection:
     seconds: float = 0.0
 
 
+FULL_MIRRORED_TEXTURE_MIN_COVERAGE = 0.95
+FULL_MIRRORED_TEXTURE_MAX_RIGID_COVERAGE = 0.001
+FULL_MIRRORED_TEXTURE_MAX_CONFLICT_COVERAGE = 0.001
+
+
+def full_mirrored_texture_region(
+    mirror_mask: np.ndarray,
+    rigid_mask: np.ndarray,
+    conflict_coverage: float,
+) -> tuple[int, int, int, int] | None:
+    """Return the dedicated mirrored UV domain that should be flipped whole.
+
+    Detection is for atlases shared between mirrored and retained geometry. A
+    texture whose dominant connected UV domain is exclusively mirrored needs
+    no content analysis: every visible texel changes handedness together.
+    """
+    if mirror_mask.size == 0 or rigid_mask.shape != mirror_mask.shape:
+        return None
+    if float(rigid_mask.mean()) > FULL_MIRRORED_TEXTURE_MAX_RIGID_COVERAGE:
+        return None
+    if conflict_coverage > FULL_MIRRORED_TEXTURE_MAX_CONFLICT_COVERAGE:
+        return None
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        mirror_mask.astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return None
+    label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    area = int(stats[label, cv2.CC_STAT_AREA])
+    if area / float(mirror_mask.size) < FULL_MIRRORED_TEXTURE_MIN_COVERAGE:
+        return None
+    return (
+        int(stats[label, cv2.CC_STAT_LEFT]),
+        int(stats[label, cv2.CC_STAT_TOP]),
+        int(stats[label, cv2.CC_STAT_WIDTH]),
+        int(stats[label, cv2.CC_STAT_HEIGHT]),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class DetectionTile:
     """One atlas rectangle copied into a temporary detection collage."""
@@ -2523,6 +3736,7 @@ class DetectionView:
     tiles: tuple[DetectionTile, ...]
     atlas_shape: tuple[int, int]
     mode: str
+    relief_bridge_response: np.ndarray | None = None
 
 
 def _mask_crop_bounds(
@@ -2718,6 +3932,7 @@ def _build_collage_view(
     domain_mask: np.ndarray,
     crop_mask: np.ndarray,
     config: RhdTextureConfig,
+    relief_bridge_response: np.ndarray | None = None,
 ) -> DetectionView | None:
     """Build a packed island collage, or decline when it cannot save work."""
     height, width = crop_mask.shape[:2]
@@ -2746,12 +3961,18 @@ def _build_collage_view(
     collage_bgr = np.zeros((collage_height, collage_width, bgr.shape[2]), dtype=bgr.dtype)
     collage_mirror = np.zeros((collage_height, collage_width), dtype=bool)
     collage_domain = np.zeros((collage_height, collage_width), dtype=bool)
+    collage_bridge = (
+        np.zeros((collage_height, collage_width), dtype=relief_bridge_response.dtype)
+        if relief_bridge_response is not None else None
+    )
     for tile in tiles:
         sx0, sy0, sx1, sy1 = tile.source
         dx0, dy0, dx1, dy1 = tile.dest
         collage_bgr[dy0:dy1, dx0:dx1] = bgr[sy0:sy1, sx0:sx1]
         collage_mirror[dy0:dy1, dx0:dx1] = mirror_mask[sy0:sy1, sx0:sx1]
         collage_domain[dy0:dy1, dx0:dx1] = domain_mask[sy0:sy1, sx0:sx1]
+        if collage_bridge is not None:
+            collage_bridge[dy0:dy1, dx0:dx1] = relief_bridge_response[sy0:sy1, sx0:sx1]
     return DetectionView(
         bgr=collage_bgr,
         mirror_mask=collage_mirror,
@@ -2759,6 +3980,7 @@ def _build_collage_view(
         tiles=tiles,
         atlas_shape=(height, width),
         mode="collage",
+        relief_bridge_response=collage_bridge,
     )
 
 
@@ -2768,6 +3990,7 @@ def _build_individual_detection_views(
     domain_mask: np.ndarray,
     crop_mask: np.ndarray,
     config: RhdTextureConfig,
+    relief_bridge_response: np.ndarray | None = None,
 ) -> tuple[DetectionView, ...]:
     """Build one detection view per selected UV island crop."""
     height, width = crop_mask.shape[:2]
@@ -2800,6 +4023,10 @@ def _build_individual_detection_views(
                 tiles=(tile,),
                 atlas_shape=(height, width),
                 mode="tile",
+                relief_bridge_response=(
+                    relief_bridge_response[y0:y1, x0:x1]
+                    if relief_bridge_response is not None else None
+                ),
             )
         )
     return tuple(views)
@@ -2811,6 +4038,7 @@ def _build_crop_view(
     domain_mask: np.ndarray,
     crop_mask: np.ndarray,
     config: RhdTextureConfig,
+    relief_bridge_response: np.ndarray | None = None,
 ) -> DetectionView:
     height, width = crop_mask.shape[:2]
     crop = _mask_crop_bounds(crop_mask, config.detection_crop_padding_px)
@@ -2825,6 +4053,10 @@ def _build_crop_view(
         tiles=(tile,),
         atlas_shape=(height, width),
         mode="crop" if (x0, y0, x1, y1) != (0, 0, width, height) else "full",
+        relief_bridge_response=(
+            relief_bridge_response[y0:y1, x0:x1]
+            if relief_bridge_response is not None else None
+        ),
     )
 
 
@@ -2833,25 +4065,128 @@ def _build_detection_views(
     mirror_mask: np.ndarray,
     domain_mask: np.ndarray,
     config: RhdTextureConfig,
+    relief_bridge_response: np.ndarray | None = None,
 ) -> tuple[DetectionView, ...]:
     height, width = domain_mask.shape[:2]
     crop_mask = mirror_mask if bool(mirror_mask.any()) else domain_mask
     if not config.crop_detection_to_domain:
         tile = DetectionTile(source=(0, 0, width, height), dest=(0, 0, width, height))
-        return (DetectionView(bgr, mirror_mask, domain_mask, (tile,), (height, width), "full"),)
+        return (DetectionView(
+            bgr, mirror_mask, domain_mask, (tile,), (height, width), "full",
+            relief_bridge_response,
+        ),)
     if config.detect_island_tiles_individually:
         views = _build_individual_detection_views(
-            bgr, mirror_mask, domain_mask, crop_mask, config
+            bgr, mirror_mask, domain_mask, crop_mask, config, relief_bridge_response
         )
         if views:
             return views
     if config.collage_detection_islands:
         collage = _build_collage_view(
-            bgr, mirror_mask, domain_mask, crop_mask, config
+            bgr, mirror_mask, domain_mask, crop_mask, config, relief_bridge_response
         )
         if collage is not None:
             return (collage,)
-    return (_build_crop_view(bgr, mirror_mask, domain_mask, crop_mask, config),)
+    return (_build_crop_view(
+        bgr, mirror_mask, domain_mask, crop_mask, config, relief_bridge_response
+    ),)
+
+
+def _build_detection_views_for_island(
+    bgr: np.ndarray,
+    island: np.ndarray | UvIslandCrop,
+    config: RhdTextureConfig,
+    relief_bridge_response: np.ndarray | None = None,
+) -> tuple[DetectionView, ...]:
+    """Build ordinary detection views without expanding a compact island atlas."""
+    if isinstance(island, np.ndarray):
+        return _build_detection_views(
+            bgr, island, island, config, relief_bridge_response
+        )
+
+    if not config.crop_detection_to_domain:
+        full = np.zeros(bgr.shape[:2], dtype=bool)
+        x0, y0, x1, y1 = island.bounds
+        full[y0:y1, x0:x1] = island.mask
+        return _build_detection_views(
+            bgr, full, full, config, relief_bridge_response
+        )
+
+    x0, y0, x1, y1 = island.bounds
+    local_bridge = (
+        relief_bridge_response[y0:y1, x0:x1]
+        if relief_bridge_response is not None
+        else None
+    )
+    local_views = _build_detection_views(
+        bgr[y0:y1, x0:x1],
+        island.mask,
+        island.mask,
+        config,
+        local_bridge,
+    )
+    atlas_shape = bgr.shape[:2]
+    return tuple(
+        DetectionView(
+            bgr=view.bgr,
+            mirror_mask=view.mirror_mask,
+            domain_mask=view.domain_mask,
+            tiles=tuple(
+                DetectionTile(
+                    source=(
+                        tile.source[0] + x0,
+                        tile.source[1] + y0,
+                        tile.source[2] + x0,
+                        tile.source[3] + y0,
+                    ),
+                    dest=tile.dest,
+                )
+                for tile in view.tiles
+            ),
+            atlas_shape=atlas_shape,
+            mode=view.mode,
+            relief_bridge_response=view.relief_bridge_response,
+        )
+        for view in local_views
+    )
+
+
+def _coalesce_overlapping_uv_consumers(
+    islands: tuple[np.ndarray | UvIslandCrop, ...],
+) -> tuple[np.ndarray | UvIslandCrop, ...]:
+    """Union UV placements sharing atlas pixels before detector pipelines run."""
+    sources: list[np.ndarray | UvIslandCrop] = []
+    crops: list[tuple[int, int, np.ndarray]] = []
+    for island in islands:
+        if isinstance(island, UvIslandCrop):
+            if not bool(island.mask.any()):
+                continue
+            x0, y0, _x1, _y1 = island.bounds
+            sources.append(island)
+            crops.append((x0, y0, island.mask))
+            continue
+        if not bool(island.any()):
+            continue
+        ys, xs = np.nonzero(island)
+        x0, y0 = int(xs.min()), int(ys.min())
+        x1, y1 = int(xs.max()) + 1, int(ys.max()) + 1
+        sources.append(island)
+        crops.append((x0, y0, island[y0:y1, x0:x1]))
+
+    groups = overlapping_mask_crop_groups(tuple(crops))
+    merged_crops = merge_overlapping_mask_crops(tuple(crops), groups=groups)
+    result: list[np.ndarray | UvIslandCrop] = []
+    for indices, (x, y, mask) in zip(groups, merged_crops):
+        if len(indices) == 1:
+            result.append(sources[indices[0]])
+            continue
+        result.append(
+            UvIslandCrop(
+                (x, y, x + mask.shape[1], y + mask.shape[0]),
+                mask,
+            )
+        )
+    return tuple(result)
 
 
 def _tile_intersection_area(
@@ -2949,13 +4284,28 @@ def _detect_flip_regions_in_view(
     mser_config: MserConfig,
     source: str,
     log=print,
+    initial_contrast: LocalContrastDetection | None = None,
 ) -> RegionDetection:
     """Run detection and post-filters on one crop/collage/tile view."""
     started = time.perf_counter()
     detection_bgr = view.bgr
     detection_mirror_mask = view.mirror_mask
     detection_domain_mask = view.domain_mask
-    detection = run_detection(detection_bgr, detection_domain_mask, mser_config)
+    detection = run_detection(
+        detection_bgr,
+        detection_domain_mask,
+        mser_config,
+        initial_boxes=(
+            initial_contrast.boxes if initial_contrast is not None else None
+        ),
+        initial_contrast_response=(
+            initial_contrast.response if initial_contrast is not None else None
+        ),
+        initial_contrast_threshold=(
+            initial_contrast.threshold if initial_contrast is not None else None
+        ),
+        initial_relief_bridge_response=view.relief_bridge_response,
+    )
     final = detection.stages[-1]
     detected = list(final.kept)
     use_rotated_regions = (
@@ -3063,6 +4413,7 @@ def detect_flip_regions(
     mser_config: MserConfig,
     source: str = "colour",
     log=print,
+    relief_bridge_response: np.ndarray | None = None,
 ) -> RegionDetection:
     """Find the self-contained marks on one image that sit on mirrored geometry.
 
@@ -3072,7 +4423,11 @@ def detect_flip_regions(
     its own surround, not about colour, so they read a normal map's relief as
     readily as they read print.
     """
-    views = _build_detection_views(bgr, mirror_mask, domain_mask, config)
+    if relief_bridge_response is not None and relief_bridge_response.shape != domain_mask.shape:
+        raise ValueError("relief bridge response must match the detection atlas")
+    views = _build_detection_views(
+        bgr, mirror_mask, domain_mask, config, relief_bridge_response
+    )
     atlas_height, atlas_width = domain_mask.shape[:2]
     total_work_area = sum(view.domain_mask.shape[0] * view.domain_mask.shape[1] for view in views)
     if len(views) > 1:
@@ -3119,6 +4474,107 @@ def detect_flip_regions(
     if len(views) > 1:
         log(f"  [{source}] {result.detected} total region(s) detected")
         log(f"  [{source}] {len(result.regions)} total mirrored region(s) kept")
+    result.seconds = time.perf_counter() - started
+    return result
+
+
+def detect_flip_regions_by_uv_island(
+    bgr: np.ndarray,
+    island_masks: tuple[np.ndarray | UvIslandCrop, ...],
+    config: RhdTextureConfig,
+    mser_config: MserConfig,
+    source: str = "colour",
+    log=print,
+    relief_bridge_response: np.ndarray | None = None,
+) -> RegionDetection:
+    """Detect a foreground layer island-by-island, never across atlas seams.
+
+    The result deliberately remains ``RegionDetection``-compatible so the
+    normal merge, containment, planning and companion replay paths need no
+    special handling.  Each island is both the candidate mirror mask and its
+    detection domain; a foreground component therefore cannot form a box
+    around nearby but unrelated UV islands.
+    """
+    started = time.perf_counter()
+    result = RegionDetection(source=source, detected=0)
+    island_masks = _coalesce_overlapping_uv_consumers(island_masks)
+
+    if mser_config.box_source == "contrast_gpu":
+        indexed_views: list[tuple[int, DetectionView]] = []
+        for index, island in enumerate(island_masks, start=1):
+            if isinstance(island, np.ndarray):
+                has_pixels = bool(island.any())
+            else:
+                has_pixels = bool(island.mask.any())
+            if not has_pixels:
+                continue
+            indexed_views.extend(
+                (index, view)
+                for view in _build_detection_views_for_island(
+                    bgr, island, config, relief_bridge_response
+                )
+            )
+        detections = detect_local_contrast_gpu_batch(
+            [(view.bgr, view.domain_mask) for _index, view in indexed_views],
+            mser_config,
+        )
+
+        for (index, view), contrast in zip(indexed_views, detections):
+            partial = _detect_flip_regions_in_view(
+                view,
+                config,
+                mser_config,
+                f"{source}:uv-island-{index}",
+                log,
+                contrast,
+            )
+            result.detected += partial.detected
+            result.regions.extend(partial.regions)
+            result.rotations.extend(partial.rotations)
+            result.uncontained.extend(partial.uncontained)
+            result.blobs.extend(partial.blobs)
+            result.work_views.extend(partial.work_views)
+        result.seconds = time.perf_counter() - started
+        return result
+
+    for index, island in enumerate(island_masks, start=1):
+        if isinstance(island, np.ndarray):
+            has_pixels = bool(island.any())
+        else:
+            has_pixels = bool(island.mask.any())
+        if not has_pixels:
+            continue
+        if isinstance(island, UvIslandCrop):
+            views = _build_detection_views_for_island(
+                bgr, island, config, relief_bridge_response
+            )
+            partial = RegionDetection(source=f"{source}:uv-island-{index}", detected=0)
+            for view in views:
+                view_result = _detect_flip_regions_in_view(
+                    view, config, mser_config, partial.source, log
+                )
+                partial.detected += view_result.detected
+                partial.regions.extend(view_result.regions)
+                partial.rotations.extend(view_result.rotations)
+                partial.uncontained.extend(view_result.uncontained)
+                partial.blobs.extend(view_result.blobs)
+                partial.work_views.extend(view_result.work_views)
+        elif relief_bridge_response is None:
+            partial = detect_flip_regions(
+                bgr, island, island, config, mser_config,
+                f"{source}:uv-island-{index}", log,
+            )
+        else:
+            partial = detect_flip_regions(
+                bgr, island, island, config, mser_config,
+                f"{source}:uv-island-{index}", log, relief_bridge_response,
+            )
+        result.detected += partial.detected
+        result.regions.extend(partial.regions)
+        result.rotations.extend(partial.rotations)
+        result.uncontained.extend(partial.uncontained)
+        result.blobs.extend(partial.blobs)
+        result.work_views.extend(partial.work_views)
     result.seconds = time.perf_counter() - started
     return result
 
@@ -3271,7 +4727,7 @@ def rebuild_companion_map(
 
     stem = _texture_stem(companion.member)
     png_path = output_directory / f"{stem}_rhd.png"
-    dds_path = output_directory / f"{stem}_rhd.dds"
+    dds_path: Path | None = output_directory / f"{stem}_rhd.dds"
     Image.fromarray(rgba).save(png_path, compress_level=0)
     preview_path = None
     if companion.kind == "normal":
@@ -3279,8 +4735,17 @@ def rebuild_companion_map(
         Image.fromarray(reconstruct_normal_z(rgba)).save(
             preview_path, compress_level=0
         )
-    info = write_dds(dds_path, rgba, codec, config.bc7_profile)
-    written = str(info["codec"])
+    if beamng_compressed_texture_size_supported(*size):
+        info = write_dds(dds_path, rgba, codec, config.bc7_profile)
+        written = str(info["codec"])
+        written_detail = (
+            f"{dds_path.name} {written.upper()} "
+            f"{info['levels']} mips {info['bytes']:,} bytes"
+        )
+    else:
+        dds_path = None
+        written = "png"
+        written_detail = f"{png_path.name} PNG (non-power-of-two source)"
     log(f"    {PurePosixPath(companion.member).name} ({companion.stage_key}, "
         f"{companion.kind}): {moved:,} texels moved"
         + (
@@ -3288,8 +4753,7 @@ def rebuild_companion_map(
             if companion.kind == "normal" and config.reflect_flipped_normal_vectors
             else ""
         )
-        + f"; wrote {dds_path.name} {written.upper()} "
-        f"{info['levels']} mips {info['bytes']:,} bytes")
+        + f"; wrote {written_detail}")
     return CompanionResult(
         member=companion.member,
         stage_key=companion.stage_key,
@@ -3349,6 +4813,7 @@ def build_rhd_texture(
     masks: DomainMasks | None = None,
     sweep_cache: dict[str, object] | None = None,
     written_companions: set[str] | None = None,
+    detection_session: ProductionDetectionSession[RegionDetection] | None = None,
     log=print,
     progress: ProgressCallback | None = None,
 ) -> RhdTextureResult:
@@ -3359,11 +4824,9 @@ def build_rhd_texture(
     share their masks exactly, so recomputing them per skin would repeat every
     sweep and every rasterisation for nothing.
 
-    ``written_companions`` is the set of companion members already rebuilt in
-    this run.  Skins commonly share one normal or palette map between them, and
-    each skin plans against its own print; rebuilding a shared map per skin
-    would leave whichever ran last on disk.  The first plan to reach it wins,
-    and the rest say so.
+    ``detection_session`` shares the one GPU warm-up and exact-input cache
+    across every physical material layer in an export.  No detection result is
+    transferred between different images.
     """
     started = time.perf_counter()
     phase_timings: list[dict[str, object]] = []
@@ -3431,6 +4894,19 @@ def build_rhd_texture(
         symbols.update(material_symbols_for_binding(loaded, binding))
     if not symbols:
         raise ValueError(f"No COLLADA symbol resolved for {texture_member}")
+    layer_stage_keys = tuple(
+        dict.fromkeys(getattr(binding, "stage_key", "baseColorMap") for _, binding in candidates)
+    )
+    layer_kinds = {
+        getattr(binding, "kind", "colour") for _, binding in candidates
+    }
+    layer_kind = (
+        "normal"
+        if layer_kinds == {"normal"}
+        else "colour"
+        if "colour" in layer_kinds
+        else "scalar"
+    )
     timing = record_phase(
         phase_timings,
         "resolve_texture_scope",
@@ -3459,8 +4935,9 @@ def build_rhd_texture(
             texture=texture_member,
         )
         log(f"  {len(candidates)} part(s) use this texture; symbols {sorted(symbols)}")
+        unique_parts = _unique_candidate_parts(candidates)
         masks = build_domain_masks(
-            loaded, [part for part, _b in candidates], symbols,
+            loaded, unique_parts, symbols,
             (width, height), config, sweep_cache, log,
         )
         timing = record_phase(
@@ -3468,7 +4945,7 @@ def build_rhd_texture(
             "build_domain_masks",
             phase_started,
             texture=texture_member,
-            selected_parts=len(candidates),
+            selected_parts=len(unique_parts),
         )
         emit_progress(
             progress,
@@ -3492,25 +4969,368 @@ def build_rhd_texture(
     mirror_mask, rigid_mask = masks.mirror, masks.rigid
     analysed = masks.parts_analysed
 
-    # Resolved whether or not they are being rebuilt: the normal map is also a
-    # detection source, and reading relief off it is worth doing even for a run
-    # that only wants the colour map out the other end.
-    companion_list: list[CompanionMap] = []
-    seen_companions: set[str] = set()
-    for _part, binding in candidates:
-        for companion in companion_maps_for_binding(archive, binding):
-            if companion.member.lower() in seen_companions:
-                continue
-            seen_companions.add(companion.member.lower())
-            companion_list.append(companion)
-    companions = tuple(companion_list)
-    if companions:
-        log("  companion maps on this layout: "
-            + ", ".join(
-                f"{PurePosixPath(c.member).name} ({c.kind})" for c in companions
-            ))
+    # Every archive-backed stage map is a first-class texture job.  Keeping the
+    # old companion container empty prevents a base layer's plan being replayed
+    # onto another image; manifest assembly groups the independent outputs back
+    # into their source materials later.
+    companions: tuple[CompanionMap, ...] = ()
+    authoritative_masks = authoritative_visibility_masks_for_layer_bindings(
+        archive, candidates, texture_member
+    )
 
     domain_mask = mirror_mask | rigid_mask
+    full_domain_region = full_mirrored_texture_region(
+        mirror_mask,
+        rigid_mask,
+        masks.conflict_coverage,
+    )
+    if detection_session is None:
+        detection_session = ProductionDetectionSession()
+
+    def detect_layer_regions(
+        image: np.ndarray,
+        image_mirror_mask: np.ndarray,
+        image_domain_mask: np.ndarray,
+        detector: MserConfig,
+        source_name: str,
+        island_masks: tuple[np.ndarray | UvIslandCrop, ...] = (),
+        relief_bridge_response: np.ndarray | None = None,
+    ) -> RegionDetection:
+        cache_key = detection_session.key(
+            image,
+            image_mirror_mask,
+            image_domain_mask,
+            detector,
+            island_masks=tuple(
+                island.mask if isinstance(island, UvIslandCrop) else island
+                for island in island_masks
+            ),
+            relief_bridge_response=relief_bridge_response,
+            policy=(
+                repr(config),
+                tuple(
+                    island.bounds if isinstance(island, UvIslandCrop) else None
+                    for island in island_masks
+                ),
+            ),
+        )
+        cached = detection_session.get(cache_key)
+        if cached is not None:
+            log(f"  {source_name}: reused an identical layer detection")
+            return replace(cached, source=source_name, seconds=0.0)
+
+        # Detection and fitting must stay inside a real UV island, matching the
+        # tuning harness.  This is especially important for shallow normal-map
+        # relief: a near-full-atlas edge run lets loud trim seams suppress marks
+        # such as AIRBAG.  The supplied full-atlas response is sliced per island,
+        # so edge_gpu still performs only one GPU dispatch.
+        if detector.box_source in {
+            "foreground", "opacity_mask", "contrast", "contrast_gpu", "edge_gpu",
+        } and island_masks:
+            if relief_bridge_response is None:
+                detected = detect_flip_regions_by_uv_island(
+                    image, island_masks, config, detector, source_name, log,
+                )
+            else:
+                detected = detect_flip_regions_by_uv_island(
+                    image, island_masks, config, detector, source_name, log,
+                    relief_bridge_response,
+                )
+        elif relief_bridge_response is None:
+            detected = detect_flip_regions(
+                image, image_mirror_mask, image_domain_mask, config, detector,
+                source_name, log,
+            )
+        else:
+            detected = detect_flip_regions(
+                image, image_mirror_mask, image_domain_mask, config, detector,
+                source_name, log, relief_bridge_response,
+            )
+        detection_session.put(cache_key, detected)
+        return detected
+
+    # Production uses the same hybrid path as the tuning harness: local
+    # contrast finds glyphs on this physical layer, while a companion normal
+    # contributes only cached edge barriers during grouping.  If no compatible
+    # normal exists, local contrast remains the complete detector.
+    hybrid_gpu_detection = config.detect_on_normal_map
+    production_colour_config = _production_layer_detection_config(
+        mser_config, hybrid_gpu_detection
+    )
+    # An authored opacity map is already a foreground/background declaration.
+    # Local contrast expands binary glyph edges and can make the resulting box
+    # fail shaped-domain recovery, so extract its foreground directly while
+    # retaining the shared grouping and safety filters.
+    opacity_mask_config = _production_layer_detection_config(
+        mser_config,
+        hybrid_gpu_detection,
+        authoritative_opacity_mask=True,
+    )
+    # A physical normal layer is not colour evidence.  Render its tangent-space
+    # vectors as slope relief and run the same island-scoped GPU edge detector
+    # used by the tuning harness.
+    production_relief_config = replace(
+        relief_mser_config,
+        box_source="edge_gpu",
+    )
+    layer_detection_config = (
+        production_relief_config
+        if layer_kind == "normal"
+        else _production_layer_detection_config(
+            mser_config, hybrid_gpu_detection, layer_stage_keys
+        )
+    )
+    phase_started = time.perf_counter()
+    island_cache_reused = (
+        masks.foreground_islands is not None
+        and masks.foreground_island_padding_px == config.detection_crop_padding_px
+    )
+    if full_domain_region is not None:
+        foreground_islands: tuple[UvIslandCrop, ...] = ()
+    elif island_cache_reused:
+        foreground_islands = masks.foreground_islands or ()
+    else:
+        foreground_islands = mirrored_uv_island_crops(
+            masks.mirrored_uv,
+            mirror_mask,
+            config.detection_crop_padding_px,
+        )
+        masks.foreground_islands = foreground_islands
+        masks.foreground_island_padding_px = config.detection_crop_padding_px
+    phase_timings.append(
+        {
+            "phase": "prepare_uv_islands",
+            "seconds": round(time.perf_counter() - phase_started, 6),
+            "texture": texture_member,
+            "islands": len(foreground_islands),
+            "cache_reused": island_cache_reused,
+        }
+    )
+    use_authoritative_masks = bool(authoritative_masks) and full_domain_region is None
+    authoritative_mask_regions = (
+        use_authoritative_masks
+        or layer_detection_config.box_source == "opacity_mask"
+    )
+    if use_authoritative_masks:
+        log(
+            "  opacity mask is authoritative for visible correction regions: "
+            + ", ".join(PurePosixPath(mask.member).name for mask in authoritative_masks)
+        )
+    direct_normal_edge_data = None
+    if (
+        layer_kind == "normal"
+        and full_domain_region is None
+        and not use_authoritative_masks
+    ):
+        direct_normal_edge_data, reused = detection_session.normal_edge_data(
+            rgb,
+            config.relief,
+            production_relief_config.edge_operator,
+            production_relief_config.edge_kernel_px,
+            production_relief_config.edge_blur_sigma,
+        )
+        phase_timings.append(
+            {
+                "phase": "prepare_normal_gpu_edge",
+                "seconds": 0.0 if reused else round(
+                    direct_normal_edge_data.render_seconds
+                    + direct_normal_edge_data.edge_seconds,
+                    6,
+                ),
+                "render_seconds": 0.0 if reused else round(
+                    direct_normal_edge_data.render_seconds, 6
+                ),
+                "edge_seconds": 0.0 if reused else round(
+                    direct_normal_edge_data.edge_seconds, 6
+                ),
+                "texture": texture_member,
+                "normal_texture": texture_member,
+                "source": "normal_layer_relief",
+                "cache_reused": reused,
+            }
+        )
+
+    normal_maps = (
+        normal_maps_for_layer_bindings(archive, candidates, texture_member)
+        if hybrid_gpu_detection
+        and layer_kind != "normal"
+        and full_domain_region is None
+        and not use_authoritative_masks
+        else ()
+    )
+    normal_edge_responses: list[np.ndarray] = []
+    normal_edge_sources: list[dict[str, object]] = []
+    normal_edge_notes: list[str] = []
+    for normal_map in normal_maps:
+        normal_name = PurePosixPath(normal_map.member).name
+        try:
+            with Image.open(extract_archive_member(archive, normal_map.member)) as image:
+                normal_size = image.size
+                normal_rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            if normal_size != (width, height):
+                normal_edge_notes.append(
+                    f"{normal_name} is {normal_size[0]}x{normal_size[1]}, not "
+                    f"{width}x{height}; relief-edge grouping skipped"
+                )
+                continue
+            edge_data, reused = detection_session.normal_edge_data(
+                normal_rgb,
+                config.relief,
+                "scharr",
+                3,
+                0.0,
+            )
+            normal_edge_responses.append(edge_data.edge_response)
+            normal_edge_sources.append(
+                {
+                    "member": normal_map.member,
+                    "stage_key": normal_map.stage_key,
+                    "cache_reused": reused,
+                }
+            )
+            phase_timings.append(
+                {
+                    "phase": "prepare_normal_gpu_edge",
+                    "seconds": 0.0 if reused else round(
+                        edge_data.render_seconds + edge_data.edge_seconds, 6
+                    ),
+                    "render_seconds": 0.0 if reused else round(
+                        edge_data.render_seconds, 6
+                    ),
+                    "edge_seconds": 0.0 if reused else round(
+                        edge_data.edge_seconds, 6
+                    ),
+                    "texture": texture_member,
+                    "normal_texture": normal_map.member,
+                    "source": "relief_grouping_barrier",
+                    "cache_reused": reused,
+                }
+            )
+        except Exception as exc:
+            normal_edge_notes.append(
+                f"{normal_name}: {type(exc).__name__}: {exc}; "
+                "relief-edge grouping skipped"
+            )
+    relief_bridge_response = (
+        normal_edge_responses[0]
+        if len(normal_edge_responses) == 1
+        else np.maximum.reduce(normal_edge_responses)
+        if normal_edge_responses
+        else None
+    )
+    for note in normal_edge_notes:
+        log(f"  ! {note}")
+
+    authoritative_detection_reports: list[dict[str, object]] = []
+
+    def detect_primary_job() -> RegionDetection:
+        if full_domain_region is not None:
+            log(
+                "  dedicated mirrored texture domain covers "
+                f"{mirror_mask.mean():.2%}; flipping it whole"
+            )
+            return RegionDetection(
+                source="full_mirrored_domain",
+                detected=1,
+                regions=[full_domain_region],
+                rotations=[None],
+                work_views=[
+                    {
+                        "mode": "full_mirrored_domain",
+                        "size": [width, height],
+                        "area_px": int(mirror_mask.sum()),
+                        "atlas_fraction": round(float(mirror_mask.mean()), 6),
+                    }
+                ],
+            )
+        if use_authoritative_masks:
+            combined = RegionDetection(source="opacity_mask", detected=0)
+            combined_regions: list[tuple[int, int, int, int]] = []
+            combined_rotations: list[tuple[tuple[float, float], ...] | None] = []
+            for visibility_mask in authoritative_masks:
+                mask_name = PurePosixPath(visibility_mask.member).name
+                source_name = f"opacityMap:{mask_name}"
+                try:
+                    with Image.open(
+                        extract_archive_member(archive, visibility_mask.member)
+                    ) as image:
+                        mask_size = image.size
+                        mask_bgr = companion_detection_bgr(image)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"authoritative opacity mask {mask_name} could not be loaded"
+                    ) from exc
+
+                mask_mirror = _resize_bool_mask(mirror_mask, mask_size)
+                mask_domain = _resize_bool_mask(domain_mask, mask_size)
+                mask_islands = resize_uv_island_crops(
+                    foreground_islands,
+                    mirror_mask.shape,
+                    mask_size,
+                    config.detection_crop_padding_px,
+                )
+                detected_mask = detect_layer_regions(
+                    mask_bgr,
+                    mask_mirror,
+                    mask_domain,
+                    opacity_mask_config,
+                    source_name,
+                    mask_islands,
+                )
+                authoritative_detection_reports.append(
+                    {
+                        "source": source_name,
+                        "pipeline": "authoritative_opacity_mask",
+                        "seconds": round(detected_mask.seconds, 6),
+                        "regions_detected": detected_mask.detected,
+                        "mirrored_regions": len(detected_mask.regions),
+                        "work_views": detected_mask.work_views,
+                        "source_size": [mask_size[0], mask_size[1]],
+                    }
+                )
+                detected_mask = _scale_detection_to_texture(
+                    detected_mask, mask_size, (width, height)
+                )
+                combined.detected += detected_mask.detected
+                combined.uncontained.extend(detected_mask.uncontained)
+                combined.blobs.extend(detected_mask.blobs)
+                combined.work_views.extend(detected_mask.work_views)
+                combined_regions, _added, combined_rotations = (
+                    merge_region_sets_with_rotations(
+                        combined_regions,
+                        detected_mask.regions,
+                        config,
+                        combined_rotations,
+                        detected_mask.rotations,
+                    )
+                )
+            combined.regions = combined_regions
+            combined.rotations = combined_rotations
+            combined.seconds = sum(
+                float(report["seconds"])
+                for report in authoritative_detection_reports
+            )
+            return combined
+        if direct_normal_edge_data is not None:
+            return detect_layer_regions(
+                direct_normal_edge_data.relief_bgr,
+                mirror_mask,
+                domain_mask,
+                production_relief_config,
+                "relief",
+                foreground_islands,
+                direct_normal_edge_data.edge_response,
+            )
+        return detect_layer_regions(
+            rgba_detection_bgr(rgba),
+            mirror_mask,
+            domain_mask,
+            layer_detection_config,
+            layer_kind,
+            foreground_islands,
+            relief_bridge_response,
+        )
+
     emit_progress(
         progress,
         "begin",
@@ -3519,16 +5339,22 @@ def build_rhd_texture(
         texture=texture_member,
         source="colour",
     )
-    colour = detect_flip_regions(
-        rgb[:, :, ::-1].copy(), mirror_mask, domain_mask, config, mser_config,
-        "colour", log,
+    cold_detection = run_colour_and_relief_jobs(detect_primary_job)
+    colour = cold_detection.colour.value
+    primary_source = (
+        "opacity_mask"
+        if use_authoritative_masks
+        else "relief"
+        if direct_normal_edge_data is not None
+        else "colour"
     )
     phase_timings.append(
         {
             "phase": "detect_texture_regions",
             "seconds": round(colour.seconds, 6),
+            "job_seconds": round(cold_detection.colour.seconds, 6),
             "texture": texture_member,
-            "source": "colour",
+            "source": primary_source,
             "regions_detected": colour.detected,
             "mirrored_regions": len(colour.regions),
         }
@@ -3537,104 +5363,251 @@ def build_rhd_texture(
         progress,
         "end",
         "detect_texture_regions",
-        f"Detected {len(colour.regions)} mirrored colour region(s) for {texture_name}",
+        f"Detected {len(colour.regions)} mirrored {primary_source} region(s) for {texture_name}",
         texture=texture_member,
-        source="colour",
+        source=primary_source,
         regions_detected=colour.detected,
         mirrored_regions=len(colour.regions),
         seconds=round(colour.seconds, 6),
     )
-    detection_reports: list[dict[str, object]] = [
-        {
-            "source": "colour",
-            "seconds": round(colour.seconds, 6),
-            "regions_detected": colour.detected,
-            "mirrored_regions": len(colour.regions),
-            "work_views": colour.work_views,
-        }
-    ]
+    detection_reports: list[dict[str, object]] = (
+        authoritative_detection_reports
+        if use_authoritative_masks
+        else [
+            {
+                "source": primary_source,
+                "pipeline": (
+                    "relief_edge_gpu"
+                    if direct_normal_edge_data is not None
+                    else "colour_glyphs_relief_edge_grouping"
+                    if relief_bridge_response is not None
+                    else "colour_local_contrast_gpu"
+                    if hybrid_gpu_detection
+                    else production_colour_config.box_source
+                ),
+                "seconds": round(colour.seconds, 6),
+                "regions_detected": colour.detected,
+                "mirrored_regions": len(colour.regions),
+                "work_views": colour.work_views,
+                "normal_edge_sources": normal_edge_sources,
+                "normal_edge_notes": normal_edge_notes,
+            }
+        ]
+    )
     mirrored_regions = colour.regions
     mirrored_rotations = colour.rotations
     uncontained = list(colour.uncontained)
     blobs = list(colour.blobs)
     detected_total = colour.detected
+    companion_regions_added = 0
+    companion_detection_sources: set[tuple[str, str]] = set()
+
+    for companion in companion_maps_for_region_detection(companions, texture_member):
+        companion_detection_sources.add((companion.member.lower(), companion.stage_key))
+        companion_name = PurePosixPath(companion.member).name
+        source_name = f"{companion.stage_key}:{companion_name}"
+        try:
+            with Image.open(extract_archive_member(archive, companion.member)) as image:
+                companion_size = image.size
+                companion_bgr = companion_detection_bgr(image)
+        except Exception as exc:
+            log(f"  ! {companion_name}: {type(exc).__name__}: {exc}; "
+                f"{companion.stage_key} detection skipped")
+            continue
+        if companion_size != (width, height):
+            log(f"  ! {companion_name} is "
+                f"{companion_size[0]}x{companion_size[1]}, not {width}x{height}; "
+                f"{companion.stage_key} detection skipped")
+            continue
+
+        emit_progress(
+            progress,
+            "begin",
+            "detect_texture_regions",
+            f"Detecting {companion.stage_key} regions for {texture_name}",
+            texture=texture_member,
+            source=source_name,
+        )
+        detected_companion = detect_layer_regions(
+            companion_bgr,
+            mirror_mask,
+            domain_mask,
+            mser_config,
+            source_name,
+            foreground_islands,
+        )
+        phase_timings.append(
+            {
+                "phase": "detect_texture_regions",
+                "seconds": round(detected_companion.seconds, 6),
+                "texture": texture_member,
+                "source": source_name,
+                "regions_detected": detected_companion.detected,
+                "mirrored_regions": len(detected_companion.regions),
+            }
+        )
+        emit_progress(
+            progress,
+            "end",
+            "detect_texture_regions",
+            f"Detected {len(detected_companion.regions)} mirrored "
+            f"{companion.stage_key} region(s) for {texture_name}",
+            texture=texture_member,
+            source=source_name,
+            regions_detected=detected_companion.detected,
+            mirrored_regions=len(detected_companion.regions),
+            seconds=round(detected_companion.seconds, 6),
+        )
+        detection_reports.append(
+            {
+                "source": source_name,
+                "seconds": round(detected_companion.seconds, 6),
+                "regions_detected": detected_companion.detected,
+                "mirrored_regions": len(detected_companion.regions),
+                "work_views": detected_companion.work_views,
+            }
+        )
+        detected_total += detected_companion.detected
+        uncontained.extend(detected_companion.uncontained)
+        blobs.extend(detected_companion.blobs)
+        mirrored_regions, added, mirrored_rotations = merge_region_sets_with_rotations(
+            mirrored_regions,
+            detected_companion.regions,
+            config,
+            mirrored_rotations,
+            detected_companion.rotations,
+        )
+        companion_regions_added += added
+        log(f"  {added} of {len(detected_companion.regions)} "
+            f"{companion.stage_key} mark(s) joined the plan; "
+            f"{len(mirrored_regions)} region(s) to flip")
+
+    state_group_regions_added = 0
+    state_group_maps: tuple[StateDetectionMap, ...] = ()
+    state_group_maps = tuple(
+        state_map
+        for state_map in state_group_maps
+        if (state_map.member.lower(), state_map.stage_key) not in companion_detection_sources
+    )
+    if state_group_maps:
+        log(
+            "  switch-group detection maps: "
+            + ", ".join(
+                f"{PurePosixPath(state_map.member).name}"
+                f" ({state_map.material_key}:{state_map.switch_state or 'unknown'}"
+                f":{state_map.stage_key})"
+                for state_map in state_group_maps
+            )
+        )
+
+    for state_map in state_group_maps:
+        state_name = PurePosixPath(state_map.member).name
+        source_name = (
+            f"state:{state_map.material_key}:{state_map.switch_state or 'unknown'}"
+            f":{state_map.stage_key}:{state_name}"
+        )
+        try:
+            with Image.open(extract_archive_member(archive, state_map.member)) as image:
+                state_size = image.size
+                state_bgr = companion_detection_bgr(image)
+        except Exception as exc:
+            log(f"  ! {state_name}: {type(exc).__name__}: {exc}; "
+                f"{state_map.stage_key} switch-group detection skipped")
+            continue
+
+        state_mirror_mask = _resize_bool_mask(mirror_mask, state_size)
+        state_domain_mask = _resize_bool_mask(domain_mask, state_size)
+        if state_size != (width, height):
+            log(
+                f"  {state_name}: detecting at {state_size[0]}x{state_size[1]} "
+                f"and scaling regions to {width}x{height}"
+            )
+
+        emit_progress(
+            progress,
+            "begin",
+            "detect_texture_regions",
+            f"Detecting switch-group {state_map.stage_key} regions for {texture_name}",
+            texture=texture_member,
+            source=source_name,
+        )
+        state_foreground_islands = resize_uv_island_crops(
+            foreground_islands,
+            mirror_mask.shape,
+            state_size,
+            config.detection_crop_padding_px,
+        )
+        detected_state = detect_layer_regions(
+            state_bgr,
+            state_mirror_mask,
+            state_domain_mask,
+            mser_config,
+            source_name,
+            state_foreground_islands,
+        )
+        phase_timings.append(
+            {
+                "phase": "detect_texture_regions",
+                "seconds": round(detected_state.seconds, 6),
+                "texture": texture_member,
+                "source": source_name,
+                "regions_detected": detected_state.detected,
+                "mirrored_regions": len(detected_state.regions),
+            }
+        )
+        emit_progress(
+            progress,
+            "end",
+            "detect_texture_regions",
+            f"Detected {len(detected_state.regions)} mirrored switch-group "
+            f"{state_map.stage_key} region(s) for {texture_name}",
+            texture=texture_member,
+            source=source_name,
+            regions_detected=detected_state.detected,
+            mirrored_regions=len(detected_state.regions),
+            seconds=round(detected_state.seconds, 6),
+        )
+        detection_reports.append(
+            {
+                "source": source_name,
+                "seconds": round(detected_state.seconds, 6),
+                "regions_detected": detected_state.detected,
+                "mirrored_regions": len(detected_state.regions),
+                "work_views": detected_state.work_views,
+                "source_size": [state_size[0], state_size[1]],
+                "switch_state": state_map.switch_state,
+            }
+        )
+        detected_state = _scale_detection_to_texture(
+            detected_state,
+            state_size,
+            (width, height),
+        )
+        detected_total += detected_state.detected
+        uncontained.extend(detected_state.uncontained)
+        blobs.extend(detected_state.blobs)
+        mirrored_regions, added, mirrored_rotations = merge_region_sets_with_rotations(
+            mirrored_regions,
+            detected_state.regions,
+            config,
+            mirrored_rotations,
+            detected_state.rotations,
+        )
+        state_group_regions_added += added
+        log(f"  {added} of {len(detected_state.regions)} switch-group "
+            f"{state_map.stage_key} mark(s) joined the plan; "
+            f"{len(mirrored_regions)} region(s) to flip")
+
     relief_added = 0
 
-    # A mark can be moulded into the trim without being printed on it, and no
-    # amount of looking at the colour map will find one.  The normal map is the
-    # only place it exists, so it is detected on in its own right and its marks
-    # folded into the same plan.
-    normal_map = next((c for c in companions if c.kind == "normal"), None)
-    if config.detect_on_normal_map and normal_map is not None:
-        try:
-            with Image.open(extract_archive_member(archive, normal_map.member)) as image:
-                relief_size = image.size
-                normal_rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
-        except Exception as exc:
-            log(f"  ! {PurePosixPath(normal_map.member).name}: "
-                f"{type(exc).__name__}: {exc}; relief detection skipped")
-        else:
-            if relief_size != (width, height):
-                log(f"  ! {PurePosixPath(normal_map.member).name} is "
-                    f"{relief_size[0]}x{relief_size[1]}, not {width}x{height}; "
-                    "relief detection skipped")
-            else:
-                emit_progress(
-                    progress,
-                    "begin",
-                    "detect_texture_regions",
-                    f"Detecting relief regions for {texture_name}",
-                    texture=texture_member,
-                    source="relief",
-                )
-                relief = detect_flip_regions(
-                    normal_map_relief(normal_rgb, config), mirror_mask, domain_mask,
-                    config, relief_mser_config, "relief", log,
-                )
-                phase_timings.append(
-                    {
-                        "phase": "detect_texture_regions",
-                        "seconds": round(relief.seconds, 6),
-                        "texture": texture_member,
-                        "source": "relief",
-                        "regions_detected": relief.detected,
-                        "mirrored_regions": len(relief.regions),
-                    }
-                )
-                emit_progress(
-                    progress,
-                    "end",
-                    "detect_texture_regions",
-                    f"Detected {len(relief.regions)} mirrored relief region(s) for {texture_name}",
-                    texture=texture_member,
-                    source="relief",
-                    regions_detected=relief.detected,
-                    mirrored_regions=len(relief.regions),
-                    seconds=round(relief.seconds, 6),
-                )
-                detection_reports.append(
-                    {
-                        "source": "relief",
-                        "seconds": round(relief.seconds, 6),
-                        "regions_detected": relief.detected,
-                        "mirrored_regions": len(relief.regions),
-                        "work_views": relief.work_views,
-                    }
-                )
-                detected_total += relief.detected
-                uncontained.extend(relief.uncontained)
-                blobs.extend(relief.blobs)
-                mirrored_regions, relief_added, mirrored_rotations = (
-                    merge_region_sets_with_rotations(
-                        mirrored_regions,
-                        relief.regions,
-                        config,
-                        mirrored_rotations,
-                        relief.rotations,
-                    )
-                )
-                log(f"  {relief_added} of {len(relief.regions)} relief mark(s) "
-                    f"joined the plan; {len(mirrored_regions)} region(s) to flip")
+    mirrored_regions, mirrored_rotations, duplicate_regions_removed = (
+        deduplicate_region_detections(mirrored_regions, mirrored_rotations)
+    )
+    if duplicate_regions_removed:
+        log(
+            f"  collapsed {duplicate_regions_removed} overlapping/repeated "
+            "atlas region(s) before flip planning"
+        )
 
     phase_started = time.perf_counter()
     emit_progress(
@@ -3644,14 +5617,11 @@ def build_rhd_texture(
         f"Planning texture flips for {texture_name}",
         texture=texture_member,
     )
+    components = domain_mask_components(masks)
     flips, flipped_islands = plan_island_flips(
-        mirror_mask, mirrored_regions, config, masks.axis_map
+        mirror_mask, mirrored_regions, config, masks.axis_map, components
     )
-    label_image = None
-    if flips:
-        count, label_image, _stats, _centroids = cv2.connectedComponentsWithStats(
-            mirror_mask.astype(np.uint8), connectivity=8
-        )
+    label_image = components[1] if flips else None
     # The plan is recorded as it is applied, so every other map of the material
     # can be turned over by exactly the same steps in exactly the same order.
     steps: list[FlipStep] = []
@@ -3670,8 +5640,10 @@ def build_rhd_texture(
     imperfect: list[tuple[int, int, int, int, str, float]] = []
     skewed: list[tuple[int, int, int, int, str, float]] = []
     expanded = 0
+    authoritative_expanded = 0
     skipped = 0
     marginal = 0
+    cached_skew_frames = None
     for (x, y, w, h), rotation in zip(mirrored_regions, mirrored_rotations):
         x0, y0 = max(x, 0), max(y, 0)
         x1, y1 = min(x + w, width), min(y + h, height)
@@ -3701,7 +5673,9 @@ def build_rhd_texture(
             ):
                 rotation = None
                 rotated_axis = None
-        if config.enable_skewed_region_filter:
+        if config.enable_skewed_region_filter and not authoritative_mask_regions:
+            if cached_skew_frames is None:
+                cached_skew_frames = domain_skew_frames(masks, (width, height))
             delta = skew_delta_for_region(
                 masks.mirrored_uv,
                 masks.mirrored_xyz,
@@ -3710,6 +5684,7 @@ def build_rhd_texture(
                 width,
                 height,
                 config,
+                cached_skew_frames,
             )
             if delta is not None:
                 skipped += 1
@@ -3721,14 +5696,29 @@ def build_rhd_texture(
         # and keep their original content.  Measured on both axes so the
         # report says whether the other one would have fared better; the
         # surface still decides which is applied.
-        if rotation is not None and rotated_axis is not None:
-            exchangeable = rotated_exchangeable_share(
-                mirror_mask, rotation, rotated_axis
-            )
+        if authoritative_mask_regions:
+            # Opacity components are authored visibility, not inferred texture
+            # detail. Once one belongs to mirrored geometry, turn over the
+            # complete component bounds; clipping the write back through the
+            # rasterised UV mask tears words whose glyph bleed extends beyond
+            # the sampled triangle footprint.
+            stencil = STENCIL_REGION
+            exchangeable = 1.0
+            authoritative_expanded += 1
         else:
-            exchangeable = exchangeable_share(mirror_mask, (x, y, w, h), axis)
-        stencil = STENCIL_MIRROR
-        if exchangeable < config.min_region_exchangeable:
+            if rotation is not None and rotated_axis is not None:
+                exchangeable = rotated_exchangeable_share(
+                    mirror_mask, rotation, rotated_axis
+                )
+            else:
+                exchangeable = exchangeable_share(
+                    mirror_mask, (x, y, w, h), axis
+                )
+            stencil = STENCIL_MIRROR
+        if (
+            not authoritative_mask_regions
+            and exchangeable < config.min_region_exchangeable
+        ):
             other = "vertical" if axis == "horizontal" else "horizontal"
             alternative = exchangeable_share(mirror_mask, (x, y, w, h), other)
             if rotation is not None and rotated_axis is not None:
@@ -3774,6 +5764,10 @@ def build_rhd_texture(
         f"{in_place_axes.count('vertical')} vertical"
         + (f", {marginal} marginal" if marginal else "")
         + (f"; {expanded} used full domain" if expanded else "")
+        + (
+            f"; {authoritative_expanded} used opacity bounds"
+            if authoritative_expanded else ""
+        )
         + (f"; {skipped} skipped" if skipped else "") + ")")
     timing = record_phase(
         phase_timings,
@@ -3807,9 +5801,19 @@ def build_rhd_texture(
         steps,
         mirror_mask,
         label_image,
-        "colour",
+        layer_kind,
         domain_mask,
         config.region_boundary_blend_px,
+        normal_detail_gate=config.normal_region_detail_gate,
+        normal_detail_sigma_px=config.normal_region_detail_sigma_px,
+        normal_detail_floor=config.normal_region_detail_floor,
+        normal_detail_percentile=config.normal_region_detail_percentile,
+        scalar_detail_gate=config.scalar_region_detail_gate,
+        scalar_detail_sigma_px=config.scalar_region_detail_sigma_px,
+        scalar_detail_floor=config.scalar_region_detail_floor,
+        scalar_detail_percentile=config.scalar_region_detail_percentile,
+        correct_normal_background=config.correct_flipped_normal_background,
+        reflect_normal_vectors=config.reflect_flipped_normal_vectors,
     )
     timing = record_phase(
         phase_timings,
@@ -3831,7 +5835,7 @@ def build_rhd_texture(
     stem = _texture_stem(texture_member)
     output_directory.mkdir(parents=True, exist_ok=True)
     png_path = output_directory / f"{stem}_rhd.png"
-    dds_path = output_directory / f"{stem}_rhd.dds"
+    dds_path: Path | None = output_directory / f"{stem}_rhd.dds"
 
     # Stored uncompressed: this is a scratch file for inspecting the result in
     # Blender, not something that ships, and deflate costs more than the disk.
@@ -3844,19 +5848,37 @@ def build_rhd_texture(
         texture=texture_member,
     )
     Image.fromarray(rgba).save(png_path, compress_level=0)
+    preview_path: Path | None = None
+    if layer_kind == "normal":
+        preview_path = output_directory / f"{stem}_rhd.preview.png"
+        Image.fromarray(reconstruct_normal_z(rgba)).save(
+            preview_path, compress_level=0
+        )
     log(f"  wrote {png_path.name}")
-    info = write_dds(
-        dds_path, rgba, source_dds_codec(texture_path), config.bc7_profile
-    )
-    log(f"  wrote {dds_path.name}  {str(info['codec']).upper()} "
-        f"{info['levels']} mips  {info['bytes']:,} bytes")
+    if beamng_compressed_texture_size_supported(width, height):
+        info = write_dds(
+            dds_path, rgba, source_dds_codec(texture_path), config.bc7_profile
+        )
+        log(f"  wrote {dds_path.name}  {str(info['codec']).upper()} "
+            f"{info['levels']} mips  {info['bytes']:,} bytes")
+    else:
+        dds_path = None
+        info = {
+            "codec": "png",
+            "levels": 1,
+            "bytes": png_path.stat().st_size,
+        }
+        log(
+            f"  kept {png_path.name} for BeamNG: compressed DDS does not "
+            f"support non-power-of-two size {width}x{height}"
+        )
     timing = record_phase(
         phase_timings,
         "write_base_texture",
         phase_started,
         texture=texture_member,
         png=str(png_path),
-        dds=str(dds_path),
+        dds=str(dds_path) if dds_path is not None else None,
         codec=str(info["codec"]),
         mip_levels=info["levels"],
         bytes=info["bytes"],
@@ -3875,8 +5897,7 @@ def build_rhd_texture(
     rebuild_companion_maps = (
         bool(companions)
         and config.rebuild_companion_maps
-        and config.detect_on_normal_map
-        and relief_added > 0
+        and bool(flips)
     )
     if rebuild_companion_maps:
         phase_started = time.perf_counter()
@@ -3944,12 +5965,44 @@ def build_rhd_texture(
             if value
         )
     )
+    switch_base_aliases = tuple(
+        dict.fromkeys(
+            binding.dae_material
+            for _part, binding in candidates
+            if _normalise_material_alias(binding.dae_material)
+            in getattr(archive, "material_switch_targets", {})
+        )
+    )
     source_materials = _source_material_reports_for_aliases(
         archive,
         material_aliases,
     )
+    layer_bindings = [
+        {
+            "dae_material": binding.dae_material,
+            "material_key": binding.material_key,
+            "materials_member": binding.materials_member,
+            "stage_key": getattr(binding, "stage_key", "baseColorMap"),
+            "kind": getattr(binding, "kind", "colour"),
+        }
+        for _part, binding in candidates
+    ]
+    layer_bindings = list(
+        {
+            (
+                entry["dae_material"],
+                entry["material_key"],
+                entry["materials_member"],
+                entry["stage_key"],
+            ): entry
+            for entry in layer_bindings
+        }.values()
+    )
     texture_report: dict[str, object] = {
         "texture": texture_member,
+        "layer_kind": layer_kind,
+        "stage_keys": list(layer_stage_keys),
+        "layer_bindings": layer_bindings,
         "size": [width, height],
         "source_texture_path": str(texture_path),
         "selected_parts": [
@@ -3965,6 +6018,7 @@ def build_rhd_texture(
             for part, binding in candidates
         ],
         "material_aliases": list(material_aliases),
+        "switch_base_aliases": list(switch_base_aliases),
         "source_materials": source_materials,
         "collada_symbols": sorted(symbols),
         "parts_analysed": analysed,
@@ -3975,19 +6029,38 @@ def build_rhd_texture(
         "rigid_triangles": masks.rigid_triangles,
         "phase_timings": phase_timings,
         "detection": detection_reports,
+        "detection_authority": (
+            "opacity_mask" if use_authoritative_masks else "texture_layer"
+        ),
+        "authoritative_mask_sources": [
+            mask.member for mask in authoritative_masks
+        ] if use_authoritative_masks else [],
         "reflect_flipped_normal_vectors": config.reflect_flipped_normal_vectors,
         "correct_flipped_normal_background": (
             config.correct_flipped_normal_background
         ),
+        "normal_region_detail_gate": config.normal_region_detail_gate,
+        "normal_region_detail_sigma_px": config.normal_region_detail_sigma_px,
+        "normal_region_detail_floor": config.normal_region_detail_floor,
+        "normal_region_detail_percentile": (
+            config.normal_region_detail_percentile
+        ),
         "enable_skewed_region_filter": config.enable_skewed_region_filter,
+        "skewed_region_filter_applied": (
+            config.enable_skewed_region_filter and not authoritative_mask_regions
+        ),
         "skewed_region_min_delta": config.skewed_region_min_delta,
         "skewed_region_max_condition": config.skewed_region_max_condition,
         "regions_detected": detected_total,
         "mirrored_regions": len(mirrored_regions),
+        "companion_regions_added": companion_regions_added,
+        "state_group_regions_added": state_group_regions_added,
         "relief_regions_added": relief_added,
+        "duplicate_regions_removed": duplicate_regions_removed,
         "outputs": {
             "png": str(png_path),
-            "dds": str(dds_path),
+            "dds": str(dds_path) if dds_path is not None else None,
+            "preview": str(preview_path) if preview_path is not None else None,
         },
         "companion_maps": [
             {
@@ -4006,6 +6079,12 @@ def build_rhd_texture(
             }
             for rebuilt in companion_results
         ],
+        "detection_cache": {
+            "hits": detection_session.hits,
+            "misses": detection_session.misses,
+            "normal_edge_hits": detection_session.normal_edge_hits,
+            "normal_edge_misses": detection_session.normal_edge_misses,
+        },
         "island_flips": [
             {
                 "label": flip.label,
@@ -4303,10 +6382,79 @@ def write_blender_preview(
     Blender reads them without a decoder, and the normal map's preview PNG has
     its z reconstructed, which the shipped two-channel DDS deliberately lacks.
     """
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
     materials: list[dict[str, object]] = []
     for result in results:
         if not result.material_aliases or result.png_path is None:
             continue
+        layer_bindings = result.report.get("layer_bindings", [])
+        if isinstance(layer_bindings, list) and layer_bindings:
+            source_materials = result.report.get("source_materials", [])
+            source_by_key = {
+                (str(item.get("materialsMember") or ""), str(item.get("key") or "")): item
+                for item in source_materials
+                if isinstance(item, dict)
+            } if isinstance(source_materials, list) else {}
+            switch_bases = {
+                str(alias)
+                for alias in result.report.get("switch_base_aliases", [])
+                if isinstance(alias, str)
+            }
+            for layer in layer_bindings:
+                if not isinstance(layer, dict):
+                    continue
+                materials_member = str(layer.get("materials_member") or "")
+                material_key = str(layer.get("material_key") or "")
+                dae_material = str(layer.get("dae_material") or "")
+                stage_key = str(layer.get("stage_key") or "baseColorMap")
+                group_key = (materials_member, material_key)
+                source = source_by_key.get(group_key)
+                aliases = [dae_material, material_key]
+                if isinstance(source, dict):
+                    aliases.extend(
+                        str(alias) for alias in source.get("aliases", []) if str(alias)
+                    )
+                entry = grouped.setdefault(
+                    group_key,
+                    {
+                        "aliases": [],
+                        "switchBaseAliases": [],
+                        "maps": {},
+                        "outputMaps": [],
+                        "sourceMaterials": [source] if source is not None else [],
+                    },
+                )
+                entry_aliases = entry["aliases"]
+                assert isinstance(entry_aliases, list)
+                for alias in aliases:
+                    if alias and alias not in entry_aliases:
+                        entry_aliases.append(alias)
+                entry_switch_bases = entry["switchBaseAliases"]
+                assert isinstance(entry_switch_bases, list)
+                if dae_material in switch_bases and dae_material not in entry_switch_bases:
+                    entry_switch_bases.append(dae_material)
+                path = (
+                    result.report.get("outputs", {}).get("preview")
+                    if isinstance(result.report.get("outputs"), dict)
+                    else None
+                )
+                output_path = Path(str(path)).name if path else result.png_path.name
+                maps = entry["maps"]
+                assert isinstance(maps, dict)
+                maps.setdefault(stage_key, output_path)
+                output_maps = entry["outputMaps"]
+                assert isinstance(output_maps, list)
+                output_map = {
+                    "stageKey": stage_key,
+                    "member": result.texture_member,
+                    "png": result.png_path.name,
+                    "dds": result.dds_path.name if result.dds_path is not None else None,
+                }
+                if output_map not in output_maps:
+                    output_maps.append(output_map)
+            continue
+
+        # Compatibility for callers/tests constructing pre-layer result data.
         maps: dict[str, str] = {"baseColorMap": result.png_path.name}
         output_maps: list[dict[str, object]] = [
             {
@@ -4332,11 +6480,17 @@ def write_blender_preview(
         materials.append(
             {
                 "aliases": list(result.material_aliases),
+                "switchBaseAliases": list(
+                    result.report.get("switch_base_aliases", [])
+                    if isinstance(result.report.get("switch_base_aliases"), list)
+                    else []
+                ),
                 "maps": maps,
                 "outputMaps": output_maps,
                 "sourceMaterials": result.report.get("source_materials", []),
             }
         )
+    materials.extend(grouped.values())
     if not materials:
         return None
 
@@ -4466,6 +6620,42 @@ def _base_colours_by_alias(results: list[RhdTextureResult]) -> dict[str, Path]:
     for result in results:
         if result.png_path is None:
             continue
+        layer_bindings = result.report.get("layer_bindings", [])
+        if isinstance(layer_bindings, list) and layer_bindings:
+            colour_layers = [
+                layer
+                for layer in layer_bindings
+                if isinstance(layer, dict)
+                and str(layer.get("stage_key") or "") in COLOUR_MAP_STAGE_KEYS
+            ]
+            if not colour_layers:
+                continue
+            source_materials = result.report.get("source_materials", [])
+            source_aliases = {
+                (str(item.get("materialsMember") or ""), str(item.get("key") or "")): [
+                    str(alias) for alias in item.get("aliases", []) if str(alias)
+                ]
+                for item in source_materials
+                if isinstance(item, dict)
+            } if isinstance(source_materials, list) else {}
+            for layer in colour_layers:
+                aliases = [
+                    str(layer.get("dae_material") or ""),
+                    str(layer.get("material_key") or ""),
+                ]
+                aliases.extend(
+                    source_aliases.get(
+                        (
+                            str(layer.get("materials_member") or ""),
+                            str(layer.get("material_key") or ""),
+                        ),
+                        [],
+                    )
+                )
+                for alias in aliases:
+                    if alias:
+                        base_colours.setdefault(alias, result.png_path)
+            continue
         for alias in result.material_aliases:
             base_colours.setdefault(alias, result.png_path)
     return base_colours
@@ -4548,6 +6738,9 @@ def export_parts_preview(
     relief_mser_config: MserConfig | None = None,
     log=print,
     progress: ProgressCallback | None = None,
+    texture_member_scope: set[str] | None = None,
+    force_mirrored_part_keys: set[str] | None = None,
+    texture_part_scope: list[DaePart] | None = None,
 ) -> PartPreview:
     """Export selected parts, converted and retextured, ready to open in Blender.
 
@@ -4573,6 +6766,7 @@ def export_parts_preview(
     output_directory.mkdir(parents=True, exist_ok=True)
     if not parts:
         raise ValueError("No parts selected for preview export.")
+    relief_mser_config = relief_mser_config or DEFAULT_RELIEF_DETECTION_CONFIG
 
     phase_started = time.perf_counter()
     emit_progress(
@@ -4582,7 +6776,15 @@ def export_parts_preview(
         "Resolving texture/material jobs",
         selected_parts=len(parts),
     )
-    bindings_by_texture = texture_bindings_for_parts(archive, loaded, parts)
+    texture_parts = texture_part_scope if texture_part_scope is not None else parts
+    bindings_by_texture = texture_bindings_for_parts(archive, loaded, texture_parts)
+    if texture_member_scope is not None:
+        scoped_members = {member.lower() for member in texture_member_scope}
+        bindings_by_texture = {
+            member: entries
+            for member, entries in bindings_by_texture.items()
+            if member.lower() in scoped_members
+        }
     if not bindings_by_texture:
         labels = ", ".join(part.label for part in parts)
         raise ValueError(f"No materials-JSON texture resolved for {labels}")
@@ -4606,7 +6808,23 @@ def export_parts_preview(
     sweep_cache: dict[str, object] = {}
     mask_cache: dict[tuple, DomainMasks] = {}
     written: set[str] = set()
+    detection_session: ProductionDetectionSession[RegionDetection] = (
+        ProductionDetectionSession()
+    )
+    if (
+        config.detect_on_normal_map
+        or mser_config.box_source in {"contrast_gpu", "edge_gpu"}
+        or relief_mser_config.box_source == "edge_gpu"
+        or any(
+            getattr(binding, "kind", "colour") == "normal"
+            for entries in bindings_by_texture.values()
+            for _part, binding in entries
+        )
+    ):
+        detection_session.prewarm_gpu()
     results: list[RhdTextureResult] = []
+    detection_attempted_members: set[str] = set()
+    detection_skips: list[dict[str, str]] = []
     for texture_index, (member, entries) in enumerate(bindings_by_texture.items(), start=1):
         texture_name = PurePosixPath(member).name
         texture_parts: list[DaePart] = []
@@ -4646,7 +6864,14 @@ def export_parts_preview(
                     selected_parts=len(texture_parts),
                 )
                 masks = build_domain_masks(
-                    loaded, texture_parts, symbols, size, config, sweep_cache, log
+                    loaded,
+                    texture_parts,
+                    symbols,
+                    size,
+                    config,
+                    sweep_cache,
+                    log,
+                    force_mirrored_part_keys,
                 )
                 mask_cache[mask_key] = masks
                 timing = record_phase(
@@ -4672,7 +6897,11 @@ def export_parts_preview(
                 )
             if not bool(masks.mirror.any()):
                 log("  nothing mirrored on this selected texture domain; skipped")
+                detection_skips.append(
+                    {"texture": member, "reason": "no mirrored UV domain"}
+                )
                 continue
+            detection_attempted_members.add(member)
             result = build_rhd_texture(
                 archive, loaded, member, output_directory,
                 config, mser_config, relief_mser_config,
@@ -4680,12 +6909,19 @@ def export_parts_preview(
                 masks=masks,
                 sweep_cache=sweep_cache,
                 written_companions=written,
+                detection_session=detection_session,
                 log=log,
                 progress=progress,
             )
             results.append(result)
         except Exception as exc:
             log(f"  ! failed: {type(exc).__name__}: {exc}")
+            detection_skips.append(
+                {
+                    "texture": member,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
 
     phase_started = time.perf_counter()
     emit_progress(
@@ -4713,6 +6949,9 @@ def export_parts_preview(
     )
 
     base_colours = _base_colours_by_alias(results)
+    runtime_display_uv_flip_aliases = runtime_display_dae_aliases_for_parts(
+        archive, loaded, parts
+    )
     dae_paths: list[Path] = []
     dae_exports: list[dict[str, object]] = []
     failed_parts: list[dict[str, object]] = []
@@ -4739,6 +6978,7 @@ def export_parts_preview(
                 sweep,
                 dae_path,
                 blender_base_colours=base_colours or None,  # type: ignore[arg-type]
+                runtime_display_uv_flip_materials=runtime_display_uv_flip_aliases,
             )
         except Exception as exc:
             # One part that cannot be wired says nothing about the others.
@@ -4846,6 +7086,12 @@ def export_parts_preview(
             )
 
     seconds = time.perf_counter() - started
+    source_archive_rasters = {
+        member
+        for member in getattr(archive, "members", ())
+        if PurePosixPath(member).suffix.lower() in RASTER_TEXTURE_SUFFIXES
+        and (getattr(archive, "member_archive_indices", {}) or {}).get(member, 0) == 0
+    }
     report: dict[str, object] = {
         "mode": "standalone_texture_corrected_preview",
         "source_archive": str(getattr(archive, "path", "")),
@@ -4855,6 +7101,15 @@ def export_parts_preview(
         "texture_jobs": [result.report for result in results],
         "dae_exports": dae_exports,
         "failed_parts": failed_parts,
+        "runtime_display_uv_flip_aliases": sorted(runtime_display_uv_flip_aliases),
+        "texture_detection_inventory": {
+            "candidate_files": sorted(bindings_by_texture),
+            "detection_attempted_files": sorted(detection_attempted_members),
+            "skipped_candidates": detection_skips,
+            "source_archive_raster_files_not_candidates": sorted(
+                source_archive_rasters.difference(bindings_by_texture)
+            ),
+        },
         "phase_timings": phase_timings,
         "outputs": {
             "dae_paths": [str(path) for path in dae_paths],
@@ -4983,7 +7238,11 @@ def textures_for_parts(
             choices = archive_texture_choices_for_part(archive, loaded, part)
         except Exception:
             continue
-        wanted.update(binding.texture_member for binding in choices)
+        wanted.update(
+            layer.texture_member
+            for binding in choices
+            for layer in material_texture_layers_for_binding(archive, binding)
+        )
 
     by_texture: dict[str, list[DaePart]] = {member: [] for member in sorted(wanted)}
     for part in loaded.parts:
@@ -4991,9 +7250,13 @@ def textures_for_parts(
             choices = archive_texture_choices_for_part(archive, loaded, part)
         except Exception:
             continue
-        for binding in choices:
-            if binding.texture_member in by_texture:
-                by_texture[binding.texture_member].append(part)
+        matched_members = {
+            layer.texture_member
+            for binding in choices
+            for layer in material_texture_layers_for_binding(archive, binding)
+        }
+        for member in matched_members.intersection(by_texture):
+            by_texture[member].append(part)
     return by_texture
 
 
@@ -5021,15 +7284,29 @@ def build_all_rhd_textures(
     sweep_cache: dict[str, object] = {}
     mask_cache: dict[tuple, DomainMasks] = {}
     written_companions: set[str] = set()
+    detection_session: ProductionDetectionSession[RegionDetection] = (
+        ProductionDetectionSession()
+    )
+    if (
+        config.detect_on_normal_map
+        or mser_config.box_source in {"contrast_gpu", "edge_gpu"}
+        or any(
+            getattr(binding, "kind", "colour") == "normal"
+            for member in by_texture
+            for _part, binding in parts_using_material(archive, loaded, member)
+        )
+    ):
+        detection_session.prewarm_gpu()
     results: list[RhdTextureResult] = []
 
     for member, parts in by_texture.items():
         log(f"\n{PurePosixPath(member).name}")
         try:
             binding = next(
-                b
+                layer
                 for b in archive_texture_choices_for_part(archive, loaded, parts[0])
-                if b.texture_member == member
+                for layer in material_texture_layers_for_binding(archive, b)
+                if layer.texture_member == member
             )
             symbols = frozenset(material_symbols_for_binding(loaded, binding))
             with Image.open(extract_archive_member(archive, member)) as image:
@@ -5049,7 +7326,9 @@ def build_all_rhd_textures(
                     archive, loaded, member, output_directory, config, mser_config,
                     relief_mser_config,
                     masks=masks, sweep_cache=sweep_cache,
-                    written_companions=written_companions, log=log,
+                    written_companions=written_companions,
+                    detection_session=detection_session,
+                    log=log,
                 )
             )
         except Exception as exc:

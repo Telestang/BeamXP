@@ -5,6 +5,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import sys
 import tempfile
@@ -188,6 +189,12 @@ class ArchiveTextureBinding:
     preview_layers: tuple[ArchiveMaterialPreviewLayer, ...] = ()
 
 
+@dataclass(slots=True, frozen=True)
+class ArchiveMaterialSwitchState:
+    state: str
+    material: str
+
+
 @dataclass(slots=True)
 class VehicleArchive:
     path: Path
@@ -197,9 +204,15 @@ class VehicleArchive:
     dae_members: tuple[str, ...]
     materials: tuple[ArchiveMaterialRecord, ...]
     workspace: Path
+    material_switch_targets: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    material_switch_states: dict[str, tuple[ArchiveMaterialSwitchState, ...]] = field(
+        default_factory=dict
+    )
+    material_switch_triggers: dict[str, tuple[str, ...]] = field(default_factory=dict)
     member_source_zips: dict[str, Path] = field(default_factory=dict)
     member_archive_indices: dict[str, int] = field(default_factory=dict)
     archive_paths: tuple[Path, ...] = ()
+    runtime_material_aliases: tuple[str, ...] = ()
     material_errors: tuple[str, ...] = ()
 
 
@@ -403,7 +416,7 @@ def _human_size(size: int) -> str:
 
 
 def _material_texture_reference(stage: dict[str, object]) -> str:
-    for key in ("baseColorMap", "colorMap", "diffuseMap"):
+    for key in ("baseColorMap", "colorMap", "diffuseMap", "emissiveMap"):
         value = stage.get(key)
         if isinstance(value, str) and value.strip() and not value.lstrip().startswith("@"):
             return value.strip()
@@ -421,6 +434,30 @@ def _material_base_colour_reference(material: dict[str, object]) -> str:
         if reference:
             return reference
     return ""
+
+
+def _runtime_texture_references(value: object) -> tuple[str, ...]:
+    """Return normalised ``@`` runtime texture names nested in material data."""
+    found: list[str] = []
+
+    def visit(child: object) -> None:
+        if isinstance(child, str):
+            stripped = child.strip()
+            if stripped.startswith("@"):
+                alias = _normalise_material_alias(stripped[1:])
+                if alias and alias not in found:
+                    found.append(alias)
+            return
+        if isinstance(child, dict):
+            for nested in child.values():
+                visit(nested)
+            return
+        if isinstance(child, (list, tuple)):
+            for nested in child:
+                visit(nested)
+
+    visit(value)
+    return tuple(found)
 
 
 def _material_base_colour_factor(value: object) -> tuple[float, float, float, float] | None:
@@ -474,6 +511,187 @@ def _material_preview_layers(material: dict[str, object]) -> tuple[ArchiveMateri
     return tuple(layers)
 
 
+_GLOW_MAP_RE = re.compile(r'"glowMap"\s*:[\s,]*\{')
+_JBEAM_OBJECT_ENTRY_RE = re.compile(r'"(?P<key>(?:[^"\\]|\\.)+)"\s*:[\s,]*\{')
+_GLOW_STATE_RE = re.compile(
+    r'"(?P<state>off|on|on_intense)"\s*:\s*"@?(?P<material>(?:[^"\\]|\\.)*)"',
+)
+_GLOW_SIMPLE_FUNCTION_RE = re.compile(r'"simpleFunction"\s*:\s*(?P<value>"(?:[^"\\]|\\.)*"|\{)')
+_GLOW_ADVANCED_TRIGGERS_RE = re.compile(r'"triggers"\s*:\s*\[')
+_JBEAM_ARRAY_STRING_RE = re.compile(r'"(?P<value>(?:[^"\\]|\\.)*)"')
+_JBEAM_OBJECT_KEY_RE = re.compile(r'"(?P<key>(?:[^"\\]|\\.)+)"\s*:')
+
+
+def _find_matching_text_block(text: str, open_idx: int, open_char: str, close_char: str) -> int:
+    depth = 0
+    in_string = False
+    escape = False
+    idx = open_idx
+    while idx < len(text):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == open_char:
+            depth += 1
+        elif ch == close_char:
+            depth -= 1
+            if depth == 0:
+                return idx + 1
+        idx += 1
+    raise ValueError(f"Unclosed {open_char}{close_char} block")
+
+
+def _decode_json_string_token(token: str) -> str:
+    try:
+        return str(json.loads(token))
+    except Exception:
+        return token.strip('"')
+
+
+def _jbeam_glowmap_switch_targets(text: str) -> dict[str, tuple[str, ...]]:
+    return {
+        key: tuple(dict.fromkeys(state.material for state in states))
+        for key, states in _jbeam_glowmap_switch_states(text).items()
+        if states
+    }
+
+
+def _jbeam_glowmap_trigger_keys(block: str) -> tuple[str, ...]:
+    keys: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip()
+        if value and value not in keys:
+            keys.append(value)
+
+    simple = _GLOW_SIMPLE_FUNCTION_RE.search(block)
+    if simple is not None:
+        value = simple.group("value")
+        if value.startswith('"'):
+            add(_decode_json_string_token(value))
+        else:
+            brace = simple.start("value")
+            try:
+                end = _find_matching_text_block(block, brace, "{", "}")
+            except ValueError:
+                end = -1
+            if end > brace:
+                inner = block[brace + 1 : end - 1]
+                for entry in _JBEAM_OBJECT_KEY_RE.finditer(inner):
+                    add(_decode_json_string_token(f'"{entry.group("key")}"'))
+
+    advanced = _GLOW_ADVANCED_TRIGGERS_RE.search(block)
+    if advanced is not None:
+        bracket = block.rfind("[", advanced.start(), advanced.end())
+        try:
+            end = _find_matching_text_block(block, bracket, "[", "]")
+        except ValueError:
+            end = -1
+        if end > bracket:
+            for item in _JBEAM_ARRAY_STRING_RE.finditer(block[bracket + 1 : end - 1]):
+                add(_decode_json_string_token(f'"{item.group("value")}"'))
+
+    return tuple(keys)
+
+
+def _jbeam_glowmap_switch_triggers(text: str) -> dict[str, tuple[str, ...]]:
+    triggers_by_base: dict[str, tuple[str, ...]] = {}
+    search_at = 0
+    while True:
+        match = _GLOW_MAP_RE.search(text, search_at)
+        if match is None:
+            break
+        brace = text.rfind("{", match.start(), match.end())
+        try:
+            end = _find_matching_text_block(text, brace, "{", "}")
+        except ValueError:
+            search_at = match.end()
+            continue
+        inner = text[brace + 1 : end - 1]
+        offset = brace + 1
+        idx = 0
+        while idx < len(inner):
+            entry = _JBEAM_OBJECT_ENTRY_RE.search(inner, idx)
+            if entry is None:
+                break
+            key = _decode_json_string_token(f'"{entry.group("key")}"')
+            entry_brace = offset + inner.rfind("{", entry.start(), entry.end())
+            try:
+                entry_end = _find_matching_text_block(text, entry_brace, "{", "}")
+            except ValueError:
+                idx = entry.end()
+                continue
+            block = text[entry_brace:entry_end]
+            triggers = _jbeam_glowmap_trigger_keys(block)
+            if triggers:
+                triggers_by_base[key] = triggers
+            idx = entry_end - offset
+        search_at = end
+    return triggers_by_base
+
+
+def _jbeam_glowmap_switch_states(
+    text: str,
+) -> dict[str, tuple[ArchiveMaterialSwitchState, ...]]:
+    states_by_base: dict[str, list[ArchiveMaterialSwitchState]] = {}
+    search_at = 0
+    while True:
+        match = _GLOW_MAP_RE.search(text, search_at)
+        if match is None:
+            break
+        brace = text.rfind("{", match.start(), match.end())
+        try:
+            end = _find_matching_text_block(text, brace, "{", "}")
+        except ValueError:
+            search_at = match.end()
+            continue
+        inner = text[brace + 1 : end - 1]
+        offset = brace + 1
+        idx = 0
+        while idx < len(inner):
+            entry = _JBEAM_OBJECT_ENTRY_RE.search(inner, idx)
+            if entry is None:
+                break
+            key = _decode_json_string_token(f'"{entry.group("key")}"')
+            entry_brace = offset + inner.rfind("{", entry.start(), entry.end())
+            try:
+                entry_end = _find_matching_text_block(text, entry_brace, "{", "}")
+            except ValueError:
+                idx = entry.end()
+                continue
+            block = text[entry_brace:entry_end]
+            states = states_by_base.setdefault(key, [])
+            for state in _GLOW_STATE_RE.finditer(block):
+                material = _decode_json_string_token(f'"{state.group("material")}"')
+                state_name = state.group("state")
+                if material and not any(
+                    existing.state == state_name and existing.material == material
+                    for existing in states
+                ):
+                    states.append(
+                        ArchiveMaterialSwitchState(
+                            state=state_name,
+                            material=material,
+                        )
+                    )
+            idx = entry_end - offset
+        search_at = end
+    return {
+        key: tuple(values)
+        for key, values in states_by_base.items()
+        if values
+    }
+
+
 def scan_vehicle_archive(
     path: Path,
     workspace: Path | None = None,
@@ -516,6 +734,10 @@ def scan_vehicle_archive(
     member_source_zips: dict[str, Path] = {}
     member_archive_indices: dict[str, int] = {}
     materials: list[ArchiveMaterialRecord] = []
+    material_switch_targets: dict[str, list[str]] = {}
+    material_switch_states: dict[str, list[ArchiveMaterialSwitchState]] = {}
+    material_switch_triggers: dict[str, list[str]] = {}
+    runtime_material_aliases: list[str] = []
     errors: list[str] = []
 
     for archive_index, archive_path in enumerate(ordered_paths):
@@ -556,11 +778,22 @@ def scan_vehicle_archive(
                 for key, value in document.items():
                     if not isinstance(value, dict):
                         continue
+                    name = str(value.get("name") or "").strip()
+                    map_to = str(value.get("mapTo") or "").strip()
+                    runtime_references = _runtime_texture_references(value)
+                    if runtime_references:
+                        for candidate in (
+                            *runtime_references,
+                            str(key).strip(),
+                            name,
+                            map_to,
+                        ):
+                            alias = _normalise_material_alias(candidate)
+                            if alias and alias not in runtime_material_aliases:
+                                runtime_material_aliases.append(alias)
                     base_colour = _material_base_colour_reference(value)
                     if not base_colour:
                         continue
-                    name = str(value.get("name") or "").strip()
-                    map_to = str(value.get("mapTo") or "").strip()
                     materials.append(
                         ArchiveMaterialRecord(
                             key=str(key).strip(),
@@ -573,6 +806,48 @@ def scan_vehicle_archive(
                             archive_index=archive_index,
                         )
                     )
+
+            for member in archive_members:
+                if not member.lower().endswith(".jbeam"):
+                    continue
+                try:
+                    raw = archive.read(member).decode("utf-8-sig", errors="replace")
+                except Exception as exc:
+                    errors.append(f"{archive_path.name}:{member}: {type(exc).__name__}: {exc}")
+                    continue
+                for base, targets in _jbeam_glowmap_switch_targets(raw).items():
+                    base_key = _normalise_material_alias(base)
+                    if not base_key:
+                        continue
+                    values = material_switch_targets.setdefault(base_key, [])
+                    for target in targets:
+                        target_key = _normalise_material_alias(target)
+                        if target_key and target_key not in values:
+                            values.append(target_key)
+                for base, states in _jbeam_glowmap_switch_states(raw).items():
+                    base_key = _normalise_material_alias(base)
+                    if not base_key:
+                        continue
+                    values = material_switch_states.setdefault(base_key, [])
+                    for state in states:
+                        material_key = _normalise_material_alias(state.material)
+                        if not material_key:
+                            continue
+                        normalised_state = ArchiveMaterialSwitchState(
+                            state=state.state,
+                            material=material_key,
+                        )
+                        if normalised_state not in values:
+                            values.append(normalised_state)
+                for base, triggers in _jbeam_glowmap_switch_triggers(raw).items():
+                    base_key = _normalise_material_alias(base)
+                    if not base_key:
+                        continue
+                    values = material_switch_triggers.setdefault(base_key, [])
+                    for trigger in triggers:
+                        trigger_key = trigger.strip()
+                        if trigger_key and trigger_key not in values:
+                            values.append(trigger_key)
 
     dae_members = [member for member in members if member.lower().endswith(".dae")]
     dae_members.sort(
@@ -593,9 +868,25 @@ def scan_vehicle_archive(
         dae_members=tuple(dae_members),
         materials=tuple(materials),
         workspace=workspace,
+        material_switch_targets={
+            key: tuple(values)
+            for key, values in material_switch_targets.items()
+            if values
+        },
+        material_switch_states={
+            key: tuple(values)
+            for key, values in material_switch_states.items()
+            if values
+        },
+        material_switch_triggers={
+            key: tuple(values)
+            for key, values in material_switch_triggers.items()
+            if values
+        },
         member_source_zips=member_source_zips,
         member_archive_indices=member_archive_indices,
         archive_paths=tuple(ordered_paths),
+        runtime_material_aliases=tuple(runtime_material_aliases),
         material_errors=tuple(errors),
     )
 
@@ -763,19 +1054,63 @@ def _material_alias_lookup_keys(value: str) -> tuple[str, ...]:
     normalised = _normalise_material_alias(value)
     if not normalised:
         return ()
-    keys = [normalised]
-    skin_marker = next(
-        (
-            index
-            for index in range(len(normalised))
-            if normalised.startswith(".skin", index)
-            and (index + len(".skin") == len(normalised) or normalised[index + len(".skin")] in "._")
-        ),
-        -1,
-    )
-    if skin_marker > 0:
-        keys.append(normalised[:skin_marker])
+
+    keys: list[str] = []
+
+    def add(key: str) -> None:
+        if key and key not in keys:
+            keys.append(key)
+
+    def add_derived_keys(key: str) -> None:
+        add(key)
+
+        duplicate = re.match(r"^(?P<base>.+?)(?:[._]\d{3})$", key)
+        if duplicate is not None:
+            add(duplicate.group("base"))
+
+        for suffix in ("_on", "_off"):
+            if key.endswith(suffix) and len(key) > len(suffix):
+                add(key[: -len(suffix)])
+                break
+
+        skin_marker = next(
+            (
+                index
+                for index in range(len(key))
+                if key.startswith(".skin", index)
+                and (
+                    index + len(".skin") == len(key)
+                    or key[index + len(".skin")] in "._"
+                )
+            ),
+            -1,
+        )
+        if skin_marker > 0:
+            add(key[:skin_marker])
+
+    add_derived_keys(normalised)
+    for key in tuple(keys):
+        if key != normalised:
+            add_derived_keys(key)
     return tuple(dict.fromkeys(keys))
+
+
+def _material_alias_lookup_keys_with_switch_targets(
+    archive: VehicleArchive,
+    value: str,
+) -> tuple[str, ...]:
+    keys: list[str] = []
+    queue = list(_material_alias_lookup_keys(value))
+    while queue:
+        key = queue.pop(0)
+        if key in keys:
+            continue
+        keys.append(key)
+        for target in archive.material_switch_targets.get(key, ()):
+            for derived in _material_alias_lookup_keys(target):
+                if derived not in keys and derived not in queue:
+                    queue.append(derived)
+    return tuple(keys)
 
 
 def _material_alias_match_rank(
@@ -805,8 +1140,11 @@ def _preview_layer_signature(
     )
 
 
-def material_names_for_part(loaded: LoadedDae, part: DaePart) -> tuple[str, ...]:
-    """Return COLLADA material names/symbols bound to the selected scene node."""
+def _material_alias_groups_for_part(
+    loaded: LoadedDae,
+    part: DaePart,
+) -> tuple[tuple[str, ...], ...]:
+    """Return each COLLADA binding's equivalent name, target and symbol aliases."""
     root = loaded.tree.getroot()
     namespace = loaded.namespace
     target = _find_target_node(root, namespace, part)
@@ -819,15 +1157,28 @@ def material_names_for_part(loaded: LoadedDae, part: DaePart) -> tuple[str, ...]
             if material_id:
                 material_names[material_id] = material_name
 
-    names: list[str] = []
+    groups: list[tuple[str, ...]] = []
     for instance_geometry in target.findall(qname(namespace, "instance_geometry")):
         for instance_material in instance_geometry.iter(qname(namespace, "instance_material")):
             symbol = (instance_material.get("symbol") or "").strip()
             target_id = (instance_material.get("target") or "").strip().lstrip("#")
+            aliases: list[str] = []
             for value in (material_names.get(target_id, ""), target_id, symbol):
                 value = value.strip()
-                if value and value not in names:
-                    names.append(value)
+                if value and value not in aliases:
+                    aliases.append(value)
+            if aliases:
+                groups.append(tuple(aliases))
+    return tuple(groups)
+
+
+def material_names_for_part(loaded: LoadedDae, part: DaePart) -> tuple[str, ...]:
+    """Return COLLADA material names/symbols bound to the selected scene node."""
+    names: list[str] = []
+    for aliases in _material_alias_groups_for_part(loaded, part):
+        for value in aliases:
+            if value not in names:
+                names.append(value)
     return tuple(names)
 
 
@@ -843,7 +1194,7 @@ def archive_texture_choices_for_part(
     the referenced texture resolves to a real archive member.  No filename-only
     guessing is used.
     """
-    requested = material_names_for_part(loaded, part)
+    requested_groups = _material_alias_groups_for_part(loaded, part)
     records_by_alias: dict[str, list[ArchiveMaterialRecord]] = defaultdict(list)
     for record in archive.materials:
         record_keys: set[str] = set()
@@ -854,12 +1205,38 @@ def archive_texture_choices_for_part(
 
     choices: list[ArchiveTextureBinding] = []
     used_members: set[
-        tuple[str, str, tuple[tuple[str, tuple[float, float, float, float], str], ...]]
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            tuple[tuple[str, tuple[float, float, float, float], str], ...],
+        ]
     ] = set()
-    for dae_material in requested:
+    for requested_aliases in requested_groups:
+        dae_material = requested_aliases[0]
         normalised_dae_material = _normalise_material_alias(dae_material)
+        requested_keys = tuple(
+            dict.fromkeys(
+                key
+                for alias in requested_aliases
+                for key in _material_alias_lookup_keys_with_switch_targets(
+                    archive,
+                    alias,
+                )
+            )
+        )
+        candidate_records: list[ArchiveMaterialRecord] = []
+        seen_record_keys: set[tuple[str, str]] = set()
+        for key in requested_keys:
+            for record in records_by_alias.get(key, ()):
+                record_key = (record.materials_member, record.key)
+                if record_key in seen_record_keys:
+                    continue
+                seen_record_keys.add(record_key)
+                candidate_records.append(record)
         records = sorted(
-            records_by_alias.get(normalised_dae_material, ()),
+            candidate_records,
             key=lambda record: (
                 _material_alias_match_rank(record, normalised_dae_material),
                 record.archive_index,
@@ -879,6 +1256,8 @@ def archive_texture_choices_for_part(
                 continue
             signature = (
                 normalised_dae_material,
+                record.materials_member.lower(),
+                record.key.lower(),
                 texture_member.lower(),
                 _preview_layer_signature(record.preview_layers),
             )
@@ -3116,6 +3495,7 @@ def _subset_source_element(
     new_source_id: str,
     used_ids: set[str],
     namespace: str,
+    value_cache: dict[int, tuple[np.ndarray, int, int]] | None = None,
 ) -> ET.Element:
     source = copy.deepcopy(original)
     source.set("id", new_source_id)
@@ -3133,22 +3513,33 @@ def _subset_source_element(
                 element.set("id", replacement)
         return source
 
-    values = np.asarray(parse_float_list(float_array.text), dtype=float)
-    stride = max(1, int(accessor.get("stride", "1")))
-    offset = max(0, int(accessor.get("offset", "0")))
-    rows: list[np.ndarray] = []
-    for index in selected_indices:
-        start = offset + index * stride
-        end = start + stride
-        if 0 <= start and end <= len(values):
-            rows.append(values[start:end])
-    compact = np.concatenate(rows) if rows else np.empty(0, dtype=float)
+    cached = value_cache.get(id(original)) if value_cache is not None else None
+    if cached is None:
+        values = np.asarray(parse_float_list(float_array.text), dtype=float)
+        stride = max(1, int(accessor.get("stride", "1")))
+        offset = max(0, int(accessor.get("offset", "0")))
+        if value_cache is not None:
+            value_cache[id(original)] = (values, stride, offset)
+    else:
+        values, stride, offset = cached
+
+    indices = np.asarray(selected_indices, dtype=np.int64)
+    if len(indices):
+        starts = offset + indices * stride
+        valid = (starts >= 0) & (starts + stride <= len(values))
+        starts = starts[valid]
+        columns = np.arange(stride, dtype=np.int64)
+        compact = values[starts[:, None] + columns].reshape(-1)
+        row_count = len(starts)
+    else:
+        compact = np.empty(0, dtype=float)
+        row_count = 0
     float_id = _unique_id(f"{new_source_id}_array", used_ids)
     float_array.set("id", float_id)
     float_array.set("count", str(len(compact)))
     float_array.text = " ".join(f"{float(value):.9g}" for value in compact)
     accessor.set("source", f"#{float_id}")
-    accessor.set("count", str(len(rows)))
+    accessor.set("count", str(row_count))
     accessor.set("offset", "0")
     return source
 
@@ -3209,6 +3600,7 @@ def _subset_geometry(
     reverse_winding: bool = False,
     position_transform: np.ndarray | None = None,
     normal_transform: np.ndarray | None = None,
+    source_value_cache: dict[int, tuple[np.ndarray, int, int]] | None = None,
 ) -> ET.Element:
     original_mesh = original.find(qname(namespace, "mesh"))
     if original_mesh is None:
@@ -3288,6 +3680,7 @@ def _subset_geometry(
             compact_id,
             used_ids,
             namespace,
+            source_value_cache,
         )
         if position_transform is not None and source_id in position_source_ids:
             _transform_compact_source_xyz(
@@ -3413,6 +3806,105 @@ def _subset_geometry(
         if local_name(child.tag) != "mesh":
             geometry.append(copy.deepcopy(child))
     return geometry
+
+
+def _flip_material_texcoord_islands(
+    geometry: ET.Element,
+    namespace: str,
+    material_aliases: set[str],
+) -> dict[str, object]:
+    """Reflect U for targeted material islands in one generated geometry."""
+    targets = {
+        alias
+        for value in material_aliases
+        if (alias := _normalise_material_alias(value))
+    }
+    mesh = geometry.find(qname(namespace, "mesh"))
+    if mesh is None or not targets:
+        return {"matched_materials": [], "modified_sources": [], "modified_texcoords": 0}
+
+    sources = {
+        source.get("id", ""): source
+        for source in mesh.findall(qname(namespace, "source"))
+        if source.get("id")
+    }
+    targeted: dict[str, set[int]] = defaultdict(set)
+    protected: dict[str, set[int]] = defaultdict(set)
+    matched_materials: set[str] = set()
+    for primitive_tag in PRIMITIVE_TAGS:
+        for primitive in mesh.findall(qname(namespace, primitive_tag)):
+            inputs = primitive.findall(qname(namespace, "input"))
+            if not inputs:
+                continue
+            stride = max(int(item.get("offset", "0")) for item in inputs) + 1
+            texcoord = next(
+                (
+                    item
+                    for item in inputs
+                    if (item.get("semantic") or "").upper() == "TEXCOORD"
+                    and (item.get("source") or "").startswith("#")
+                ),
+                None,
+            )
+            if texcoord is None:
+                continue
+            source_id = (texcoord.get("source") or "")[1:]
+            offset = int(texcoord.get("offset", "0"))
+            indices: set[int] = set()
+            for index_data in primitive.findall(qname(namespace, "p")):
+                values = parse_int_list(index_data.text)
+                indices.update(values[offset::stride])
+            if not indices:
+                continue
+            material = _normalise_material_alias(primitive.get("material") or "")
+            if material in targets:
+                targeted[source_id].update(indices)
+                matched_materials.add(material)
+            else:
+                protected[source_id].update(indices)
+
+    modified_sources: list[str] = []
+    modified_texcoords = 0
+    for source_id, indices in targeted.items():
+        source = sources.get(source_id)
+        flippable = indices - protected.get(source_id, set())
+        if source is None or not flippable:
+            continue
+        float_array = source.find(qname(namespace, "float_array"))
+        accessor = source.find(
+            f"./{qname(namespace, 'technique_common')}/{qname(namespace, 'accessor')}"
+        )
+        if float_array is None or accessor is None or not float_array.text:
+            continue
+        values = parse_float_list(float_array.text)
+        source_stride = max(1, int(accessor.get("stride", "2")))
+        source_offset = max(0, int(accessor.get("offset", "0")))
+        params = [
+            (param.get("name") or "").upper()
+            for param in accessor.findall(qname(namespace, "param"))
+        ]
+        s_slot = params.index("S") if "S" in params else 0
+        positions = [
+            source_offset + index * source_stride + s_slot
+            for index in flippable
+            if 0 <= source_offset + index * source_stride + s_slot < len(values)
+        ]
+        if not positions:
+            continue
+        pivot = min(values[position] for position in positions) + max(
+            values[position] for position in positions
+        )
+        for position in positions:
+            values[position] = pivot - values[position]
+        float_array.text = " ".join(f"{float(value):.9g}" for value in values)
+        modified_sources.append(source_id)
+        modified_texcoords += len(positions)
+
+    return {
+        "matched_materials": sorted(matched_materials),
+        "modified_sources": sorted(modified_sources),
+        "modified_texcoords": modified_texcoords,
+    }
 
 
 def _format_matrix(matrix: np.ndarray) -> str:
@@ -4054,6 +4546,7 @@ def export_transformed_part_dae(
     output_path: Path,
     blender_base_colour: Path | None = None,
     blender_base_colours: dict[str, Path] | None = None,
+    runtime_display_uv_flip_materials: set[str] | None = None,
 ) -> dict[str, object]:
     """Export only the selected part, already converted to its opposite hand.
 
@@ -4065,29 +4558,54 @@ def export_transformed_part_dae(
     the equivalent proper rotation+translation G*L, where L is reflection in the
     candidate's own symmetry plane. No stitching or node snapping is performed.
     """
-    tree = copy.deepcopy(loaded.tree)
-    root = tree.getroot()
+    source_root = loaded.tree.getroot()
     namespace = loaded.namespace
     if namespace:
         ET.register_namespace("", namespace)
 
-    target = _find_target_node(root, namespace, result.part)
+    target = _find_target_node(source_root, namespace, result.part)
     original_instances = list(target.findall(qname(namespace, "instance_geometry")))
     if len(original_instances) != len(result.part.instances):
         raise ValueError(
             "The selected node's instance_geometry count changed between analysis and export."
         )
 
-    library = root.find(f"./{qname(namespace, 'library_geometries')}")
-    if library is None:
+    source_library = source_root.find(f"./{qname(namespace, 'library_geometries')}")
+    if source_library is None:
         raise ValueError("DAE has no library_geometries element.")
     geometry_lookup = {
         geometry.get("id", ""): geometry
-        for geometry in library.findall(qname(namespace, "geometry"))
+        for geometry in source_library.findall(qname(namespace, "geometry"))
         if geometry.get("id")
     }
-    used_ids = {element.get("id") for element in root.iter() if element.get("id")}
+    used_ids = {
+        element.get("id") for element in source_root.iter() if element.get("id")
+    }
     used_ids.discard(None)
+
+    # A vehicle DAE can be hundreds of megabytes, almost all of it unrelated
+    # geometry.  The old exporter deep-copied that entire tree and then removed
+    # every source geometry.  Build the selected-part document directly: retain
+    # only the small libraries needed by cloned material bindings and create an
+    # empty geometry library in the source document's schema order.
+    root = ET.Element(source_root.tag, dict(source_root.attrib))
+    root.text = source_root.text
+    library: ET.Element | None = None
+    retained_libraries = {
+        "asset",
+        "library_images",
+        "library_effects",
+        "library_materials",
+    }
+    for child in source_root:
+        name = local_name(child.tag)
+        if name in retained_libraries:
+            root.append(copy.deepcopy(child))
+        elif name == "library_geometries":
+            library = ET.SubElement(root, child.tag, dict(child.attrib))
+    if library is None:
+        library = ET.SubElement(root, qname(namespace, "library_geometries"))
+    tree = ET.ElementTree(root)
 
     accepted_by_source: dict[tuple[int, int, int], int] = {}
     for face_index, candidate_id in enumerate(_candidate_ids_by_face(result)):
@@ -4113,6 +4631,7 @@ def export_transformed_part_dae(
     # Generate compact geometries before clearing the original geometry library.
     generated_geometries: list[ET.Element] = []
     generated_geometry_ids: list[str] = []
+    source_value_cache: dict[int, tuple[np.ndarray, int, int]] = {}
     base_node_name = result.part.node_name or result.part.node_id or "beamxp_part"
 
     mirror_world = _global_x_reflection()
@@ -4128,6 +4647,7 @@ def export_transformed_part_dae(
     carrier_node = _new_preview_node(namespace, carrier_id, carrier_id, carrier_matrix)
     residual_triangle_count = 0
     residual_geometry_ids: list[str] = []
+    runtime_display_uv_flips: list[dict[str, object]] = []
     for instance_index, original_instance in enumerate(original_instances):
         instance_info = result.part.instances[instance_index]
         raw = parse_geometry(loaded, instance_info.geometry_id)
@@ -4150,7 +4670,16 @@ def export_transformed_part_dae(
             reverse_winding=True,
             position_transform=carrier_local_reflection,
             normal_transform=carrier_normal_transform,
+            source_value_cache=source_value_cache,
         )
+        uv_flip = _flip_material_texcoord_islands(
+            geometry,
+            namespace,
+            runtime_display_uv_flip_materials or set(),
+        )
+        if uv_flip["matched_materials"]:
+            uv_flip.update({"geometry_id": geometry_id, "role": "mirrored_carrier"})
+            runtime_display_uv_flips.append(uv_flip)
         generated_geometries.append(geometry)
         generated_geometry_ids.append(geometry_id)
         residual_geometry_ids.append(geometry_id)
@@ -4193,7 +4722,22 @@ def export_transformed_part_dae(
                 namespace,
                 used_ids,
                 reverse_winding=False,
+                source_value_cache=source_value_cache,
             )
+            uv_flip = _flip_material_texcoord_islands(
+                geometry,
+                namespace,
+                runtime_display_uv_flip_materials or set(),
+            )
+            if uv_flip["matched_materials"]:
+                uv_flip.update(
+                    {
+                        "geometry_id": geometry_id,
+                        "role": "rigid_symmetric",
+                        "candidate_id": candidate_id,
+                    }
+                )
+                runtime_display_uv_flips.append(uv_flip)
             generated_geometries.append(geometry)
             generated_geometry_ids.append(geometry_id)
             instance_geometry_ids.append(geometry_id)
@@ -4224,31 +4768,11 @@ def export_transformed_part_dae(
             }
         )
 
-    # The preview DAE contains only the generated selected-part geometries. Keep
-    # material/effect/image libraries from the source because cloned bindings may
-    # reference them, but discard unrelated source meshes and static scene nodes.
-    for child in list(library):
-        library.remove(child)
+    # The preview DAE contains only the generated selected-part geometries. Its
+    # material/effect/image libraries were retained above because cloned
+    # bindings may reference them.
     for geometry in generated_geometries:
         library.append(geometry)
-
-    # Controllers/animations can retain references to geometry that was pruned;
-    # this output is intentionally a static transform preview.
-    removable_libraries = {
-        "library_animations",
-        "library_animation_clips",
-        "library_controllers",
-        "library_nodes",
-        "library_cameras",
-        "library_lights",
-        "library_force_fields",
-        "library_physics_materials",
-        "library_physics_models",
-        "library_physics_scenes",
-    }
-    for child in list(root):
-        if local_name(child.tag) in removable_libraries:
-            root.remove(child)
 
     blender_texture_info: dict[str, object] | None = None
     if blender_base_colours:
@@ -4289,6 +4813,19 @@ def export_transformed_part_dae(
         },
         "rigid_symmetric_nodes": generated_candidates,
         "generated_geometry_ids": generated_geometry_ids,
+        "runtime_display_uv_flip": {
+            "requested_materials": sorted(
+                {
+                    alias
+                    for value in (runtime_display_uv_flip_materials or set())
+                    if (alias := _normalise_material_alias(value))
+                }
+            ),
+            "geometries": runtime_display_uv_flips,
+            "modified_texcoords": sum(
+                int(row["modified_texcoords"]) for row in runtime_display_uv_flips
+            ),
+        },
         "blender_texture": blender_texture_info,
     }
 

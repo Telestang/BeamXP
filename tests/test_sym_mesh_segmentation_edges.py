@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -14,6 +16,7 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
     _IslandGeometry,
     _resolve_touching_symmetric_unions,
     _surface_points_and_samples,
+    analyse_symmetry_sweep,
     build_topology,
     measure_perimeter_symmetry,
     pseudo_aspect_ratio_from_area_perimeter,
@@ -181,11 +184,11 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
     def test_pseudo_aspect_ratio_clamps_compact_shapes_to_one(self) -> None:
         self.assertEqual(pseudo_aspect_ratio_from_area_perimeter(math.pi, 2.0 * math.pi), 1.0)
 
-    def test_symmetry_requires_final_rms_to_reach_direct_threshold(self) -> None:
+    def test_symmetry_that_cannot_reach_direct_fit_is_rejected(self) -> None:
         vertices = np.array(
             [
                 [-1.0, 0.0, -1.0],
-                [1.005, 0.0, -1.0],
+                [1.0015, 0.0, -1.0],
                 [1.0, 0.0, 1.0],
                 [-1.0, 0.0, 1.0],
             ],
@@ -196,14 +199,61 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             vertices,
             ((0, 1, 2, 3),),
             sample_spacing=0.05,
-            rms_tolerance=0.01,
-            direct_rms_tolerance=0.001,
+            rms_tolerance=0.001,
+            direct_rms_tolerance=0.0005,
         )
 
         self.assertFalse(measurement.passed)
         self.assertTrue(measurement.tilt_search_applied)
-        self.assertLessEqual(measurement.initial_rms_error, 0.01)
-        self.assertGreater(measurement.rms_error, 0.001)
+        self.assertLessEqual(measurement.initial_rms_error, 0.001)
+        self.assertGreater(measurement.rms_error, 0.0005)
+
+    def test_failed_corrected_fit_remains_on_mirrored_carrier(self) -> None:
+        topology = _open_square_topology()
+        topology.vertices[1, 0] += 0.0015
+
+        with patch(
+            "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.topology_for_part",
+            return_value=topology,
+        ):
+            result = analyse_symmetry_sweep(
+                SimpleNamespace(),
+                SimpleNamespace(key="test"),
+                crease_max=90.0,
+                crease_min=15.0,
+                threshold_steps=2,
+                min_region_faces=1,
+                max_pseudo_aspect_ratio=10.0,
+                symmetry_tolerance_metres=0.001,
+                direct_symmetry_tolerance_metres=0.0005,
+                sample_spacing_metres=0.05,
+            )
+
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(result.remaining_faces, (0, 1))
+
+    def test_symmetry_above_outer_threshold_is_rejected_without_tilt_search(self) -> None:
+        vertices = np.array(
+            [
+                [-1.0, 0.0, -1.0],
+                [1.0025, 0.0, -1.0],
+                [1.0, 0.0, 1.0],
+                [-1.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        measurement = measure_perimeter_symmetry(
+            vertices,
+            ((0, 1, 2, 3),),
+            sample_spacing=0.05,
+            rms_tolerance=0.001,
+            direct_rms_tolerance=0.0005,
+        )
+
+        self.assertFalse(measurement.passed)
+        self.assertFalse(measurement.tilt_search_applied)
+        self.assertGreater(measurement.initial_rms_error, 0.001)
 
     def test_main_region_with_closed_mesh_edges_is_symmetry_candidate(self) -> None:
         topology = _open_square_topology()

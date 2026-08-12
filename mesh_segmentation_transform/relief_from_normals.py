@@ -41,7 +41,7 @@ with "Detect on" set to Relief.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -165,7 +165,6 @@ class ReliefConfig:
     # Engraving and embossing differ only in sign, and a detector keyed to
     # bright-on-dark will find one and miss the other.  Flip to check.
     invert: bool = True
-
 
 DEFAULT_RELIEF_CONFIG = ReliefConfig()
 
@@ -374,6 +373,45 @@ def render_relief(
         ).apply(grey)
 
     return np.repeat(grey[:, :, None], 3, axis=2)
+
+
+def slope_relief_edge_response(
+    normal_rgb: np.ndarray,
+    config: ReliefConfig = DEFAULT_RELIEF_CONFIG,
+) -> np.ndarray:
+    """Return sharp form-filtered slope edges for grouping barriers only.
+
+    This deliberately does not detect glyphs.  It is a cached response map
+    consulted only for the small corridor between two colour-detected boxes.
+    Slope preserves both sides of a raised/engraved edge, while form removal
+    suppresses broad panel curvature before the Scharr edge measurement.
+    """
+    slope_config = replace(config, mode=MODE_SLOPE)
+    grey = render_relief(normal_rgb, slope_config)[:, :, 0].astype(np.float32)
+    dx = cv2.Scharr(grey, cv2.CV_32F, 1, 0)
+    dy = cv2.Scharr(grey, cv2.CV_32F, 0, 1)
+    return cv2.magnitude(dx, dy)
+
+
+def slope_relief_edge_response_gpu(
+    normal_rgb: np.ndarray,
+    config: ReliefConfig = DEFAULT_RELIEF_CONFIG,
+) -> np.ndarray:
+    """Return the slope-only relief barrier response through ModernGL.
+
+    Form removal and slope rendering deliberately remain shared with the CPU
+    preview path so their tuning semantics do not change.  The expensive Scharr
+    response itself is dispatched to the same single ModernGL worker used by
+    GPU local contrast; no CPU fallback is hidden behind this function.
+    """
+    slope_config = replace(config, mode=MODE_SLOPE)
+    grey = render_relief(normal_rgb, slope_config)[:, :, 0]
+    from mesh_segmentation_transform.texture_local_contrast_gpu import (
+        compute_edge_response,
+    )
+    return compute_edge_response(
+        np.ascontiguousarray(grey), "scharr", 3, 0.0,
+    )
 
 
 def region_relief_report(

@@ -68,7 +68,14 @@ class MserConfig:
     # steps up and back down, so MSER has nothing to be stable about and finds
     # nothing.  A kernel gradient keys on exactly the thing that is there, and
     # costs one convolution instead of a region search.
-    box_source:    str   = "mser"  # default: "mser"  ("mser" or "edge")
+    # "foreground" is the cheaper default for authored UI/emissive atlases.
+    # It removes the dominant flat backing, then labels the remaining connected
+    # foreground.  Unlike MSER it does not require a glyph to contain a stable
+    # intensity plateau, which is important for anti-aliased screen artwork.
+    # "opacity_mask" reads an authored visibility mask literally: non-black
+    # texels are content.  It must not infer a dominant backing because a glyph
+    # can occupy nearly all of one small UV island.
+    box_source:    str   = "foreground"  # "foreground", "opacity_mask", "contrast", "contrast_gpu", "mser", "edge", or "edge_gpu"
 
     # MSER detector
     delta:         int   = 10  # default: 10
@@ -77,7 +84,8 @@ class MserConfig:
     max_variation: float = 1.0  # default: 0.25
     min_diversity: float = 0.1  # default: 0.2
 
-    # Edge detector.  Only read when box_source is "edge".
+    # Edge detector.  Read by both the CPU ``edge`` and ModernGL ``edge_gpu``
+    # front ends; everything after raw component fitting is shared.
     edge_operator:              str   = "scharr"  # default: "scharr" ("scharr", "sobel", "laplacian")
     edge_kernel_px:             int   = 3  # default: 3 (sobel/laplacian aperture; scharr is always 3)
     edge_blur_sigma:            float = 1.0  # default: 1.0 (pre-smooth, in texture pixels)
@@ -101,6 +109,76 @@ class MserConfig:
     edge_close_px:              int   = 5  # default: 5
     edge_dilate_px:             int   = 1  # default: 1
     edge_min_component_px:      int   = 12  # default: 12
+
+    # Foreground-mask detector.  The dominant colour is measured only inside
+    # the UV domain, so empty atlas pixels cannot become the background model.
+    # A pixel is foreground when it is sufficiently distant from that dominant
+    # backing, sufficiently colourful/bright compared with it, or lies on a
+    # strong local edge.  The components are deliberately broad; the shared
+    # filters and domain checks downstream decide what is safe to flip.
+    foreground_background_bins:       int   = 16
+    foreground_background_distance:   float = 30.0
+    foreground_value_contrast:        float = 20.0
+    foreground_min_saturation:        float = 28.0
+    foreground_edge_threshold:        float = 35.0
+    foreground_open_px:               int   = 1
+    foreground_close_px:              int   = 3
+    foreground_min_component_px:      int   = 10
+    foreground_merge_gap_px:          int   = 6
+    foreground_max_coverage:          float = 0.85
+    # A foreground component can be a whole button or trim insert because its
+    # fill differs from the atlas backing.  Re-run the same dominant-colour
+    # idea *inside* solid components: that fill then becomes the local
+    # background and independently contrasting content is fitted as children.
+    # This is polarity-neutral (dark-on-light and light-on-dark both work),
+    # unlike a white-ink threshold.
+    foreground_refine_internal_details: bool = False
+    foreground_detail_inset_px:        int   = 2
+    foreground_detail_min_parent_px:   int   = 100
+    foreground_detail_min_coverage:    float = 0.15
+    foreground_detail_min_component_px:int   = 5
+    foreground_detail_replace_area_ratio: float = 4.0
+    foreground_detail_max_depth:        int   = 2
+    # Keep the hierarchy a cheap panel/switch refinement, not a second
+    # texture-segmentation pass over carpet, seams or large atlas islands.
+    foreground_detail_max_parent_px:   int   = 10000
+    foreground_detail_max_children:    int   = 8
+
+    # Authoritative opacity/visibility-mask detector.  A small non-zero floor
+    # retains anti-aliased glyph edges while ignoring near-black compression
+    # noise.  Component sizing and joining deliberately share the foreground
+    # controls above so downstream grouping behaves identically.
+    opacity_mask_threshold:             int   = 8
+
+    # Local-contrast detector.  A masked box filter calculates the colour
+    # average at every pixel, using only texels from the current UV island.
+    # The response is the distance from that local mean.  Its absolute floor
+    # rejects compression/grain noise; its percentile is measured per island
+    # so one noisy or bright atlas area cannot set another island's threshold.
+    contrast_kernel_px:                int   = 5
+    contrast_min_response:             float = 20.0
+    contrast_percentile:               float = 70.0
+    contrast_open_px:                  int   = 0
+    contrast_close_px:                 int   = 2
+    contrast_min_component_px:         int   = 6
+    contrast_merge_gap_px:             int   = 5
+    contrast_max_coverage:             float = 0.85
+    # Only affects local-contrast runs.  A proximity join is refused if its
+    # shared-axis corridor crosses too much response which the front end had
+    # already classified as high contrast.  This keeps separate button faces
+    # apart without remeasuring colour during grouping.
+    enable_contrast_continuity_grouping: bool = True
+    contrast_bridge_min_response:      float = 8.0
+    contrast_bridge_max_high_coverage: float = 0.05
+    # A normal map can contribute without becoming a second glyph detector:
+    # reject a colour-box proximity join when its corridor crosses a sharp,
+    # cached relief edge (for example a button or panel boundary).  Unlike the
+    # colour bridge, relief is directional: a glyph's own top/bottom outline
+    # may touch a narrow gap, but a real separator must span most of the
+    # cross-axis between the two boxes.
+    enable_relief_edge_bridge_grouping: bool = True
+    relief_bridge_min_response:        float = 150.0
+    relief_bridge_min_cross_axis_coverage: float = 0.70
 
     # Stroke width (Epshtein et al.).  Off by default, so the colour pipeline
     # is exactly what it was.  This is the test that separates lettering from
@@ -143,19 +221,15 @@ class MserConfig:
     # aspect ratio come from, and because a hull of thirty points is a busier
     # outline to read at a glance.
     bounds_shape:                  str = SHAPE_HULL  # default: "hull"
-    # Optional UV-edge agreement for adopting a rotated outline.  This answers
-    # a different question from the feature fit: a long mark can have a real
-    # direction while still not being a mark that should rotate with the trim.
-    # When enabled, the region has to sit near a UV island edge and the fitted
-    # feature direction has to agree with that edge.  The outline then uses the
-    # edge angle, so one side of the drawn rectangle is parallel to the island
-    # edge rather than wobbling with glyph noise.
+    # Optional UV-edge direction for adopting a rotated outline.  The closest
+    # contiguous UV contour is authoritative: glyph pixels determine only the
+    # outline extent and its distance from that contour, never its angle.
     enable_edge_aligned_rotation: bool = False  # default: False
     rotation_edge_min_gap_px:     float = 2.0  # default: 2.0 (touching the edge is not proximity)
     rotation_edge_search_px:      int = 24  # default: 24 (max distance to UV edge)
     rotation_edge_band_px:        int = 6  # default: 6 (edge samples near closest approach)
     rotation_edge_min_points:     int = 8  # default: 8 (else no edge angle is fitted)
-    max_rotation_edge_angle_degrees: float = 12.0  # default: 12.0
+    max_rotation_edge_angle_degrees: float = 12.0  # default: 12.0 (max local UV-tangent instability)
     max_opposite_rotation_edge_fraction: float = 0.5  # default: 0.5 (reject UV-bounded strips)
     # How much of the enclosing shape has to be feature before the outline is
     # worth adopting.  An absolute bar, not a comparison against the
@@ -193,6 +267,16 @@ class MserConfig:
     # components to measure scatter 0.18 to 0.56.
     max_baseline_scatter:        float = 0.15  # default: 0.15
 
+    # Final relief-text classifier.  Unlike ``Text lines`` this does not rely
+    # on connected components: shallow letters can touch in the edge mask.
+    # It thresholds the already-rendered relief region at a local response
+    # percentile and counts repeated occupied bands along its long axis.
+    enable_relief_text_filter: bool = False
+    relief_text_response_percentile: float = 80.0
+    relief_text_projection_min_coverage: float = 0.10
+    relief_text_min_runs: int = 4
+    relief_text_min_band_scale: float = 0.20
+
     # Region flatness.  The other half of the pair: the ring test rejects a
     # region because of what surrounds it, this one because there is nothing
     # in it.  A bolster roll or a fascia curve raises an edge without carrying
@@ -216,6 +300,26 @@ class MserConfig:
     # high-contrast too, and no threshold up to 10 removed a single one of 113
     # colour detections.  This is a relief-side filter.
     min_region_relief:           float = 10.0  # default: 10.0
+
+    # Relief glyph structure.  A normal-map glyph is either a compact, dense
+    # edge mark (an icon or the AIRBAG emboss), or several independent edge
+    # fragments lying on one baseline (a word such as ARDENTE).  A trim seam
+    # generally has one dominant component and fails both tests.  This is
+    # deliberately an edge-only semantic filter, separate from generic colour
+    # blob/text heuristics.
+    enable_relief_glyph_filter: bool = False
+    relief_glyph_min_component_px: int = 8
+    relief_glyph_min_line_components: int = 3
+    relief_glyph_max_line_scatter: float = 0.15
+    relief_glyph_max_dominant_component_fraction: float = 0.5
+    relief_glyph_min_compact_edge_coverage: float = 0.30
+    # Outlined badges and script marks can be sparse and deliberately curved,
+    # so neither the dense-compact nor straight-baseline branch describes them.
+    # Their edge pixels still occupy two dimensions, unlike a trim seam.
+    relief_glyph_min_outline_components: int = 3
+    relief_glyph_min_outline_edge_coverage: float = 0.10
+    relief_glyph_max_outline_dominant_component_fraction: float = 0.65
+    relief_glyph_min_outline_scatter: float = 0.20
 
     enable_ring_smoothness_filter: bool = False  # default: False
     ring_smoothness_width_px:      int = 2  # default: 2 (how thick a ring)
@@ -251,7 +355,7 @@ class MserConfig:
 
     # If the same magic-wand feature continues outside the detected bounds, the
     # box is probably a slice of a larger motif/material run rather than a mark.
-    enable_feature_extension_filter:   bool = False  # default: True
+    enable_feature_extension_filter:   bool = False  # default: False
     feature_extension_context_px:      int = 12  # default: 12
     feature_extension_min_ratio:       float = 0.25  # default: 0.25 (outside / inside)
 
@@ -292,7 +396,7 @@ class MserConfig:
     # minimum union-area test.  This replaces the old additive
     # merge_distance_px + group_dilate_px pair.
     #
-    # Candidate joins first collapse boxes that significantly overlap, which
+    # Candidate joins first collapse every pair with positive overlap, which
     # keeps nested MSER fragments attached to their containing symbol.  Remaining
     # joins are attempted closest-first, but only along rows or columns.  A
     # diagonal group has no useful near-symmetry once flipped, so boxes separated
@@ -302,15 +406,18 @@ class MserConfig:
     # groups alive.
     merge_distance_px:              int  = 150  # default: 150
     min_group_union_region_px:      int  = 1  # default: 1 (any overlap merges)
-    min_group_overlap_ratio:        float = 1.0  # default: 1.0 (intersection / smaller box)
+    # Proximity grouping is directional.  Boxes must both overlap on the
+    # shared axis and have their centre lines close on that axis; overlap alone
+    # lets a thin seam attached to an edge of a tall panel masquerade as text
+    # on the same row.  Expressed as a fraction of the smaller box's shared
+    # dimension so it stays scale independent across texture resolutions.
+    group_axis_center_tolerance:    float = 0.50
     enable_island_bounded_grouping: bool = True  # default: True
-    enable_overlap_group_merge:     bool = True  # default: True
 
     # Round regions: inscribe a circle in a squarish group and keep it when the
     # corners it drops are one solid colour or contain no UV domain at all.
     enable_circular_groups:            bool  = True  # default: True
     circular_group_min_squareness:     float = 0.80  # default: 0.80 (min side / max side)
-    circular_group_padding_px:         int   = 3  # default: 3 (grown past a strict inscribe)
     circular_group_colour_tolerance:   int   = 24  # default: 24
     circular_group_max_corner_content: float = 0.05  # default: 0.05 of the corner area
 
@@ -353,7 +460,14 @@ class MserConfig:
 # edge-heavy pipeline and rotated boxes, while printed marks should keep the
 # colour-oriented defaults.
 
-DEFAULT_COLOUR_CONFIG = MserConfig()
+DEFAULT_COLOUR_CONFIG = replace(
+    MserConfig(),
+    contrast_kernel_px=7,
+    contrast_close_px=0,
+    contrast_min_component_px=24,
+    contrast_merge_gap_px=0,
+    enable_feature_extension_filter=True,
+)
 DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     DEFAULT_COLOUR_CONFIG,
     box_source="edge",
@@ -367,15 +481,19 @@ DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     rotation_edge_search_px=50,
     min_feature_tightness=0.01,
     enable_region_flatness_filter=True,
-    min_region_relief=30.0,
+    region_flatness_percentile=95.0,
+    min_region_relief=5.0,
+    enable_relief_glyph_filter=True,
+    enable_relief_text_filter=True,
+    enable_feature_extension_filter=False,
     enable_ring_smoothness_filter=True,
     ring_smoothness_margin_px=4,
     ring_smoothness_percentile=30.0,
-    min_box_width_px=15,
-    min_box_height_px=15,
+    min_box_width_px=8,
+    min_box_height_px=8,
     box_feature_min_domain_px=8,
     box_min_feature_px=15,
-    merge_distance_px=18,
+    merge_distance_px=21,
     final_max_aspect=20.0,
 )
 DEFAULT_CONFIG = DEFAULT_COLOUR_CONFIG
@@ -682,6 +800,8 @@ def edge_response(grey: np.ndarray, config: MserConfig) -> np.ndarray:
     every angle and a detector that answers differently to a vertical and a
     diagonal stroke will find some letters and lose others.
     """
+    if config.box_source == "edge_gpu":
+        return edge_response_gpu(grey, config)
     source = grey.astype(np.float32)
     if config.edge_blur_sigma > 0:
         source = cv2.GaussianBlur(source, (0, 0), config.edge_blur_sigma)
@@ -699,6 +819,22 @@ def edge_response(grey: np.ndarray, config: MserConfig) -> np.ndarray:
     return cv2.magnitude(dx, dy)
 
 
+def edge_response_gpu(grey: np.ndarray, config: MserConfig) -> np.ndarray:
+    """Run the edge/Laplacian front end on the shared ModernGL context.
+
+    ``edge_gpu`` is an explicit detector mode, so this function never hides a
+    GPU failure behind a CPU result.  The production build and tuning harness
+    call the same service in ``texture_local_contrast_gpu``.
+    """
+    from mesh_segmentation_transform.texture_local_contrast_gpu import (
+        compute_edge_response,
+    )
+    return compute_edge_response(
+        np.ascontiguousarray(grey), config.edge_operator,
+        config.edge_kernel_px, config.edge_blur_sigma,
+    )
+
+
 def edge_mask(
     grey: np.ndarray,
     uv_mask: np.ndarray | None,
@@ -711,10 +847,19 @@ def edge_mask(
     widths describe edges the boxes were never built from.
     """
     response = edge_response(grey, config)
-    domain = uv_mask if uv_mask is not None else np.ones(grey.shape[:2], bool)
+    return edge_mask_from_response(response, uv_mask, config)
+
+
+def edge_mask_from_response(
+    response: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Threshold an already-computed edge response inside one UV domain."""
+    domain = uv_mask if uv_mask is not None else np.ones(response.shape[:2], bool)
     inside = response[domain]
     if inside.size == 0:
-        return np.zeros(grey.shape[:2], dtype=bool), response
+        return np.zeros(response.shape[:2], dtype=bool), response
 
     if config.edge_local_window_px > 0:
         window = max(int(config.edge_local_window_px), 3)
@@ -735,21 +880,32 @@ def edge_mask(
     return (response >= threshold) & domain, response
 
 
-def detect_edge_boxes(
+def detect_edge_boxes_with_response(
     grey: np.ndarray,
     uv_mask: np.ndarray | None,
     config: MserConfig,
-) -> np.ndarray:
-    """Return bounding boxes of connected edge structure.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return edge boxes and the response used to construct them.
 
     Closing runs before components are labelled so a stroke's two edges become
     one blob; without it every letter arrives as a pair of thin rings and the
-    grouping stage has twice as much to join.
+    grouping stage has twice as much to join.  Keeping the response lets the
+    grouping stage distinguish a blank gap between glyphs from a sharp relief
+    boundary, without computing the Laplacian a second time.
     """
-    mask, _response = edge_mask(grey, uv_mask, config)
+    mask, response = edge_mask(grey, uv_mask, config)
+    return detect_edge_boxes_from_response(mask, response, config)
+
+
+def detect_edge_boxes_from_response(
+    mask: np.ndarray,
+    response: np.ndarray,
+    config: MserConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit edge components from a thresholded response already in memory."""
     edges = mask.astype(np.uint8)
     if not bool(edges.any()):
-        return np.empty((0, 4), dtype=np.int32)
+        return np.empty((0, 4), dtype=np.int32), response
 
     if config.edge_close_px > 0:
         size = max(int(config.edge_close_px), 1)
@@ -781,8 +937,529 @@ def detect_edge_boxes(
             continue
         boxes.append((x, y, w, h))
     if not boxes:
+        return np.empty((0, 4), dtype=np.int32), response
+    return np.asarray(boxes, dtype=np.int32), response
+
+
+def _merge_foreground_boxes(
+    boxes: list[tuple[int, int, int, int]], gap: int,
+) -> list[tuple[int, int, int, int]]:
+    """Merge nearby foreground components without requiring MSER fragments.
+
+    Screen labels often arrive as one component per letter or icon stroke.  A
+    small Chebyshev gap joins those into useful rectangular correction regions
+    before the normal grouping/filtering pipeline refines them further.
+    """
+    merged = list(boxes)
+    gap = max(int(gap), 0)
+    changed = True
+    while changed:
+        changed = False
+        for left, first in enumerate(merged):
+            ax, ay, aw, ah = first
+            ax1, ay1 = ax + aw, ay + ah
+            for right in range(left + 1, len(merged)):
+                bx, by, bw, bh = merged[right]
+                bx1, by1 = bx + bw, by + bh
+                dx = max(bx - ax1, ax - bx1, 0)
+                dy = max(by - ay1, ay - by1, 0)
+                if max(dx, dy) > gap:
+                    continue
+                x0, y0 = min(ax, bx), min(ay, by)
+                x1, y1 = max(ax1, bx1), max(ay1, by1)
+                merged[left] = (x0, y0, x1 - x0, y1 - y0)
+                merged.pop(right)
+                changed = True
+                break
+            if changed:
+                break
+    return merged
+
+
+def _refine_foreground_internal_details(
+    bgr: np.ndarray,
+    domain: np.ndarray,
+    foreground: np.ndarray,
+    boxes: list[tuple[int, int, int, int]],
+    config: MserConfig,
+) -> list[tuple[int, int, int, int]]:
+    """Replace solid, broad foreground blobs with their local detail.
+
+    The first foreground pass correctly says that a grey switch insert differs
+    from the black texture backing, but that is normally not the content which
+    needs mirroring.  For each sufficiently solid box, sample its foreground
+    pixels as a *new* local background, then retain only pixels which differ
+    from that local mode.  It is deliberately a colour-distance/value test,
+    not a bright-pixel rule, so black glyphs on light switches work just as
+    well as white glyphs on dark ones.
+
+    The outer inset suppresses the button boundary, whose contrast is useful
+    for finding the parent but should not by itself become child detail.
+    """
+    if not config.foreground_refine_internal_details:
+        return boxes
+
+    bins = max(int(config.foreground_background_bins), 2)
+    inset = max(int(config.foreground_detail_inset_px), 0)
+    min_parent = max(int(config.foreground_detail_min_parent_px), 1)
+    min_child = max(int(config.foreground_detail_min_component_px), 1)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    max_depth = max(int(config.foreground_detail_max_depth), 1)
+    max_parent = max(int(config.foreground_detail_max_parent_px), min_parent)
+    max_children = max(int(config.foreground_detail_max_children), 1)
+
+    def local_children(
+        x: int, y: int, width: int, height: int, support: np.ndarray,
+    ) -> list[tuple[tuple[int, int, int, int], np.ndarray]]:
+        """Find one locally-contrasting layer inside an exact parent mask."""
+        parent_area = width * height
+        if (
+            parent_area < min_parent
+            or parent_area > max_parent
+            or width <= inset * 2
+            or height <= inset * 2
+        ):
+            return []
+        support_count = int(support.sum())
+        if (
+            support_count < min_child
+            or support_count / max(parent_area, 1)
+            < float(config.foreground_detail_min_coverage)
+        ):
+            return []
+
+        # A dark glyph in a light switch is an enclosed hole in the parent
+        # support.  Include only such holes, never exterior atlas pixels.
+        padded_inverse = (~np.pad(support, 1, constant_values=False)).astype(np.uint8)
+        cv2.floodFill(padded_inverse, None, (0, 0), 0)
+        detail_domain = support | padded_inverse[1:-1, 1:-1].astype(bool)
+        detail_domain &= domain[y:y + height, x:x + width]
+        if inset:
+            detail_domain[:inset, :] = False
+            detail_domain[height - inset:, :] = False
+            detail_domain[:, :inset] = False
+            detail_domain[:, width - inset:] = False
+
+        crop = bgr[y:y + height, x:x + width]
+        quantized = ((crop.astype(np.uint16) * bins) // 256).astype(np.uint8)
+        samples = quantized[support]
+        packed = (
+            samples[:, 0].astype(np.int32) * bins * bins
+            + samples[:, 1].astype(np.int32) * bins
+            + samples[:, 2].astype(np.int32)
+        )
+        mode = int(np.bincount(packed, minlength=bins ** 3).argmax())
+        local_background = np.array(
+            [mode // (bins * bins), (mode // bins) % bins, mode % bins],
+            dtype=np.float32,
+        )
+        local_background = (local_background + 0.5) * (256.0 / bins)
+        distance = np.linalg.norm(crop.astype(np.float32) - local_background, axis=2)
+        local_value_delta = np.abs(
+            hsv[y:y + height, x:x + width, 2].astype(np.float32)
+            - float(local_background.max())
+        )
+        local_saturation = hsv[y:y + height, x:x + width, 1].astype(np.float32)
+        detail = (
+            (distance >= float(config.foreground_background_distance))
+            | (local_value_delta >= float(config.foreground_value_contrast))
+            | ((local_saturation >= float(config.foreground_min_saturation))
+               & (distance >= float(config.foreground_background_distance) * 0.5))
+        ) & detail_domain
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            detail.astype(np.uint8), 8,
+        )
+        children: list[tuple[tuple[int, int, int, int], np.ndarray]] = []
+        for label in range(1, count):
+            child_x, child_y, child_w, child_h, child_area = (
+                int(value) for value in stats[label]
+            )
+            if child_area >= min_child and child_w > 0 and child_h > 0:
+                children.append((
+                    (x + child_x, y + child_y, child_w, child_h),
+                    detail[child_y:child_y + child_h, child_x:child_x + child_w],
+                ))
+        return children if len(children) <= max_children else []
+
+    def refine_tree(
+        x: int, y: int, width: int, height: int, support: np.ndarray, depth: int,
+    ) -> list[tuple[int, int, int, int]]:
+        children = local_children(x, y, width, height, support)
+        if not children:
+            return [(x, y, width, height)]
+        leaves = [
+            leaf
+            for child_box, child_support in children
+            for leaf in (
+                refine_tree(*child_box, child_support, depth + 1)
+                if depth < max_depth else [child_box]
+            )
+        ]
+        leaf_box_area = sum(leaf_width * leaf_height for _, _, leaf_width, leaf_height in leaves)
+        return (
+            leaves
+            if leaf_box_area
+            and width * height >= leaf_box_area
+            * float(config.foreground_detail_replace_area_ratio)
+            else [(x, y, width, height)]
+        )
+
+    refined = [
+        leaf
+        for x, y, width, height in boxes
+        for leaf in refine_tree(
+            x, y, width, height,
+            foreground[y:y + height, x:x + width].astype(bool)
+            & domain[y:y + height, x:x + width],
+            1,
+        )
+    ]
+    return _merge_foreground_boxes(refined, config.foreground_merge_gap_px)
+
+
+def detect_foreground_boxes(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> np.ndarray:
+    """Return boxes from a cheap dominant-background foreground mask.
+
+    This front-end is intentionally independent of MSER.  It works well on
+    base, emissive, opacity, overlay and glow-state images where useful marks
+    are defined by contrast against a mostly flat panel rather than by stable
+    extremal regions.  If an RGBA image is supplied its alpha is folded into
+    the mask; normal BGR callers continue to work unchanged.
+    """
+    if image.ndim != 3 or image.shape[2] < 3:
+        return np.empty((0, 4), dtype=np.int32)
+    bgr = image[:, :, :3]
+    height, width = bgr.shape[:2]
+    domain = (
+        uv_mask.astype(bool)
+        if uv_mask is not None and uv_mask.shape[:2] == (height, width)
+        else np.ones((height, width), dtype=bool)
+    )
+    if not bool(domain.any()):
+        return np.empty((0, 4), dtype=np.int32)
+
+    # Quantisation makes the mode resilient to compression noise and gentle
+    # gradients while retaining the authored panel colour.
+    bins = max(int(config.foreground_background_bins), 2)
+    quantized = ((bgr.astype(np.uint16) * bins) // 256).astype(np.uint8)
+    samples = quantized[domain]
+    packed = (
+        samples[:, 0].astype(np.int32) * bins * bins
+        + samples[:, 1].astype(np.int32) * bins
+        + samples[:, 2].astype(np.int32)
+    )
+    mode = int(np.bincount(packed, minlength=bins ** 3).argmax())
+    background = np.array(
+        [mode // (bins * bins), (mode // bins) % bins, mode % bins],
+        dtype=np.float32,
+    )
+    background = (background + 0.5) * (256.0 / bins)
+    pixels = bgr.astype(np.float32)
+    distance = np.linalg.norm(pixels - background, axis=2)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    background_value = float(background.max())
+    value_delta = np.abs(hsv[:, :, 2].astype(np.float32) - background_value)
+    saturation = hsv[:, :, 1].astype(np.float32)
+    grey = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gradient = edge_response(grey, config)
+
+    mask = (
+        (distance >= float(config.foreground_background_distance))
+        | (value_delta >= float(config.foreground_value_contrast))
+        | ((saturation >= float(config.foreground_min_saturation))
+           & (distance >= float(config.foreground_background_distance) * 0.5))
+        | (gradient >= float(config.foreground_edge_threshold))
+    ) & domain
+    if image.shape[2] >= 4:
+        mask &= image[:, :, 3] > 0
+    work = mask.astype(np.uint8)
+    if config.foreground_open_px > 0:
+        size = max(int(config.foreground_open_px) * 2 + 1, 1)
+        work = cv2.morphologyEx(
+            work, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+    if config.foreground_close_px > 0:
+        size = max(int(config.foreground_close_px) * 2 + 1, 1)
+        work = cv2.morphologyEx(
+            work, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+    work &= domain.astype(np.uint8)
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(work, 8)
+    boxes: list[tuple[int, int, int, int]] = []
+    min_area = max(int(config.foreground_min_component_px), 1)
+    for label in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[label])
+        if area < min_area or w <= 0 or h <= 0:
+            continue
+        coverage = area / max(w * h, 1)
+        # A solid icon is a valid foreground component.  Reject only a nearly
+        # solid component that also consumes most of the selected UV domain --
+        # that is the backing panel escaping the background model, not a mark.
+        if (
+            coverage > float(config.foreground_max_coverage)
+            and area / max(int(domain.sum()), 1) > float(config.foreground_max_coverage)
+        ):
+            continue
+        boxes.append((x, y, w, h))
+    boxes = _merge_foreground_boxes(boxes, config.foreground_merge_gap_px)
+    boxes = _refine_foreground_internal_details(
+        bgr, domain, work, boxes, config,
+    )
+    if not boxes:
         return np.empty((0, 4), dtype=np.int32)
     return np.asarray(boxes, dtype=np.int32)
+
+
+def detect_opacity_mask_boxes(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> np.ndarray:
+    """Return components declared visible by an authored opacity mask.
+
+    Unlike dominant-background detection, this preserves a glyph which fills
+    most or all of its UV island.  Production invokes it per topological UV
+    island, so clipping to ``uv_mask`` is sufficient to prevent unrelated
+    neighbouring atlas content from joining.
+    """
+    if image.ndim != 3 or image.shape[2] < 3:
+        return np.empty((0, 4), dtype=np.int32)
+    height, width = image.shape[:2]
+    domain = (
+        uv_mask.astype(bool)
+        if uv_mask is not None and uv_mask.shape[:2] == (height, width)
+        else np.ones((height, width), dtype=bool)
+    )
+    if not bool(domain.any()):
+        return np.empty((0, 4), dtype=np.int32)
+
+    intensity = np.max(image[:, :, :3], axis=2)
+    work = (
+        (intensity > max(int(config.opacity_mask_threshold), 0)) & domain
+    ).astype(np.uint8)
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(work, 8)
+    min_area = max(int(config.foreground_min_component_px), 1)
+    boxes = [
+        (int(stats[label, cv2.CC_STAT_LEFT]),
+         int(stats[label, cv2.CC_STAT_TOP]),
+         int(stats[label, cv2.CC_STAT_WIDTH]),
+         int(stats[label, cv2.CC_STAT_HEIGHT]))
+        for label in range(1, count)
+        if int(stats[label, cv2.CC_STAT_AREA]) >= min_area
+        and int(stats[label, cv2.CC_STAT_WIDTH]) > 0
+        and int(stats[label, cv2.CC_STAT_HEIGHT]) > 0
+    ]
+    boxes = _merge_foreground_boxes(boxes, config.foreground_merge_gap_px)
+    if not boxes:
+        return np.empty((0, 4), dtype=np.int32)
+    return np.asarray(boxes, dtype=np.int32)
+
+
+def detect_edge_boxes(
+    grey: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> np.ndarray:
+    """Return bounding boxes of connected edge structure."""
+    return detect_edge_boxes_with_response(grey, uv_mask, config)[0]
+
+
+@dataclass(frozen=True, slots=True)
+class LocalContrastDetection:
+    """Reusable local-contrast data for detection and later grouping."""
+
+    boxes: np.ndarray
+    response: np.ndarray
+    threshold: float
+
+
+def local_contrast_detection_from_response(
+    response: np.ndarray,
+    domain: np.ndarray,
+    config: MserConfig,
+) -> LocalContrastDetection:
+    """Apply the shared percentile/mask/component stages to one response."""
+    if response.shape != domain.shape or not bool(domain.any()):
+        return LocalContrastDetection(
+            np.empty((0, 4), dtype=np.int32),
+            np.asarray(response, dtype=np.float32), 0.0,
+        )
+    island_response = response[domain]
+    percentile = min(max(float(config.contrast_percentile), 0.0), 100.0)
+    threshold = max(
+        float(config.contrast_min_response),
+        float(np.percentile(island_response, percentile)),
+    )
+    work = ((response >= threshold) & domain).astype(np.uint8)
+    if config.contrast_open_px > 0:
+        size = max(int(config.contrast_open_px) * 2 + 1, 1)
+        work = cv2.morphologyEx(
+            work, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+    if config.contrast_close_px > 0:
+        size = max(int(config.contrast_close_px) * 2 + 1, 1)
+        work = cv2.morphologyEx(
+            work, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+    work &= domain.astype(np.uint8)
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(work, 8)
+    min_area = max(int(config.contrast_min_component_px), 1)
+    boxes: list[tuple[int, int, int, int]] = []
+    domain_area = max(int(domain.sum()), 1)
+    for label in range(1, count):
+        x, y, box_width, box_height, area = (int(value) for value in stats[label])
+        if area < min_area or box_width <= 0 or box_height <= 0:
+            continue
+        coverage = area / max(box_width * box_height, 1)
+        if (
+            coverage > float(config.contrast_max_coverage)
+            and area / domain_area > float(config.contrast_max_coverage)
+        ):
+            continue
+        boxes.append((x, y, box_width, box_height))
+    boxes = _merge_foreground_boxes(boxes, config.contrast_merge_gap_px)
+    return LocalContrastDetection(
+        np.asarray(boxes, dtype=np.int32)
+        if boxes else np.empty((0, 4), dtype=np.int32),
+        response.astype(np.float32, copy=False),
+        threshold,
+    )
+
+
+def detect_local_contrast(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> LocalContrastDetection:
+    """Return boxes whose pixels are unusually contrasty for this UV island.
+
+    ``boxFilter`` provides the kernel measurement in vectorised OpenCV code.
+    Dividing filtered colours by filtered domain weights is important: the
+    kernel cannot borrow arbitrary neighbouring atlas texels across a UV-island
+    boundary.  The response has no bright/dark polarity, so glyphs, cut-outs,
+    coloured marks, and embossed-looking colour details share one front end.
+    """
+    if image.ndim != 3 or image.shape[2] < 3:
+        return LocalContrastDetection(
+            np.empty((0, 4), dtype=np.int32), np.empty((0, 0), dtype=np.float32), 0.0,
+        )
+    bgr = image[:, :, :3]
+    height, width = bgr.shape[:2]
+    domain = (
+        uv_mask.astype(bool)
+        if uv_mask is not None and uv_mask.shape[:2] == (height, width)
+        else np.ones((height, width), dtype=bool)
+    )
+    if image.shape[2] >= 4:
+        domain &= image[:, :, 3] > 0
+    if not bool(domain.any()):
+        return LocalContrastDetection(
+            np.empty((0, 4), dtype=np.int32), np.zeros((height, width), dtype=np.float32), 0.0,
+        )
+
+    kernel = max(int(config.contrast_kernel_px), 1)
+    kernel += 1 - kernel % 2  # a centred kernel has no directional bias
+    weights = cv2.boxFilter(
+        domain.astype(np.float32), cv2.CV_32F, (kernel, kernel), normalize=False,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    pixels = bgr.astype(np.float32)
+    weighted = pixels * domain[:, :, None].astype(np.float32)
+    local_sum = cv2.boxFilter(
+        weighted, cv2.CV_32F, (kernel, kernel), normalize=False,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    local_mean = local_sum / np.maximum(weights[:, :, None], 1.0)
+    response = np.linalg.norm(pixels - local_mean, axis=2)
+    return local_contrast_detection_from_response(response, domain, config)
+
+
+def detect_local_contrast_gpu(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> LocalContrastDetection:
+    """Run the local-contrast kernel on GPU; no CPU detector fallback exists."""
+    if image.ndim != 3 or image.shape[2] < 3:
+        return LocalContrastDetection(
+            np.empty((0, 4), dtype=np.int32), np.empty((0, 0), dtype=np.float32), 0.0,
+        )
+    bgr = image[:, :, :3]
+    height, width = bgr.shape[:2]
+    domain = (
+        uv_mask.astype(bool)
+        if uv_mask is not None and uv_mask.shape[:2] == (height, width)
+        else np.ones((height, width), dtype=bool)
+    )
+    if image.shape[2] >= 4:
+        domain &= image[:, :, 3] > 0
+    if not bool(domain.any()):
+        return local_contrast_detection_from_response(
+            np.zeros((height, width), dtype=np.float32), domain, config,
+        )
+    from mesh_segmentation_transform.texture_local_contrast_gpu import (
+        compute_local_contrast_response,
+    )
+    response = compute_local_contrast_response(bgr, domain, config.contrast_kernel_px)
+    return local_contrast_detection_from_response(response, domain, config)
+
+
+def detect_local_contrast_gpu_batch(
+    entries: list[tuple[np.ndarray, np.ndarray]],
+    config: MserConfig,
+) -> list[LocalContrastDetection]:
+    """GPU response for independent UV crops, packed before upload/dispatch."""
+    from mesh_segmentation_transform.texture_local_contrast_gpu import (
+        compute_local_contrast_responses,
+    )
+    images = [image[:, :, :3] for image, _mask in entries]
+    domains = [mask.astype(bool) for _image, mask in entries]
+    responses = compute_local_contrast_responses(images, domains, config.contrast_kernel_px)
+    return [
+        local_contrast_detection_from_response(response, domain, config)
+        for response, domain in zip(responses, domains)
+    ]
+
+
+def prewarm_local_contrast_gpu() -> None:
+    """Schedule context/shader creation before a GPU detector run is requested."""
+    from mesh_segmentation_transform.texture_local_contrast_gpu import prewarm_gpu
+    prewarm_gpu()
+
+
+def prewarm_edge_gpu() -> None:
+    """Prewarm the same ModernGL context used by GPU local contrast."""
+    from mesh_segmentation_transform.texture_local_contrast_gpu import prewarm_gpu
+    prewarm_gpu()
+
+
+def local_contrast_gpu_warm_state() -> str:
+    """Expose GPU context warm-up state to the tuning timing report."""
+    from mesh_segmentation_transform.texture_local_contrast_gpu import gpu_warm_state
+    return gpu_warm_state()
+
+
+def edge_gpu_warm_state() -> str:
+    """Expose the shared edge GPU context warm-up state."""
+    from mesh_segmentation_transform.texture_local_contrast_gpu import gpu_warm_state
+    return gpu_warm_state()
+
+
+def detect_local_contrast_boxes(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+) -> np.ndarray:
+    """Return only the raw boxes for callers that do not need join evidence."""
+    return detect_local_contrast(image, uv_mask, config).boxes
 
 
 @dataclass(frozen=True, slots=True)
@@ -860,6 +1537,7 @@ class EdgeAlignment:
     edge_angle_degrees: float
     feature_angle_degrees: float
     angle_delta_degrees: float
+    edge_stability_degrees: float
     distance_px: float
     edge_points: int
 
@@ -983,14 +1661,16 @@ def edge_aligned_feature_outline(
     shape: FeatureShape,
     config: MserConfig,
     uv_boundary: np.ndarray | None = None,
+    uv_contours: tuple[np.ndarray, ...] | None = None,
 ) -> EdgeAlignment | None:
     """Return a rotated feature outline whose side follows a nearby UV edge.
 
     Proximity is measured from the feature pixels, not from the box centre.  A
     long word beside a trim edge can be many pixels from that edge at its
     centre while one long side is still genuinely close.  The UV-edge angle is
-    fitted from the boundary samples nearest that closest approach, which keeps
-    corners and neighbouring islands from dominating the tangent.
+    fitted from a short contiguous arc around the single closest contour point.
+    The glyph does not contribute an angle, so curved lettering and asymmetric
+    logos cannot tilt a rectangle away from the surface direction.
     """
     if uv_mask is None:
         return None
@@ -1026,38 +1706,84 @@ def edge_aligned_feature_outline(
         return None
     feature_crop[local_y[inside], local_x[inside]] = True
 
-    distance_to_boundary = cv2.distanceTransform(
-        (~boundary_crop).astype(np.uint8), cv2.DIST_L2, 3
+    distance_to_feature = cv2.distanceTransform(
+        (~feature_crop).astype(np.uint8), cv2.DIST_L2, 3
     )
-    distances = distance_to_boundary[feature_crop]
-    if distances.size == 0:
+    if uv_contours is None:
+        found, _hierarchy = cv2.findContours(
+            uv_mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE,
+        )
+        uv_contours = tuple(found)
+
+    nearest: tuple[float, np.ndarray, int] | None = None
+    for contour in uv_contours:
+        points = contour.reshape(-1, 2)
+        if len(points) < 2:
+            continue
+        inside_search = (
+            (points[:, 0] >= sx)
+            & (points[:, 0] < sx + sw)
+            & (points[:, 1] >= sy)
+            & (points[:, 1] < sy + sh)
+        )
+        indices = np.flatnonzero(inside_search)
+        if not len(indices):
+            continue
+        local = points[indices] - np.asarray((sx, sy), dtype=np.int32)
+        distances = distance_to_feature[local[:, 1], local[:, 0]]
+        local_index = int(np.argmin(distances))
+        candidate = (float(distances[local_index]), points, int(indices[local_index]))
+        if nearest is None or candidate[0] < nearest[0]:
+            nearest = candidate
+    if nearest is None:
         return None
-    closest = float(distances.min())
+    closest, contour_points, closest_index = nearest
     minimum_gap = max(float(config.rotation_edge_min_gap_px), 0.0)
     if closest < minimum_gap:
         return None
     if closest > search:
         return None
 
-    distance_to_feature = cv2.distanceTransform(
-        (~feature_crop).astype(np.uint8), cv2.DIST_L2, 3
-    )
-    nearby_edge = boundary_crop & (distance_to_feature <= closest + band)
-    edge_points = cv2.findNonZero(nearby_edge.astype(np.uint8))
     minimum = max(int(config.rotation_edge_min_points), 2)
-    if edge_points is None or len(edge_points) < minimum:
-        return None
+    half_arc = max(minimum // 2, band * 2, 2)
 
+    def contour_arc(half_width: int) -> np.ndarray:
+        if len(contour_points) <= half_width * 2 + 1:
+            return contour_points.astype(np.float32)
+        offsets = np.arange(-half_width, half_width + 1, dtype=np.int32)
+        return contour_points[(closest_index + offsets) % len(contour_points)].astype(
+            np.float32
+        )
+
+    tangent_points = contour_arc(half_arc)
+    if len(tangent_points) < minimum:
+        return None
     vx, vy, _px, _py = cv2.fitLine(
-        edge_points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01
+        tangent_points, cv2.DIST_L2, 0, 0.01, 0.01
     ).reshape(4)
     edge_angle = _normalised_axis_angle_degrees(
         math.degrees(math.atan2(float(vy), float(vx)))
     )
+
+    wider_points = contour_arc(half_arc * 2)
+    wide_vx, wide_vy, _wide_px, _wide_py = cv2.fitLine(
+        wider_points, cv2.DIST_L2, 0, 0.01, 0.01
+    ).reshape(4)
+    wider_angle = _normalised_axis_angle_degrees(
+        math.degrees(math.atan2(float(wide_vy), float(wide_vx)))
+    )
+    edge_stability = _parallel_angle_delta_degrees(edge_angle, wider_angle)
+    if edge_stability > float(config.max_rotation_edge_angle_degrees):
+        return None
+
+    # Keep the broader nearby-boundary set only for the two-sided-strip guard;
+    # it no longer participates in the angle fit.
+    nearby_edge = boundary_crop & (distance_to_feature <= closest + band)
+    support_points = cv2.findNonZero(nearby_edge.astype(np.uint8))
+    if support_points is None or len(support_points) < minimum:
+        return None
     feature_angle = _rectangle_long_axis_angle_degrees(shape.rectangle)
     delta = _parallel_angle_delta_degrees(edge_angle, feature_angle)
-    if delta > float(config.max_rotation_edge_angle_degrees):
-        return None
 
     radians = math.radians(edge_angle)
     along = np.asarray((math.cos(radians), math.sin(radians)), dtype=np.float32)
@@ -1067,7 +1793,7 @@ def edge_aligned_feature_outline(
     min_along, max_along = float(feature_along.min()), float(feature_along.max())
     min_across, max_across = float(feature_across.min()), float(feature_across.max())
 
-    edge_absolute = edge_points.reshape(-1, 2).astype(np.float32)
+    edge_absolute = support_points.reshape(-1, 2).astype(np.float32)
     edge_absolute[:, 0] += sx
     edge_absolute[:, 1] += sy
     edge_along = edge_absolute @ along
@@ -1122,6 +1848,7 @@ def edge_aligned_feature_outline(
         edge_angle_degrees=edge_angle,
         feature_angle_degrees=feature_angle,
         angle_delta_degrees=delta,
+        edge_stability_degrees=edge_stability,
         distance_px=float(side_distances[side_candidates].min()),
         edge_points=int(side_candidates.sum()),
     )
@@ -1927,6 +2654,11 @@ def filter_boxes_by_feature(
     few regions straddling the boundary.  Those carry no geometry over most of
     their area and would otherwise drag groups out across the gaps.
     """
+    if not config.enable_box_feature_filter:
+        # This checkbox owns the whole Box filtering stage.  Keeping minimum
+        # dimensions active while it was off made a supposedly disabled stage
+        # still reject small relief candidates.
+        return np.asarray(boxes, dtype=np.int32).reshape(-1, 4).copy(), []
     if len(boxes) == 0:
         return boxes, []
 
@@ -1939,9 +2671,6 @@ def filter_boxes_by_feature(
             or box[3] < max(config.min_box_height_px, 1)
         ):
             rejected.append(box)
-            continue
-        if not config.enable_box_feature_filter:
-            kept.append(box)
             continue
         if (
             box_uv_coverage(uv_mask, box, image.shape, domain)
@@ -2105,9 +2834,10 @@ def inscribed_circle_radius(
     elsewhere in the group.  When that holds the circle is the honest region and
     the corners are dead area; when anything else lives there the square is kept.
 
-    The circle is grown by ``circular_group_padding_px`` past a strict inscribe,
-    so a round mark that touches its box edge is not clipped by a circle drawn
-    exactly through it.
+    Domain recovery may use this circle in place of the rectangle.  It must
+    therefore be a true inscribed circle: a padded circle can extend beyond its
+    squarish rectangle and create the very UV-domain failure it is meant to
+    avoid.
     """
     if not config.enable_circular_groups:
         return None
@@ -2129,10 +2859,8 @@ def inscribed_circle_radius(
         else np.ones((ch, cw), dtype=bool)
     )
 
-    radius = min(w, h) / 2.0 + max(config.circular_group_padding_px, 0)
-    # A circle is only worth having if it is the tighter region.  Padding is a
-    # fixed number of pixels, so on a small box it more than undoes the corners
-    # the inscribe saves and the "circle" ends up larger than the square.
+    radius = min(w, h) / 2.0
+    # A circle is only worth having if it is the tighter region.
     if math.pi * radius**2 >= w * h:
         return None
     if not _circle_keeps_uv_coverage(uv_mask, group, radius, config):
@@ -2147,7 +2875,10 @@ def inscribed_circle_radius(
     corners = outside_circle & domain
     corner_area = int(corners.sum())
     if corner_area == 0:
-        return int(round(radius))
+        # Later coverage and output code consumes an integer radius.  Rounding
+        # an odd 31 px box's 15.5 px inscribe up to 16 makes the represented
+        # disc 32 px wide, so floor is required to keep it inside the box.
+        return int(math.floor(radius))
 
     # Judge the discarded ring against its own dominant colour, not against the
     # primary background colour of the complete group.  This permits a uniformly
@@ -2163,7 +2894,29 @@ def inscribed_circle_radius(
     stray = float((corners & ~matching).sum()) / float(corner_area)
     if stray > config.circular_group_max_corner_content:
         return None
-    return int(round(radius))
+    return int(math.floor(radius))
+
+
+def cached_inscribed_circle_radius(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+    cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None,
+) -> int | None:
+    """Memoise the pure circle test for one detection run.
+
+    Domain recovery revisits the same assembled bounds while it tries strict
+    rebuilds.  The circle decision includes colour and UV work, so it is much
+    more expensive than the dictionary lookup; the cached value is exact for a
+    fixed image, UV mask and immutable configuration.
+    """
+    if cache is None:
+        return inscribed_circle_radius(image, uv_mask, group, config)
+    key = (config, group)
+    if key not in cache:
+        cache[key] = inscribed_circle_radius(image, uv_mask, group, config)
+    return cache[key]
 
 
 def _circle_keeps_uv_coverage(
@@ -2261,10 +3014,20 @@ class GroupCandidate:
     bounds: tuple[int, int, int, int]
     members: tuple[tuple[int, int, int, int], ...]
     units: tuple[tuple[int, int, int, int], ...] = ()
+    unit_members: tuple[tuple[tuple[int, int, int, int], ...], ...] = ()
 
     def recovery_units(self) -> tuple[tuple[int, int, int, int], ...]:
         """Return the grouping level Domain recovery should split back to."""
         return self.units or self.members
+
+    def source_members_for_unit(
+        self,
+        index: int,
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Return the raw boxes absorbed into one overlap recovery unit."""
+        if index < len(self.unit_members):
+            return self.unit_members[index]
+        return ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2297,6 +3060,10 @@ def union_region_group_candidates(
     config: MserConfig,
     uv_mask: np.ndarray | None = None,
     domain: UvDomainIndex | None = None,
+    *,
+    raster_tolerance: bool = True,
+    defer_domain_validation: bool = False,
+    circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
 ) -> list[GroupCandidate]:
     """Group boxes by overlap/proximity and retain exact membership."""
     candidates = [
@@ -2314,6 +3081,9 @@ def union_region_group_candidates(
         domain,
         include_overlap=True,
         include_proximity=True,
+        raster_tolerance=raster_tolerance,
+        defer_domain_validation=defer_domain_validation,
+        circle_cache=circle_cache,
     )
 
 
@@ -2323,6 +3093,9 @@ def strict_region_recovery_candidates(
     config: MserConfig,
     uv_mask: np.ndarray | None = None,
     domain: UvDomainIndex | None = None,
+    *,
+    include_overlap: bool = False,
+    circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
 ) -> list[GroupCandidate]:
     """Regroup valid recovery units without ever growing outside the domain."""
     candidates = [
@@ -2335,9 +3108,12 @@ def strict_region_recovery_candidates(
         config,
         uv_mask,
         domain,
-        include_overlap=False,
+        include_overlap=include_overlap,
         include_proximity=True,
         enforce_region_coverage=True,
+        raster_tolerance=False,
+        defer_domain_validation=True,
+        circle_cache=circle_cache,
     )
 
 
@@ -2347,8 +3123,10 @@ def overlap_region_group_candidates(
     config: MserConfig,
     uv_mask: np.ndarray | None = None,
     domain: UvDomainIndex | None = None,
+    *,
+    defer_domain_validation: bool = False,
 ) -> list[GroupCandidate]:
-    """Collapse significantly overlapping boxes before distance grouping."""
+    """Collapse every positive-area box overlap before distance grouping."""
     candidates = [
         GroupCandidate(
             bounds=tuple(int(value) for value in box),
@@ -2364,6 +3142,7 @@ def overlap_region_group_candidates(
         domain,
         include_overlap=True,
         include_proximity=False,
+        defer_domain_validation=defer_domain_validation,
     )
 
 
@@ -2377,12 +3156,20 @@ def _merge_region_group_candidates(
     include_overlap: bool,
     include_proximity: bool,
     enforce_region_coverage: bool = False,
+    raster_tolerance: bool = True,
+    contrast_response: np.ndarray | None = None,
+    contrast_threshold: float | None = None,
+    relief_bridge_response: np.ndarray | None = None,
+    preserve_nested_pairs: bool = False,
+    preserve_overlapping_pairs: bool = False,
+    circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
+    defer_domain_validation: bool = False,
 ) -> list[GroupCandidate]:
     """Merge candidate bounds while preserving each candidate's source boxes.
 
-    Candidate joins are attempted conservatively: significantly overlapping
-    boxes merge first, then touching and closest boxes, then progressively more
-    distant pairs.  When the UV-domain filter is active, a join whose
+    Candidate joins are attempted in two distinct phases: every positive-area
+    overlap merges first, then touching and progressively more distant pairs
+    are considered only when proximity grouping is enabled.  When the UV-domain filter is active, a join whose
     accumulated rectangular bounds would fail the loose box-domain test is
     refused while the already-formed smaller groups are kept.  The stricter
     shaped-domain test waits for Domain recovery, after circular groups have had
@@ -2397,9 +3184,18 @@ def _merge_region_group_candidates(
     height, width = image.shape[:2]
     distance = max(0, config.merge_distance_px)
     min_union_area = max(1, config.min_group_union_region_px)
-    min_overlap_ratio = max(0.0, config.min_group_overlap_ratio)
     box_tuples = [candidate.bounds for candidate in seed_candidates]
-    expanded_boxes = [expanded_box(box, distance) for box in box_tuples]
+    # Box bounds are half-open raster intervals.  Give every non-zero merge
+    # radius one pixel of symmetric tolerance so two boxes that land exactly
+    # on the integer expansion boundary still share one texel.  Otherwise a
+    # one-pixel extraction/rasterisation difference splits a row or column
+    # even though it is within the configured grouping distance in practice.
+    # Domain recovery is intentionally stricter: its job is to rebuild a
+    # domain-failed candidate without taking a rounding tolerance that could
+    # create another invalid union.  Ordinary Initial grouping gets the
+    # tolerance; strict recovery keeps its exact-domain contract.
+    expanded_distance = distance + (1 if distance and raster_tolerance else 0)
+    expanded_boxes = [expanded_box(box, expanded_distance) for box in box_tuples]
     cell_size = max(distance + int(np.sqrt(min_union_area)), 16)
     parent = list(range(len(box_tuples)))
     bounds = [(x, y, x + w, y + h) for x, y, w, h in box_tuples]
@@ -2436,6 +3232,14 @@ def _merge_region_group_candidates(
         )
 
     def merged_pre_domain_ok(rect: tuple[int, int, int, int]) -> bool:
+        # Build the complete overlap/proximity candidate first.  A rectangular
+        # bounds can cross a concave UV void while its inscribed circle fits;
+        # when neither geometry fits, Domain recovery needs the complete group
+        # provenance to undo only the joins that made it invalid.  The strict
+        # recovery pass is the sole place where a prospective merge is gated
+        # by final shape coverage.
+        if defer_domain_validation:
+            return True
         if (
             uv_mask is None
             or not config.enable_region_domain_filter
@@ -2454,7 +3258,8 @@ def _merge_region_group_candidates(
             return True
         x0, y0, x1, y1 = rect
         _radius, coverage = _region_shape_and_coverage(
-            image, uv_mask, (x0, y0, x1 - x0, y1 - y0), config, domain
+            image, uv_mask, (x0, y0, x1 - x0, y1 - y0), config, domain,
+            circle_cache,
         )
         return coverage >= config.min_region_uv_coverage
 
@@ -2513,14 +3318,145 @@ def _merge_region_group_candidates(
         overlap_y = max(min(ay1, by1) - max(ay, by), 0)
         separated_x = overlap_x <= 0
         separated_y = overlap_y <= 0
-        if separated_x and separated_y:
+        # Overlap collapse is intentionally its own earlier stage.  Initial
+        # grouping is solely for a *gap* between components on one axis.  In
+        # particular, an enormous panel candidate must not absorb a smaller
+        # glyph/seam sitting inside it merely because their rectangles overlap
+        # in both axes.
+        if separated_x == separated_y:
             return False
         min_axis_overlap = 0.5
+        centre_tolerance = max(float(config.group_axis_center_tolerance), 0.0)
         if separated_x:
-            return overlap_y >= min(ah, bh) * min_axis_overlap
+            # Horizontal join: same visual row, not merely a thin feature
+            # touching the top or bottom edge of a much taller box.
+            return (
+                overlap_y >= min(ah, bh) * min_axis_overlap
+                and abs((ay + ay1) - (by + by1)) * 0.5
+                <= min(ah, bh) * centre_tolerance
+            )
         if separated_y:
-            return overlap_x >= min(aw, bw) * min_axis_overlap
+            # Vertical join: same visual column by the equivalent test.
+            return (
+                overlap_x >= min(aw, bw) * min_axis_overlap
+                and abs((ax + ax1) - (bx + bx1)) * 0.5
+                <= min(aw, bw) * centre_tolerance
+            )
         return True
+
+    def strictly_nested(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        """Whether one box wholly contains the other without being identical."""
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        ax1, ay1 = ax + aw, ay + ah
+        bx1, by1 = bx + bw, by + bh
+        first_contains_second = ax <= bx and ay <= by and ax1 >= bx1 and ay1 >= by1
+        second_contains_first = bx <= ax and by <= ay and bx1 >= ax1 and by1 >= ay1
+        return (first_contains_second or second_contains_first) and first != second
+
+    def nested_with_raster_tolerance(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        """Treat a one-texel detector edge disagreement as containment."""
+        if not raster_tolerance:
+            return False
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        ax1, ay1 = ax + aw, ay + ah
+        bx1, by1 = bx + bw, by + bh
+        first_contains_second = (
+            ax - 1 <= bx and ay - 1 <= by and ax1 + 1 >= bx1 and ay1 + 1 >= by1
+        )
+        second_contains_first = (
+            bx - 1 <= ax and by - 1 <= ay and bx1 + 1 >= ax1 and by1 + 1 >= ay1
+        )
+        return first_contains_second or second_contains_first
+
+    def bridge_is_clear(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+        response: np.ndarray | None,
+        enabled: bool,
+        minimum_response: float,
+        max_high_coverage: float,
+        min_cross_axis_coverage: float | None = None,
+    ) -> bool:
+        """Whether one cached response field permits this proximity join."""
+        if (
+            not enabled
+            or response is None
+        ):
+            return True
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        ax1, ay1 = ax + aw, ay + ah
+        bx1, by1 = bx + bw, by + bh
+        # Only test the true gap, restricted to the shared axis.  Overlaps
+        # have no separating material and are handled by the separate overlap
+        # stage, so they stay eligible regardless of this evidence.
+        horizontal_join = ax1 <= bx or bx1 <= ax
+        if horizontal_join:
+            x0, x1 = (ax1, bx) if ax1 <= bx else (bx1, ax)
+            y0, y1 = max(ay, by), min(ay1, by1)
+        elif ay1 <= by or by1 <= ay:
+            y0, y1 = (ay1, by) if ay1 <= by else (by1, ay)
+            x0, x1 = max(ax, bx), min(ax1, bx1)
+        else:
+            return True
+        if x1 <= x0 or y1 <= y0:
+            return True
+        bridge = response[
+            max(y0, 0):min(y1, response.shape[0]),
+            max(x0, 0):min(x1, response.shape[1]),
+        ]
+        if bridge.size == 0:
+            return True
+        # ``minimum_response`` is an absolute safety floor.  For colour,
+        # ``contrast_threshold`` additionally carries the per-island cut that
+        # produced the glyph candidates.  A few mildly contrasting texels in
+        # a tiny gap (the red field behind ENGINE / start / stop, for example)
+        # are not a separator.  They must not defeat a join unless they are as
+        # strong as the island's own selected glyph response.
+        bridge_threshold = max(float(minimum_response), 0.0)
+        high = bridge >= bridge_threshold
+        if min_cross_axis_coverage is not None:
+            # A horizontal proximity join is blocked only by a near-vertical
+            # relief feature that crosses the shared height; similarly a
+            # vertical join needs a near-horizontal feature crossing its shared
+            # width.  This rejects an actual panel/button seam without treating
+            # the adjacent glyphs' own perimeter edges as a separator.
+            spans = high.mean(axis=0) if horizontal_join else high.mean(axis=1)
+            maximum_span = float(spans.max()) if spans.size else 0.0
+            return maximum_span < float(min_cross_axis_coverage)
+        high_coverage = float(high.mean())
+        return high_coverage <= float(max_high_coverage)
+
+    def bridge_is_continuous(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        """Accept only corridors clear of both colour and relief barriers."""
+        return (
+            bridge_is_clear(
+                first, second,
+                contrast_response,
+                config.enable_contrast_continuity_grouping and contrast_threshold is not None,
+                max(config.contrast_bridge_min_response, contrast_threshold or 0.0),
+                config.contrast_bridge_max_high_coverage,
+            )
+            and bridge_is_clear(
+                first, second,
+                relief_bridge_response,
+                config.enable_relief_edge_bridge_grouping,
+                config.relief_bridge_min_response,
+                0.0,
+                config.relief_bridge_min_cross_axis_coverage,
+            )
+        )
 
     # Neighbour search over a uniform grid whose cell is the merge distance, so
     # two expanded boxes that overlap always share at least one cell.  Pairs are
@@ -2538,24 +3474,34 @@ def _merge_region_group_candidates(
                 if other in checked:
                     continue
                 checked.add(other)
-                if island[index] != island[other]:
-                    continue
-                if include_overlap and min_overlap_ratio > 0.0:
+                if include_overlap:
                     overlap = intersection_area(box_tuples[index], box_tuples[other])
-                    smaller_area = max(
-                        min(
-                            box_tuples[index][2] * box_tuples[index][3],
-                            box_tuples[other][2] * box_tuples[other][3],
-                        ),
-                        1,
-                    )
-                    if float(overlap) / float(smaller_area) >= min_overlap_ratio:
+                    if (
+                        overlap > 0
+                        or nested_with_raster_tolerance(
+                            box_tuples[index], box_tuples[other]
+                        )
+                    ):
                         priority = overlap_priority(
                             box_tuples[index], box_tuples[other], index, other
                         )
                         overlap_edges.append((priority, index, other))
                 if include_proximity:
+                    if island[index] != island[other]:
+                        continue
+                    if preserve_overlapping_pairs and intersection_area(
+                        box_tuples[index], box_tuples[other]
+                    ) > 0:
+                        continue
+                    if preserve_nested_pairs and strictly_nested(
+                        box_tuples[index], box_tuples[other]
+                    ):
+                        continue
                     if not axis_aligned_grouping_link(
+                        box_tuples[index], box_tuples[other]
+                    ):
+                        continue
+                    if not bridge_is_continuous(
                         box_tuples[index], box_tuples[other]
                     ):
                         continue
@@ -2570,12 +3516,52 @@ def _merge_region_group_candidates(
     for _priority, index, other in sorted(overlap_edges):
         root = find(index)
         other_root = find(other)
-        if root == other_root or island[root] != island[other_root]:
+        if root == other_root:
             continue
         rect = merged_bounds(root, other_root)
         if not merged_pre_domain_ok(rect) or not merged_strict_region_ok(rect):
             continue
         merge(root, other_root, rect)
+
+    # A rectangular union can intersect a third candidate even when neither
+    # source rectangle did.  Re-evaluate the surviving bounds until the stage
+    # reaches its stated invariant: no mergeable positive-area overlaps remain.
+    if include_overlap:
+        while True:
+            roots = sorted({find(index) for index in range(len(box_tuples))})
+            root_overlap_edges: list[
+                tuple[tuple[float, int, int, int, int], int, int]
+            ] = []
+            for left_pos, root in enumerate(roots):
+                first = root_box(root)
+                for other_root in roots[left_pos + 1:]:
+                    second = root_box(other_root)
+                    if (
+                        intersection_area(first, second) <= 0
+                        and not nested_with_raster_tolerance(first, second)
+                    ):
+                        continue
+                    root_overlap_edges.append(
+                        (
+                            overlap_priority(first, second, root, other_root),
+                            root,
+                            other_root,
+                        )
+                    )
+
+            merged_any = False
+            for _priority, root, other_root in sorted(root_overlap_edges):
+                root = find(root)
+                other_root = find(other_root)
+                if root == other_root:
+                    continue
+                rect = merged_bounds(root, other_root)
+                if not merged_pre_domain_ok(rect) or not merged_strict_region_ok(rect):
+                    continue
+                merge(root, other_root, rect)
+                merged_any = True
+            if not merged_any:
+                break
 
     for _priority, index, other in sorted(merge_edges):
         root = find(index)
@@ -2595,16 +3581,22 @@ def _merge_region_group_candidates(
             ] = []
             for left_pos, root in enumerate(roots):
                 first = root_box(root)
-                first_expanded = expanded_box(first, distance)
+                first_expanded = expanded_box(first, expanded_distance)
                 for other_root in roots[left_pos + 1:]:
                     if island[root] != island[other_root]:
                         continue
                     second = root_box(other_root)
+                    if preserve_overlapping_pairs and intersection_area(first, second) > 0:
+                        continue
+                    if preserve_nested_pairs and strictly_nested(first, second):
+                        continue
                     if not axis_aligned_grouping_link(first, second):
+                        continue
+                    if not bridge_is_continuous(first, second):
                         continue
                     if (
                         intersection_area(
-                            first_expanded, expanded_box(second, distance)
+                            first_expanded, expanded_box(second, expanded_distance)
                         )
                         < min_union_area
                     ):
@@ -2639,10 +3631,23 @@ def _merge_region_group_candidates(
         if x1 <= x0 or y1 <= y0:
             continue
         candidate_bounds = (x0, y0, x1 - x0, y1 - y0)
+        recovery_member_groups: tuple[
+            tuple[tuple[int, int, int, int], ...], ...
+        ] = ()
         if include_overlap and not include_proximity:
             recovery_units = (candidate_bounds,)
+            recovery_member_groups = (
+                tuple(
+                    member
+                    for index in indices
+                    for member in seed_candidates[index].members
+                ),
+            )
         elif any(seed_candidates[index].units for index in indices):
             recovery_units = tuple(seed_candidates[index].bounds for index in indices)
+            recovery_member_groups = tuple(
+                seed_candidates[index].members for index in indices
+            )
         else:
             recovery_units = ()
         candidates.append(
@@ -2654,6 +3659,7 @@ def _merge_region_group_candidates(
                     for member in seed_candidates[index].members
                 ),
                 units=recovery_units,
+                unit_members=recovery_member_groups,
             )
         )
 
@@ -2829,6 +3835,23 @@ class DetectionState:
         default_factory=list
     )
     feature_hulls: list[RegionFeatureHull | None] = field(default_factory=list)
+    # Local-contrast runs compute this once in the front end.  It is retained
+    # through the early grouping stages so a join can inspect its bridge
+    # without doing another blur/percentile pass.
+    contrast_response: np.ndarray | None = None
+    contrast_threshold: float | None = None
+    relief_bridge_response: np.ndarray | None = None
+    # The edge front end and the relief-aware filters all need the same
+    # thresholded (but deliberately not component-closed) edge pixels.  Keep
+    # that per-island mask beside its response so later filters do not repeat
+    # percentile/local-threshold and morphology work merely to inspect it.
+    relief_edge_mask: np.ndarray | None = None
+    # Shared by reference between successive stages in one run.  It is a
+    # performance cache only: its keys include the immutable configuration and
+    # it never changes a circle decision.
+    circle_radii: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] = field(
+        default_factory=dict
+    )
 
     def copy(self) -> "DetectionState":
         return DetectionState(
@@ -2838,6 +3861,11 @@ class DetectionState:
             domain=self.domain,
             rotations=list(self.rotations),
             feature_hulls=list(self.feature_hulls),
+            contrast_response=self.contrast_response,
+            contrast_threshold=self.contrast_threshold,
+            relief_bridge_response=self.relief_bridge_response,
+            relief_edge_mask=self.relief_edge_mask,
+            circle_radii=self.circle_radii,
         )
 
 
@@ -2848,21 +3876,75 @@ def _step_mser(
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
     """Produce the raw boxes, by whichever front-end the config selects."""
-    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if config.box_source == "edge":
-        boxes = detect_edge_boxes(grey, uv_mask, config)
+    grey = cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2GRAY)
+    # A colour pass may be supplied a normal-map edge response by the
+    # production bundle.  Keep it alive through the contrast front-end for
+    # relief-aware grouping instead of replacing it with ``None``.
+    edge_bridge_response = state.relief_bridge_response
+    edge_mask_cache: np.ndarray | None = None
+    if config.box_source in {"edge", "edge_gpu"}:
+        # Per-island GPU runs receive one atlas response sliced by the caller.
+        # That is both cheaper than 500 context dispatches and avoids making a
+        # crop edge look like a relief edge.  A direct/final-build run creates
+        # the shared-context response here when no slice was supplied.
+        if edge_bridge_response is None:
+            edge_bridge_response = edge_response(grey, config)
+        edge_mask_cache, _response = edge_mask_from_response(
+            edge_bridge_response, uv_mask, config,
+        )
+        boxes, edge_bridge_response = detect_edge_boxes_from_response(
+            edge_mask_cache, edge_bridge_response, config,
+        )
         detail = (
             f"{config.edge_operator} gradient, threshold at the "
             f"{config.edge_threshold_percentile:g}th percentile inside the UV "
             f"domain (floor {config.edge_threshold_floor:g}), closed by "
             f"{config.edge_close_px} px"
         )
-        title = "Edge boxes"
+        title = "Edge GPU boxes" if config.box_source == "edge_gpu" else "Edge boxes"
+    elif config.box_source == "foreground":
+        boxes = detect_foreground_boxes(image, uv_mask, config)
+        detail = (
+            "dominant-background foreground mask, "
+            f"distance {config.foreground_background_distance:g}, "
+            f"closed by {config.foreground_close_px} px"
+        )
+        title = "Foreground-mask boxes"
+    elif config.box_source == "opacity_mask":
+        boxes = detect_opacity_mask_boxes(image, uv_mask, config)
+        detail = (
+            "authored opacity-mask foreground, "
+            f"threshold {config.opacity_mask_threshold}"
+        )
+        title = "Opacity-mask boxes"
+    elif config.box_source in {"contrast", "contrast_gpu"}:
+        contrast = (
+            detect_local_contrast_gpu(image, uv_mask, config)
+            if config.box_source == "contrast_gpu"
+            else detect_local_contrast(image, uv_mask, config)
+        )
+        boxes = contrast.boxes
+        detail = (
+            f"masked {config.contrast_kernel_px}px local-colour contrast, "
+            f"max({config.contrast_min_response:g}, "
+            f"{config.contrast_percentile:g}th island percentile), closed by "
+            f"{config.contrast_close_px} px"
+        )
+        title = "Local-contrast GPU boxes" if config.box_source == "contrast_gpu" else "Local-contrast CPU boxes"
     else:
         boxes = detect_mser_boxes(grey, config)
         detail = f"delta={config.delta}, area {config.min_area}-{config.max_area} px"
         title = "MSER boxes"
-    return DetectionState(boxes, []), DetectionStage(
+    return DetectionState(
+        boxes, [],
+        contrast_response=(contrast.response if config.box_source in {"contrast", "contrast_gpu"} else None),
+        contrast_threshold=(contrast.threshold if config.box_source in {"contrast", "contrast_gpu"} else None),
+        # Relief-edge grouping needs the same barrier evidence as the colour
+        # plus normal-map path.  The Laplacian was just computed above, so
+        # retain it rather than re-running a normal-map pass per UV island.
+        relief_bridge_response=edge_bridge_response,
+        relief_edge_mask=edge_mask_cache,
+    ), DetectionStage(
         key="mser",
         title=title,
         kept=tuple(tuple(int(v) for v in box) for box in boxes),  # type: ignore[misc]
@@ -2906,7 +3988,13 @@ def _step_stroke_width(
         np.asarray(kept, dtype=np.int32) if kept else np.empty((0, 4), dtype=np.int32)
     )
     marked = float((widths > 0).mean())
-    return DetectionState(boxes, []), DetectionStage(
+    return DetectionState(
+        boxes, [],
+        contrast_response=state.contrast_response,
+        contrast_threshold=state.contrast_threshold,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="stroke_width",
         title="Stroke width",
         kept=tuple(kept),
@@ -2931,7 +4019,13 @@ def _step_box_filter(
     boxes, rejected = filter_boxes_by_feature(
         image, uv_mask, state.boxes, config, domain
     )
-    return DetectionState(boxes, [], domain=domain), DetectionStage(
+    return DetectionState(
+        boxes, [], domain=domain,
+        contrast_response=state.contrast_response,
+        contrast_threshold=state.contrast_threshold,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="box_filter",
         title="Box filtering",
         kept=tuple(tuple(int(v) for v in box) for box in boxes),  # type: ignore[misc]
@@ -2956,21 +4050,29 @@ def _step_overlap_box_group(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
-    """Collapse nested or highly overlapping boxes before proximity grouping."""
+    """Collapse all intersecting boxes before proximity grouping."""
     domain = state.domain or build_uv_domain_index(uv_mask)
     candidates = overlap_region_group_candidates(
-        state.boxes, image, config, uv_mask, domain
+        state.boxes, image, config, uv_mask, domain,
+        defer_domain_validation=True,
     )
     groups = [candidate.bounds for candidate in candidates]
     absorbed = sum(max(len(candidate.members) - 1, 0) for candidate in candidates)
-    return DetectionState(state.boxes, groups, candidates, domain), DetectionStage(
+    return DetectionState(
+        state.boxes, groups, candidates, domain,
+        contrast_response=state.contrast_response,
+        contrast_threshold=state.contrast_threshold,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="overlap_box_group",
         title="Overlap grouping",
         kept=tuple(groups),
         adjusted=absorbed,
         detail=(
-            f"actual overlap >= {config.min_group_overlap_ratio:.0%} of the smaller "
-            f"box is collapsed first; {absorbed} nested/overlapping box"
+            "every positive-area overlap, including one-texel raster "
+            "containment, is collapsed first; "
+            f"{absorbed} nested/overlapping box"
             f"{'es' if absorbed != 1 else ''} absorbed"
         ),
     )
@@ -2999,17 +4101,28 @@ def _step_grouped(
         domain,
         include_overlap=False,
         include_proximity=True,
+        contrast_response=state.contrast_response,
+        contrast_threshold=state.contrast_threshold,
+        relief_bridge_response=state.relief_bridge_response,
+        defer_domain_validation=True,
     )
     groups = [candidate.bounds for candidate in candidates]
-    return DetectionState(state.boxes, groups, candidates, domain), DetectionStage(
+    return DetectionState(
+        state.boxes, groups, candidates, domain,
+        contrast_response=state.contrast_response,
+        contrast_threshold=state.contrast_threshold,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="grouped",
         title="Initial grouping",
         kept=tuple(groups),
         detail=(
             f"boxes expanded by {config.merge_distance_px} px per side; "
             "nearest horizontal/vertical joins with >= 50% shared-axis overlap "
-            "are accepted, then rechecked as groups grow; diagonal, weak-overlap "
-            "and UV-domain-breaking joins are left as smaller groups"
+            f"and centres within {config.group_axis_center_tolerance:g}x the smaller shared axis "
+            "are accepted only across colour- and relief-clear bridges, then rechecked as groups grow; diagonal and weak-overlap "
+            "joins are left as smaller groups. Domain recovery validates completed groups and splits invalid ones."
         ),
     )
 
@@ -3021,7 +4134,10 @@ def _step_pattern_group(
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
     groups, rejected = filter_groups_by_pattern(image, state.groups, config)
-    return DetectionState(state.boxes, groups), DetectionStage(
+    return DetectionState(
+        state.boxes, groups, relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="pattern_group",
         title="Repeating pattern (groups)",
         kept=tuple(groups),
@@ -3075,15 +4191,30 @@ def _step_rotated_bounds(
             ),
         )
 
-    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    mask, _response = edge_mask(grey, uv_mask, config)
+    mask = state.relief_edge_mask
+    if mask is None:
+        if state.relief_bridge_response is not None:
+            mask, _response = edge_mask_from_response(
+                state.relief_bridge_response, uv_mask, config,
+            )
+        else:
+            grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            mask, _response = edge_mask(grey, uv_mask, config)
+    if mask is None:  # keeps static typing honest; the branches always fill it.
+        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        mask, _response = edge_mask(grey, uv_mask, config)
     uv_boundary = None
+    uv_contours: tuple[np.ndarray, ...] | None = None
     if config.enable_edge_aligned_rotation and uv_mask is not None:
         uv_boundary = cv2.morphologyEx(
             uv_mask.astype(np.uint8),
             cv2.MORPH_GRADIENT,
             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
         ).astype(bool)
+        found_contours, _hierarchy = cv2.findContours(
+            uv_mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE,
+        )
+        uv_contours = tuple(found_contours)
 
     kept: list[tuple[int, int, int, int]] = []
     rejected: list[tuple[int, int, int, int]] = []
@@ -3093,7 +4224,9 @@ def _step_rotated_bounds(
     edge_unadopted = 0
     edge_adopted = 0
     for group in state.groups:
-        if inscribed_circle_radius(image, uv_mask, group, config) is not None:
+        if cached_inscribed_circle_radius(
+            image, uv_mask, group, config, state.circle_radii,
+        ) is not None:
             kept.append(group)
             rotations.append(None)
             continue
@@ -3121,7 +4254,7 @@ def _step_rotated_bounds(
             continue
         if config.enable_edge_aligned_rotation:
             alignment = edge_aligned_feature_outline(
-                mask, uv_mask, group, shape, config, uv_boundary
+                mask, uv_mask, group, shape, config, uv_boundary, uv_contours
             )
             if alignment is None:
                 edge_unadopted += 1
@@ -3139,7 +4272,11 @@ def _step_rotated_bounds(
         if config.enable_edge_aligned_rotation
         else f"{config.bounds_shape} outline"
     )
-    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+    return DetectionState(
+        state.boxes, kept, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=mask,
+    ), DetectionStage(
         key="rotated_bounds",
         title="Rotated bounds",
         kept=tuple(kept),
@@ -3155,7 +4292,8 @@ def _step_rotated_bounds(
                 f"; edge-aligned rotation adopted {edge_adopted} and declined "
                 f"{edge_unadopted} closer than {config.rotation_edge_min_gap_px:g} px, "
                 f"outside {config.rotation_edge_search_px} px, or "
-                f"{config.max_rotation_edge_angle_degrees:g} degrees off the edge; "
+                f"with a local UV tangent changing by more than "
+                f"{config.max_rotation_edge_angle_degrees:g} degrees across fit scales; "
                 f"opposite side support must be <= "
                 f"{config.max_opposite_rotation_edge_fraction:.0%}"
                 if config.enable_edge_aligned_rotation
@@ -3187,9 +4325,11 @@ def _step_region_flatness(
             ),
         )
 
-    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    response = edge_response(grey, config)
-    domain = uv_mask if uv_mask is not None else np.ones(grey.shape[:2], bool)
+    response = state.relief_bridge_response
+    if response is None:
+        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        response = edge_response(grey, config)
+    domain = uv_mask if uv_mask is not None else np.ones(response.shape[:2], bool)
     inside = response[domain]
     reference = float(np.median(inside)) if inside.size else 0.0
 
@@ -3210,7 +4350,11 @@ def _step_region_flatness(
             kept.append(group)
             rotations.append(outline)
 
-    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+    return DetectionState(
+        state.boxes, kept, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="region_flatness",
         rotations=tuple(rotations),
         title="Region flatness",
@@ -3221,6 +4365,146 @@ def _step_region_flatness(
             f"gradient at the {config.region_flatness_percentile:g}th percentile "
             "inside the region"
             + (f"; {unjudged} had too little domain to judge" if unjudged else "")
+        ),
+    )
+
+
+def relief_glyph_measures(
+    mask: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[float, int, float, float, float] | None:
+    """Measure compact-mark or aligned-fragment evidence within one region."""
+    x, y, w, h = bounds
+    height, width = mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    window = mask[y0:y1, x0:x1].astype(np.uint8)
+    if not bool(window.any()):
+        return None
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        window, connectivity=8,
+    )
+    valid = np.flatnonzero(
+        stats[1:, cv2.CC_STAT_AREA] >= max(config.relief_glyph_min_component_px, 1)
+    ) + 1
+    coverage = float(window.mean())
+    if not len(valid):
+        return coverage, 0, 1.0, float("inf"), 0.0
+    areas = stats[valid, cv2.CC_STAT_AREA].astype(np.float64)
+    dominant = float(areas.max() / max(areas.sum(), 1.0))
+    points = centroids[valid]
+    if len(points) < 3:
+        scatter = float("inf")
+    else:
+        singular = np.linalg.svd(points - points.mean(axis=0), compute_uv=False)
+        scatter = float(singular[1] / max(singular[0], 1e-6))
+    valid_labels = np.zeros(count, dtype=bool)
+    valid_labels[valid] = True
+    edge_y, edge_x = np.nonzero(valid_labels[_labels])
+    if len(edge_x) < 3:
+        outline_scatter = 0.0
+    else:
+        edge_points = np.column_stack((edge_x, edge_y)).astype(np.float64)
+        singular = np.linalg.svd(
+            edge_points - edge_points.mean(axis=0), compute_uv=False,
+        )
+        outline_scatter = float(singular[1] / max(singular[0], 1e-6))
+    return coverage, len(valid), dominant, scatter, outline_scatter
+
+
+def has_relief_outline_structure(
+    measures: tuple[float, int, float, float, float] | None,
+    config: MserConfig,
+) -> bool:
+    """Return whether sparse edge evidence forms a two-dimensional logo."""
+    if measures is None:
+        return False
+    coverage, components, dominant, _line_scatter, outline_scatter = measures
+    return (
+        coverage >= float(config.relief_glyph_min_outline_edge_coverage)
+        and components >= max(int(config.relief_glyph_min_outline_components), 1)
+        and dominant
+        <= float(config.relief_glyph_max_outline_dominant_component_fraction)
+        and outline_scatter >= float(config.relief_glyph_min_outline_scatter)
+    )
+
+
+def _step_relief_glyph_structure(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Reject broad relief/seam regions that do not have glyph structure."""
+    if not config.enable_relief_glyph_filter or not state.groups:
+        return state, DetectionStage(
+            key="relief_glyph_structure",
+            title="Relief glyph structure",
+            kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
+            detail=("disabled" if not config.enable_relief_glyph_filter else "no regions to test"),
+        )
+    mask = state.relief_edge_mask
+    if mask is None:
+        if state.relief_bridge_response is not None:
+            mask, _response = edge_mask_from_response(
+                state.relief_bridge_response, uv_mask, config,
+            )
+        else:
+            grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            mask, _response = edge_mask(grey, uv_mask, config)
+    if mask is None:  # keeps static typing honest; the branches always fill it.
+        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        mask, _response = edge_mask(grey, uv_mask, config)
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    compact_kept = 0
+    line_kept = 0
+    outline_kept = 0
+    for index, group in enumerate(state.groups):
+        measures = relief_glyph_measures(mask, group, config)
+        outline = state.rotations[index] if index < len(state.rotations) else None
+        if measures is None:
+            rejected.append(group)
+            continue
+        coverage, components, dominant, scatter, outline_scatter = measures
+        compact = coverage >= float(config.relief_glyph_min_compact_edge_coverage)
+        line = (
+            components >= max(int(config.relief_glyph_min_line_components), 3)
+            and dominant <= float(config.relief_glyph_max_dominant_component_fraction)
+            and scatter <= float(config.relief_glyph_max_line_scatter)
+        )
+        outlined = has_relief_outline_structure(measures, config)
+        if not compact and not line and not outlined:
+            rejected.append(group)
+            continue
+        compact_kept += int(compact)
+        line_kept += int(line and not compact)
+        outline_kept += int(outlined and not compact and not line)
+        kept.append(group)
+        rotations.append(outline)
+    return DetectionState(
+        state.boxes, kept, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=mask,
+    ), DetectionStage(
+        key="relief_glyph_structure",
+        title="Relief glyph structure",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        rotations=tuple(rotations),
+        detail=(
+            f"keep compact edge coverage >= {config.relief_glyph_min_compact_edge_coverage:.0%} "
+            f"or >= {config.relief_glyph_min_line_components} aligned components "
+            f"(scatter <= {config.relief_glyph_max_line_scatter:g}, dominant <= "
+            f"{config.relief_glyph_max_dominant_component_fraction:.0%}); "
+            f"or outlined edge scatter >= {config.relief_glyph_min_outline_scatter:g} "
+            f"with >= {config.relief_glyph_min_outline_edge_coverage:.0%} coverage; "
+            f"{compact_kept} compact, {line_kept} aligned, {outline_kept} outlined"
         ),
     )
 
@@ -3245,9 +4529,11 @@ def _step_ring_smoothness(
             ),
         )
 
-    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    response = edge_response(grey, config)
-    domain = uv_mask if uv_mask is not None else np.ones(grey.shape[:2], bool)
+    response = state.relief_bridge_response
+    if response is None:
+        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        response = edge_response(grey, config)
+    domain = uv_mask if uv_mask is not None else np.ones(response.shape[:2], bool)
     inside = response[domain]
     reference = float(np.median(inside)) if inside.size else 0.0
 
@@ -3274,7 +4560,11 @@ def _step_ring_smoothness(
             kept.append(group)
             rotations.append(outline)
 
-    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+    return DetectionState(
+        state.boxes, kept, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="ring_smoothness",
         rotations=tuple(rotations),
         title="Ring smoothness",
@@ -3374,7 +4664,9 @@ def _step_blob_shape(
     )
 
     return DetectionState(
-        state.boxes, kept, rotations=rotations, feature_hulls=hulls
+        state.boxes, kept, rotations=rotations, feature_hulls=hulls,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="blob_shape",
         title="Blob shape",
@@ -3423,7 +4715,11 @@ def _step_feature_extension(
             kept.append(group)
             rotations.append(outline)
 
-    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+    return DetectionState(
+        state.boxes, kept, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="feature_extension",
         title="Feature extension",
         kept=tuple(kept),
@@ -3457,8 +4753,18 @@ def _step_text_line(
             ),
         )
 
-    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    mask, _response = edge_mask(grey, uv_mask, config)
+    mask = state.relief_edge_mask
+    if mask is None:
+        if state.relief_bridge_response is not None:
+            mask, _response = edge_mask_from_response(
+                state.relief_bridge_response, uv_mask, config,
+            )
+        else:
+            grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            mask, _response = edge_mask(grey, uv_mask, config)
+    if mask is None:  # keeps static typing honest; the branches always fill it.
+        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        mask, _response = edge_mask(grey, uv_mask, config)
 
     kept: list[tuple[int, int, int, int]] = []
     rejected: list[tuple[int, int, int, int]] = []
@@ -3479,7 +4785,11 @@ def _step_text_line(
         kept.append(group)
         rotations.append(outline)
 
-    return DetectionState(state.boxes, kept, rotations=rotations), DetectionStage(
+    return DetectionState(
+        state.boxes, kept, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=mask,
+    ), DetectionStage(
         key="text_line",
         title="Text lines",
         kept=tuple(kept),
@@ -3501,7 +4811,11 @@ def _step_size(
 ) -> tuple[DetectionState, DetectionStage]:
     groups, rejected = filter_groups_by_final_size(state.groups, config)
     rotations = _rotations_for_subset(state.rotations, state.groups, groups)
-    return DetectionState(state.boxes, groups, rotations=rotations), DetectionStage(
+    return DetectionState(
+        state.boxes, groups, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="size",
         title="Final size",
         kept=tuple(groups),
@@ -3521,9 +4835,12 @@ def _region_shape_and_coverage(
     group: tuple[int, int, int, int],
     config: MserConfig,
     domain: UvDomainIndex | None = None,
+    circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
 ) -> tuple[int | None, float]:
     """Infer a region's circle, then measure that circle or its rectangle."""
-    radius = inscribed_circle_radius(image, uv_mask, group, config)
+    radius = cached_inscribed_circle_radius(
+        image, uv_mask, group, config, circle_cache,
+    )
     if radius is not None:
         x, y, w, h = group
         return radius, circle_uv_coverage(
@@ -3545,12 +4862,12 @@ def _step_region_domain(
 
     Every initial group first gets its circle decision and shaped-domain test.
     A passing group remains intact.  A failing group is split back into its
-    recovery units: after overlap grouping, those are the overlap-group boxes
-    rather than the raw nested MSER fragments.  Units failing the same shaped
-    domain test are removed.  If the failed group came from overlap grouping,
-    survivors are regrouped closest-first while enforcing the shaped domain
-    threshold on every growth step.  Older raw-member recovery still uses the
-    full-distance rebuild plus one half-distance retry before final rejection.
+    recovery units: after overlap grouping, those are the overlap-group boxes.
+    A unit failing the same shaped-domain test is split once more into the raw
+    boxes absorbed by overlap grouping.  Valid descendants are then regrouped
+    while enforcing the shaped-domain threshold on every growth step.  Older
+    raw-member recovery still uses the full-distance rebuild plus one
+    half-distance retry before final rejection.
     """
     candidates = state.candidates or [
         GroupCandidate(bounds=group, members=(group,)) for group in state.groups
@@ -3568,6 +4885,7 @@ def _step_region_domain(
     rejected: list[tuple[int, int, int, int]] = []
     failed_initial = 0
     removed_units = 0
+    overlap_members_recovered = 0
     half_distance_attempts = 0
     half_distance_rescued = 0
     strict_recovery_groups = 0
@@ -3580,7 +4898,7 @@ def _step_region_domain(
 
     for candidate in candidates:
         _radius, initial_coverage = _region_shape_and_coverage(
-            image, uv_mask, candidate.bounds, config, domain
+            image, uv_mask, candidate.bounds, config, domain, state.circle_radii,
         )
         if initial_coverage >= config.min_region_uv_coverage:
             kept_candidates.append(candidate)
@@ -3590,15 +4908,34 @@ def _step_region_domain(
         rejected.append(candidate.bounds)
 
         valid_units: list[tuple[int, int, int, int]] = []
-        for unit in candidate.recovery_units():
+        valid_unit_set: set[tuple[int, int, int, int]] = set()
+        candidate_overlap_members_recovered = 0
+        for unit_index, unit in enumerate(candidate.recovery_units()):
             _unit_radius, unit_coverage = _region_shape_and_coverage(
-                image, uv_mask, unit, config, domain
+                image, uv_mask, unit, config, domain, state.circle_radii,
             )
             if unit_coverage < config.min_region_uv_coverage:
                 rejected.append(unit)
                 removed_units += 1
-            else:
+                for member in candidate.source_members_for_unit(unit_index):
+                    if member == unit:
+                        continue
+                    _member_radius, member_coverage = _region_shape_and_coverage(
+                        image, uv_mask, member, config, domain, state.circle_radii,
+                    )
+                    if member_coverage < config.min_region_uv_coverage:
+                        rejected.append(member)
+                        removed_units += 1
+                        continue
+                    if member not in valid_unit_set:
+                        valid_units.append(member)
+                        valid_unit_set.add(member)
+                        overlap_members_recovered += 1
+                        candidate_overlap_members_recovered += 1
+                continue
+            if unit not in valid_unit_set:
                 valid_units.append(unit)
+                valid_unit_set.add(unit)
 
         if not valid_units:
             continue
@@ -3610,6 +4947,8 @@ def _step_region_domain(
                 config,
                 uv_mask,
                 domain,
+                include_overlap=candidate_overlap_members_recovered > 0,
+                circle_cache=state.circle_radii,
             )
             kept_candidates.extend(recovered)
             strict_recovery_groups += len(recovered)
@@ -3621,10 +4960,14 @@ def _step_region_domain(
             config,
             uv_mask,
             domain,
+            raster_tolerance=False,
+            defer_domain_validation=True,
+            circle_cache=state.circle_radii,
         )
         for rebuilt_candidate in rebuilt:
             _rebuilt_radius, rebuilt_coverage = _region_shape_and_coverage(
-                image, uv_mask, rebuilt_candidate.bounds, config, domain
+                image, uv_mask, rebuilt_candidate.bounds, config, domain,
+                state.circle_radii,
             )
             if rebuilt_coverage >= config.min_region_uv_coverage:
                 kept_candidates.append(rebuilt_candidate)
@@ -3641,11 +4984,15 @@ def _step_region_domain(
                 half_distance_config,
                 uv_mask,
                 domain,
+                raster_tolerance=False,
+                defer_domain_validation=True,
+                circle_cache=state.circle_radii,
             )
             rescued_here = 0
             for retry_candidate in retry_candidates:
                 _retry_radius, retry_coverage = _region_shape_and_coverage(
-                    image, uv_mask, retry_candidate.bounds, config, domain
+                    image, uv_mask, retry_candidate.bounds, config, domain,
+                    state.circle_radii,
                 )
                 if retry_coverage < config.min_region_uv_coverage:
                     rejected.append(retry_candidate.bounds)
@@ -3657,7 +5004,11 @@ def _step_region_domain(
 
     kept_candidates.sort(key=lambda candidate: (candidate.bounds[1], candidate.bounds[0]))
     kept = [candidate.bounds for candidate in kept_candidates]
-    return DetectionState(state.boxes, kept, kept_candidates, domain), DetectionStage(
+    return DetectionState(
+        state.boxes, kept, kept_candidates, domain,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
         key="region_domain",
         title="Domain recovery",
         kept=tuple(kept),
@@ -3666,6 +5017,8 @@ def _step_region_domain(
             f"first shaped test >= {config.min_region_uv_coverage:.0%}; "
             f"{failed_initial} initial group{'s' if failed_initial != 1 else ''} split, "
             f"{removed_units} invalid recovery unit{'s' if removed_units != 1 else ''} removed; "
+            f"{overlap_members_recovered} overlap member"
+            f"{'s' if overlap_members_recovered != 1 else ''} recovered; "
             f"{strict_recovery_groups} strict recovery group"
             f"{'s' if strict_recovery_groups != 1 else ''} kept; "
             f"{half_distance_attempts} broad rebuild"
@@ -3770,96 +5123,172 @@ def _step_overlap_group(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
-    """Force positive-area shaped overlaps, then validate each merged result."""
+    """Force a compact control cluster into one already-validated circle.
+
+    This deliberately is *not* a second general proximity pass: Domain
+    recovery remains terminal for ordinary rectangles.  It only reconnects a
+    circular control whose independent cardinal glyphs cannot share a row or
+    column, or whose vertical/horizontal arms overlap as a cross (a D-pad is
+    the canonical case).  The enclosing rectangle must itself earn an
+    inscribed circle and satisfy that circle's UV-domain rule, so this cannot
+    recreate a broad panel group.
+    """
     groups = list(state.groups)
     domain = state.domain or build_uv_domain_index(uv_mask)
 
-    if not config.enable_overlap_group_merge or len(groups) < 2:
-        return DetectionState(state.boxes, groups, domain=domain), DetectionStage(
+    if not config.enable_circular_groups or len(groups) < 2:
+        return DetectionState(
+            state.boxes, groups, domain=domain,
+            relief_bridge_response=state.relief_bridge_response,
+            relief_edge_mask=state.relief_edge_mask,
+            circle_radii=state.circle_radii,
+        ), DetectionStage(
             key="overlap_group",
             title="Post-circle forced merge",
             kept=tuple(groups),
             detail=(
-                "disabled"
-                if not config.enable_overlap_group_merge
-                else "fewer than two recovered groups; nothing to merge"
+                "circular groups disabled"
+                if not config.enable_circular_groups
+                else "fewer than two recovered groups; nothing to circle-merge"
             ),
         )
 
-    radii = [
-        inscribed_circle_radius(image, uv_mask, group, config)
-        if config.enable_circular_groups
-        else None
-        for group in groups
-    ]
+    distance = max(int(config.merge_distance_px), 0)
 
-    parent = list(range(len(groups)))
+    def centre_and_extent(
+        group: tuple[int, int, int, int],
+    ) -> tuple[float, float, float]:
+        x, y, width, height = group
+        return (
+            x + width / 2.0,
+            y + height / 2.0,
+            math.hypot(width, height) / 2.0,
+        )
 
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
+    centres = [centre_and_extent(group) for group in groups]
 
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
+    def box_gap(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> int:
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        return max(
+            bx - (ax + aw), ax - (bx + bw),
+            by - (ay + ah), ay - (by + bh), 0,
+        )
 
+    def bounds_for(indices: tuple[int, ...]) -> tuple[int, int, int, int]:
+        x0 = min(groups[index][0] for index in indices)
+        y0 = min(groups[index][1] for index in indices)
+        x1 = max(groups[index][0] + groups[index][2] for index in indices)
+        y1 = max(groups[index][1] + groups[index][3] for index in indices)
+        return x0, y0, x1 - x0, y1 - y0
+
+    def cardinal_spread(
+        indices: tuple[int, ...], bounds: tuple[int, int, int, int],
+    ) -> int:
+        """Count occupied quadrants around the proposed circular control."""
+        x, y, width, height = bounds
+        centre_x = x + width / 2.0
+        centre_y = y + height / 2.0
+        quadrants: set[int] = set()
+        for index in indices:
+            point_x, point_y, _extent = centres[index]
+            angle = math.atan2(point_y - centre_y, point_x - centre_x)
+            quadrants.add(int(math.floor((angle + math.pi) / (math.pi / 2.0))) % 4)
+        return len(quadrants)
+
+    # A pair of opposing cardinal marks reveals the control's centre and
+    # radius.  Collect every recovered group whose *centre* fits that trial
+    # disc, rather than taking one broad proximity component: a nearby label
+    # cannot poison a valid D-pad cluster merely through a short chain.
+    candidate_sets: set[tuple[int, ...]] = set()
     for left in range(len(groups)):
+        left_x, left_y, left_extent = centres[left]
         for right in range(left + 1, len(groups)):
-            if _shaped_regions_overlap(
-                groups[left], radii[left], groups[right], radii[right]
-            ):
-                union(left, right)
-
-    components: dict[int, list[int]] = {}
-    for index in range(len(groups)):
-        components.setdefault(find(index), []).append(index)
-
-    merged: list[tuple[int, int, int, int]] = []
-    rejected: list[tuple[int, int, int, int]] = []
-    absorbed = 0
-    for indices in components.values():
-        if len(indices) == 1:
-            result = groups[indices[0]]
-        else:
-            absorbed += len(indices) - 1
-            bounds = [
-                _shaped_region_bounds(groups[index], radii[index], image.shape)
-                for index in indices
-            ]
-            x0 = min(x for x, _y, _w, _h in bounds)
-            y0 = min(y for _x, y, _w, _h in bounds)
-            x1 = max(x + w for x, _y, w, _h in bounds)
-            y1 = max(y + h for _x, y, _w, h in bounds)
-            result = (x0, y0, x1 - x0, y1 - y0)
-
-        if config.enable_region_domain_filter and uv_mask is not None:
-            _radius, coverage = _region_shape_and_coverage(
-                image, uv_mask, result, config, domain
-            )
-            if coverage < config.min_region_uv_coverage:
-                rejected.append(result)
+            if box_gap(groups[left], groups[right]) > distance:
                 continue
-        merged.append(result)
+            right_x, right_y, right_extent = centres[right]
+            centre_x = (left_x + right_x) / 2.0
+            centre_y = (left_y + right_y) / 2.0
+            trial_radius = (
+                math.hypot(left_x - right_x, left_y - right_y) / 2.0
+                + max(left_extent, right_extent)
+                + 2.0  # tolerate half-open raster bounds at the disc edge
+            )
+            indices = tuple(
+                index
+                for index, (point_x, point_y, _extent) in enumerate(centres)
+                if math.hypot(point_x - centre_x, point_y - centre_y)
+                <= trial_radius
+            )
+            if len(indices) >= 3:
+                candidate_sets.add(indices)
+            # A vertical and horizontal D-pad arm overlap at the centre.  The
+            # pair has no useful centre-line direction, but its *combined*
+            # square can still be a valid circle.  Keep this narrow exception
+            # separate from generic two-mark proximity, which remains banned.
+            if intersection_area(groups[left], groups[right]) > 0:
+                candidate_sets.add((left, right))
 
+    accepted: list[tuple[tuple[int, ...], tuple[int, int, int, int]]] = []
+    for indices in candidate_sets:
+        bounds = bounds_for(indices)
+        width, height = bounds[2], bounds[3]
+        if width <= 0 or height <= 0:
+            continue
+        if min(width, height) / max(width, height) < config.circular_group_min_squareness:
+            continue
+        if len(indices) == 2:
+            if intersection_area(groups[indices[0]], groups[indices[1]]) <= 0:
+                continue
+        elif cardinal_spread(indices, bounds) < 3:
+            continue
+        radius = cached_inscribed_circle_radius(
+            image, uv_mask, bounds, config, state.circle_radii,
+        )
+        if radius is None:
+            continue
+        coverage = circle_uv_coverage(
+            uv_mask,
+            (bounds[0] + bounds[2] / 2.0, bounds[1] + bounds[3] / 2.0),
+            float(radius), domain,
+        )
+        if coverage < config.min_region_uv_coverage:
+            continue
+        accepted.append((indices, bounds))
+
+    # Choose the most complete valid control first.  Its members are consumed,
+    # which keeps two nearby circular controls independent.
+    accepted.sort(key=lambda item: (-len(item[0]), item[1][1], item[1][0]))
+    consumed: set[int] = set()
+    merged: list[tuple[int, int, int, int]] = []
+    absorbed = 0
+    for indices, bounds in accepted:
+        if any(index in consumed for index in indices):
+            continue
+        consumed.update(indices)
+        merged.append(bounds)
+        absorbed += len(indices) - 1
+    merged.extend(group for index, group in enumerate(groups) if index not in consumed)
     merged.sort(key=lambda group: (group[1], group[0]))
-    detail = (
-        f"absorbed {absorbed} overlapping region{'s' if absorbed != 1 else ''}; "
-        f"{len(rejected)} merged group{'s' if len(rejected) != 1 else ''} "
-        "failed the final shaped-domain test"
-    )
-    return DetectionState(state.boxes, merged, domain=domain), DetectionStage(
+
+    return DetectionState(
+        state.boxes, merged, domain=domain,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+        circle_radii=state.circle_radii,
+    ), DetectionStage(
         key="overlap_group",
         title="Post-circle forced merge",
         kept=tuple(merged),
-        rejected=tuple(rejected),
-        detail=detail,
+        detail=(
+            f"forced {absorbed} cardinal fragment{'s' if absorbed != 1 else ''} "
+            "into UV-valid inscribed circles; ordinary rectangle proximity is not retried"
+        ),
         adjusted=absorbed,
     )
-
 
 def _step_final_padding(
     image: np.ndarray,
@@ -3880,7 +5309,9 @@ def _step_final_padding(
     image_height, image_width = image.shape[:2]
 
     for group in state.groups:
-        radius = inscribed_circle_radius(image, uv_mask, group, config)
+        radius = cached_inscribed_circle_radius(
+            image, uv_mask, group, config, state.circle_radii,
+        )
         x, y, w, h = group
 
         if radius is not None:
@@ -3926,7 +5357,9 @@ def _step_final_padding(
     # Outlines pass through unpadded: they describe the feature, not the box
     # that was grown around it, and growing one would misreport the fit.
     return DetectionState(
-        state.boxes, padded, rotations=list(state.rotations)
+        state.boxes, padded, rotations=list(state.rotations),
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="final_padding",
         title="Final padding",
@@ -3938,11 +5371,135 @@ def _step_final_padding(
     )
 
 
+def relief_text_measures(
+    response: np.ndarray,
+    uv_mask: np.ndarray | None,
+    bounds: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[int, int, bool, float] | None:
+    """Count repeated high-relief bands along a candidate's long axis.
+
+    Connected-component counting cannot see individual shallow letters once
+    their edges touch.  A projection at a locally chosen response percentile
+    can: a word produces several occupied bands along its baseline, whereas a
+    seam stays occupied as one continuous band.
+    """
+    x, y, w, h = bounds
+    height, width = response.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    window = response[y0:y1, x0:x1]
+    domain = (
+        uv_mask[y0:y1, x0:x1].astype(bool)
+        if uv_mask is not None else np.ones(window.shape, dtype=bool)
+    )
+    values = window[domain]
+    if not values.size:
+        return None
+    threshold = float(np.percentile(
+        values, min(max(config.relief_text_response_percentile, 0.0), 100.0),
+    ))
+    feature = (window >= threshold) & domain
+    horizontal = (x1 - x0) >= (y1 - y0)
+    if horizontal:
+        support = feature.sum(axis=0)
+        available = domain.sum(axis=0)
+    else:
+        support = feature.sum(axis=1)
+        available = domain.sum(axis=1)
+    occupied = support >= np.maximum(
+        1, np.ceil(available * float(config.relief_text_projection_min_coverage))
+    )
+    transitions = np.diff(np.r_[False, occupied, False].astype(np.int8))
+    starts = np.flatnonzero(transitions == 1)
+    ends = np.flatnonzero(transitions == -1)
+    runs = int(len(starts))
+    # Long seams and serrations can both create many occupied projection runs.
+    # A letter-scale run must also span a material fraction of the cross-axis:
+    # AIRBAG has several such bands despite being one connected edge component,
+    # whereas an incidental seam has at most one and fine teeth have none.
+    cross_axis = (y1 - y0) if horizontal else (x1 - x0)
+    minimum_band = max(int(np.ceil(cross_axis * config.relief_text_min_band_scale)), 1)
+    substantial = int(sum((end - start) >= minimum_band for start, end in zip(starts, ends)))
+    return runs, substantial, horizontal, float(feature.mean())
+
+
+def _step_relief_text(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Keep final relief regions whose edge projection reads as text."""
+    if not config.enable_relief_text_filter or not state.groups:
+        return state, DetectionStage(
+            key="relief_text",
+            title="Relief text",
+            kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
+            detail=("disabled" if not config.enable_relief_text_filter else "no regions to test"),
+        )
+    # The edge front end already made this response.  Keeping it through the
+    # pipeline makes this terminal classifier an inspection, not another full
+    # Laplacian pass.  The fallback preserves the helper's standalone use.
+    response = state.relief_bridge_response
+    if response is None:
+        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        response = edge_response(grey, config)
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    outlined_kept = 0
+    mask = state.relief_edge_mask
+    if mask is None:
+        mask, _response = edge_mask_from_response(response, uv_mask, config)
+    for index, group in enumerate(state.groups):
+        outline = state.rotations[index] if index < len(state.rotations) else None
+        measures = relief_text_measures(response, uv_mask, group, config)
+        text = (
+            measures is not None
+            and measures[0] >= max(int(config.relief_text_min_runs), 1)
+            and measures[1] >= max(int(config.relief_text_min_runs), 1)
+        )
+        outlined = has_relief_outline_structure(
+            relief_glyph_measures(mask, group, config), config,
+        )
+        if text or outlined:
+            kept.append(group)
+            rotations.append(outline)
+            outlined_kept += int(outlined and not text)
+        else:
+            rejected.append(group)
+    return DetectionState(
+        state.boxes, kept, rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
+        relief_edge_mask=state.relief_edge_mask,
+    ), DetectionStage(
+        key="relief_text",
+        title="Relief text",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        rotations=tuple(rotations),
+        detail=(
+            f"keep >= {config.relief_text_min_runs} repeated bands, each with "
+            f">= {config.relief_text_min_band_scale:.0%} of the cross-axis, at the "
+            f"{config.relief_text_response_percentile:g}th response percentile, "
+            "or a previously admissible two-dimensional relief outline; "
+            f"{outlined_kept} outlined logo"
+            f"{'s' if outlined_kept != 1 else ''} retained"
+        ),
+    )
+
+
 # Stages holding assembled regions rather than raw MSER boxes; only these are
-# worth shaping, and only these are few enough for it to be cheap.
+# worth shaping, and only these are few enough for it to be cheap.  Overlap
+# collapse deliberately stays rectangular: it is only a housekeeping step and
+# Initial grouping is the first stage at which a circle can describe the group
+# the user will actually tune.
 GROUP_STAGE_KEYS = frozenset(
     {
-        "overlap_box_group",
         "grouped",
         "region_domain",
         "overlap_group",
@@ -3966,12 +5523,14 @@ PIPELINE_STEPS = (
     _step_pattern_group,
     _step_rotated_bounds,
     _step_region_flatness,
+    _step_relief_glyph_structure,
     _step_blob_shape,
     _step_ring_smoothness,
     _step_feature_extension,
     _step_text_line,
     _step_size,
     _step_final_padding,
+    _step_relief_text,
 )
 
 # Named so the table below cannot drift when a step is inserted.  It was ints
@@ -3992,12 +5551,14 @@ STEP_INDEX = {
             "pattern_group",
             "rotated_bounds",
             "region_flatness",
+            "relief_glyph_structure",
             "blob_shape",
             "ring_smoothness",
             "feature_extension",
             "text_line",
             "size",
             "final_padding",
+            "relief_text",
         )
     )
 }
@@ -4023,6 +5584,40 @@ PARAMETER_STEP = {
     "edge_close_px": STEP_INDEX["boxes"],
     "edge_dilate_px": STEP_INDEX["boxes"],
     "edge_min_component_px": STEP_INDEX["boxes"],
+    "foreground_background_bins": STEP_INDEX["boxes"],
+    "foreground_background_distance": STEP_INDEX["boxes"],
+    "foreground_value_contrast": STEP_INDEX["boxes"],
+    "foreground_min_saturation": STEP_INDEX["boxes"],
+    "foreground_edge_threshold": STEP_INDEX["boxes"],
+    "foreground_open_px": STEP_INDEX["boxes"],
+    "foreground_close_px": STEP_INDEX["boxes"],
+    "foreground_min_component_px": STEP_INDEX["boxes"],
+    "foreground_merge_gap_px": STEP_INDEX["boxes"],
+    "foreground_max_coverage": STEP_INDEX["boxes"],
+    "foreground_refine_internal_details": STEP_INDEX["boxes"],
+    "foreground_detail_inset_px": STEP_INDEX["boxes"],
+    "foreground_detail_min_parent_px": STEP_INDEX["boxes"],
+    "foreground_detail_min_coverage": STEP_INDEX["boxes"],
+    "foreground_detail_min_component_px": STEP_INDEX["boxes"],
+    "foreground_detail_replace_area_ratio": STEP_INDEX["boxes"],
+    "foreground_detail_max_depth": STEP_INDEX["boxes"],
+    "foreground_detail_max_parent_px": STEP_INDEX["boxes"],
+    "foreground_detail_max_children": STEP_INDEX["boxes"],
+    "opacity_mask_threshold": STEP_INDEX["boxes"],
+    "contrast_kernel_px": STEP_INDEX["boxes"],
+    "contrast_min_response": STEP_INDEX["boxes"],
+    "contrast_percentile": STEP_INDEX["boxes"],
+    "contrast_open_px": STEP_INDEX["boxes"],
+    "contrast_close_px": STEP_INDEX["boxes"],
+    "contrast_min_component_px": STEP_INDEX["boxes"],
+    "contrast_merge_gap_px": STEP_INDEX["boxes"],
+    "contrast_max_coverage": STEP_INDEX["boxes"],
+    "enable_contrast_continuity_grouping": STEP_INDEX["grouped"],
+    "contrast_bridge_min_response": STEP_INDEX["grouped"],
+    "contrast_bridge_max_high_coverage": STEP_INDEX["grouped"],
+    "enable_relief_edge_bridge_grouping": STEP_INDEX["grouped"],
+    "relief_bridge_min_response": STEP_INDEX["grouped"],
+    "relief_bridge_min_cross_axis_coverage": STEP_INDEX["grouped"],
     "enable_stroke_width_filter": STEP_INDEX["stroke_width"],
     "swt_polarity": STEP_INDEX["stroke_width"],
     "swt_gradient_tolerance_degrees": STEP_INDEX["stroke_width"],
@@ -4042,18 +5637,16 @@ PARAMETER_STEP = {
     "box_feature_context_px": STEP_INDEX["box_filter"],
     "min_box_uv_coverage": STEP_INDEX["box_filter"],
     "box_min_feature_px": STEP_INDEX["box_filter"],
-    "min_group_overlap_ratio": STEP_INDEX["overlap_box_group"],
+    "group_axis_center_tolerance": STEP_INDEX["grouped"],
     "merge_distance_px": STEP_INDEX["grouped"],
     "min_group_union_region_px": STEP_INDEX["grouped"],
     "enable_island_bounded_grouping": STEP_INDEX["grouped"],
     "enable_circular_groups": STEP_INDEX["grouped"],
     "circular_group_min_squareness": STEP_INDEX["grouped"],
-    "circular_group_padding_px": STEP_INDEX["grouped"],
     "circular_group_colour_tolerance": STEP_INDEX["grouped"],
     "circular_group_max_corner_content": STEP_INDEX["grouped"],
     "enable_region_domain_filter": STEP_INDEX["grouped"],
     "min_region_uv_coverage": STEP_INDEX["region_domain"],
-    "enable_overlap_group_merge": STEP_INDEX["overlap_group"],
     "enable_pattern_group_filter": STEP_INDEX["pattern_group"],
     "max_pattern_autocorrelation": STEP_INDEX["pattern_group"],
     "pattern_window_scale": STEP_INDEX["pattern_group"],
@@ -4078,6 +5671,16 @@ PARAMETER_STEP = {
     "region_flatness_percentile": STEP_INDEX["region_flatness"],
     "region_flatness_min_domain_px": STEP_INDEX["region_flatness"],
     "min_region_relief": STEP_INDEX["region_flatness"],
+    "enable_relief_glyph_filter": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_min_component_px": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_min_line_components": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_max_line_scatter": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_max_dominant_component_fraction": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_min_compact_edge_coverage": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_min_outline_components": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_min_outline_edge_coverage": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_max_outline_dominant_component_fraction": STEP_INDEX["relief_glyph_structure"],
+    "relief_glyph_min_outline_scatter": STEP_INDEX["relief_glyph_structure"],
     "enable_ring_smoothness_filter": STEP_INDEX["ring_smoothness"],
     "ring_smoothness_width_px": STEP_INDEX["ring_smoothness"],
     "ring_smoothness_margin_px": STEP_INDEX["ring_smoothness"],
@@ -4108,6 +5711,11 @@ PARAMETER_STEP = {
     "enable_final_aspect_filter": STEP_INDEX["size"],
     "final_max_aspect": STEP_INDEX["size"],
     "final_region_padding_px": STEP_INDEX["final_padding"],
+    "enable_relief_text_filter": STEP_INDEX["relief_text"],
+    "relief_text_response_percentile": STEP_INDEX["relief_text"],
+    "relief_text_projection_min_coverage": STEP_INDEX["relief_text"],
+    "relief_text_min_runs": STEP_INDEX["relief_text"],
+    "relief_text_min_band_scale": STEP_INDEX["relief_text"],
     "uv_island_mask_path": len(PIPELINE_STEPS),
     "green_colour": len(PIPELINE_STEPS),
     "red_colour": len(PIPELINE_STEPS),
@@ -4141,6 +5749,11 @@ def run_detection(
     uv_mask: np.ndarray | None,
     config: MserConfig | None = None,
     previous: DetectionRun | None = None,
+    initial_boxes: np.ndarray | None = None,
+    initial_contrast_response: np.ndarray | None = None,
+    initial_contrast_threshold: float | None = None,
+    initial_relief_bridge_response: np.ndarray | None = None,
+    initial_relief_edge_mask: np.ndarray | None = None,
 ) -> DetectionRun:
     """Run the pipeline, resuming from the first step a config change affects.
 
@@ -4148,8 +5761,69 @@ def run_detection(
     filter does not re-run MSER over the whole atlas.
     """
     config = config or DEFAULT_CONFIG
-    start = 0
-    if previous is not None and len(previous.entry_states) == len(PIPELINE_STEPS):
+    if initial_boxes is not None:
+        # The tuning harness preflights foreground components per UV island.
+        # Reusing those raw boxes avoids repeating HSV/gradient/morphology work
+        # before the unchanged downstream grouping and fitting stages.
+        boxes = np.asarray(initial_boxes, dtype=np.int32).reshape(-1, 4)
+        if config.box_source == "foreground":
+            title = "Foreground-mask boxes"
+            detail = "precomputed dominant-background foreground mask"
+        elif config.box_source == "opacity_mask":
+            title = "Opacity-mask boxes"
+            detail = "precomputed authored opacity-mask foreground"
+        elif config.box_source in {"contrast", "contrast_gpu"}:
+            title = "Local-contrast GPU boxes" if config.box_source == "contrast_gpu" else "Local-contrast CPU boxes"
+            detail = "precomputed masked local-contrast boxes and bridge response"
+        elif config.box_source in {"edge", "edge_gpu"}:
+            title = "Edge GPU boxes" if config.box_source == "edge_gpu" else "Edge boxes"
+            detail = "precomputed edge boxes"
+        else:
+            title = "MSER boxes"
+            detail = "precomputed MSER boxes"
+        raw_stage = DetectionStage(
+            key="mser", title=title,
+            kept=tuple(tuple(int(value) for value in box) for box in boxes),
+            detail=detail,
+        )
+        if previous is not None and len(previous.entry_states) == len(PIPELINE_STEPS):
+            start = first_changed_step(previous.config, config)
+            if start >= len(PIPELINE_STEPS):
+                return DetectionRun(
+                    config=config,
+                    stages=list(previous.stages),
+                    entry_states=previous.entry_states,
+                    resumed_from=start,
+                )
+            if start > 0:
+                stages = list(previous.stages[:start])
+                entry_states = list(previous.entry_states[:start])
+                state = previous.entry_states[start].copy()
+            else:
+                stages = [raw_stage]
+                entry_states = [DetectionState(np.empty((0, 4), dtype=np.int32), [])]
+                state = DetectionState(
+                    boxes.copy(), [],
+                    contrast_response=initial_contrast_response,
+                    contrast_threshold=initial_contrast_threshold,
+                    relief_bridge_response=initial_relief_bridge_response,
+                    relief_edge_mask=initial_relief_edge_mask,
+                )
+                start = 1
+        else:
+            stages = [raw_stage]
+            entry_states = [DetectionState(np.empty((0, 4), dtype=np.int32), [])]
+            state = DetectionState(
+                boxes.copy(), [],
+                contrast_response=initial_contrast_response,
+                contrast_threshold=initial_contrast_threshold,
+                relief_bridge_response=initial_relief_bridge_response,
+                relief_edge_mask=initial_relief_edge_mask,
+            )
+            start = 1
+    else:
+        start = 0
+    if initial_boxes is None and previous is not None and len(previous.entry_states) == len(PIPELINE_STEPS):
         start = first_changed_step(previous.config, config)
         if start >= len(PIPELINE_STEPS):
             # Nothing the pipeline reads changed, so the previous run still
@@ -4161,24 +5835,38 @@ def run_detection(
                 resumed_from=start,
             )
 
-    stages = list(previous.stages[:start]) if previous is not None and start else []
-    entry_states = list(previous.entry_states[:start]) if previous is not None and start else []
-    state = (
-        previous.entry_states[start].copy()
-        if previous is not None and start
-        else DetectionState(np.empty((0, 4), dtype=np.int32), [])
-    )
+    if initial_boxes is None:
+        stages = list(previous.stages[:start]) if previous is not None and start else []
+        entry_states = list(previous.entry_states[:start]) if previous is not None and start else []
+        state = (
+            previous.entry_states[start].copy()
+            if previous is not None and start
+            else DetectionState(
+                np.empty((0, 4), dtype=np.int32), [],
+                relief_bridge_response=initial_relief_bridge_response,
+                relief_edge_mask=initial_relief_edge_mask,
+            )
+        )
 
     for index in range(start, len(PIPELINE_STEPS)):
         entry_states.append(state.copy())
         state, stage = PIPELINE_STEPS[index](image, uv_mask, config, state)
+        # Most stages only change boxes/groups.  Preserve the immutable
+        # per-island edge evidence automatically, rather than relying on every
+        # filter constructor to remember to thread it through.
+        if state.relief_edge_mask is None:
+            state.relief_edge_mask = entry_states[-1].relief_edge_mask
+        if not state.circle_radii:
+            state.circle_radii = entry_states[-1].circle_radii
         if stage.key in GROUP_STAGE_KEYS and config.enable_circular_groups:
             # Shape is a property of the region's pixels, so it is derived per
             # stage rather than carried: a stage that moves a box reshapes it.
             stage = replace(
                 stage,
                 circles=tuple(
-                    inscribed_circle_radius(image, uv_mask, group, config)
+                    cached_inscribed_circle_radius(
+                        image, uv_mask, group, config, state.circle_radii,
+                    )
                     for group in stage.kept
                 ),
             )
@@ -4209,7 +5897,15 @@ def detect_texture_regions(
     """Run texture-region detection on an already loaded BGR image."""
     stages = detect_texture_region_stages(image, uv_mask, config)
     by_key = {stage.key: stage for stage in stages}
-    final = by_key["final_padding"]
+    # Relief text is a terminal semantic filter, after padding.  Keep the
+    # original final-padding endpoint for every other detector so their circle
+    # metadata retains its established meaning.
+    active_config = config or DEFAULT_CONFIG
+    final = (
+        by_key["relief_text"]
+        if active_config.enable_relief_text_filter
+        else by_key["final_padding"]
+    )
 
     return {
         "image_size": f"{image.shape[1]}x{image.shape[0]}",

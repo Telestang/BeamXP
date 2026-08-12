@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from types import SimpleNamespace
 import tempfile
 import unittest
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
+from beamxp import hand_drive_core as core
 from beamxp.core.dae import DaeObject
 from beamxp.core.models import VehicleContext
-from beamxp import hand_drive_core as core
 from beamxp.hand_drive_parts import build_pipeline
 
 
@@ -51,6 +52,174 @@ def minimal_context(tmp: Path) -> VehicleContext:
 
 
 class TextureCorrectionIntegrationTests(unittest.TestCase):
+    def test_texture_asset_search_excludes_its_installed_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            context = minimal_context(tmp)
+            generated = tmp / build_pipeline.package_name_for_context(context)
+            generated.write_bytes(b"generated")
+            sibling = tmp / "shared_assets.zip"
+            sibling.write_bytes(b"assets")
+
+            with patch.object(build_pipeline, "beamng_game_common_zips", return_value=[]):
+                archives = build_pipeline.texture_correction_asset_archives(context)
+
+        self.assertIn(context.source_zip, archives)
+        self.assertIn(sibling, archives)
+        self.assertNotIn(generated, archives)
+
+    def test_switched_navigator_gets_conversion_owned_runtime_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            source = tmp / "lexlc500.zip"
+            source_jbeam = r'''
+            {
+              "lc500": {
+                "slotType":"main",
+                "controller":[["fileName"], ["beamNavigator", {
+                  "screenMaterialName":"@lc500_GPS",
+                  "htmlFilePath":"local://local/vehicles/lc500/lc500_GPS.html",
+                  "name":"lc500_GPS"
+                }]],
+                "glowMap":{
+                  "lc500_centralscreen":{"simpleFunction":{"ignitionLevel":0.5},
+                    "off":"lc500_screens_off", "on":"lc500_centralscreen_on",
+                    "on_intense":"lc500_GPS"}
+                }
+              }
+            }
+            '''
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("vehicles/lc500/lc500.jbeam", source_jbeam)
+                archive.writestr(
+                    "vehicles/lc500/main.materials.json",
+                    json.dumps(
+                        {
+                            "lc500_GPS": {
+                                "name": "lc500_GPS",
+                                "mapTo": "lc500_GPS",
+                                "class": "Material",
+                                "Stages": [
+                                    {"colorMap": "@lc500_GPS", "emissive": True}
+                                ],
+                            }
+                        }
+                    ),
+                )
+            output = tmp / "out" / "vehicles" / "lc500"
+            output.mkdir(parents=True)
+            target_mesh = core.generated_mesh_name("lc500_interior", core.HAND_RHD)
+            generated_jbeam = output / "handdrive_visual_conversion.jbeam"
+            generated_jbeam.write_text(
+                '{"lc500":{"slotType":"main","flexbodies":[["mesh","[group]:"],["'
+                + target_mesh
+                + '",["lc500_body"]]]},'
+                '"lc500_body_xp_rhd":{"slotType":"lc500_body",'
+                '"flexbodies":[["mesh","[group]:"],["'
+                + target_mesh
+                + '",["lc500_body"]]]},'
+                '"lc500_interior_xp_rhd":{"slotType":"lc500_interior",'
+                '"flexbodies":[["mesh","[group]:"],["'
+                + target_mesh
+                + '",["lc500_body"]]]}}',
+                encoding="utf-8",
+            )
+            context = VehicleContext(
+                source_zip=source,
+                vehicle_id="lc500",
+                vehicle_path="vehicles/lc500",
+                dae_paths=["vehicles/lc500/lc500.dae"],
+                variants={},
+                objects={},
+                preview_by_id={
+                    "lc500_interior": {"materials": ["lc500_centralscreen"]}
+                },
+                jbeam_texts={"vehicles/lc500/lc500.jbeam": source_jbeam},
+                node_positions={},
+                project_dir=tmp,
+                part_body_index={
+                    "lc500": (source_jbeam, "vehicles/lc500/lc500.jbeam")
+                },
+            )
+
+            report = build_pipeline.isolate_converted_runtime_screens(
+                context,
+                output,
+                {"lc500_interior"},
+                {core.HAND_RHD},
+            )
+            patched = generated_jbeam.read_text(encoding="utf-8")
+            materials = json.loads(
+                (output / "beamxp_runtime_screens.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertTrue(report["enabled"])
+        target_alias = report["materials"][0]
+        self.assertIn('"screenMaterialName":"@' + target_alias + '"', patched)
+        self.assertEqual(patched.count('"screenMaterialName":"@' + target_alias + '"'), 1)
+        self.assertIn('"on_intense":"' + target_alias + '"', patched)
+        self.assertEqual(materials[target_alias]["Stages"][0]["colorMap"], "@" + target_alias)
+
+    def test_non_power_of_two_dds_falls_back_to_generated_png(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            target = tmp / "vehicles/lc500"
+            job.mkdir()
+            header = bytearray(20)
+            header[:4] = b"DDS "
+            header[12:16] = (349).to_bytes(4, "little")
+            header[16:20] = (922).to_bytes(4, "little")
+            (job / "overlay_rhd.dds").write_bytes(header)
+            (job / "overlay_rhd.png").write_bytes(b"png")
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {
+                                "aliases": ["screen_overlay"],
+                                "maps": {"baseColorMap": "overlay_rhd.png"},
+                                "outputMaps": [
+                                    {
+                                        "stageKey": "baseColorMap",
+                                        "member": "vehicles/lc500/overlay.png",
+                                        "png": "overlay_rhd.png",
+                                        "dds": "overlay_rhd.dds",
+                                    }
+                                ],
+                                "sourceMaterials": [
+                                    {
+                                        "key": "screen_overlay",
+                                        "aliases": ["screen_overlay"],
+                                        "material": {
+                                            "name": "screen_overlay",
+                                            "mapTo": "screen_overlay",
+                                            "Stages": [
+                                                {
+                                                    "baseColorMap": "/vehicles/lc500/overlay.png"
+                                                }
+                                            ],
+                                        },
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+            material = json.loads(
+                (target / "beamxp_texture_correction.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )["screen_overlay_beamxp_tc"]
+
+        self.assertTrue(material["Stages"][0]["baseColorMap"].endswith("_overlay_rhd.png"))
+
     def test_texture_correction_flag_survives_merge_and_import(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             context = minimal_context(Path(raw))
@@ -134,6 +303,122 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertEqual(report["missing"], [])
             self.assertTrue(any("Texture correction:" in message for message in progress_messages))
             self.assertTrue(any("finished" in message for message in progress_messages))
+
+    def test_export_auto_includes_only_mirrored_dependencies_sharing_an_atlas(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            context = minimal_context(tmp)
+            for mesh_id in ("door_source", "unrelated_source"):
+                context.objects[mesh_id] = DaeObject(
+                    id=mesh_id,
+                    name=mesh_id,
+                    dae_path="vehicles/scintilla/scintilla.dae",
+                    x=0.0,
+                    y=0.0,
+                    z=0.0,
+                    geometry_ids=(f"{mesh_id}_geom",),
+                )
+            loaded = SimpleNamespace(
+                parts=[
+                    SimpleNamespace(
+                        key="scintilla_dashboard",
+                        node_id="scintilla_dashboard",
+                        node_name="Dashboard",
+                    ),
+                    SimpleNamespace(
+                        key="door_source", node_id="door_source", node_name="Door"
+                    ),
+                    SimpleNamespace(
+                        key="unrelated_source",
+                        node_id="unrelated_source",
+                        node_name="Unrelated",
+                    ),
+                ]
+            )
+            preview = SimpleNamespace(
+                report_path=tmp / "scintilla_rhd_preview.report.json",
+                dae_paths=(tmp / "dashboard_rhd.dae", tmp / "door_rhd.dae"),
+                textures=[object()],
+                seconds=1.0,
+                failed_parts=(),
+            )
+
+            def texture_bindings(_archive, _loaded, parts):
+                keys = {part.key for part in parts}
+                if "scintilla_dashboard" in keys or "door_source" in keys:
+                    return {"vehicles/scintilla/shared.png": []}
+                return {"vehicles/scintilla/unrelated.png": []}
+
+            with (
+                patch(
+                    "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.scan_vehicle_archive",
+                    return_value=object(),
+                ),
+                patch(
+                    "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.extract_archive_member",
+                    return_value=tmp / "source.dae",
+                ),
+                patch(
+                    "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.load_dae",
+                    return_value=loaded,
+                ),
+                patch(
+                    "mesh_segmentation_transform.mirror_texture_for_rhd.texture_bindings_for_parts",
+                    side_effect=texture_bindings,
+                ),
+                patch(
+                    "mesh_segmentation_transform.mirror_texture_for_rhd.export_parts_preview",
+                    return_value=preview,
+                ) as export,
+            ):
+                report = core.export_texture_correction_artifacts(
+                    context,
+                    tmp / "artifacts",
+                    ["scintilla_dashboard"],
+                    shared_atlas_dependency_targets={
+                        "door_source": {"door_target"},
+                        "unrelated_source": {"unrelated_target"},
+                    },
+                    force_mirrored_dependency_ids={"door_source"},
+                )
+
+        self.assertEqual(len(export.call_args_list), 2)
+        self.assertEqual(
+            [part.key for part in export.call_args_list[0].args[2]],
+            ["scintilla_dashboard"],
+        )
+        self.assertEqual(
+            [part.key for part in export.call_args_list[1].args[2]], ["door_source"]
+        )
+        self.assertEqual(
+            export.call_args_list[0].kwargs["texture_member_scope"],
+            {"vehicles/scintilla/shared.png"},
+        )
+        self.assertEqual(
+            export.call_args_list[1].kwargs["texture_member_scope"],
+            {"vehicles/scintilla/shared.png"},
+        )
+        self.assertEqual(
+            export.call_args_list[0].kwargs["force_mirrored_part_keys"],
+            {"door_source"},
+        )
+        self.assertEqual(
+            export.call_args_list[1].kwargs["force_mirrored_part_keys"],
+            {"door_source"},
+        )
+        self.assertEqual(
+            [part.key for part in export.call_args_list[0].kwargs["texture_part_scope"]],
+            ["scintilla_dashboard", "door_source"],
+        )
+        self.assertEqual(
+            [part.key for part in export.call_args_list[1].kwargs["texture_part_scope"]],
+            ["door_source"],
+        )
+        self.assertEqual(report["autoIncludedTargets"], {"door_source": ["door_target"]})
+        self.assertEqual(
+            [job["meshes"] for job in report["jobs"]],
+            [["scintilla_dashboard"], ["door_source"]],
+        )
 
     def test_a_skipped_part_is_reported_per_mesh_not_per_dae(self) -> None:
         """One unbindable mesh must not be reported as ten failed ones.
@@ -225,6 +510,264 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertNotIn('"scintilla_controls_xp_rhd"', updated)
         self.assertIn('"scintilla_dashboard__beamxp_rigid_001"', updated)
         self.assertIn('"scintilla_controls__beamxp_mirrored_carrier"', updated)
+
+    def test_jbeam_patch_clones_glowmap_for_corrected_material_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw)
+            jbeam = vehicle_dir / "ardente_body.jbeam"
+            jbeam.write_text(
+                """{
+  "ardente_body": {
+    "glowMap":{
+      "ardente_interior":{"simpleFunction":{"lowhighbeam":0.49}, "off":"ardente_interior", "on":"ardente_interior_on", "on_intense":"ardente_interior_on"},
+      "screen_runtime":{"simpleFunction":{"ignitionLevel":0.1}, "off":"screen_off", "on":"@lc500_GPS"}
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            result = build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {},
+                [
+                    {
+                        "ardente_interior": "ardente_interior_beamxp_tc",
+                        "ardente_interior_on": "ardente_interior_on_beamxp_tc",
+                    }
+                ],
+            )
+
+            updated = jbeam.read_text(encoding="utf-8")
+
+        self.assertEqual(result["replacedRows"], 0)
+        self.assertEqual(result["files"], [str(jbeam)])
+        self.assertIn('"ardente_interior_beamxp_tc"', updated)
+        self.assertIn('"off":"ardente_interior_beamxp_tc"', updated)
+        self.assertIn('"on":"ardente_interior_on_beamxp_tc"', updated)
+        self.assertIn('"on_intense":"ardente_interior_on_beamxp_tc"', updated)
+        self.assertIn('"on":"@lc500_GPS"', updated)
+
+    def test_jbeam_patch_uses_combined_aliases_for_split_glow_state_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw)
+            jbeam = vehicle_dir / "lc500.jbeam"
+            jbeam.write_text(
+                """{
+  "lc500": {
+    "glowMap":{
+      "lc500_screen_off":{"simpleFunction":"running", "off":"lc500_screen_off_off", "on":"lc500_screen_off_on"}
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {},
+                [
+                    {
+                        "lc500_screen_off": "lc500_screen_off_off_beamxp_tc",
+                        "lc500_screen_off_off": "lc500_screen_off_off_beamxp_tc",
+                    },
+                    {
+                        "lc500_screen_off_on": "lc500_screen_off_on_beamxp_tc",
+                    },
+                ],
+            )
+            updated = jbeam.read_text(encoding="utf-8")
+
+        self.assertIn('"lc500_screen_off_off_beamxp_tc"', updated)
+        self.assertIn('"off":"lc500_screen_off_off_beamxp_tc"', updated)
+        self.assertIn('"on":"lc500_screen_off_on_beamxp_tc"', updated)
+
+    def test_jbeam_patch_retargets_preserved_switch_base_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw)
+            jbeam = vehicle_dir / "lc500.jbeam"
+            jbeam.write_text(
+                """{
+  "lc500": {
+    "glowMap":{
+      "lc500_screen_off":{"simpleFunction":"running", "off":"lc500_screen_off_off", "on":"lc500_screen_off_on"}
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {},
+                [
+                    {
+                        "lc500_screen_off": "lc500_screen_off_off_beamxp_tc",
+                        "lc500_screen_off_off": "lc500_screen_off_off_beamxp_tc",
+                    },
+                    {
+                        "lc500_screen_off_on": "lc500_screen_off_on_beamxp_tc",
+                    },
+                ],
+                {"lc500_screen_off"},
+            )
+            updated = jbeam.read_text(encoding="utf-8")
+
+        self.assertIn('"lc500_screen_off"', updated)
+        self.assertNotIn('"lc500_screen_off_off_beamxp_tc":', updated)
+        self.assertIn('"off":"lc500_screen_off_off_beamxp_tc"', updated)
+        self.assertIn('"on":"lc500_screen_off_on_beamxp_tc"', updated)
+
+    def test_jbeam_patch_imports_source_glowmap_into_generated_part(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw)
+            jbeam = vehicle_dir / "handdrive_visual_conversion.jbeam"
+            jbeam.write_text(
+                '''{
+                  "lc500_interior_xp_rhd": {
+                    "flexbodies": [
+                      ["mesh", "[group]:"],
+                      ["lc500_interior_xp_rhd", ["dash"]]
+                    ]
+                  }
+                }''',
+                encoding="utf-8",
+            )
+            source_jbeam = '''{
+              "lc500": {
+                "glowMap": {
+                  "lc500_screen_off": {
+                    "simpleFunction":"running",
+                    "off":"lc500_screen_off_off",
+                    "on":"lc500_screen_off_on"
+                  }
+                }
+              }
+            }'''
+
+            build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {
+                    "lc500_interior_xp_rhd": [
+                        "lc500_interior__beamxp_mirrored_carrier"
+                    ]
+                },
+                [
+                    {
+                        "lc500_screen_off": "lc500_screen_off_off_beamxp_tc",
+                        "lc500_screen_off_off": "lc500_screen_off_off_beamxp_tc",
+                        "lc500_screen_off_on": "lc500_screen_off_on_beamxp_tc",
+                    }
+                ],
+                {"lc500_screen_off"},
+                [source_jbeam],
+            )
+            updated = jbeam.read_text(encoding="utf-8")
+
+        self.assertIn('"glowMap"', updated)
+        self.assertIn('"lc500_screen_off"', updated)
+        self.assertIn('"off":"lc500_screen_off_off_beamxp_tc"', updated)
+        self.assertIn('"on":"lc500_screen_off_on_beamxp_tc"', updated)
+
+    def test_jbeam_patch_retargets_runtime_switch_state_without_cloning_base(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw)
+            jbeam = vehicle_dir / "lc500.jbeam"
+            jbeam.write_text(
+                """{
+  "lc500": {
+    "glowMap":{
+      "lc500_centralscreen":{"simpleFunction":{"ignitionLevel":0.5}, "off":"lc500_screens_off", "on":"lc500_centralscreen_on", "on_intense":"lc500_GPS"}
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {},
+                [
+                    {
+                        "lc500_centralscreen_on": "lc500_centralscreen_on_beamxp_tc",
+                    },
+                ],
+            )
+            updated = jbeam.read_text(encoding="utf-8")
+
+        self.assertIn('"lc500_centralscreen"', updated)
+        self.assertNotIn('"lc500_centralscreen_on_beamxp_tc":', updated)
+        self.assertIn('"on":"lc500_centralscreen_on_beamxp_tc"', updated)
+        self.assertIn('"on_intense":"lc500_GPS"', updated)
+
+    def test_prune_keeps_texture_corrected_materials_referenced_by_glowmap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            vehicle_dir = tmp / "vehicles/car"
+            vehicle_dir.mkdir(parents=True)
+            for name in ("base.dds", "on.dds", "unused.dds"):
+                (vehicle_dir / name).write_bytes(b"dds")
+            (vehicle_dir / "car.dae").write_text(
+                """<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
+  <library_materials>
+    <material id="dash_beamxp_tc-material" name="dash_beamxp_tc"/>
+  </library_materials>
+  <library_geometries>
+    <geometry id="geom"><mesh><triangles material="dash_beamxp_tc" count="0"/></mesh></geometry>
+  </library_geometries>
+</COLLADA>
+""",
+                encoding="utf-8",
+            )
+            (vehicle_dir / "car.jbeam").write_text(
+                """{
+  "dash": {
+    "glowMap":{
+      "dash_beamxp_tc":{"off":"dash_beamxp_tc", "on":"dash_on_beamxp_tc"}
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+            (vehicle_dir / "beamxp_texture_correction.materials.json").write_text(
+                json.dumps(
+                    {
+                        "dash_beamxp_tc": {
+                            "Stages": [{"baseColorMap": "/vehicles/car/base.dds"}]
+                        },
+                        "dash_on_beamxp_tc": {
+                            "Stages": [{"baseColorMap": "/vehicles/car/on.dds"}]
+                        },
+                        "dash_unused_beamxp_tc": {
+                            "Stages": [{"baseColorMap": "/vehicles/car/unused.dds"}]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = build_pipeline.prune_unused_texture_correction_assets(
+                tmp,
+                vehicle_dir,
+            )
+            materials = json.loads(
+                (vehicle_dir / "beamxp_texture_correction.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            kept_glow_texture = (vehicle_dir / "on.dds").is_file()
+            removed_unused_texture = not (vehicle_dir / "unused.dds").exists()
+
+        self.assertEqual(result["removedMaterials"], ["dash_unused_beamxp_tc"])
+        self.assertIn("dash_beamxp_tc", materials)
+        self.assertIn("dash_on_beamxp_tc", materials)
+        self.assertTrue(kept_glow_texture)
+        self.assertTrue(removed_unused_texture)
 
     def test_structural_texture_correction_retargets_generated_node_without_row_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -510,6 +1053,229 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertIn("dash_nm.normal_rhd.dds", material["Stages"][1]["normalMap"])
             self.assertIn("dash_leather_o.data_rhd.dds", material["Stages"][1]["opacityMap"])
             self.assertIn("dash_carpet_o.data_rhd.dds", material["Stages"][2]["opacityMap"])
+
+    def test_shared_base_texture_material_states_get_distinct_corrected_materials(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            target = tmp / "vehicles/vivace"
+            job.mkdir()
+            for name in (
+                "ardente_interior_b.color_rhd.dds",
+                "ardente_interior_g.color_rhd.dds",
+            ):
+                (job / name).write_bytes(b"dds")
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {
+                                "aliases": [
+                                    "ardente_interior",
+                                    "ardente_interior-material",
+                                    "ardente_interior_on",
+                                ],
+                                "maps": {
+                                    "baseColorMap": "ardente_interior_b.color_rhd.dds",
+                                    "emissiveMap": "ardente_interior_g.color_rhd.dds",
+                                },
+                                "outputMaps": [
+                                    {
+                                        "stageKey": "baseColorMap",
+                                        "member": "vehicles/vivace/ardente/ardente_interior_b.color.png",
+                                        "dds": "ardente_interior_b.color_rhd.dds",
+                                    },
+                                    {
+                                        "stageKey": "emissiveMap",
+                                        "member": "vehicles/vivace/ardente/ardente_interior_g.color.png",
+                                        "dds": "ardente_interior_g.color_rhd.dds",
+                                    },
+                                ],
+                                "sourceMaterials": [
+                                    {
+                                        "key": "ardente_interior",
+                                        "aliases": ["ardente_interior"],
+                                        "materialsMember": "vehicles/vivace/ardente/main.materials.json",
+                                        "material": {
+                                            "name": "ardente_interior",
+                                            "mapTo": "ardente_interior",
+                                            "class": "Material",
+                                            "Stages": [
+                                                {
+                                                    "baseColorMap": "/vehicles/vivace/ardente/ardente_interior_b.color.png",
+                                                },
+                                            ],
+                                        },
+                                    },
+                                    {
+                                        "key": "ardente_interior_on",
+                                        "aliases": ["ardente_interior_on"],
+                                        "materialsMember": "vehicles/vivace/ardente/main.materials.json",
+                                        "material": {
+                                            "name": "ardente_interior_on",
+                                            "mapTo": "ardente_interior_on",
+                                            "class": "Material",
+                                            "Stages": [
+                                                {
+                                                    "baseColorMap": "/vehicles/vivace/ardente/ardente_interior_b.color.png",
+                                                    "emissiveMap": "/vehicles/vivace/ardente/ardente_interior_g.color.png",
+                                                    "emissiveIntensityNits": 0.4,
+                                                },
+                                            ],
+                                        },
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            mapping = build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+            materials = json.loads(
+                (target / "beamxp_texture_correction.materials.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(mapping["ardente_interior"], "ardente_interior_beamxp_tc")
+        self.assertEqual(mapping["ardente_interior_on"], "ardente_interior_on_beamxp_tc")
+        self.assertIn("ardente_interior_beamxp_tc", materials)
+        self.assertIn("ardente_interior_on_beamxp_tc", materials)
+        self.assertNotIn("emissiveMap", materials["ardente_interior_beamxp_tc"]["Stages"][0])
+        self.assertIn(
+            "ardente_interior_on_beamxp_tc_ardente_interior_g.color_rhd.dds",
+            materials["ardente_interior_on_beamxp_tc"]["Stages"][0]["emissiveMap"],
+        )
+
+    def test_switch_base_alias_maps_to_corrected_off_state_material(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            target = tmp / "vehicles/lc500"
+            job.mkdir()
+            (job / "LEX_LC5_rhd.dds").write_bytes(b"dds")
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {
+                                "aliases": [
+                                    "lc500_screen_off",
+                                    "lc500_screen_off_off",
+                                    "lc500_screen_off_on",
+                                ],
+                                "maps": {"baseColorMap": "LEX_LC5_rhd.dds"},
+                                "outputMaps": [
+                                    {
+                                        "stageKey": "baseColorMap",
+                                        "member": "vehicles/lc500/LEX_LC5.dds",
+                                        "dds": "LEX_LC5_rhd.dds",
+                                    }
+                                ],
+                                "sourceMaterials": [
+                                    {
+                                        "key": "lc500_screen_off_off",
+                                        "aliases": ["lc500_screen_off_off"],
+                                        "materialsMember": "vehicles/lc500/main.materials.json",
+                                        "material": {
+                                            "name": "lc500_screen_off_off",
+                                            "mapTo": "lc500_screen_off_off",
+                                            "class": "Material",
+                                            "Stages": [
+                                                {
+                                                    "baseColorMap": "/vehicles/lc500/LEX_LC5.dds",
+                                                },
+                                            ],
+                                        },
+                                    },
+                                    {
+                                        "key": "lc500_screen_off_on",
+                                        "aliases": ["lc500_screen_off_on"],
+                                        "materialsMember": "vehicles/lc500/main.materials.json",
+                                        "material": {
+                                            "name": "lc500_screen_off_on",
+                                            "mapTo": "lc500_screen_off_on",
+                                            "class": "Material",
+                                            "Stages": [
+                                                {
+                                                    "baseColorMap": "/vehicles/lc500/LEX_LC5.dds",
+                                                    "emissiveMap": "/vehicles/lc500/LEX_LC5.dds",
+                                                },
+                                            ],
+                                        },
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            mapping = build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+
+        self.assertEqual(mapping["lc500_screen_off"], "lc500_screen_off_off_beamxp_tc")
+        self.assertEqual(mapping["lc500_screen_off_off"], "lc500_screen_off_off_beamxp_tc")
+        self.assertEqual(mapping["lc500_screen_off_on"], "lc500_screen_off_on_beamxp_tc")
+
+    def test_runtime_screen_on_state_does_not_claim_switch_base_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            target = tmp / "vehicles/lc500"
+            job.mkdir()
+            (job / "lc500_bootscreen_rhd.dds").write_bytes(b"dds")
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {
+                                "aliases": [
+                                    "lc500_centralscreen",
+                                    "lc500_centralscreen_on",
+                                ],
+                                "maps": {"baseColorMap": "lc500_bootscreen_rhd.dds"},
+                                "outputMaps": [
+                                    {
+                                        "stageKey": "baseColorMap",
+                                        "member": "vehicles/lc500/textures/lc500_bootscreen.png",
+                                        "dds": "lc500_bootscreen_rhd.dds",
+                                    }
+                                ],
+                                "sourceMaterials": [
+                                    {
+                                        "key": "lc500_centralscreen_on",
+                                        "aliases": ["lc500_centralscreen_on"],
+                                        "materialsMember": "vehicles/lc500/main.materials.json",
+                                        "material": {
+                                            "name": "lc500_centralscreen_on",
+                                            "mapTo": "lc500_centralscreen_on",
+                                            "class": "Material",
+                                            "Stages": [
+                                                {
+                                                    "baseColorMap": "/vehicles/lc500/textures/lc500_bootscreen.png",
+                                                },
+                                            ],
+                                        },
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            mapping = build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+
+        self.assertNotIn("lc500_centralscreen", mapping)
+        self.assertEqual(
+            mapping["lc500_centralscreen_on"],
+            "lc500_centralscreen_on_beamxp_tc",
+        )
 
     def test_repeated_alias_jobs_get_distinct_corrected_materials(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

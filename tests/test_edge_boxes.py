@@ -20,6 +20,8 @@ import numpy as np
 from mesh_segmentation_transform.annotate_texture_regions import (
     DEFAULT_CONFIG,
     detect_edge_boxes,
+    detect_foreground_boxes,
+    detect_opacity_mask_boxes,
     detect_mser_boxes,
     edge_response,
     run_detection,
@@ -109,6 +111,30 @@ class EdgeResponseTests(unittest.TestCase):
             answers.append(float(edge_response(image, DEFAULT_CONFIG).max()))
         self.assertLess(max(answers) / min(answers), 1.25)
 
+    def test_gpu_laplacian_uses_the_shared_context_and_tracks_cpu_response(self) -> None:
+        from mesh_segmentation_transform.texture_local_contrast_gpu import (
+            LocalContrastGpuUnavailable,
+            gpu_renderer,
+        )
+
+        image = embossed_text(size=96)[:, :, 0]
+        cpu_config = replace(
+            DEFAULT_CONFIG, box_source="edge", edge_operator="laplacian",
+        )
+        gpu_config = replace(cpu_config, box_source="edge_gpu")
+        try:
+            renderer = gpu_renderer()
+            gpu = edge_response(image, gpu_config)
+        except LocalContrastGpuUnavailable as exc:
+            self.skipTest(str(exc))
+        cpu = edge_response(image, cpu_config)
+        self.assertEqual(gpu.shape, cpu.shape)
+        self.assertEqual(gpu_renderer(), renderer)
+        self.assertGreater(float(np.corrcoef(cpu.ravel(), gpu.ravel())[0, 1]), 0.99)
+        self.assertAlmostEqual(
+            float(np.percentile(gpu, 90)), float(np.percentile(cpu, 90)), delta=3.0,
+        )
+
 
 class EdgeBoxTests(unittest.TestCase):
     def test_edges_find_moulded_text_where_mser_finds_none(self) -> None:
@@ -170,16 +196,34 @@ class EdgeBoxTests(unittest.TestCase):
 
 
 class PipelineIntegrationTests(unittest.TestCase):
-    def test_the_colour_path_is_untouched_by_default(self) -> None:
-        # box_source defaults to mser, so every existing colour run must be
-        # bit-for-bit what it was before the edge front-end existed.
-        self.assertEqual(DEFAULT_CONFIG.box_source, "mser")
+    def test_opacity_mask_keeps_a_glyph_filling_its_uv_island(self) -> None:
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        domain = np.zeros((32, 32), dtype=bool)
+        domain[8:24, 10:22] = True
+        image[8:24, 10:22] = 239
+        config = replace(
+            DEFAULT_CONFIG,
+            box_source="opacity_mask",
+            foreground_min_component_px=4,
+            foreground_merge_gap_px=0,
+        )
+
+        boxes = detect_opacity_mask_boxes(image, domain, config)
+        run = run_detection(image, domain, config)
+
+        self.assertEqual(boxes.tolist(), [[10, 8, 12, 16]])
+        self.assertEqual(run.stages[0].title, "Opacity-mask boxes")
+        self.assertEqual(run.stages[0].kept, ((10, 8, 12, 16),))
+
+    def test_the_colour_path_uses_the_foreground_front_end_by_default(self) -> None:
+        # Authored UI/emissive atlases are now detected from their foreground
+        # mask; MSER remains an explicit comparison mode.
+        self.assertEqual(DEFAULT_CONFIG.box_source, "foreground")
         image = embossed_text()
-        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         run = run_detection(image, None, DEFAULT_CONFIG)
-        self.assertEqual(run.stages[0].title, "MSER boxes")
+        self.assertEqual(run.stages[0].title, "Foreground-mask boxes")
         self.assertEqual(
-            len(run.stages[0].kept), len(detect_mser_boxes(grey, DEFAULT_CONFIG))
+            len(run.stages[0].kept), len(detect_foreground_boxes(image, None, DEFAULT_CONFIG))
         )
 
     def test_the_edge_source_renames_the_first_stage(self) -> None:
@@ -273,6 +317,48 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         self.assertEqual([group.bounds for group in groups], [(20, 20, 8, 22)])
 
+    def test_grouping_tolerates_one_raster_pixel_at_the_expansion_boundary(self) -> None:
+        """A half-open box boundary must not split an otherwise aligned run."""
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            union_region_group_candidates,
+        )
+
+        image = np.full((96, 64, 3), 128, dtype=np.uint8)
+        # The raw gap is 21 px.  A 10-px expansion on both sides misses by a
+        # single raster cell without the grouping tolerance.
+        boxes = np.asarray(((20, 20, 8, 8), (20, 49, 8, 8)), dtype=np.int32)
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=10,
+            enable_circular_groups=False,
+        )
+
+        groups = union_region_group_candidates(boxes, image, config)
+
+        self.assertEqual([group.bounds for group in groups], [(20, 20, 8, 37)])
+
+    def test_overlap_grouping_tolerates_one_pixel_near_containment(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            overlap_region_group_candidates,
+        )
+
+        image = np.full((192, 384, 3), 128, dtype=np.uint8)
+        # The inner edge response begins one texel above the enclosing response,
+        # matching the Scintilla badge atlas.  They still describe one mark.
+        boxes = np.asarray(
+            ((21, 8, 291, 145), (67, 7, 197, 77)), dtype=np.int32
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=0,
+            enable_circular_groups=False,
+        )
+
+        groups = overlap_region_group_candidates(boxes, image, config)
+
+        self.assertEqual([group.bounds for group in groups], [(21, 7, 291, 146)])
+        self.assertEqual(len(groups[0].members), 2)
+
     def test_significant_overlap_groups_before_proximity(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
             overlap_region_group_candidates,
@@ -290,7 +376,6 @@ class ConservativeGroupingTests(unittest.TestCase):
             DEFAULT_CONFIG,
             merge_distance_px=0,
             min_group_union_region_px=10_000,
-            min_group_overlap_ratio=0.75,
             enable_circular_groups=False,
         )
 
@@ -298,7 +383,7 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         self.assertEqual([group.bounds for group in groups], [(20, 20, 28, 28)])
 
-    def test_overlap_threshold_can_leave_nested_boxes_separate(self) -> None:
+    def test_any_positive_overlap_groups_but_edge_contact_does_not(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
             overlap_region_group_candidates,
         )
@@ -306,8 +391,9 @@ class ConservativeGroupingTests(unittest.TestCase):
         image = np.full((80, 80, 3), 128, dtype=np.uint8)
         boxes = np.asarray(
             [
-                (20, 20, 28, 28),
-                (30, 30, 8, 8),
+                (20, 20, 20, 20),
+                (35, 35, 20, 20),
+                (55, 35, 10, 20),
             ],
             dtype=np.int32,
         )
@@ -315,7 +401,6 @@ class ConservativeGroupingTests(unittest.TestCase):
             DEFAULT_CONFIG,
             merge_distance_px=0,
             min_group_union_region_px=10_000,
-            min_group_overlap_ratio=1.01,
             enable_circular_groups=False,
         )
 
@@ -323,7 +408,7 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         self.assertEqual(
             [group.bounds for group in groups],
-            [(20, 20, 28, 28), (30, 30, 8, 8)],
+            [(20, 20, 35, 35), (55, 35, 10, 20)],
         )
 
     def test_overlap_grouping_runs_before_initial_grouping(self) -> None:
@@ -331,6 +416,65 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         self.assertLess(STEP_INDEX["box_filter"], STEP_INDEX["overlap_box_group"])
         self.assertLess(STEP_INDEX["overlap_box_group"], STEP_INDEX["grouped"])
+
+    def test_circles_begin_at_initial_grouping_not_overlap_collapse(self) -> None:
+        """Overlap collapse is rectilinear housekeeping, not a shape fit."""
+        image = np.full((80, 80, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(((20, 20, 32, 32), (25, 25, 12, 12)), dtype=np.int32)
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_box_feature_filter=False,
+            enable_circular_groups=True,
+        )
+
+        run = run_detection(image, None, config, initial_boxes=boxes)
+
+        self.assertEqual(run.stages[3].key, "overlap_box_group")
+        self.assertEqual(run.stages[3].circles, ())
+        self.assertEqual(run.stages[4].key, "grouped")
+        self.assertEqual(run.stages[4].circles, (16,))
+
+    def test_local_contrast_also_collapses_nested_overlap_before_proximity(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_overlap_box_group,
+        )
+
+        image = np.full((80, 80, 3), 128, dtype=np.uint8)
+        boxes = np.asarray([(20, 20, 28, 28), (30, 30, 8, 8)], dtype=np.int32)
+        config = replace(
+            DEFAULT_CONFIG,
+            box_source="contrast",
+            enable_circular_groups=False,
+        )
+
+        state, stage = _step_overlap_box_group(
+            image, None, config, DetectionState(boxes, []),
+        )
+
+        self.assertEqual(stage.kept, ((20, 20, 28, 28),))
+        self.assertEqual(state.candidates[0].members, ((20, 20, 28, 28), (30, 30, 8, 8)))
+
+    def test_overlap_grouping_repeats_when_a_union_creates_a_new_overlap(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_overlap_box_group,
+        )
+
+        image = np.full((64, 64, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            ((0, 0, 10, 10), (8, 8, 10, 10), (16, 0, 5, 7)),
+            dtype=np.int32,
+        )
+        config = replace(DEFAULT_CONFIG, enable_circular_groups=False)
+
+        state, stage = _step_overlap_box_group(
+            image, None, config, DetectionState(boxes, [])
+        )
+
+        self.assertEqual(stage.kept, ((0, 0, 21, 18),))
+        self.assertEqual(stage.adjusted, 2)
+        self.assertEqual(len(state.candidates[0].members), 3)
 
     def test_initial_grouping_continues_from_overlap_candidates(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
@@ -351,7 +495,6 @@ class ConservativeGroupingTests(unittest.TestCase):
         config = replace(
             DEFAULT_CONFIG,
             merge_distance_px=18,
-            min_group_overlap_ratio=0.75,
             enable_circular_groups=False,
         )
 
@@ -376,6 +519,64 @@ class ConservativeGroupingTests(unittest.TestCase):
             grouped_state.candidates[0].units,
             ((20, 20, 28, 28), (58, 20, 8, 28)),
         )
+
+    def test_proximity_grouping_rejects_a_thin_box_on_a_tall_boxs_edge(self) -> None:
+        """Shared-axis overlap alone falsely treats this as one text row."""
+        image = np.full((128, 256, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            ((10, 10, 100, 80), (120, 80, 50, 10)), dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=20,
+            enable_box_feature_filter=False,
+            enable_circular_groups=False,
+            enable_contrast_continuity_grouping=False,
+            enable_relief_edge_bridge_grouping=False,
+        )
+
+        run = run_detection(image, None, config, initial_boxes=boxes)
+
+        self.assertEqual(run.stages[4].kept, tuple(tuple(box) for box in boxes))
+
+    def test_proximity_grouping_keeps_a_thin_box_on_the_same_centreline(self) -> None:
+        image = np.full((128, 256, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            ((10, 10, 100, 80), (120, 45, 50, 10)), dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=20,
+            enable_box_feature_filter=False,
+            enable_circular_groups=False,
+            enable_contrast_continuity_grouping=False,
+            enable_relief_edge_bridge_grouping=False,
+        )
+
+        run = run_detection(image, None, config, initial_boxes=boxes)
+
+        self.assertEqual(run.stages[4].kept, ((10, 10, 160, 80),))
+
+    def test_nested_detail_is_absorbed_only_by_overlap_grouping(self) -> None:
+        """Initial grouping receives the already-collapsed overlap candidate."""
+        image = np.full((160, 256, 3), 128, dtype=np.uint8)
+        boxes = np.asarray(
+            ((10, 10, 180, 100), (130, 70, 20, 12)), dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=20,
+            enable_box_feature_filter=False,
+            enable_circular_groups=False,
+            enable_contrast_continuity_grouping=False,
+            enable_relief_edge_bridge_grouping=False,
+        )
+
+        run = run_detection(image, None, config, initial_boxes=boxes)
+
+        self.assertEqual(run.stages[3].kept, ((10, 10, 180, 100),))
+        self.assertEqual(run.stages[3].adjusted, 1)
+        self.assertEqual(run.stages[4].kept, ((10, 10, 180, 100),))
 
     def test_domain_recovery_splits_failed_initial_groups_to_overlap_groups(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
@@ -404,7 +605,6 @@ class ConservativeGroupingTests(unittest.TestCase):
             merge_distance_px=12,
             min_box_uv_coverage=0.75,
             min_region_uv_coverage=1.0,
-            min_group_overlap_ratio=0.75,
             enable_circular_groups=False,
         )
 
@@ -481,6 +681,108 @@ class ConservativeGroupingTests(unittest.TestCase):
         )
         self.assertIn("2 strict recovery groups kept", recovered_stage.detail)
 
+    def test_domain_recovery_can_split_an_invalid_overlap_group_to_valid_members(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_grouped,
+            _step_overlap_box_group,
+            _step_region_domain,
+        )
+
+        image = np.full((64, 64, 3), 128, dtype=np.uint8)
+        uv = np.zeros((64, 64), dtype=bool)
+        uv[15:40, 10:40] = True
+        boxes = np.asarray(
+            [(10, 10, 30, 30), (15, 20, 10, 10)],
+            dtype=np.int32,
+        )
+        config = replace(
+            DEFAULT_CONFIG,
+            min_box_uv_coverage=0.8,
+            min_region_uv_coverage=1.0,
+            merge_distance_px=0,
+            enable_circular_groups=False,
+        )
+
+        overlap_state, _overlap_stage = _step_overlap_box_group(
+            image, uv, config, DetectionState(boxes, []),
+        )
+        grouped_state, _grouped_stage = _step_grouped(
+            image, uv, config, overlap_state,
+        )
+        recovered_state, recovered_stage = _step_region_domain(
+            image, uv, config, grouped_state,
+        )
+
+        self.assertEqual(overlap_state.groups, [(10, 10, 30, 30)])
+        self.assertEqual(recovered_state.groups, [(15, 20, 10, 10)])
+        self.assertIn("1 overlap member recovered", recovered_stage.detail)
+
+    def test_post_circle_forced_merge_reconnects_cardinal_control(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_overlap_group,
+        )
+
+        image = np.full((220, 220, 3), 24, dtype=np.uint8)
+        # Four D-pad glyphs: no pair is horizontally or vertically aligned,
+        # but their enclosing square is an unambiguous, UV-valid circle.
+        groups = [(92, 40, 20, 20), (40, 92, 20, 20),
+                  (144, 92, 20, 20), (92, 144, 20, 20)]
+        config = replace(
+            DEFAULT_CONFIG,
+            merge_distance_px=100,
+            enable_region_domain_filter=True,
+            min_region_uv_coverage=1.0,
+        )
+
+        state, stage = _step_overlap_group(
+            image, np.ones(image.shape[:2], dtype=bool), config,
+            DetectionState(np.empty((0, 4), dtype=np.int32), groups),
+        )
+
+        self.assertEqual(stage.kept, ((40, 40, 124, 124),))
+        self.assertEqual(stage.adjusted, 3)
+        self.assertEqual(state.groups, [(40, 40, 124, 124)])
+
+    def test_post_circle_forced_merge_reconnects_overlapping_cross_arms(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_overlap_group,
+        )
+
+        image = np.full((220, 220, 3), 24, dtype=np.uint8)
+        # The same D-pad can arrive as one vertical and one horizontal edge
+        # component.  They overlap, but only their square union earns a circle.
+        groups = [(92, 40, 20, 124), (40, 92, 124, 20)]
+        config = replace(DEFAULT_CONFIG, merge_distance_px=100)
+
+        state, stage = _step_overlap_group(
+            image, np.ones(image.shape[:2], dtype=bool), config,
+            DetectionState(np.empty((0, 4), dtype=np.int32), groups),
+        )
+
+        self.assertEqual(stage.kept, ((40, 40, 124, 124),))
+        self.assertEqual(stage.adjusted, 1)
+        self.assertEqual(state.groups, [(40, 40, 124, 124)])
+
+    def test_post_circle_forced_merge_does_not_join_only_two_marks(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_overlap_group,
+        )
+
+        image = np.full((160, 160, 3), 24, dtype=np.uint8)
+        groups = [(40, 40, 20, 20), (100, 100, 20, 20)]
+        config = replace(DEFAULT_CONFIG, merge_distance_px=100)
+
+        _state, stage = _step_overlap_group(
+            image, np.ones(image.shape[:2], dtype=bool), config,
+            DetectionState(np.empty((0, 4), dtype=np.int32), groups),
+        )
+
+        self.assertEqual(stage.kept, tuple(groups))
+
     def test_weakly_overlapping_vertical_neighbours_do_not_group(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
             union_region_group_candidates,
@@ -552,6 +854,10 @@ class ConservativeGroupingTests(unittest.TestCase):
             DEFAULT_CONFIG,
             merge_distance_px=20,
             enable_circular_groups=False,
+            # This fixture deliberately exercises the follow-up/accumulated
+            # union rather than the default strict same-row/column policy.
+            # Its cross-shaped layout is intentionally not centre-aligned.
+            group_axis_center_tolerance=10.0,
         )
 
         groups = union_region_group_candidates(boxes, image, config)
@@ -1296,7 +1602,6 @@ class RotatedBoundsTests(unittest.TestCase):
         config = replace(
             DEFAULT_CONFIG,
             enable_circular_groups=True,
-            circular_group_padding_px=0,
             enable_rotated_bounds_filter=True,
             rotated_bounds_min_points=8,
             min_rotated_fill=0.0,
@@ -1316,6 +1621,28 @@ class RotatedBoundsTests(unittest.TestCase):
 
         self.assertEqual(stage.kept, (group,))
         self.assertEqual(stage.rotations, (None,))
+
+    def test_circle_domain_candidate_never_expands_past_its_rectangle(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            inscribed_circle_radius,
+        )
+
+        image = np.full((64, 64, 3), 128, dtype=np.uint8)
+        group = (18, 18, 20, 20)
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_circular_groups=True,
+        )
+
+        radius = inscribed_circle_radius(image, None, group, config)
+
+        self.assertEqual(radius, 10)
+        self.assertLessEqual(radius * 2, min(group[2], group[3]))
+        odd_radius = inscribed_circle_radius(
+            image, None, (18, 18, 21, 21), config,
+        )
+        self.assertEqual(odd_radius, 10)
+        self.assertLessEqual(odd_radius * 2, 21)
 
     def test_too_few_points_fits_nothing(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
@@ -1428,34 +1755,71 @@ class RotatedBoundsTests(unittest.TestCase):
         ) % 180.0
         self.assertAlmostEqual(side_angle, alignment.edge_angle_degrees, delta=0.01)
 
-    def test_edge_aligned_rotation_rejects_an_angle_mismatch(self) -> None:
+    def test_edge_aligned_rotation_uses_uv_edge_when_glyph_angle_disagrees(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
             edge_aligned_feature_outline,
             feature_shape,
         )
 
-        feature = np.zeros((128, 128), np.uint8)
-        cv2.line(feature, (58, 45), (58, 105), 255, 6)
+        feature = np.zeros((160, 160), np.uint8)
+        cv2.line(feature, (80, 85), (80, 120), 255, 6)
         mask = feature > 0
-        uv = np.zeros((128, 128), np.uint8)
+        uv = np.zeros((160, 160), np.uint8)
         cv2.fillPoly(
             uv,
-            [np.asarray([(0, 36), (127, 100), (127, 127), (0, 127)], np.int32)],
+            [np.asarray([(0, 20), (159, 100), (159, 159), (0, 159)], np.int32)],
             255,
         )
         config = replace(
             DEFAULT_CONFIG,
             enable_edge_aligned_rotation=True,
-            rotation_edge_search_px=24,
+            rotation_edge_search_px=30,
             rotation_edge_band_px=5,
             max_rotation_edge_angle_degrees=10.0,
         )
-        box = (50, 38, 18, 75)
+        box = (72, 79, 18, 48)
         shape = feature_shape(mask, box, config)
         self.assertIsNotNone(shape)
-        self.assertIsNone(
-            edge_aligned_feature_outline(mask, uv > 0, box, shape, config)
+        alignment = edge_aligned_feature_outline(
+            mask, uv > 0, box, shape, config
         )
+        self.assertIsNotNone(alignment)
+        assert alignment is not None
+        self.assertGreater(
+            alignment.angle_delta_degrees,
+            config.max_rotation_edge_angle_degrees,
+        )
+        self.assertAlmostEqual(alignment.edge_angle_degrees, 26.7, delta=2.0)
+
+    def test_closest_uv_tangent_does_not_inherit_a_glyph_tilt(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            edge_aligned_feature_outline,
+            feature_shape,
+        )
+
+        feature = np.zeros((128, 192), np.uint8)
+        cv2.line(feature, (24, 62), (168, 54), 255, 5)
+        mask = feature > 0
+        uv = np.zeros((128, 192), np.uint8)
+        cv2.rectangle(uv, (0, 38), (191, 127), 255, -1)
+        config = replace(
+            DEFAULT_CONFIG,
+            enable_edge_aligned_rotation=True,
+            rotation_edge_search_px=30,
+            rotation_edge_band_px=5,
+            max_rotation_edge_angle_degrees=10.0,
+        )
+        box = (18, 48, 156, 22)
+        shape = feature_shape(mask, box, config)
+        self.assertIsNotNone(shape)
+        alignment = edge_aligned_feature_outline(
+            mask, uv > 0, box, shape, config
+        )
+
+        self.assertIsNotNone(alignment)
+        assert alignment is not None
+        self.assertGreater(alignment.angle_delta_degrees, 2.0)
+        self.assertAlmostEqual(alignment.edge_angle_degrees, 0.0, delta=0.25)
 
     def test_edge_aligned_rotation_rejects_a_distant_edge(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (

@@ -12,6 +12,7 @@ import json
 import math
 import re
 import shutil
+import zipfile
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -77,6 +78,7 @@ from beamxp.core.files import (
     write_xml_tree,
     zip_member_path,
 )
+from beamxp.core.beam_json import parse_beamng_json
 from beamxp.core.models import (
     BakedMeshSpec,
     BuildResult,
@@ -520,9 +522,15 @@ def texture_correction_asset_archives(context: VehicleContext) -> list[Path]:
         if candidate.is_file():
             paths.append(candidate)
 
+    generated_package = package_name_for_context(context).lower()
+
     add(context.source_zip)
     if context.source_zip.parent.is_dir():
         for candidate in sorted(context.source_zip.parent.glob("*.zip"), key=lambda item: item.name.lower()):
+            # Generated conversion assets must not become inputs to the next
+            # build, or corrected files recursively turn into *_rhd_rhd jobs.
+            if candidate.name.lower() == generated_package:
+                continue
             add(candidate)
     for common_zip in beamng_game_common_zips():
         parent = common_zip.parent
@@ -539,6 +547,9 @@ def export_texture_correction_artifacts(
     artifact_root: Path,
     mesh_ids: Iterable[str],
     progress: Callable[[str], None] | None = None,
+    shared_atlas_dependency_targets: dict[str, set[str]] | None = None,
+    force_mirrored_dependency_ids: set[str] | None = None,
+    texture_member_scope_by_source: dict[tuple[Path, str], set[str]] | None = None,
 ) -> dict[str, object]:
     """Run the standalone atlas-correction exporter for marked meshes.
 
@@ -569,6 +580,7 @@ def export_texture_correction_artifacts(
             DEFAULT_RELIEF_DETECTION_CONFIG,
             DEFAULT_RHD_CONFIG,
             export_parts_preview,
+            texture_bindings_for_parts,
         )
         from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
             extract_archive_member,
@@ -580,7 +592,11 @@ def export_texture_correction_artifacts(
             "Texture correction was requested, but the standalone texture tooling "
             f"could not be loaded: {type(exc).__name__}: {exc}"
         ) from exc
-    texture_config = replace(DEFAULT_RHD_CONFIG, detect_on_normal_map=True)
+    texture_config = replace(
+        DEFAULT_RHD_CONFIG,
+        detect_on_normal_map=True,
+        write_debug_overlays=False,
+    )
 
     by_source: dict[tuple[Path, str], list[str]] = {}
     for mesh_id in selected:
@@ -589,6 +605,21 @@ def export_texture_correction_artifacts(
             continue
         source_zip = obj.dae_source_zip or context.source_zip
         by_source.setdefault((source_zip, obj.dae_path), []).append(mesh_id)
+    dependency_targets = shared_atlas_dependency_targets or {}
+    forced_dependency_ids = force_mirrored_dependency_ids or set()
+    scoped_members_by_source = texture_member_scope_by_source or {}
+    dependencies_by_source: dict[tuple[Path, str], list[str]] = {}
+    for mesh_id in dependency_targets:
+        if mesh_id in selected:
+            continue
+        obj = context.objects.get(mesh_id)
+        if obj is None or not obj.dae_path:
+            continue
+        source_zip = obj.dae_source_zip or context.source_zip
+        dependencies_by_source.setdefault((source_zip, obj.dae_path), []).append(mesh_id)
+    auto_included_targets: dict[str, set[str]] = {}
+    deferred_forced_meshes: set[str] = set()
+    deferred_forced_scope: dict[tuple[Path, str], set[str]] = {}
 
     output_dir = artifact_root
     workspace_root = context.project_dir / "build" / "texture_correction_workspace"
@@ -648,6 +679,53 @@ def export_texture_correction_artifacts(
             )
         if not parts:
             continue
+        texture_parts = list(parts)
+        texture_part_keys = {part.key for part in texture_parts}
+        forced_texture_part_keys: set[str] = set()
+        selected_texture_members = set(
+            texture_bindings_for_parts(archive, loaded, parts)
+        )
+        requested_member_scope = scoped_members_by_source.get((source_zip, dae_member))
+        if requested_member_scope is not None:
+            selected_texture_members.intersection_update(requested_member_scope)
+        for dependency_mesh in sorted(
+            dependencies_by_source.get((source_zip, dae_member), ())
+        ):
+            dependency_parts, _dependency_missing = _matching_loaded_dae_parts(
+                loaded, (dependency_mesh,)
+            )
+            if not dependency_parts:
+                continue
+            dependency_members = set(
+                texture_bindings_for_parts(archive, loaded, dependency_parts)
+            )
+            shared_members = selected_texture_members.intersection(dependency_members)
+            if not shared_members:
+                continue
+            if dependency_mesh in forced_dependency_ids:
+                for dependency_part in dependency_parts:
+                    if dependency_part.key not in texture_part_keys:
+                        texture_parts.append(dependency_part)
+                        texture_part_keys.add(dependency_part.key)
+                    forced_texture_part_keys.add(dependency_part.key)
+                deferred_forced_meshes.add(dependency_mesh)
+                deferred_forced_scope.setdefault((source_zip, dae_member), set()).update(
+                    shared_members
+                )
+                auto_included_targets.setdefault(dependency_mesh, set()).update(
+                    dependency_targets.get(dependency_mesh, ())
+                )
+                continue
+            parts.extend(dependency_parts)
+            wanted_meshes.append(dependency_mesh)
+            auto_included_targets.setdefault(dependency_mesh, set()).update(
+                dependency_targets.get(dependency_mesh, ())
+            )
+        wanted_meshes = sorted(set(wanted_meshes))
+        forced_part_keys = (
+            set(wanted_meshes).intersection(forced_dependency_ids)
+            | forced_texture_part_keys
+        )
         matched_meshes = [mesh for mesh in wanted_meshes if mesh not in set(missing)]
         if progress is not None:
             progress(
@@ -666,6 +744,9 @@ def export_texture_correction_artifacts(
                 bake=False,
                 relief_mser_config=DEFAULT_RELIEF_DETECTION_CONFIG,
                 log=log,
+                texture_member_scope=selected_texture_members,
+                force_mirrored_part_keys=forced_part_keys,
+                texture_part_scope=texture_parts,
             )
             (job_dir / "texture_correction.log").write_text(
                 "\n".join(log_lines) + ("\n" if log_lines else ""),
@@ -708,10 +789,19 @@ def export_texture_correction_artifacts(
                         }
                         for part in parts
                     ],
+                    "textureScopeParts": [
+                        {
+                            "key": str(getattr(part, "key", "") or ""),
+                            "nodeId": str(getattr(part, "node_id", "") or ""),
+                            "nodeName": str(getattr(part, "node_name", "") or ""),
+                        }
+                        for part in texture_parts
+                    ],
                     "outputDirectory": str(job_dir),
                     "reportPath": str(preview.report_path) if preview.report_path is not None else None,
                     "daePaths": [str(path) for path in preview.dae_paths],
                     "textureCount": len(preview.textures),
+                    "forceMirroredMeshes": sorted(forced_part_keys),
                     "seconds": round(float(preview.seconds), 6),
                 }
             )
@@ -747,6 +837,23 @@ def export_texture_correction_artifacts(
             "Texture correction failed for marked mesh(es): "
             f"{', '.join(first.get('meshes', []))}: {first.get('error')}"
         )
+    if deferred_forced_meshes:
+        forced_report = export_texture_correction_artifacts(
+            context,
+            artifact_root / "structural_mirror",
+            deferred_forced_meshes,
+            progress=progress,
+            force_mirrored_dependency_ids=deferred_forced_meshes,
+            texture_member_scope_by_source=deferred_forced_scope,
+        )
+        for key in ("jobs", "missing", "failures"):
+            values = forced_report.get(key, [])
+            if isinstance(values, list):
+                report[key].extend(values)
+    report["autoIncludedTargets"] = {
+        source: sorted(targets)
+        for source, targets in sorted(auto_included_targets.items())
+    }
     summary_path = output_dir / "texture_correction.report.json"
     report["reportPath"] = str(summary_path)
     summary_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -890,13 +997,38 @@ def _material_source_for_beamng(job_dir: Path, relative_path: str) -> Path:
     candidates: list[Path] = []
     if name.lower().endswith(".preview.png"):
         candidates.append(source.with_name(name[: -len(".preview.png")] + ".dds"))
+        candidates.append(source.with_name(name[: -len(".preview.png")] + ".png"))
     if source.suffix.lower() == ".png":
         candidates.append(source.with_suffix(".dds"))
     candidates.append(source)
     for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+        if not candidate.is_file():
+            continue
+        if candidate.suffix.lower() == ".dds" and not _beamng_dds_size_supported(candidate):
+            png = candidate.with_suffix(".png")
+            if png.is_file():
+                return png
+            continue
+        return candidate
     return source
+
+
+def _beamng_dds_size_supported(path: Path) -> bool:
+    """Reject compressed NPOT DDS files that BeamNG's texture loader rejects."""
+    try:
+        header = path.read_bytes()[:20]
+    except OSError:
+        return True
+    if len(header) < 20 or header[:4] != b"DDS ":
+        return True
+    height = int.from_bytes(header[12:16], "little")
+    width = int.from_bytes(header[16:20], "little")
+    return (
+        width > 0
+        and height > 0
+        and width & (width - 1) == 0
+        and height & (height - 1) == 0
+    )
 
 
 def _texture_correction_material_name(alias: str, used: set[str]) -> str:
@@ -1036,6 +1168,90 @@ def _select_source_material(entry: dict[str, object]) -> dict[str, object] | Non
     return copy.deepcopy(best[1]) if best is not None else None
 
 
+def _duplicate_safe_material_alias(value: str) -> str:
+    alias = _normalise_material_alias(value)
+    duplicate = re.match(r"^(?P<base>.+?)(?:[._]\d{3})$", alias)
+    return duplicate.group("base") if duplicate is not None else alias
+
+
+def _switch_base_aliases_for_source_aliases(
+    source_aliases: Iterable[str],
+    all_source_exact_keys: set[str],
+) -> set[str]:
+    bases: set[str] = set()
+    for alias in source_aliases:
+        key = _duplicate_safe_material_alias(alias)
+        suffix = "_off"
+        if key.endswith(suffix) and len(key) > len(suffix):
+            bases.add(key[: -len(suffix)])
+    return bases
+
+
+def _entry_material_variants(
+    entry: dict[str, object],
+    aliases: list[str],
+) -> list[tuple[list[str], dict[str, object] | None]]:
+    source_materials = entry.get("sourceMaterials")
+    if not isinstance(source_materials, list):
+        return [(aliases, _select_source_material(entry))]
+
+    variants: list[tuple[list[str], dict[str, object] | None]] = []
+    seen_sources: set[tuple[str, ...]] = set()
+    all_source_exact_keys = {
+        _duplicate_safe_material_alias(alias)
+        for item in source_materials
+        if isinstance(item, dict)
+        for alias in (
+            item.get("aliases", [])
+            if isinstance(item.get("aliases"), list)
+            else [item.get("key")]
+        )
+        if isinstance(alias, str) and _duplicate_safe_material_alias(alias)
+    }
+    for item in source_materials:
+        if not isinstance(item, dict):
+            continue
+        material = item.get("material")
+        if not isinstance(material, dict):
+            continue
+        report_aliases = [
+            str(alias)
+            for alias in item.get("aliases", [])
+            if isinstance(alias, str) and alias.strip()
+        ]
+        if not report_aliases:
+            key = item.get("key")
+            if isinstance(key, str) and key.strip():
+                report_aliases = [key]
+        source_exact_keys = {
+            _duplicate_safe_material_alias(alias)
+            for alias in report_aliases
+            if _duplicate_safe_material_alias(alias)
+        }
+        switch_base_aliases = _switch_base_aliases_for_source_aliases(
+            report_aliases,
+            all_source_exact_keys,
+        )
+        if not source_exact_keys:
+            continue
+        source_signature = tuple(sorted(source_exact_keys))
+        if source_signature in seen_sources:
+            continue
+        seen_sources.add(source_signature)
+
+        variant_aliases: list[str] = []
+        for alias in (*report_aliases, *aliases):
+            alias_key = _duplicate_safe_material_alias(alias)
+            if (
+                alias_key in source_exact_keys
+                or alias_key in switch_base_aliases
+            ) and alias not in variant_aliases:
+                variant_aliases.append(alias)
+        variants.append((variant_aliases or report_aliases, copy.deepcopy(material)))
+
+    return variants or [(aliases, _select_source_material(entry))]
+
+
 def _retarget_material_document(
     material: dict[str, object],
     material_name: str,
@@ -1098,21 +1314,45 @@ _DAE_MATERIAL_SYMBOL_RE = re.compile(r'<instance_material[^>]*\bsymbol="([^"]+)"
 _DAE_MATERIAL_ID_RE = re.compile(r'<material[^>]*\bid="([^"]+)"')
 
 
+def _glowmap_material_references(text: str) -> set[str]:
+    references: set[str] = set()
+
+    def collect(glow_text: str) -> tuple[str, int]:
+        for key, _start, _end, value_text in _top_level_jbeam_object_entries(glow_text):
+            if key:
+                references.add(key)
+            for match in _GLOW_MATERIAL_STATE_RE.finditer(value_text):
+                material = _decode_jbeam_string(f'"{match.group("material")}"')
+                if material:
+                    references.add(material.lstrip("@"))
+        return glow_text, 0
+
+    _replace_all_jbeam_object_regions(text, "glowMap", collect)
+    return {_normalise_material_alias(reference) for reference in references}
+
+
 def _materials_bound_by_generated_meshes(output_vehicle_dir: Path) -> set[str]:
-    """Every material name the generated COLLADA actually binds."""
+    """Every material name the generated assets can reach."""
     bound: set[str] = set()
     for path in output_vehicle_dir.rglob("*"):
-        if not path.is_file() or path.suffix.lower() != ".dae":
+        if not path.is_file():
             continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        bound.update(_DAE_MATERIAL_SYMBOL_RE.findall(text))
-        for value in _DAE_MATERIAL_ID_RE.findall(text):
-            bound.add(value)
-            if value.endswith("-material"):
-                bound.add(value[: -len("-material")])
+        if path.suffix.lower() == ".dae":
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            bound.update(_DAE_MATERIAL_SYMBOL_RE.findall(text))
+            for value in _DAE_MATERIAL_ID_RE.findall(text):
+                bound.add(value)
+                if value.endswith("-material"):
+                    bound.add(value[: -len("-material")])
+        elif path.suffix.lower() == ".jbeam":
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            bound.update(_glowmap_material_references(text))
     return bound
 
 
@@ -1203,34 +1443,55 @@ def _prepare_texture_correction_materials(
         maps = entry.get("maps", {})
         if not aliases or not isinstance(maps, dict):
             continue
-        material_name = _texture_correction_material_name(aliases[0], used_names)
-        for alias in aliases:
-            alias_to_material.setdefault(_normalise_material_alias(alias), material_name)
+        for variant_aliases, source_material in _entry_material_variants(entry, aliases):
+            if not variant_aliases:
+                continue
+            material_name = _texture_correction_material_name(variant_aliases[0], used_names)
+            for alias in variant_aliases:
+                alias_to_material.setdefault(_normalise_material_alias(alias), material_name)
 
-        by_source, by_stage = _entry_corrected_texture_outputs(
-            job_dir,
-            target_dir,
-            output_root,
-            material_name,
-            entry,
-        )
-        source_material = _select_source_material(entry)
-        if source_material is not None:
-            existing[material_name] = _retarget_material_document(
-                source_material,
+            by_source, by_stage = _entry_corrected_texture_outputs(
+                job_dir,
+                target_dir,
+                output_root,
                 material_name,
-                by_source,
-                by_stage,
+                entry,
             )
-        else:
-            existing[material_name] = _fallback_texture_correction_material(
-                material_name,
-                by_stage,
-            )
+            if source_material is not None:
+                existing[material_name] = _retarget_material_document(
+                    source_material,
+                    material_name,
+                    by_source,
+                    by_stage,
+                )
+            else:
+                existing[material_name] = _fallback_texture_correction_material(
+                    material_name,
+                    by_stage,
+                )
 
     if alias_to_material:
         material_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
     return alias_to_material
+
+
+def _texture_correction_switch_base_aliases(job_dir: Path) -> set[str]:
+    manifest = job_dir / "rhd_materials.json"
+    if not manifest.is_file():
+        return set()
+    try:
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    entries = document.get("materials", []) if isinstance(document, dict) else []
+    aliases: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for alias in entry.get("switchBaseAliases", []):
+            if isinstance(alias, str) and alias.strip():
+                aliases.add(_normalise_material_alias(alias))
+    return aliases
 
 
 def _retarget_collada_materials(root: ET.Element, alias_to_material: dict[str, str]) -> None:
@@ -1526,13 +1787,380 @@ def _expand_texture_correction_flexbody_array(
     return "".join(out), changed
 
 
+_GLOW_MATERIAL_STATE_RE = re.compile(
+    r'("(?P<state>off|on|on_intense)"\s*:\s*)"@?(?P<material>(?:[^"\\]|\\.)*)"',
+)
+
+
+def _normalise_jbeam_material_alias(value: str) -> str:
+    return _normalise_material_alias(value.lstrip("@"))
+
+
+def _decode_jbeam_string(token: str) -> str:
+    try:
+        loaded = json.loads(token)
+    except ValueError:
+        return token.strip('"')
+    return str(loaded)
+
+
+def _top_level_jbeam_object_entries(
+    object_text: str,
+) -> list[tuple[str, int, int, str]]:
+    """Return top-level ``"key": value`` spans from a JBeam object body."""
+    masked = transform_helpers.mask_comments_preserve_offsets(object_text)
+    brace = masked.find("{")
+    if brace < 0:
+        return []
+    try:
+        close = transform_helpers.find_matching(masked, brace, "{", "}") - 1
+    except ValueError:
+        return []
+
+    entries: list[tuple[str, int, int, str]] = []
+    idx = brace + 1
+    while idx < close:
+        while idx < close and masked[idx] in " \t\r\n,":
+            idx += 1
+        if idx >= close:
+            break
+        if masked[idx] != '"':
+            idx += 1
+            continue
+        key_start = idx
+        idx += 1
+        escape = False
+        while idx < close:
+            ch = masked[idx]
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                idx += 1
+                break
+            idx += 1
+        key_token = object_text[key_start:idx]
+        key = _decode_jbeam_string(key_token)
+        while idx < close and masked[idx] in " \t\r\n":
+            idx += 1
+        if idx >= close or masked[idx] != ":":
+            continue
+        idx += 1
+        while idx < close and masked[idx] in " \t\r\n,":
+            idx += 1
+        value_start = idx
+        if idx >= close:
+            break
+        try:
+            if masked[idx] == "{":
+                value_end = transform_helpers.find_matching(masked, idx, "{", "}")
+            elif masked[idx] == "[":
+                value_end = transform_helpers.find_matching(masked, idx, "[", "]")
+            elif masked[idx] == '"':
+                idx += 1
+                escape = False
+                while idx < close:
+                    ch = masked[idx]
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        idx += 1
+                        break
+                    idx += 1
+                value_end = idx
+            else:
+                while idx < close and masked[idx] not in ",\r\n}":
+                    idx += 1
+                value_end = idx
+        except ValueError:
+            break
+        entries.append((key, key_start, value_end, object_text[value_start:value_end]))
+        idx = value_end
+    return entries
+
+
+def _replace_glow_material_states(
+    value_text: str,
+    base_key: str,
+    corrected_base: str,
+    alias_to_material: dict[str, str],
+) -> str:
+    base_alias = _normalise_jbeam_material_alias(base_key)
+
+    def replace(match: re.Match[str]) -> str:
+        material = _decode_jbeam_string(f'"{match.group("material")}"')
+        material_alias = _normalise_jbeam_material_alias(material)
+        replacement = alias_to_material.get(material_alias)
+        if replacement is None and corrected_base and material_alias == base_alias:
+            replacement = corrected_base
+        if replacement is None:
+            return match.group(0)
+        return f'{match.group(1)}"{replacement}"'
+
+    return _GLOW_MATERIAL_STATE_RE.sub(replace, value_text)
+
+
+def _retarget_unmapped_glowmap_state_entries(
+    glow_text: str,
+    entries: list[tuple[str, int, int, str]],
+    alias_to_material: dict[str, str],
+    switch_base_aliases: set[str],
+) -> tuple[str, int]:
+    if not alias_to_material:
+        return glow_text, 0
+    out: list[str] = []
+    cursor = 0
+    changed = 0
+    for key, _start, end, value_text in entries:
+        key_alias = _normalise_jbeam_material_alias(key)
+        if key_alias in alias_to_material and key_alias not in switch_base_aliases:
+            continue
+        value_start = end - len(value_text)
+        updated_value = _replace_glow_material_states(
+            value_text,
+            key,
+            "",
+            alias_to_material,
+        )
+        if updated_value == value_text:
+            continue
+        out.append(glow_text[cursor:value_start])
+        out.append(updated_value)
+        cursor = end
+        changed += 1
+    if not out:
+        return glow_text, 0
+    out.append(glow_text[cursor:])
+    return "".join(out), changed
+
+
+def _append_texture_correction_glowmap_entries(
+    glow_text: str,
+    material_alias_sets: Iterable[dict[str, str]],
+    switch_base_aliases: set[str] | None = None,
+) -> tuple[str, int]:
+    entries = _top_level_jbeam_object_entries(glow_text)
+    if not entries:
+        return glow_text, 0
+    switch_base_aliases = switch_base_aliases or set()
+    combined_alias_to_material: dict[str, str] = {}
+    for alias_to_material in material_alias_sets:
+        for alias, material in alias_to_material.items():
+            combined_alias_to_material.setdefault(alias, material)
+    if not combined_alias_to_material:
+        return glow_text, 0
+    updated_glow_text, retargeted_entries = _retarget_unmapped_glowmap_state_entries(
+        glow_text,
+        entries,
+        combined_alias_to_material,
+        switch_base_aliases,
+    )
+    existing_keys = {_normalise_jbeam_material_alias(key) for key, *_ in entries}
+    additions: list[str] = []
+    for alias_to_material in material_alias_sets:
+        if not alias_to_material:
+            continue
+        for key, _start, _end, value_text in entries:
+            if _normalise_jbeam_material_alias(key) in switch_base_aliases:
+                continue
+            corrected_base = alias_to_material.get(_normalise_jbeam_material_alias(key))
+            if not corrected_base:
+                continue
+            corrected_alias = _normalise_jbeam_material_alias(corrected_base)
+            if corrected_alias in existing_keys:
+                continue
+            corrected_value = _replace_glow_material_states(
+                value_text,
+                key,
+                corrected_base,
+                combined_alias_to_material,
+            )
+            additions.append(f'{json.dumps(corrected_base)}:{corrected_value},')
+            existing_keys.add(corrected_alias)
+    if not additions:
+        return updated_glow_text, retargeted_entries
+
+    last_entry_start = entries[-1][1]
+    line_start = glow_text.rfind("\n", 0, last_entry_start)
+    indent = ""
+    if line_start >= 0:
+        indent = re.match(r"[ \t]*", glow_text[line_start + 1 : last_entry_start]).group(0)
+    insertion = "".join(f"\n{indent}{entry}" for entry in additions)
+    close = updated_glow_text.rfind("}")
+    if close < 0:
+        return updated_glow_text, retargeted_entries
+    return (
+        updated_glow_text[:close] + insertion + updated_glow_text[close:],
+        retargeted_entries + len(additions),
+    )
+
+
+def _replace_all_jbeam_object_regions(text: str, key: str, transform) -> str:
+    pattern = re.compile(rf'"{re.escape(key)}"\s*:[\s,]*\{{')
+    out: list[str] = []
+    cursor = 0
+    search_at = 0
+    masked = transform_helpers.mask_comments_preserve_offsets(text)
+    while True:
+        match = pattern.search(masked, search_at)
+        if match is None:
+            break
+        brace = masked.rfind("{", match.start(), match.end())
+        try:
+            end = transform_helpers.find_matching(masked, brace, "{", "}")
+        except Exception:
+            search_at = match.end()
+            continue
+        old = text[match.start() : end]
+        new, _changed = transform(old)
+        out.append(text[cursor : match.start()])
+        out.append(new)
+        cursor = end
+        search_at = end
+    if not out:
+        return text
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def _corrected_source_glowmap_entries(
+    source_jbeam_texts: Iterable[str],
+    material_alias_sets: Iterable[dict[str, str]],
+    switch_base_aliases: set[str],
+) -> dict[str, str]:
+    combined: dict[str, str] = {}
+    for alias_to_material in material_alias_sets:
+        for alias, material in alias_to_material.items():
+            combined.setdefault(_normalise_jbeam_material_alias(alias), material)
+    if not combined:
+        return {}
+
+    corrected: dict[str, str] = {}
+
+    def collect(glow_text: str) -> tuple[str, int]:
+        for key, _start, _end, value_text in _top_level_jbeam_object_entries(glow_text):
+            key_alias = _normalise_jbeam_material_alias(key)
+            updated_value = _replace_glow_material_states(
+                value_text,
+                key,
+                "",
+                combined,
+            )
+            if updated_value == value_text and key_alias not in combined:
+                continue
+            output_key = key
+            if key_alias in combined and key_alias not in switch_base_aliases:
+                output_key = combined[key_alias]
+                updated_value = _replace_glow_material_states(
+                    value_text,
+                    key,
+                    output_key,
+                    combined,
+                )
+            corrected.setdefault(output_key, updated_value)
+        return glow_text, 0
+
+    for source_text in source_jbeam_texts:
+        _replace_all_jbeam_object_regions(source_text, "glowMap", collect)
+    return corrected
+
+
+def _upsert_glowmap_entries(
+    glow_text: str,
+    entries: dict[str, str],
+) -> str:
+    existing = _top_level_jbeam_object_entries(glow_text)
+    out: list[str] = []
+    cursor = 0
+    consumed: set[str] = set()
+    for key, key_start, end, value_text in existing:
+        replacement = entries.get(key)
+        if replacement is None:
+            continue
+        out.append(glow_text[cursor:key_start])
+        out.append(f"{json.dumps(key)}:{replacement}")
+        cursor = end
+        consumed.add(key)
+    if out:
+        out.append(glow_text[cursor:])
+        glow_text = "".join(out)
+
+    missing = [(key, value) for key, value in entries.items() if key not in consumed]
+    if not missing:
+        return glow_text
+    close = glow_text.rfind("}")
+    if close < 0:
+        return glow_text
+    prefix = glow_text[:close].rstrip()
+    separator = "" if prefix.endswith(("{", ",")) else ","
+    additions = "".join(
+        f"\n      {json.dumps(key)}:{value}," for key, value in missing
+    )
+    return prefix + separator + additions + "\n    " + glow_text[close:]
+
+
+def _upsert_part_glowmap(
+    text: str,
+    part_name: str,
+    entries: dict[str, str],
+) -> tuple[str, bool]:
+    if not entries:
+        return text, False
+    masked = transform_helpers.mask_comments_preserve_offsets(text)
+    match = re.search(rf'"{re.escape(part_name)}"\s*:[\s,]*\{{', masked)
+    if match is None:
+        return text, False
+    brace = masked.rfind("{", match.start(), match.end())
+    try:
+        end = transform_helpers.find_matching(masked, brace, "{", "}")
+    except ValueError:
+        return text, False
+    part_body = text[brace:end]
+    updated = _replace_all_jbeam_object_regions(
+        part_body,
+        "glowMap",
+        lambda glow: (_upsert_glowmap_entries(glow, entries), len(entries)),
+    )
+    if updated == part_body:
+        close = part_body.rfind("}")
+        if close < 0:
+            return text, False
+        prefix = part_body[:close].rstrip()
+        separator = "" if prefix.endswith(("{", ",")) else ","
+        rows = "".join(
+            f"\n      {json.dumps(key)}:{value}," for key, value in entries.items()
+        )
+        updated = (
+            prefix
+            + separator
+            + "\n    \"glowMap\":{"
+            + rows
+            + "\n    },\n  "
+            + part_body[close:]
+        )
+    return text[:brace] + updated + text[end:], updated != part_body
+
+
 def _patch_texture_correction_jbeams(
     output_vehicle_dir: Path,
     replacements: dict[str, list[str]],
+    material_alias_sets: Iterable[dict[str, str]] = (),
+    switch_base_aliases: Iterable[str] = (),
+    source_jbeam_texts: Iterable[str] = (),
 ) -> dict[str, object]:
     patched_files: list[str] = []
     replaced_rows = 0
-    if not replacements:
+    material_alias_sets = tuple(material_alias_sets)
+    switch_base_aliases = set(switch_base_aliases)
+    corrected_source_glow_entries = _corrected_source_glowmap_entries(
+        source_jbeam_texts,
+        material_alias_sets,
+        switch_base_aliases,
+    )
+    if not replacements and not material_alias_sets:
         return {"files": patched_files, "replacedRows": replaced_rows}
     for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
         original = path.read_text(encoding="utf-8")
@@ -1545,6 +2173,23 @@ def _patch_texture_correction_jbeams(
             return new_text, changed
 
         updated = _replace_all_jbeam_array_regions(original, "flexbodies", replace_array)
+        if material_alias_sets:
+            updated = _replace_all_jbeam_object_regions(
+                updated,
+                "glowMap",
+                lambda text: _append_texture_correction_glowmap_entries(
+                    text,
+                    material_alias_sets,
+                    switch_base_aliases,
+                ),
+            )
+        if corrected_source_glow_entries:
+            for part_name in replacements:
+                updated, _changed = _upsert_part_glowmap(
+                    updated,
+                    part_name,
+                    corrected_source_glow_entries,
+                )
         if updated == original:
             continue
         path.write_text(updated, encoding="utf-8")
@@ -1580,6 +2225,320 @@ def _replace_all_jbeam_array_regions(text: str, key: str, transform) -> str:
     return "".join(out)
 
 
+_BEAM_NAVIGATOR_ROW_RE = re.compile(r'\[\s*"beamNavigator"\s*,\s*\{')
+_JBEAM_STRING_FIELD_RE = r'("{field}"\s*:\s*)"(?:[^"\\]|\\.)*"'
+_GENERATED_HAND_PART_RE = re.compile(r'(?:^|_)xp_(?:lhd|rhd)(?:_|$)', re.IGNORECASE)
+
+
+def _runtime_alias(value: object) -> str:
+    return str(value or "").strip().lstrip("@").lower()
+
+
+def _replace_jbeam_string_field(object_text: str, field: str, value: str) -> str:
+    pattern = re.compile(_JBEAM_STRING_FIELD_RE.format(field=re.escape(field)))
+    replacement = lambda match: match.group(1) + json.dumps(value)
+    updated, changed = pattern.subn(replacement, object_text, count=1)
+    if changed:
+        return updated
+    close = object_text.rfind("}")
+    if close < 0:
+        return object_text
+    prefix = object_text[:close].rstrip()
+    separator = "" if prefix.endswith(("{", ",")) else ","
+    return prefix + separator + f" {json.dumps(field)}:{json.dumps(value)}" + object_text[close:]
+
+
+def _source_beam_navigator_objects(context: VehicleContext) -> dict[str, str]:
+    controllers: dict[str, str] = {}
+    for text in context.jbeam_texts.values():
+        masked = transform_helpers.mask_comments_preserve_offsets(text)
+        for match in _BEAM_NAVIGATOR_ROW_RE.finditer(masked):
+            brace = masked.rfind("{", match.start(), match.end())
+            try:
+                end = transform_helpers.find_matching(masked, brace, "{", "}")
+            except ValueError:
+                continue
+            object_text = text[brace:end]
+            material_match = re.search(
+                _JBEAM_STRING_FIELD_RE.format(field="screenMaterialName"),
+                object_text,
+            )
+            if material_match is None:
+                continue
+            try:
+                screen_material = json.loads(material_match.group(0).split(":", 1)[1])
+            except Exception:
+                continue
+            alias = _runtime_alias(screen_material)
+            if alias:
+                controllers.setdefault(alias, object_text)
+    return controllers
+
+
+def _source_glow_entries_for_runtime_alias(
+    context: VehicleContext,
+    runtime_alias: str,
+) -> dict[str, str]:
+    entries: dict[str, str] = {}
+
+    def collect(glow_text: str) -> tuple[str, int]:
+        for key, _start, _end, value_text in _top_level_jbeam_object_entries(glow_text):
+            references = {
+                _runtime_alias(match.group(1))
+                for match in re.finditer(r':\s*"(@?(?:[^"\\]|\\.)*)"', value_text)
+            }
+            if runtime_alias in references:
+                entries.setdefault(key, value_text)
+        return glow_text, 0
+
+    for source_text in context.jbeam_texts.values():
+        _replace_all_jbeam_object_regions(source_text, "glowMap", collect)
+    return entries
+
+
+def _replace_runtime_alias_in_glow_entry(
+    value_text: str,
+    source_alias: str,
+    target_alias: str,
+) -> str:
+    def replace(match: re.Match[str]) -> str:
+        value = match.group(1)
+        if _runtime_alias(value) != source_alias:
+            return match.group(0)
+        return match.group(0)[: match.group(0).find('"')] + json.dumps(target_alias)
+
+    return re.sub(r':\s*"(@?(?:[^"\\]|\\.)*)"', replace, value_text)
+
+
+def _clone_runtime_material_definition(
+    context: VehicleContext,
+    source_alias: str,
+    target_alias: str,
+) -> dict[str, object] | None:
+    try:
+        archive = zipfile.ZipFile(context.source_zip, "r")
+    except Exception:
+        return None
+    with archive:
+        for member in archive.namelist():
+            if not member.lower().endswith(".materials.json"):
+                continue
+            try:
+                document = parse_beamng_json(
+                    archive.read(member).decode("utf-8-sig", errors="replace"),
+                    label=member,
+                )
+            except Exception:
+                continue
+            for key, material in document.items():
+                if not isinstance(material, dict):
+                    continue
+                aliases = {
+                    _runtime_alias(key),
+                    _runtime_alias(material.get("name")),
+                    _runtime_alias(material.get("mapTo")),
+                }
+                if source_alias not in aliases:
+                    continue
+                cloned = copy.deepcopy(material)
+                cloned["name"] = target_alias
+                cloned["mapTo"] = target_alias
+                for stage in cloned.get("Stages", []):
+                    if not isinstance(stage, dict):
+                        continue
+                    for stage_key, stage_value in tuple(stage.items()):
+                        if (
+                            isinstance(stage_value, str)
+                            and stage_value.strip().startswith("@")
+                            and _runtime_alias(stage_value) == source_alias
+                        ):
+                            stage[stage_key] = "@" + target_alias
+                return cloned
+    return None
+
+
+def _append_controller_row(part_body: str, row: str, runtime_alias: str) -> str:
+    controller = transform_helpers.extract_named_array(part_body, "controller")
+    if controller:
+        if runtime_alias.lower() in controller.lower():
+            return part_body
+        close = controller.rfind("]")
+        if close < 0:
+            return part_body
+        prefix = controller[:close].rstrip()
+        separator = "" if prefix.endswith(("[", ",")) else ","
+        updated = prefix + separator + "\n      " + row + ",\n    " + controller[close:]
+        return part_body.replace(controller, updated, 1)
+
+    close = part_body.rfind("}")
+    if close < 0:
+        return part_body
+    prefix = part_body[:close].rstrip()
+    separator = "" if prefix.endswith(("{", ",")) else ","
+    addition = (
+        separator
+        + '\n    "controller": [\n      ["fileName"],\n      '
+        + row
+        + ",\n    ],\n  "
+    )
+    return prefix + addition + part_body[close:]
+
+
+def _upsert_part_glow_entries(part_body: str, entries: dict[str, str]) -> str:
+    if not entries:
+        return part_body
+    glow = transform_helpers.extract_keyed_object(part_body, "glowMap")
+    if glow:
+        updated = _upsert_glowmap_entries(glow, entries)
+        return part_body.replace(glow, updated, 1)
+    close = part_body.rfind("}")
+    if close < 0:
+        return part_body
+    prefix = part_body[:close].rstrip()
+    separator = "" if prefix.endswith(("{", ",")) else ","
+    rows = "".join(f"\n      {json.dumps(key)}:{value}," for key, value in entries.items())
+    return prefix + separator + '\n    "glowMap":{' + rows + "\n    },\n  " + part_body[close:]
+
+
+def _patch_runtime_screen_parts(
+    text: str,
+    target_meshes: set[str],
+    specs: list[dict[str, object]],
+) -> tuple[str, int]:
+    key_pattern = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:[\s,]*\{')
+    masked = transform_helpers.mask_comments_preserve_offsets(text)
+    out: list[str] = []
+    cursor = 0
+    changed = 0
+    for match in key_pattern.finditer(masked):
+        if match.start() < cursor:
+            continue
+        brace = masked.find("{", match.start(), match.end())
+        try:
+            end = transform_helpers.find_matching(masked, brace, "{", "}")
+        except ValueError:
+            continue
+        part_id = match.group(1)
+        part_body = text[match.start():end]
+        if (
+            '"slotType"' not in part_body
+            or _GENERATED_HAND_PART_RE.search(part_id) is None
+            or part_id not in target_meshes
+            or not any(
+            json.dumps(mesh) in part_body for mesh in target_meshes
+            )
+        ):
+            continue
+        updated = part_body
+        for spec in specs:
+            updated = _append_controller_row(
+                updated,
+                str(spec["controllerRow"]),
+                str(spec["targetAlias"]),
+            )
+            updated = _upsert_part_glow_entries(
+                updated,
+                dict(spec["glowEntries"]),
+            )
+        if updated == part_body:
+            continue
+        out.append(text[cursor:match.start()])
+        out.append(updated)
+        cursor = end
+        changed += 1
+    if not out:
+        return text, 0
+    out.append(text[cursor:])
+    return "".join(out), changed
+
+
+def isolate_converted_runtime_screens(
+    context: VehicleContext,
+    output_vehicle_dir: Path,
+    source_meshes: Iterable[str],
+    target_hands: Iterable[str],
+) -> dict[str, object]:
+    """Give switched HTML screens a conversion-owned webview/material key.
+
+    Two stock configs can safely share their authored runtime identity. A
+    converted mesh has different UV consumers and corrected overlay materials,
+    so it must not recreate the stock vehicle's live texture under that key.
+    """
+    nav_scope = nav_screen_mesh_scope(context)
+    selected_sources = set(source_meshes).intersection(nav_scope)
+    target_meshes = {
+        generated_mesh_name(source_mesh, hand)
+        for source_mesh in selected_sources
+        for hand in set(target_hands)
+    }
+    if not target_meshes:
+        return {"enabled": False, "materials": [], "jbeamFiles": []}
+
+    controllers = _source_beam_navigator_objects(context)
+    suffix = mod_id_for_context(context).lower()
+    material_definitions: dict[str, object] = {}
+    specs: list[dict[str, object]] = []
+    for source_alias, controller_object in controllers.items():
+        source_entries = _source_glow_entries_for_runtime_alias(context, source_alias)
+        # Direct-bound navigator materials do not need a glowMap override and
+        # require COLLADA material retargeting, which is a separate path.
+        if not source_entries:
+            continue
+        target_alias = f"{source_alias}_beamxp_{suffix}"
+        material = _clone_runtime_material_definition(
+            context, source_alias, target_alias
+        )
+        if material is None:
+            continue
+        controller = _replace_jbeam_string_field(
+            controller_object, "screenMaterialName", "@" + target_alias
+        )
+        controller = _replace_jbeam_string_field(
+            controller, "name", "beamxp_" + target_alias
+        )
+        glow_entries = {
+            key: _replace_runtime_alias_in_glow_entry(
+                value, source_alias, target_alias
+            )
+            for key, value in source_entries.items()
+        }
+        material_definitions[target_alias] = material
+        specs.append(
+            {
+                "sourceAlias": source_alias,
+                "targetAlias": target_alias,
+                "controllerRow": '["beamNavigator", ' + controller + "]",
+                "glowEntries": glow_entries,
+            }
+        )
+    if not specs:
+        return {"enabled": False, "materials": [], "jbeamFiles": []}
+
+    patched_files: list[str] = []
+    for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
+        original = path.read_text(encoding="utf-8")
+        updated, changed = _patch_runtime_screen_parts(
+            original, target_meshes, specs
+        )
+        if not changed:
+            continue
+        path.write_text(updated, encoding="utf-8")
+        patched_files.append(str(path))
+    if not patched_files:
+        return {"enabled": False, "materials": [], "jbeamFiles": []}
+
+    material_path = output_vehicle_dir / "beamxp_runtime_screens.materials.json"
+    material_path.write_text(
+        json.dumps(material_definitions, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "enabled": True,
+        "materials": sorted(material_definitions),
+        "jbeamFiles": patched_files,
+    }
+
+
 def integrate_texture_correction_artifacts(
     context: VehicleContext,
     output_root: Path,
@@ -1596,6 +2555,8 @@ def integrate_texture_correction_artifacts(
 
     dae_patches: list[dict[str, object]] = []
     row_replacements: dict[str, list[str]] = {}
+    glow_material_alias_sets: list[dict[str, str]] = []
+    glow_switch_base_aliases: set[str] = set()
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
     structural_sources = structural_sources or {}
@@ -1616,6 +2577,15 @@ def integrate_texture_correction_artifacts(
             target_dae.parent,
             output_root,
         )
+        switch_base_aliases = _texture_correction_switch_base_aliases(output_directory)
+        glow_switch_base_aliases.update(switch_base_aliases)
+        collada_alias_to_material = {
+            alias: material
+            for alias, material in alias_to_material.items()
+            if alias not in switch_base_aliases
+        }
+        if alias_to_material:
+            glow_material_alias_sets.append(alias_to_material)
         detail = json.loads(report_path.read_text(encoding="utf-8"))
         for dae_export in detail.get("dae_exports", []):
             if not isinstance(dae_export, dict):
@@ -1648,7 +2618,7 @@ def integrate_texture_correction_artifacts(
                     target_dae,
                     source_dae,
                     set(split_nodes),
-                    alias_to_material,
+                    collada_alias_to_material,
                     superseded_nodes={
                         generated_mesh_name(target_mesh, hand)
                         for target_mesh in row_target_meshes
@@ -1669,7 +2639,7 @@ def integrate_texture_correction_artifacts(
                         for target_mesh in structural_target_meshes
                         for hand in hands
                     },
-                    alias_to_material,
+                    collada_alias_to_material,
                 )
             dae_patches.append(
                 {
@@ -1679,10 +2649,18 @@ def integrate_texture_correction_artifacts(
                     "appendedNodes": appended,
                     "retargetedNodes": retargeted,
                     "materialAliases": sorted(alias_to_material),
+                    "colladaMaterialAliases": sorted(collada_alias_to_material),
+                    "switchBaseAliases": sorted(switch_base_aliases),
                 }
             )
 
-    jbeam_patch = _patch_texture_correction_jbeams(output_vehicle_dir, row_replacements)
+    jbeam_patch = _patch_texture_correction_jbeams(
+        output_vehicle_dir,
+        row_replacements,
+        glow_material_alias_sets,
+        glow_switch_base_aliases,
+        context.jbeam_texts.values(),
+    )
     return {
         "enabled": True,
         "daePatches": dae_patches,
@@ -1754,6 +2732,8 @@ def build_batch(
     texture_correction_ids: set[str] = set()
     texture_correction_targets: dict[str, set[str]] = {}
     texture_correction_source_ids: set[str] = set()
+    shared_atlas_dependency_targets: dict[str, set[str]] = {}
+    force_mirrored_dependency_ids: set[str] = set()
     if generated_variant_targets:
         object_modes = active_part_modes(conversion)
         # A vehicle whose every converted trim is fully covered by an authored
@@ -1794,6 +2774,16 @@ def build_batch(
             source_mesh = structural_sources.get(mesh, mesh)
             texture_correction_targets.setdefault(source_mesh, set()).add(mesh)
         texture_correction_source_ids = set(texture_correction_targets)
+        if texture_correction_source_ids:
+            for target_mesh, mode in object_modes.items():
+                if mode not in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
+                    continue
+                source_mesh = structural_sources.get(target_mesh, target_mesh)
+                shared_atlas_dependency_targets.setdefault(source_mesh, set()).add(
+                    target_mesh
+                )
+                if mode == MODE_MIRROR_STRUCTURAL:
+                    force_mirrored_dependency_ids.add(source_mesh)
         node_mirror_map = build_node_mirror_map(context.node_positions)
         translated_prop_meshes = {
             mesh for mesh, mode in object_modes.items() if mode == MODE_TRANSLATE and mesh in prop_meshes
@@ -1852,6 +2842,11 @@ def build_batch(
         "missing": [],
         "failures": [],
     }
+    runtime_screen_patch: dict[str, object] = {
+        "enabled": False,
+        "materials": [],
+        "jbeamFiles": [],
+    }
     if variant_targets:
         emit_progress("Writing generated JBeam and config files...")
         generated_configs.extend(write_generated_jbeam_and_configs(
@@ -1889,6 +2884,12 @@ def build_batch(
             baked_shared_specs,
             texture_flip_ids,
         )
+        runtime_screen_patch = isolate_converted_runtime_screens(
+            context,
+            output_vehicle_dir,
+            texture_flip_ids,
+            set(generated_variant_targets.values()),
+        )
     if generated_variant_targets and texture_correction_ids:
         emit_progress(f"Running texture correction for {len(texture_correction_ids)} mesh(es)...")
         texture_correction_report = export_texture_correction_artifacts(
@@ -1896,7 +2897,17 @@ def build_batch(
             context.project_dir / "build" / "texture_correction",
             texture_correction_source_ids,
             progress=emit_progress,
+            shared_atlas_dependency_targets=shared_atlas_dependency_targets,
+            force_mirrored_dependency_ids=force_mirrored_dependency_ids,
         )
+        auto_included = texture_correction_report.get("autoIncludedTargets", {})
+        if isinstance(auto_included, dict):
+            for source_mesh, targets in auto_included.items():
+                if not isinstance(targets, list):
+                    continue
+                texture_correction_targets.setdefault(str(source_mesh), set()).update(
+                    str(target) for target in targets
+                )
         emit_progress("Integrating texture-corrected meshes...")
         texture_correction_report["integration"] = integrate_texture_correction_artifacts(
             context,
@@ -1916,6 +2927,7 @@ def build_batch(
                 json.dumps(texture_correction_report, indent=2) + "\n",
                 encoding="utf-8",
             )
+    texture_correction_report["runtimeScreens"] = runtime_screen_patch
     emit_progress("Writing original config outputs...")
     generated_configs.extend(write_original_plate_configs(
         context,
