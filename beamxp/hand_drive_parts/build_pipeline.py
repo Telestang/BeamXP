@@ -1031,13 +1031,79 @@ def _beamng_dds_size_supported(path: Path) -> bool:
     )
 
 
-def _texture_correction_material_name(alias: str, used: set[str]) -> str:
-    base = safe_id(f"{_normalise_material_alias(alias)}_beamxp_tc") or "beamxp_texture_corrected"
+def _material_skin_suffix_start(name: str) -> int:
+    """Where BeamNG's skin-variant suffix begins in a material name, or -1.
+
+    A skin is authored as ``<material>.<slotType>.<skinName>`` --
+    ``scintilla_interior.skin_interior.luxe`` beside ``scintilla_interior`` --
+    and a skin part is nothing but that pair of names:
+
+        "scintilla_skin_interior_luxe": {
+            "slotType" : "skin_interior",
+            "skinName" : "luxe"
+        }
+
+    The engine rebinds by composing them onto whatever material the mesh
+    actually binds, so the suffix has to survive on the end of any name we give
+    that material or the rebinding has nothing to find.
+    """
+    for index in range(len(name)):
+        if not name.startswith(".skin", index):
+            continue
+        after = index + len(".skin")
+        if after == len(name) or name[after] in "._":
+            return index
+    return -1
+
+
+def _split_material_skin_suffix(name: str) -> tuple[str, str]:
+    """A material name as (base, skin suffix); the suffix is "" when plain."""
+    index = _material_skin_suffix_start(name)
+    if index <= 0:
+        return name, ""
+    return name[:index], name[index:]
+
+
+def _texture_correction_material_name(
+    alias: str,
+    used: set[str],
+    base_names: dict[str, str] | None = None,
+) -> str:
+    """The corrected material's name, with any skin suffix left on the end.
+
+    A skin has to be named for the material it skins, so the correction suffix
+    goes on the base and the skin suffix stays last:
+    ``scintilla_interior_beamxp_tc.skin_interior.luxe``. Suffixing the whole
+    alias instead gave ``scintilla_interior.skin_interior.luxe_beamxp_tc`` --
+    a material no config could ever ask for, since the mesh binds
+    ``scintilla_interior_beamxp_tc`` and the engine looks for that name plus
+    the skin's slot and name. The prune pass then removed it as unreachable,
+    quite correctly, and every mirrored mesh fell back to the base textures:
+    ten of the scintilla's sixteen trims wore the wrong interior.
+
+    ``base_names`` carries the corrected name already chosen for each base
+    alias, so a skin lands on its own base rather than starting a fresh one.
+    """
+    base_alias, skin_suffix = _split_material_skin_suffix(_normalise_material_alias(alias))
+    skin_suffix = safe_id(skin_suffix)
+    if skin_suffix and base_names is not None:
+        base_name = base_names.get(base_alias)
+        if base_name is not None:
+            candidate = f"{base_name}{skin_suffix}"
+            used.add(candidate.lower())
+            return candidate
+    base = safe_id(f"{base_alias}_beamxp_tc") or "beamxp_texture_corrected"
     candidate = base
     counter = 2
-    while candidate.lower() in used:
+    while f"{candidate}{skin_suffix}".lower() in used:
         candidate = f"{base}_{counter}"
         counter += 1
+    if base_names is not None and not skin_suffix:
+        # The newest base wins: where one alias corrects to two materials -- two
+        # layouts sharing a name, which is what the _2 suffix is for -- the
+        # skins named after it belong to the one just allocated.
+        base_names[base_alias] = candidate
+    candidate = f"{candidate}{skin_suffix}"
     used.add(candidate.lower())
     return candidate
 
@@ -1369,11 +1435,19 @@ def prune_unused_texture_correction_assets(
     racing interior's alcantar and alumin variants are corrected and never
     bound, which is 69.9 MB of DDS in a 189.6 MB package.
 
+    A skin variant is reachable without ever being bound: no mesh names
+    ``..._beamxp_tc.skin_interior.luxe``, the engine composes it at runtime from
+    the material the mesh does bind and the skin part the config selected. So a
+    skin is kept exactly when the base it skins is kept, and dropped with it.
+
     Runs on the finished output rather than predicting up front, so it cannot
     be wrong about what is in use, and only ever removes files inside the
     generated vehicle folder.
     """
     bound = _materials_bound_by_generated_meshes(output_vehicle_dir)
+
+    def reachable(name: str) -> bool:
+        return name in bound or _split_material_skin_suffix(name)[0] in bound
     removed_materials: list[str] = []
     removed_files: list[str] = []
     freed = 0
@@ -1384,8 +1458,8 @@ def prune_unused_texture_correction_assets(
             continue
         if not isinstance(document, dict):
             continue
-        keep = {name: body for name, body in document.items() if name in bound}
-        drop = {name: body for name, body in document.items() if name not in bound}
+        keep = {name: body for name, body in document.items() if reachable(name)}
+        drop = {name: body for name, body in document.items() if not reachable(name)}
         if not drop:
             continue
 
@@ -1436,6 +1510,15 @@ def _prepare_texture_correction_materials(
 
     alias_to_material: dict[str, str] = {}
     used_names = {str(key).lower() for key in existing}
+    base_names: dict[str, str] = {}
+    for key in existing:
+        base_alias, skin_suffix = _split_material_skin_suffix(str(key).lower())
+        if not skin_suffix and base_alias.endswith("_beamxp_tc"):
+            base_names.setdefault(base_alias[: -len("_beamxp_tc")], str(key))
+
+    # Skins are named for the base they skin, so every base has to be named
+    # first -- a manifest lists them in whatever order the exporter found them.
+    pending: list[tuple[list[str], dict[str, object] | None, dict[str, object]]] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -1444,31 +1527,38 @@ def _prepare_texture_correction_materials(
         if not aliases or not isinstance(maps, dict):
             continue
         for variant_aliases, source_material in _entry_material_variants(entry, aliases):
-            if not variant_aliases:
-                continue
-            material_name = _texture_correction_material_name(variant_aliases[0], used_names)
-            for alias in variant_aliases:
-                alias_to_material.setdefault(_normalise_material_alias(alias), material_name)
+            if variant_aliases:
+                pending.append((variant_aliases, source_material, entry))
 
-            by_source, by_stage = _entry_corrected_texture_outputs(
-                job_dir,
-                target_dir,
-                output_root,
+    def is_skin(item: tuple[list[str], dict[str, object] | None, dict[str, object]]) -> bool:
+        return bool(_split_material_skin_suffix(_normalise_material_alias(item[0][0]))[1])
+
+    for variant_aliases, source_material, entry in sorted(pending, key=is_skin):
+        material_name = _texture_correction_material_name(
+            variant_aliases[0], used_names, base_names
+        )
+        for alias in variant_aliases:
+            alias_to_material.setdefault(_normalise_material_alias(alias), material_name)
+
+        by_source, by_stage = _entry_corrected_texture_outputs(
+            job_dir,
+            target_dir,
+            output_root,
+            material_name,
+            entry,
+        )
+        if source_material is not None:
+            existing[material_name] = _retarget_material_document(
+                source_material,
                 material_name,
-                entry,
+                by_source,
+                by_stage,
             )
-            if source_material is not None:
-                existing[material_name] = _retarget_material_document(
-                    source_material,
-                    material_name,
-                    by_source,
-                    by_stage,
-                )
-            else:
-                existing[material_name] = _fallback_texture_correction_material(
-                    material_name,
-                    by_stage,
-                )
+        else:
+            existing[material_name] = _fallback_texture_correction_material(
+                material_name,
+                by_stage,
+            )
 
     if alias_to_material:
         material_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")

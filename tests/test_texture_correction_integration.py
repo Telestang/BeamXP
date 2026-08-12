@@ -1325,6 +1325,187 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertIn("dash_b.color_rhd.dds", materials["dash_mat_beamxp_tc"]["Stages"][0]["baseColorMap"])
             self.assertIn("console_b.color_rhd.dds", materials["dash_mat_beamxp_tc_2"]["Stages"][0]["baseColorMap"])
 
+    @staticmethod
+    def _skin_manifest_job(directory: Path) -> Path:
+        """One corrected material and two skins over it, as scintilla ships them.
+
+        ``scintilla_interior`` is the material the dashboard binds;
+        ``scintilla_interior.skin_interior.luxe`` and ``.race`` are what the
+        engine swaps in when the config selects that interior skin part.
+        """
+        job = directory / "job"
+        job.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "interior_b.color_rhd.dds",
+            "interior_luxe_b.color_rhd.dds",
+            "interior_race_b.color_rhd.dds",
+        ):
+            (job / name).write_bytes(b"dds")
+
+        def entry(key: str, source: str, output: str) -> dict:
+            return {
+                "aliases": ["scintilla_interior", key],
+                "maps": {"baseColorMap": output},
+                "outputMaps": [
+                    {
+                        "stageKey": "baseColorMap",
+                        "member": f"vehicles/scintilla/{source}",
+                        "dds": output,
+                    }
+                ],
+                "sourceMaterials": [
+                    {
+                        "key": key,
+                        "aliases": [key],
+                        "materialsMember": "vehicles/scintilla/main.materials.json",
+                        "material": {
+                            "name": key,
+                            "mapTo": key,
+                            "class": "Material",
+                            "Stages": [
+                                {"baseColorMap": f"/vehicles/scintilla/{source}"}
+                            ],
+                            "version": 1.5,
+                        },
+                    }
+                ],
+            }
+
+        (job / "rhd_materials.json").write_text(
+            json.dumps(
+                {
+                    "materials": [
+                        # Deliberately skin-first: a manifest lists variants in
+                        # whatever order the exporter found them, and the base
+                        # still has to be named before anything named after it.
+                        entry(
+                            "scintilla_interior.skin_interior.luxe",
+                            "interior_luxe_b.color.dds",
+                            "interior_luxe_b.color_rhd.dds",
+                        ),
+                        entry(
+                            "scintilla_interior",
+                            "interior_b.color.dds",
+                            "interior_b.color_rhd.dds",
+                        ),
+                        entry(
+                            "scintilla_interior.skin_interior.race",
+                            "interior_race_b.color.dds",
+                            "interior_race_b.color_rhd.dds",
+                        ),
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return job
+
+    def test_a_corrected_skin_keeps_its_skin_suffix_on_the_end(self) -> None:
+        """The engine composes <bound material>.<slotType>.<skinName>.
+
+        Suffixing the whole alias instead -- ``...luxe_beamxp_tc`` -- names a
+        material no config can ask for, because the mesh binds
+        ``scintilla_interior_beamxp_tc`` and the engine appends the skin to
+        that. Ten of the scintilla's sixteen trims wore the base interior.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            target = tmp / "vehicles/scintilla"
+            target.mkdir(parents=True)
+            mapping = build_pipeline._prepare_texture_correction_materials(
+                self._skin_manifest_job(tmp), target, tmp
+            )
+            materials = json.loads(
+                (target / "beamxp_texture_correction.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(mapping["scintilla_interior"], "scintilla_interior_beamxp_tc")
+        for skin in ("luxe", "race"):
+            name = f"scintilla_interior_beamxp_tc.skin_interior.{skin}"
+            self.assertEqual(mapping[f"scintilla_interior.skin_interior.{skin}"], name)
+            self.assertIn(name, materials)
+            # named for itself, or the engine cannot bind what it swapped in
+            self.assertEqual(materials[name]["mapTo"], name)
+            self.assertIn(
+                f"interior_{skin}_b.color_rhd.dds",
+                materials[name]["Stages"][0]["baseColorMap"],
+            )
+        self.assertNotIn("scintilla_interior.skin_interior.luxe_beamxp_tc", materials)
+
+    def test_a_skin_follows_the_base_it_skins_when_one_alias_corrects_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            target = tmp / "vehicles/scintilla"
+            target.mkdir(parents=True)
+            job = self._skin_manifest_job(tmp)
+            build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+            second = build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+
+        # The second layout's skins belong to the second layout's base, not to
+        # the first one's -- otherwise they overwrite a skin already correct.
+        self.assertEqual(second["scintilla_interior"], "scintilla_interior_beamxp_tc_2")
+        self.assertEqual(
+            second["scintilla_interior.skin_interior.luxe"],
+            "scintilla_interior_beamxp_tc_2.skin_interior.luxe",
+        )
+
+    def test_prune_keeps_a_skin_of_a_bound_material_and_drops_one_of_an_unbound(self) -> None:
+        """A skin is reachable without ever being named by a mesh.
+
+        Nothing binds ``..._beamxp_tc.skin_interior.luxe``; the engine composes
+        it at runtime. Pruning on bound names alone deleted every corrected
+        skin the exporter had just built -- 372 MB of it on the scintilla.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            vehicle_dir = tmp / "vehicles/scintilla"
+            vehicle_dir.mkdir(parents=True)
+            for name in ("base.dds", "luxe.dds", "other.dds", "other_luxe.dds"):
+                (vehicle_dir / name).write_bytes(b"dds")
+            (vehicle_dir / "car.dae").write_text(
+                '<x><instance_material symbol="interior_beamxp_tc" target="#a"/></x>',
+                encoding="utf-8",
+            )
+            (vehicle_dir / "beamxp_texture_correction.materials.json").write_text(
+                json.dumps(
+                    {
+                        "interior_beamxp_tc": {
+                            "Stages": [{"baseColorMap": "/vehicles/scintilla/base.dds"}]
+                        },
+                        "interior_beamxp_tc.skin_interior.luxe": {
+                            "Stages": [{"baseColorMap": "/vehicles/scintilla/luxe.dds"}]
+                        },
+                        "other_beamxp_tc": {
+                            "Stages": [{"baseColorMap": "/vehicles/scintilla/other.dds"}]
+                        },
+                        "other_beamxp_tc.skin_interior.luxe": {
+                            "Stages": [{"baseColorMap": "/vehicles/scintilla/other_luxe.dds"}]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = build_pipeline.prune_unused_texture_correction_assets(tmp, vehicle_dir)
+            materials = json.loads(
+                (vehicle_dir / "beamxp_texture_correction.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            kept_skin_texture = (vehicle_dir / "luxe.dds").is_file()
+            dropped_skin_texture = not (vehicle_dir / "other_luxe.dds").exists()
+
+        self.assertEqual(
+            result["removedMaterials"],
+            ["other_beamxp_tc", "other_beamxp_tc.skin_interior.luxe"],
+        )
+        self.assertIn("interior_beamxp_tc.skin_interior.luxe", materials)
+        self.assertTrue(kept_skin_texture)
+        # an unbound base still takes its skins with it
+        self.assertTrue(dropped_skin_texture)
+
 
 if __name__ == "__main__":
     unittest.main()
