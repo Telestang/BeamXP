@@ -1798,6 +1798,72 @@ def _append_texture_correction_dae(
     return [str(node.get("id") or "") for node in appended_nodes]
 
 
+def _node_material_symbols(dae_path: Path, node_ids: set[str]) -> dict[str, set[str]]:
+    """The materials each named node's geometry actually paints with.
+
+    Read off the geometry's own primitives, never the node's
+    ``instance_material`` table: a split keeps the whole mesh's binding table on
+    every piece, so asking the node says each piece paints with everything and
+    tells the pieces apart not at all. The primitives are what the piece really
+    carries.
+    """
+    if not node_ids:
+        return {}
+    try:
+        root = ET.parse(dae_path).getroot()
+    except (OSError, ET.ParseError):
+        return {}
+    geometry_materials: dict[str, set[str]] = {}
+    for geometry in root.findall(".//c:geometry", NS):
+        geometry_id = geometry.get("id")
+        if not geometry_id:
+            continue
+        geometry_materials[geometry_id] = {
+            _normalise_material_alias(symbol)
+            for primitive in geometry.iter()
+            if (symbol := primitive.get("material"))
+        }
+    found: dict[str, set[str]] = {}
+    for node in root.findall(".//c:node", NS):
+        node_id = node.get("id") or ""
+        if node_id not in node_ids:
+            continue
+        symbols: set[str] = set()
+        for instance in node.findall(".//c:instance_geometry", NS):
+            symbols |= geometry_materials.get((instance.get("url") or "").lstrip("#"), set())
+        found[node_id] = symbols
+    return found
+
+
+def _mirror_row_split_target(
+    pieces: Iterable[str],
+    piece_materials: dict[str, set[str]],
+    corrected_materials: set[str],
+) -> str:
+    """Which split piece a ``mirrors`` row should follow, or "" when unclear.
+
+    Splitting a mesh for texture correction renames it, and ``addMirror`` binds
+    by mesh name (``lua/common/jbeam/sections/mirror.lua``), so a row left
+    naming the whole mesh binds nothing at all and the glass stops reflecting --
+    the same failure the rename fix cured, arriving by a later rename.
+
+    A row names one mesh, so it has to be the piece holding the reflective
+    surface rather than the housing. A mirror material is the reflection: it
+    carries no base colour of its own, which is exactly why the texture
+    correction never records it and never renames it, so the glass is the piece
+    the correction did not touch. Where that does not pick out a single piece
+    the row is left alone -- a mirrors row aimed at a dashboard would turn the
+    dashboard into a mirror, which is worse than the reflection staying broken.
+    """
+    candidates = [
+        piece
+        for piece in pieces
+        if (symbols := piece_materials.get(piece))
+        and not symbols & corrected_materials
+    ]
+    return candidates[0] if len(candidates) == 1 else ""
+
+
 def _retarget_texture_correction_generated_nodes(
     target_dae: Path,
     source_dae: Path,
@@ -2240,9 +2306,12 @@ def _patch_texture_correction_jbeams(
     material_alias_sets: Iterable[dict[str, str]] = (),
     switch_base_aliases: Iterable[str] = (),
     source_jbeam_texts: Iterable[str] = (),
+    mirror_row_targets: dict[str, str] | None = None,
 ) -> dict[str, object]:
     patched_files: list[str] = []
     replaced_rows = 0
+    mirror_rows = 0
+    mirror_row_targets = mirror_row_targets or {}
     material_alias_sets = tuple(material_alias_sets)
     switch_base_aliases = set(switch_base_aliases)
     corrected_source_glow_entries = _corrected_source_glowmap_entries(
@@ -2251,7 +2320,11 @@ def _patch_texture_correction_jbeams(
         switch_base_aliases,
     )
     if not replacements and not material_alias_sets:
-        return {"files": patched_files, "replacedRows": replaced_rows}
+        return {
+            "files": patched_files,
+            "replacedRows": replaced_rows,
+            "mirrorRows": mirror_rows,
+        }
     for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
         original = path.read_text(encoding="utf-8")
         file_replacements = 0
@@ -2262,7 +2335,18 @@ def _patch_texture_correction_jbeams(
             file_replacements += changed
             return new_text, changed
 
+        def replace_mirrors(array_text: str) -> tuple[str, int]:
+            nonlocal mirror_rows
+            new_text = rewrite_mirror_rows(array_text, mirror_row_targets, {})
+            changed = 1 if new_text != array_text else 0
+            mirror_rows += changed
+            return new_text, changed
+
         updated = _replace_all_jbeam_array_regions(original, "flexbodies", replace_array)
+        if mirror_row_targets:
+            # The glass followed its mesh into the split; the row that binds it
+            # has to follow too, or addMirror finds nothing to reflect into.
+            updated = _replace_all_jbeam_array_regions(updated, "mirrors", replace_mirrors)
         if material_alias_sets:
             updated = _replace_all_jbeam_object_regions(
                 updated,
@@ -2285,7 +2369,11 @@ def _patch_texture_correction_jbeams(
         path.write_text(updated, encoding="utf-8")
         patched_files.append(str(path))
         replaced_rows += file_replacements
-    return {"files": patched_files, "replacedRows": replaced_rows}
+    return {
+        "files": patched_files,
+        "replacedRows": replaced_rows,
+        "mirrorRows": mirror_rows,
+    }
 
 
 def _replace_all_jbeam_array_regions(text: str, key: str, transform) -> str:
@@ -2645,6 +2733,7 @@ def integrate_texture_correction_artifacts(
 
     dae_patches: list[dict[str, object]] = []
     row_replacements: dict[str, list[str]] = {}
+    mirror_row_targets: dict[str, str] = {}
     glow_material_alias_sets: list[dict[str, str]] = []
     glow_switch_base_aliases: set[str] = set()
     hands = sorted(set(target_hands))
@@ -2716,9 +2805,24 @@ def integrate_texture_correction_artifacts(
                     },
                 )
                 if appended:
+                    # Read back off the DAE just written: the pieces carry the
+                    # retargeted material names, which is what has to be
+                    # compared against the ones the correction minted.
+                    piece_materials = _node_material_symbols(target_dae, set(appended))
+                    glass = _mirror_row_split_target(
+                        appended,
+                        piece_materials,
+                        {
+                            _normalise_material_alias(name)
+                            for name in collada_alias_to_material.values()
+                        },
+                    )
                     for target_mesh in row_target_meshes:
                         for hand in hands:
-                            row_replacements[generated_mesh_name(target_mesh, hand)] = appended
+                            name = generated_mesh_name(target_mesh, hand)
+                            row_replacements[name] = appended
+                            if glass:
+                                mirror_row_targets[name] = glass
             retargeted: list[str] = []
             if structural_target_meshes:
                 retargeted = _retarget_texture_correction_generated_nodes(
@@ -2750,12 +2854,14 @@ def integrate_texture_correction_artifacts(
         glow_material_alias_sets,
         glow_switch_base_aliases,
         context.jbeam_texts.values(),
+        mirror_row_targets,
     )
     return {
         "enabled": True,
         "daePatches": dae_patches,
         "jbeamPatch": jbeam_patch,
         "rowReplacements": row_replacements,
+        "mirrorRowTargets": mirror_row_targets,
     }
 
 

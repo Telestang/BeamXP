@@ -864,7 +864,9 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             root = ET.parse(target_dae).getroot()
 
         self.assertEqual(result["rowReplacements"], {})
-        self.assertEqual(result["jbeamPatch"], {"files": [], "replacedRows": 0})
+        self.assertEqual(
+            result["jbeamPatch"], {"files": [], "replacedRows": 0, "mirrorRows": 0}
+        )
         self.assertEqual(result["daePatches"][0]["appendedNodes"], [])
         self.assertEqual(result["daePatches"][0]["retargetedNodes"], ["doorpanel_FL_xp_rhd"])
         self.assertIn('"doorpanel_FL_xp_rhd", ["door_FL"]', jbeam)
@@ -1324,6 +1326,108 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             )
             self.assertIn("dash_b.color_rhd.dds", materials["dash_mat_beamxp_tc"]["Stages"][0]["baseColorMap"])
             self.assertIn("console_b.color_rhd.dds", materials["dash_mat_beamxp_tc_2"]["Stages"][0]["baseColorMap"])
+
+    # The glass piece a split leaves behind, and the housing pieces beside it.
+    MIRROR_SPLIT = {
+        "carrier": "scintilla_interior_mirror__beamxp_mirrored_carrier",
+        "housing": "scintilla_interior_mirror__beamxp_rigid_001",
+        "glass": "scintilla_interior_mirror__beamxp_rigid_003",
+    }
+
+    def _split_dae(self, path: Path) -> None:
+        """A split mesh: two housing pieces on the corrected atlas, one glass."""
+        pieces = "".join(
+            f'<geometry id="g_{name}"><mesh><triangles material="{material}" count="0"/>'
+            f"</mesh></geometry>"
+            for name, material in (
+                (self.MIRROR_SPLIT["carrier"], "scintilla_interior_beamxp_tc"),
+                (self.MIRROR_SPLIT["housing"], "scintilla_interior_beamxp_tc"),
+                (self.MIRROR_SPLIT["glass"], "mirror_F-material"),
+            )
+        )
+        nodes = "".join(
+            # every piece keeps the whole mesh's binding table, which is exactly
+            # why the node's bindings cannot tell the pieces apart
+            f'<node id="{name}" name="{name}">'
+            f'<instance_geometry url="#g_{name}"><bind_material><technique_common>'
+            f'<instance_material symbol="scintilla_interior_beamxp_tc" target="#a"/>'
+            f'<instance_material symbol="mirror_F" target="#b"/>'
+            f"</technique_common></bind_material></instance_geometry></node>"
+            for name in self.MIRROR_SPLIT.values()
+        )
+        path.write_text(
+            '<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">'
+            f"<library_geometries>{pieces}</library_geometries>"
+            f"<library_visual_scenes><visual_scene>{nodes}</visual_scene>"
+            "</library_visual_scenes></COLLADA>",
+            encoding="utf-8",
+        )
+
+    def test_the_glass_piece_is_the_one_the_correction_did_not_touch(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dae = Path(raw) / "gen.dae"
+            self._split_dae(dae)
+            pieces = list(self.MIRROR_SPLIT.values())
+            materials = build_pipeline._node_material_symbols(dae, set(pieces))
+            glass = build_pipeline._mirror_row_split_target(
+                pieces, materials, {"scintilla_interior_beamxp_tc"}
+            )
+
+        self.assertEqual(glass, self.MIRROR_SPLIT["glass"])
+
+    def test_a_split_with_no_single_untouched_piece_leaves_the_row_alone(self) -> None:
+        """Better a mirror that does not reflect than a dashboard that does."""
+        with tempfile.TemporaryDirectory() as raw:
+            dae = Path(raw) / "gen.dae"
+            self._split_dae(dae)
+            pieces = list(self.MIRROR_SPLIT.values())
+            materials = build_pipeline._node_material_symbols(dae, set(pieces))
+            # nothing corrected: every piece qualifies, so none is picked
+            self.assertEqual(build_pipeline._mirror_row_split_target(pieces, materials, set()), "")
+            # a piece with no geometry at all is never a candidate
+            self.assertEqual(
+                build_pipeline._mirror_row_split_target(["absent"], materials, set()), ""
+            )
+
+    def test_a_mirrors_row_follows_its_mesh_into_the_split(self) -> None:
+        """addMirror binds by mesh name, so a stale row reflects nothing.
+
+        The rename fix cured this once; splitting a mesh for texture correction
+        renames it again, later, and brought the same failure back.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw) / "vehicles/scintilla"
+            vehicle_dir.mkdir(parents=True)
+            (vehicle_dir / "car.jbeam").write_text(
+                """{
+"scintilla_interior_xp_rhd": {
+    "flexbodies": [
+        ["mesh", "[group]:"],
+        ["scintilla_interior_mirror_xp_rhd", ["scintilla_interior"]],
+    ],
+    "mirrors": [
+        ["mesh", "idRef:", "id1:", "id2:"],
+        ["scintilla_interior_mirror_xp_rhd","rf1","rf1rr","f6l",{"refBaseTranslation":{"x":0.0,"y":0.0,"z":-0.09}}],
+    ],
+}
+}""",
+                encoding="utf-8",
+            )
+            result = build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {"scintilla_interior_mirror_xp_rhd": list(self.MIRROR_SPLIT.values())},
+                mirror_row_targets={
+                    "scintilla_interior_mirror_xp_rhd": self.MIRROR_SPLIT["glass"]
+                },
+            )
+            updated = (vehicle_dir / "car.jbeam").read_text(encoding="utf-8")
+
+        self.assertEqual(result["mirrorRows"], 1)
+        self.assertIn(f'["{self.MIRROR_SPLIT["glass"]}","rf1"', updated)
+        self.assertNotIn('["scintilla_interior_mirror_xp_rhd","rf1"', updated)
+        # the flexbody rows still take every piece, glass included
+        for name in self.MIRROR_SPLIT.values():
+            self.assertIn(f'["{name}", ["scintilla_interior"]]', updated)
 
     @staticmethod
     def _skin_manifest_job(directory: Path) -> Path:
