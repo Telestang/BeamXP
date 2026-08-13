@@ -15,6 +15,35 @@ from beamxp.core.models import VehicleContext
 from beamxp.hand_drive_parts import build_pipeline
 
 
+def _screen_quad_dae(u_low: float, u_high: float) -> str:
+    """A one-quad DAE whose screen material reads u_low..u_high of its page."""
+    return f"""<?xml version="1.0"?>
+    <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
+      <library_geometries>
+        <geometry id="cluster">
+          <mesh>
+            <source id="cluster-map">
+              <float_array id="cluster-map-array" count="8">
+                {u_low} 0.0  {u_high} 0.0  {u_high} 1.0  {u_low} 1.0
+              </float_array>
+              <technique_common>
+                <accessor source="#cluster-map-array" count="4" stride="2">
+                  <param name="S" type="float"/><param name="T" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <triangles material="lc500_screen_off-material" count="2">
+              <input semantic="VERTEX" source="#cluster-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#cluster-map" offset="1" set="0"/>
+              <p>0 0 1 1 2 2 0 0 2 2 3 3</p>
+            </triangles>
+          </mesh>
+        </geometry>
+      </library_geometries>
+    </COLLADA>
+    """
+
+
 def minimal_context(tmp: Path) -> VehicleContext:
     source_zip = tmp / "vehicle.zip"
     source_zip.write_bytes(b"placeholder")
@@ -121,7 +150,12 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 '"lc500_interior_xp_rhd":{"slotType":"lc500_interior",'
                 '"flexbodies":[["mesh","[group]:"],["'
                 + target_mesh
-                + '",["lc500_body"]]]}}',
+                + '",["lc500_body"]]],'
+                # Texture correction runs first and has already claimed the
+                # "off" state; isolating the live state must not undo that.
+                '"glowMap":{"lc500_centralscreen":{"simpleFunction":{"ignitionLevel":0.5},'
+                '"off":"lc500_screens_off_beamxp_tc", "on":"lc500_centralscreen_on",'
+                '"on_intense":"lc500_GPS"}}}}',
                 encoding="utf-8",
             )
             context = VehicleContext(
@@ -161,6 +195,177 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertEqual(patched.count('"screenMaterialName":"@' + target_alias + '"'), 1)
         self.assertIn('"on_intense":"' + target_alias + '"', patched)
         self.assertEqual(materials[target_alias]["Stages"][0]["colorMap"], "@" + target_alias)
+        self.assertIn('"off":"lc500_screens_off_beamxp_tc"', patched)
+        self.assertNotIn('"on_intense":"lc500_GPS"', patched)
+
+    def test_lua_owned_runtime_tag_gets_a_conversion_copy_of_its_controller(self) -> None:
+        # The LC500's cluster tag lives in the mod's own controller Lua, not in
+        # a jbeam field, and obj:createWebView hands one global tag to whichever
+        # vehicle asks first -- so the conversion needs its own controller.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            source = tmp / "lexlc500.zip"
+            source_jbeam = r'''
+            {
+              "lc500_interior": {
+                "slotType":"lc500_interior",
+                "controller":[["fileName"], ["LEX_LC500_21"], ["gauges/customModules/tireData"]],
+                "glowMap":{
+                  "lc500_screen_off":{"simpleFunction":{"ignitionLevel":0.5},
+                    "off":"lc500_screen_off_off", "on":"lc500_screen_off_on"}
+                }
+              }
+            }
+            '''
+            controller_lua = (
+                'local settings = {\n'
+                '  textureName = "@LEX_LC500_21_fh6_gauge",\n'
+                '  width = 1280\n'
+                '}\n'
+                'local htmlPath = "local://local/vehicles/lc500/html/lc500.html"\n'
+                'htmlTexture.create(settings.textureName, htmlPath, 1280, 720, 30)\n'
+            )
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("vehicles/lc500/lc500_interior.jbeam", source_jbeam)
+                archive.writestr(
+                    "vehicles/lc500/lua/controller/LEX_LC500_21.lua", controller_lua
+                )
+                archive.writestr(
+                    "vehicles/lc500/html/lc500.html",
+                    "<html><head><title>gauge</title></head><body>0</body></html>",
+                )
+                archive.writestr(
+                    "vehicles/lc500/main.materials.json",
+                    json.dumps(
+                        {
+                            "lc500_screen_off_on": {
+                                "name": "lc500_screen_off_on",
+                                "mapTo": "lc500_screen_off_on",
+                                "class": "Material",
+                                "Stages": [
+                                    {"emissiveMap": "@LEX_LC500_21_fh6_gauge"}
+                                ],
+                            }
+                        }
+                    ),
+                )
+            output = tmp / "out" / "vehicles" / "lc500"
+            output.mkdir(parents=True)
+            generated_jbeam = output / "handdrive_visual_conversion.jbeam"
+            # The generated part already carries a corrected "off" state; the
+            # rebind must move the live "on" state without undoing that.
+            generated_jbeam.write_text(
+                '{"lc500_interior_xp_rhd":{"slotType":"lc500_interior",'
+                '"controller":[["fileName"], ["LEX_LC500_21"], '
+                '["gauges/customModules/tireData"]],'
+                '"glowMap":{"lc500_screen_off":{"simpleFunction":{"ignitionLevel":0.5},'
+                '"off":"lc500_screen_off_off_beamxp_tc", "on":"lc500_screen_off_on"}}}}',
+                encoding="utf-8",
+            )
+            context = VehicleContext(
+                source_zip=source,
+                vehicle_id="lc500",
+                vehicle_path="vehicles/lc500",
+                dae_paths=["vehicles/lc500/lc500.dae"],
+                variants={},
+                objects={},
+                preview_by_id={},
+                jbeam_texts={"vehicles/lc500/lc500_interior.jbeam": source_jbeam},
+                node_positions={},
+                project_dir=tmp,
+                part_body_index={
+                    "lc500_interior": (
+                        source_jbeam,
+                        "vehicles/lc500/lc500_interior.jbeam",
+                    )
+                },
+            )
+
+            report = build_pipeline.isolate_converted_runtime_screens(
+                context,
+                output,
+                {"lc500_interior"},
+                {core.HAND_RHD},
+            )
+            patched = generated_jbeam.read_text(encoding="utf-8")
+            materials = json.loads(
+                (output / "beamxp_runtime_screens.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            suffix = build_pipeline.mod_id_for_context(context).lower()
+            copied = output / "lua" / "controller" / f"LEX_LC500_21_beamxp_{suffix}.lua"
+            copied_text = copied.read_text(encoding="utf-8")
+            page = output / "html" / f"lc500_beamxp_{suffix}.html"
+            page_text = page.read_text(encoding="utf-8")
+
+        target_alias = f"lex_lc500_21_fh6_gauge_beamxp_{suffix}"
+        target_material = f"lc500_screen_off_on_beamxp_{suffix}"
+
+        self.assertTrue(report["enabled"])
+        # The conversion loads its own controller, and only that row moved.
+        self.assertIn(f'["LEX_LC500_21_beamxp_{suffix}"]', patched)
+        self.assertNotIn('["LEX_LC500_21"]', patched)
+        self.assertIn('["gauges/customModules/tireData"]', patched)
+        # That controller creates its own webview tag, not the donor's.
+        self.assertIn(f'"@{target_alias}"', copied_text)
+        self.assertNotIn('"@LEX_LC500_21_fh6_gauge"', copied_text)
+        # The material drawing from the tag follows it, and the glow trigger
+        # that switches the screen on now names the conversion's material.
+        self.assertEqual(
+            materials[target_material]["Stages"][0]["emissiveMap"], "@" + target_alias
+        )
+        self.assertIn(f'"on":"{target_material}"', patched)
+        self.assertIn('"off":"lc500_screen_off_off_beamxp_tc"', patched)
+        self.assertEqual(patched.count('"lc500_screen_off"'), 1)
+        # The live screen is corrected at its source: the page the webview
+        # renders is reflected, so the reflected quad reads the right way round.
+        self.assertIn(
+            f'"local://local/vehicles/lc500/html/lc500_beamxp_{suffix}.html"',
+            copied_text,
+        )
+        self.assertNotIn('"local://local/vehicles/lc500/html/lc500.html"', copied_text)
+        self.assertIn("transform:scaleX(-1)", page_text)
+        self.assertIn("<title>gauge</title>", page_text)
+        self.assertLess(page_text.index("beamxp-mirror"), page_text.index("</head>"))
+        # The quad reads u 0.2..0.8, so the page turns about the middle of that
+        # window (50%), not about a window it never shows.
+        self.assertIn("transform-origin:50.0000% 50%", page_text)
+
+    def test_an_off_centre_screen_window_turns_about_its_own_middle(self) -> None:
+        # A quad reading u 0.27..0.79 of its page: reflecting about the page
+        # centre would slide the dial 12% of the quad's width out of place.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            source = tmp / "lexlc500.zip"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr(
+                    "vehicles/lc500/lc500.dae", _screen_quad_dae(0.27493, 0.78493)
+                )
+            context = VehicleContext(
+                source_zip=source,
+                vehicle_id="lc500",
+                vehicle_path="vehicles/lc500",
+                dae_paths=["vehicles/lc500/lc500.dae"],
+                variants={},
+                objects={},
+                preview_by_id={},
+                jbeam_texts={},
+                node_positions={},
+                project_dir=tmp,
+                part_body_index={},
+            )
+            centre = build_pipeline._sampled_u_centre(context, {"lc500_screen_off"})
+
+        self.assertAlmostEqual(centre, 0.52993, places=5)
+        page = build_pipeline._mirrored_screen_page("<html><head></head></html>", centre)
+        self.assertIn("transform-origin:52.9930% 50%", page)
+
+    def test_a_screen_symbol_with_no_uvs_falls_back_to_the_page_centre(self) -> None:
+        self.assertIn(
+            "transform-origin:50.0000% 50%",
+            build_pipeline._mirrored_screen_page("<html><head></head></html>"),
+        )
 
     def test_non_power_of_two_dds_falls_back_to_generated_png(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

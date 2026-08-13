@@ -2488,10 +2488,366 @@ def _replace_runtime_alias_in_glow_entry(
     return re.sub(r':\s*"(@?(?:[^"\\]|\\.)*)"', replace, value_text)
 
 
+_CONTROLLER_LUA_MEMBER_RE = re.compile(r"(?:^|/)lua/controller/(.+)\.lua$", re.IGNORECASE)
+
+
+def _source_controller_lua(context: VehicleContext) -> dict[str, tuple[str, str]]:
+    """Controller file name -> (archive member, source text) for the mod's Lua.
+
+    ``lua/vehicle/controller.lua`` loads a jbeam controller row through
+    ``require("controller/" .. fileName)``, so a vehicle's own
+    ``lua/controller`` directory is the name space its controllers live in and
+    the row's ``fileName`` is the path within it.
+    """
+    try:
+        archive = zipfile.ZipFile(context.source_zip, "r")
+    except Exception:
+        return {}
+    controllers: dict[str, tuple[str, str]] = {}
+    with archive:
+        for member in archive.namelist():
+            match = _CONTROLLER_LUA_MEMBER_RE.search(member)
+            if match is None:
+                continue
+            try:
+                text = archive.read(member).decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            controllers.setdefault(match.group(1), (member, text))
+    return controllers
+
+
+def _lua_owned_runtime_aliases(
+    context: VehicleContext,
+    runtime_aliases: Iterable[str],
+) -> dict[str, str]:
+    """Runtime texture alias -> the controller file name that hard-codes it.
+
+    ``htmlTexture.create`` ends in ``obj:createWebView(tag, ...)`` and that tag
+    is a single global key: the first vehicle to ask for it owns it, and a
+    second vehicle asking for the same tag gets nothing.  That is why a
+    conversion spawned beside its donor leaves one of the two live screens
+    black, whichever spawned second.  A tag the controller's own Lua names
+    cannot be moved from jbeam the way ``screenMaterialName`` can, so the
+    conversion has to carry its own copy of that controller.
+    """
+    wanted = {alias for alias in runtime_aliases if alias}
+    if not wanted:
+        return {}
+    owners: dict[str, str] = {}
+    for file_name, (_member, text) in _source_controller_lua(context).items():
+        for match in re.finditer(r'"@([^"\\]+)"', text):
+            alias = _runtime_alias(match.group(1))
+            if alias in wanted:
+                owners.setdefault(alias, file_name)
+    return owners
+
+
+def _retag_controller_lua(text: str, source_alias: str, target_alias: str) -> str:
+    """Point one controller's hard-coded runtime tag at the conversion's own."""
+    pattern = re.compile(r'"@(' + re.escape(source_alias) + r')"', re.IGNORECASE)
+    return pattern.sub('"@' + target_alias + '"', text)
+
+
+_LOCAL_PAGE_RE = re.compile(r'"local://local/([^"]+\.html)"', re.IGNORECASE)
+
+
+def _mirror_page_style(origin: float) -> str:
+    """Reflect the rendered page about ``origin`` of its own width.
+
+    Reflecting the page is the only correction a live screen can take: there is
+    no image to rewrite, and no UV island to reflect either, because a
+    texture-corrected mesh is rebuilt by the symmetry sweep and never sees the
+    flip scope.  The axis has to be the middle of the window the quad actually
+    samples, not the middle of the page -- the LC500's cluster reads
+    u 0.275..0.785, so reflecting about the page instead slides the dial 12% of
+    the quad's width to the left and tucks part of it behind the binnacle.
+    """
+    return (
+        '<style id="beamxp-mirror">'
+        f"html{{transform:scaleX(-1);transform-origin:{origin * 100:.4f}% 50%;}}"
+        "</style>"
+    )
+
+
+def _mirrored_screen_page(page: str, origin: float = 0.5) -> str:
+    """Return the page rendered left-to-right reversed about ``origin``."""
+    if 'id="beamxp-mirror"' in page:
+        return page
+    style = _mirror_page_style(origin)
+    match = re.search(r"</head\s*>", page, re.IGNORECASE)
+    if match is not None:
+        return page[: match.start()] + style + "\n" + page[match.start():]
+    return style + "\n" + page
+
+
+def _sampled_u_centre(context: VehicleContext, symbols: set[str]) -> float | None:
+    """Middle of the horizontal texture window ``symbols`` sample, or None.
+
+    A screen quad rarely reads the whole page: the LC500's cluster takes the
+    middle half of it. The reflection has to turn that window about its own
+    centre so the same pixels stay on the quad, exactly as the UV flip path
+    reflects s within its own bounds rather than within 0..1.
+    """
+    if not symbols:
+        return None
+    wanted = {symbol.lower() for symbol in symbols}
+    wanted |= {f"{symbol}-material" for symbol in wanted}
+    lowest = highest = None
+    try:
+        archive = zipfile.ZipFile(context.source_zip, "r")
+    except Exception:
+        return None
+    with archive:
+        for dae_path in context.dae_paths:
+            try:
+                with archive.open(dae_path) as handle:
+                    root = ET.parse(handle).getroot()
+            except Exception:
+                continue
+            for mesh in root.iter(f"{{{NS['c']}}}mesh"):
+                sources = {
+                    source.get("id"): source
+                    for source in mesh.findall("c:source", NS)
+                }
+                for primitive in mesh:
+                    if primitive.tag.rpartition("}")[2] not in {"triangles", "polylist"}:
+                        continue
+                    if (primitive.get("material") or "").lower() not in wanted:
+                        continue
+                    inputs = primitive.findall("c:input", NS)
+                    if not inputs:
+                        continue
+                    stride = max(int(n.get("offset", "0")) for n in inputs) + 1
+                    texcoord = None
+                    for node in inputs:
+                        if node.get("semantic") != "TEXCOORD":
+                            continue
+                        if texcoord is None or int(node.get("set", "0")) < int(
+                            texcoord.get("set", "0")
+                        ):
+                            texcoord = node
+                    index_node = primitive.find("c:p", NS)
+                    if texcoord is None or index_node is None:
+                        continue
+                    source = sources.get(texcoord.get("source", "")[1:])
+                    if source is None:
+                        continue
+                    array = source.find("c:float_array", NS)
+                    accessor = source.find("c:technique_common/c:accessor", NS)
+                    if array is None or array.text is None:
+                        continue
+                    values = [float(v) for v in array.text.split()]
+                    uv_stride = int(accessor.get("stride", "2")) if accessor is not None else 2
+                    offset = int(texcoord.get("offset", "0"))
+                    indices = [int(v) for v in (index_node.text or "").split()]
+                    for start in range(offset, len(indices), stride):
+                        u = values[indices[start] * uv_stride]
+                        lowest = u if lowest is None else min(lowest, u)
+                        highest = u if highest is None else max(highest, u)
+            if lowest is not None:
+                break
+    if lowest is None or highest is None:
+        return None
+    return (lowest + highest) / 2.0
+
+
+def _mirrored_controller_pages(
+    context: VehicleContext,
+    controller_text: str,
+    suffix: str,
+    origin: float = 0.5,
+) -> tuple[str, dict[str, str]]:
+    """Give a controller its own mirrored copy of each page it renders.
+
+    The copy keeps the donor's directory so its relative fonts and images still
+    resolve, and only the file name carries the conversion's id.
+    """
+    vehicle_root = str(context.vehicle_path).strip("/").lower()
+    pages: dict[str, str] = {}
+    updated = controller_text
+    try:
+        archive = zipfile.ZipFile(context.source_zip, "r")
+    except Exception:
+        return controller_text, {}
+    with archive:
+        members = {name.lower(): name for name in archive.namelist()}
+        for match in _LOCAL_PAGE_RE.finditer(controller_text):
+            reference = match.group(1)
+            member = members.get(reference.lower())
+            if member is None:
+                continue
+            relative = reference.lower().removeprefix(vehicle_root).strip("/")
+            if not relative or relative == reference.lower():
+                # Outside this vehicle's folder: not ours to copy or reflect.
+                continue
+            try:
+                page = archive.read(member).decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            head, _, name = relative.rpartition("/")
+            stem, _, extension = name.rpartition(".")
+            target_name = f"{stem}_beamxp_{suffix}.{extension}"
+            target_relative = f"{head}/{target_name}" if head else target_name
+            pages[target_relative] = _mirrored_screen_page(page, origin)
+            head_reference, _, _ = reference.rpartition("/")
+            updated = updated.replace(
+                match.group(0),
+                '"local://local/'
+                + (f"{head_reference}/{target_name}" if head_reference else target_name)
+                + '"',
+            )
+    return updated, pages
+
+
+def _source_materials_referencing_runtime_alias(
+    context: VehicleContext,
+    runtime_alias: str,
+) -> tuple[str, ...]:
+    """Material keys whose stages draw from one runtime texture."""
+    try:
+        archive = zipfile.ZipFile(context.source_zip, "r")
+    except Exception:
+        return ()
+    keys: list[str] = []
+    with archive:
+        for member in archive.namelist():
+            if not member.lower().endswith(".materials.json"):
+                continue
+            try:
+                document = parse_beamng_json(
+                    archive.read(member).decode("utf-8-sig", errors="replace"),
+                    label=member,
+                )
+            except Exception:
+                continue
+            if not isinstance(document, dict):
+                continue
+            for key, material in document.items():
+                if not isinstance(material, dict):
+                    continue
+                for stage in material.get("Stages", []):
+                    if not isinstance(stage, dict):
+                        continue
+                    if any(
+                        isinstance(value, str) and _runtime_alias(value) == runtime_alias
+                        for value in stage.values()
+                        if isinstance(value, str) and value.strip().startswith("@")
+                    ):
+                        alias = _runtime_alias(key)
+                        if alias and alias not in keys:
+                            keys.append(alias)
+                        break
+    return tuple(keys)
+
+
+def _rename_controller_file(part_body: str, source: str, target: str) -> str:
+    """Point a part's controller row at the conversion's copy of that file."""
+    controller = transform_helpers.extract_named_array(part_body, "controller")
+    if not controller:
+        return part_body
+    pattern = re.compile(r'(\[\s*)"' + re.escape(source) + r'"(?=\s*[,\]])')
+    updated, changed = pattern.subn(
+        lambda match: match.group(1) + json.dumps(target), controller
+    )
+    if not changed:
+        return part_body
+    return part_body.replace(controller, updated, 1)
+
+
+def _rebind_part_glow_materials(
+    part_body: str,
+    renames: dict[str, str],
+) -> tuple[str, set[str]]:
+    """Point a part's own glow rows at the conversion's copies of a material.
+
+    Returns the rewritten part and which trigger keys were touched, so the
+    caller only has to fall back to the donor's row for a trigger this part
+    does not carry.
+    """
+    glow = transform_helpers.extract_keyed_object(part_body, "glowMap")
+    if not glow or not renames:
+        return part_body, set()
+    touched: set[str] = set()
+    updated_entries: dict[str, str] = {}
+    for key, _start, _end, value_text in _top_level_jbeam_object_entries(glow):
+        rewritten = value_text
+        for source, target in renames.items():
+            rewritten = _replace_runtime_alias_in_glow_entry(rewritten, source, target)
+        if rewritten != value_text:
+            updated_entries[key] = rewritten
+            touched.add(key)
+    if not updated_entries:
+        return part_body, set()
+    return (
+        part_body.replace(glow, _upsert_glowmap_entries(glow, updated_entries), 1),
+        touched,
+    )
+
+
+def _patch_controller_owned_screen_parts(
+    text: str,
+    specs: list[dict[str, object]],
+) -> tuple[str, int]:
+    """Rewrite generated parts that load a controller owning a runtime tag."""
+    key_pattern = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:[\s,]*\{')
+    masked = transform_helpers.mask_comments_preserve_offsets(text)
+    out: list[str] = []
+    cursor = 0
+    changed = 0
+    for match in key_pattern.finditer(masked):
+        if match.start() < cursor:
+            continue
+        brace = masked.find("{", match.start(), match.end())
+        try:
+            end = transform_helpers.find_matching(masked, brace, "{", "}")
+        except ValueError:
+            continue
+        part_id = match.group(1)
+        part_body = text[match.start():end]
+        if (
+            '"slotType"' not in part_body
+            or _GENERATED_HAND_PART_RE.search(part_id) is None
+        ):
+            continue
+        updated = part_body
+        for spec in specs:
+            renamed = _rename_controller_file(
+                updated,
+                str(spec["sourceController"]),
+                str(spec["targetController"]),
+            )
+            if renamed == updated:
+                continue
+            # Rewriting the part's own rows rather than replacing them with the
+            # donor's keeps whatever texture correction has already done to the
+            # other states of the same trigger.
+            updated, rebound = _rebind_part_glow_materials(
+                renamed, dict(spec["materialRenames"])
+            )
+            missing = {
+                key: value
+                for key, value in dict(spec["glowEntries"]).items()
+                if key not in rebound
+            }
+            updated = _upsert_part_glow_entries(updated, missing)
+        if updated == part_body:
+            continue
+        out.append(text[cursor:match.start()])
+        out.append(updated)
+        cursor = end
+        changed += 1
+    if not out:
+        return text, 0
+    out.append(text[cursor:])
+    return "".join(out), changed
+
+
 def _clone_runtime_material_definition(
     context: VehicleContext,
     source_alias: str,
     target_alias: str,
+    runtime_aliases: dict[str, str] | None = None,
 ) -> dict[str, object] | None:
     try:
         archive = zipfile.ZipFile(context.source_zip, "r")
@@ -2518,6 +2874,7 @@ def _clone_runtime_material_definition(
                 }
                 if source_alias not in aliases:
                     continue
+                rewrites = runtime_aliases or {source_alias: target_alias}
                 cloned = copy.deepcopy(material)
                 cloned["name"] = target_alias
                 cloned["mapTo"] = target_alias
@@ -2525,12 +2882,14 @@ def _clone_runtime_material_definition(
                     if not isinstance(stage, dict):
                         continue
                     for stage_key, stage_value in tuple(stage.items()):
-                        if (
+                        if not (
                             isinstance(stage_value, str)
                             and stage_value.strip().startswith("@")
-                            and _runtime_alias(stage_value) == source_alias
                         ):
-                            stage[stage_key] = "@" + target_alias
+                            continue
+                        replacement = rewrites.get(_runtime_alias(stage_value))
+                        if replacement:
+                            stage[stage_key] = "@" + replacement
                 return cloned
     return None
 
@@ -2614,9 +2973,20 @@ def _patch_runtime_screen_parts(
                 str(spec["controllerRow"]),
                 str(spec["targetAlias"]),
             )
+            # In place first: this runs after texture correction has rewritten
+            # the other states of the same trigger, and replacing the row with
+            # the donor's would hand those states back to the donor.
+            updated, rebound = _rebind_part_glow_materials(
+                updated,
+                {str(spec["sourceAlias"]): str(spec["targetAlias"])},
+            )
             updated = _upsert_part_glow_entries(
                 updated,
-                dict(spec["glowEntries"]),
+                {
+                    key: value
+                    for key, value in dict(spec["glowEntries"]).items()
+                    if key not in rebound
+                },
             )
         if updated == part_body:
             continue
@@ -2635,6 +3005,7 @@ def isolate_converted_runtime_screens(
     output_vehicle_dir: Path,
     source_meshes: Iterable[str],
     target_hands: Iterable[str],
+    reflected_geometry: bool = True,
 ) -> dict[str, object]:
     """Give switched HTML screens a conversion-owned webview/material key.
 
@@ -2649,8 +3020,6 @@ def isolate_converted_runtime_screens(
         for source_mesh in selected_sources
         for hand in set(target_hands)
     }
-    if not target_meshes:
-        return {"enabled": False, "materials": [], "jbeamFiles": []}
 
     controllers = _source_beam_navigator_objects(context)
     suffix = mod_id_for_context(context).lower()
@@ -2689,21 +3058,49 @@ def isolate_converted_runtime_screens(
                 "glowEntries": glow_entries,
             }
         )
-    if not specs:
-        return {"enabled": False, "materials": [], "jbeamFiles": []}
+
+    # Isolating the tag is needed whatever the conversion does to the geometry.
+    # Reflecting the page is only right once the cabin is actually reflected --
+    # a translate-mode conversion leaves the screen reading as authored.
+    controller_specs, controller_materials, controller_lua, controller_pages = (
+        _controller_owned_screen_specs(
+            context, controllers, suffix, reflect_pages=reflected_geometry
+        )
+    )
+    material_definitions.update(controller_materials)
 
     patched_files: list[str] = []
     for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
         original = path.read_text(encoding="utf-8")
-        updated, changed = _patch_runtime_screen_parts(
-            original, target_meshes, specs
-        )
-        if not changed:
+        updated = original
+        if specs and target_meshes:
+            updated, _changed = _patch_runtime_screen_parts(
+                updated, target_meshes, specs
+            )
+        if controller_specs:
+            updated, _changed = _patch_controller_owned_screen_parts(
+                updated, controller_specs
+            )
+        if updated == original:
             continue
         path.write_text(updated, encoding="utf-8")
         patched_files.append(str(path))
     if not patched_files:
         return {"enabled": False, "materials": [], "jbeamFiles": []}
+
+    written_lua: list[str] = []
+    for file_name, text in controller_lua.items():
+        path = output_vehicle_dir / "lua" / "controller" / f"{file_name}.lua"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        written_lua.append(str(path))
+
+    written_pages: list[str] = []
+    for relative, text in controller_pages.items():
+        path = output_vehicle_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        written_pages.append(str(path))
 
     material_path = output_vehicle_dir / "beamxp_runtime_screens.materials.json"
     material_path.write_text(
@@ -2714,7 +3111,134 @@ def isolate_converted_runtime_screens(
         "enabled": True,
         "materials": sorted(material_definitions),
         "jbeamFiles": patched_files,
+        "controllerFiles": sorted(written_lua),
+        "screenPages": sorted(written_pages),
     }
+
+
+def _controller_owned_screen_specs(
+    context: VehicleContext,
+    navigator_controllers: dict[str, str],
+    suffix: str,
+    reflect_pages: bool = False,
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, str], dict[str, str]]:
+    """Plan the isolation of runtime tags a mod's own controller hard-codes.
+
+    The navigator path can move its tag because ``screenMaterialName`` is a
+    jbeam field.  A controller that names its tag in Lua cannot, so the
+    conversion ships a copy of that controller under its own file name, points
+    the copy at its own tag, and re-binds every material that drew from the
+    original.
+    """
+    aliases = _runtime_aliases_in_source_materials(context)
+    owners = _lua_owned_runtime_aliases(
+        context,
+        (alias for alias in aliases if alias not in navigator_controllers),
+    )
+    if not owners:
+        return [], {}, {}, {}
+
+    lua_sources = _source_controller_lua(context)
+    specs: list[dict[str, object]] = []
+    materials: dict[str, object] = {}
+    lua_files: dict[str, str] = {}
+    page_files: dict[str, str] = {}
+    for source_alias, source_controller in sorted(owners.items()):
+        entry = lua_sources.get(source_controller)
+        if entry is None:
+            continue
+        target_alias = f"{source_alias}_beamxp_{suffix}"
+        head, _, stem = source_controller.rpartition("/")
+        target_controller = f"{head}/{stem}_beamxp_{suffix}" if head else f"{stem}_beamxp_{suffix}"
+
+        renames: dict[str, str] = {}
+        for material_key in _source_materials_referencing_runtime_alias(
+            context, source_alias
+        ):
+            target_material = f"{material_key}_beamxp_{suffix}"
+            cloned = _clone_runtime_material_definition(
+                context,
+                material_key,
+                target_material,
+                {source_alias: target_alias},
+            )
+            if cloned is None:
+                continue
+            materials[target_material] = cloned
+            renames[material_key] = target_material
+        if not renames:
+            continue
+
+        glow_entries: dict[str, str] = {}
+        for material_key, target_material in renames.items():
+            for key, value in _source_glow_entries_for_runtime_alias(
+                context, material_key
+            ).items():
+                glow_entries[key] = _replace_runtime_alias_in_glow_entry(
+                    glow_entries.get(key, value), material_key, target_material
+                )
+
+        controller_text = _retag_controller_lua(entry[1], source_alias, target_alias)
+        if reflect_pages:
+            # The glow trigger keys are the symbols the DAE binds, which is what
+            # tells us how much of the page this screen actually shows.
+            origin = _sampled_u_centre(context, set(glow_entries))
+            controller_text, pages = _mirrored_controller_pages(
+                context,
+                controller_text,
+                suffix,
+                0.5 if origin is None else origin,
+            )
+            page_files.update(pages)
+        lua_files[target_controller] = controller_text
+        specs.append(
+            {
+                "sourceAlias": source_alias,
+                "targetAlias": target_alias,
+                "sourceController": source_controller,
+                "targetController": target_controller,
+                "materialRenames": renames,
+                "glowEntries": glow_entries,
+            }
+        )
+    return specs, materials, lua_files, page_files
+
+
+def _runtime_aliases_in_source_materials(context: VehicleContext) -> tuple[str, ...]:
+    """Every ``@`` runtime texture the donor's materials draw from."""
+    try:
+        archive = zipfile.ZipFile(context.source_zip, "r")
+    except Exception:
+        return ()
+    aliases: list[str] = []
+    with archive:
+        for member in archive.namelist():
+            if not member.lower().endswith(".materials.json"):
+                continue
+            try:
+                document = parse_beamng_json(
+                    archive.read(member).decode("utf-8-sig", errors="replace"),
+                    label=member,
+                )
+            except Exception:
+                continue
+            if not isinstance(document, dict):
+                continue
+            for material in document.values():
+                if not isinstance(material, dict):
+                    continue
+                for stage in material.get("Stages", []):
+                    if not isinstance(stage, dict):
+                        continue
+                    for value in stage.values():
+                        if not (
+                            isinstance(value, str) and value.strip().startswith("@")
+                        ):
+                            continue
+                        alias = _runtime_alias(value)
+                        if alias and alias not in aliases:
+                            aliases.append(alias)
+    return tuple(aliases)
 
 
 def integrate_texture_correction_artifacts(
@@ -3080,12 +3604,6 @@ def build_batch(
             baked_shared_specs,
             texture_flip_ids,
         )
-        runtime_screen_patch = isolate_converted_runtime_screens(
-            context,
-            output_vehicle_dir,
-            texture_flip_ids,
-            set(generated_variant_targets.values()),
-        )
     if generated_variant_targets and texture_correction_ids:
         emit_progress(f"Running texture correction for {len(texture_correction_ids)} mesh(es)...")
         texture_correction_report = export_texture_correction_artifacts(
@@ -3123,6 +3641,20 @@ def build_batch(
                 json.dumps(texture_correction_report, indent=2) + "\n",
                 encoding="utf-8",
             )
+    if generated_variant_targets and object_modes:
+        # After correction, not before: correction rebuilds a switched trigger's
+        # row from the donor's jbeam, so a runtime rebind applied first is
+        # handed straight back to the donor's material.
+        runtime_screen_patch = isolate_converted_runtime_screens(
+            context,
+            output_vehicle_dir,
+            texture_flip_ids,
+            set(generated_variant_targets.values()),
+            reflected_geometry=any(
+                mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
+                for mode in object_modes.values()
+            ),
+        )
     texture_correction_report["runtimeScreens"] = runtime_screen_patch
     emit_progress("Writing original config outputs...")
     generated_configs.extend(write_original_plate_configs(
