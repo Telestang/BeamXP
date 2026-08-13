@@ -498,6 +498,66 @@ class CroppedDetectionTests(unittest.TestCase):
 
         self.assertEqual(len(islands), 2)
 
+    def test_a_shared_uv_corner_needs_the_meshes_to_meet_there_too(self) -> None:
+        # Two charts packed so they share their boundary UV vertices exactly.
+        # Nothing in the atlas separates them; only the surface does.
+        triangles = (
+            np.asarray([(0.1, 0.1), (0.5, 0.1), (0.1, 0.5)]),
+            np.asarray([(0.5, 0.1), (0.9, 0.5), (0.1, 0.5)]),
+        )
+        mirror = rhd.rasterise_uv_triangles(list(triangles), 32, 32)
+
+        joined = (
+            np.asarray([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]),
+            np.asarray([(1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]),
+        )
+        apart = (
+            joined[0],
+            joined[1] + np.asarray([0.0, 0.0, 0.25]),
+        )
+
+        self.assertEqual(len(rhd.mirrored_uv_island_masks(triangles, mirror)), 1)
+        self.assertEqual(
+            len(rhd.mirrored_uv_island_masks(triangles, mirror, joined)), 1
+        )
+        self.assertEqual(
+            len(rhd.mirrored_uv_island_masks(triangles, mirror, apart)), 2
+        )
+
+    def test_surface_corners_only_split_where_the_mesh_is_really_apart(self) -> None:
+        # A 10 um offset is transform noise on a welded vertex, not a boundary.
+        triangles = (
+            np.asarray([(0.1, 0.1), (0.5, 0.1), (0.1, 0.5)]),
+            np.asarray([(0.5, 0.1), (0.9, 0.5), (0.1, 0.5)]),
+        )
+        mirror = rhd.rasterise_uv_triangles(list(triangles), 32, 32)
+        surfaces = (
+            np.asarray([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]),
+            np.asarray([(1.0, 0.0, 1e-6), (1.0, 1.0, 0.0), (0.0, 1.0, 1e-6)]),
+        )
+
+        self.assertEqual(
+            len(rhd.mirrored_uv_island_masks(triangles, mirror, surfaces)), 1
+        )
+
+    def test_mismatched_surface_corners_fall_back_to_the_uv_grouping(self) -> None:
+        triangles = (
+            np.asarray([(0.1, 0.1), (0.5, 0.1), (0.1, 0.5)]),
+            np.asarray([(0.5, 0.1), (0.9, 0.5), (0.1, 0.5)]),
+        )
+        mirror = rhd.rasterise_uv_triangles(list(triangles), 32, 32)
+
+        self.assertEqual(
+            len(
+                rhd.mirrored_uv_island_masks(
+                    triangles,
+                    mirror,
+                    (np.asarray([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]),),
+                )
+            ),
+            1,
+        )
+
     def test_compact_uv_island_crops_reconstruct_full_masks_exactly(self) -> None:
         triangles = (
             np.asarray([(0.1, 0.1), (0.4, 0.1), (0.1, 0.4)]),

@@ -1997,6 +1997,14 @@ def region_flip_axis(
     return "vertical", vertical / total
 
 
+# Two triangles meet on the surface when their corners land in the same cell of
+# this grid.  10 um is orders of magnitude below the gap an author leaves
+# between two separate pieces of a vehicle, and orders of magnitude above the
+# noise a part matrix leaves on an already welded vertex, so neither a real
+# seam nor a real boundary lands on the wrong side of it.
+SURFACE_WELD_KEYS_PER_METRE = 100_000
+
+
 @dataclass(slots=True)
 class UvIslandCrop:
     """One topological UV island retained as a compact atlas-aligned mask."""
@@ -2027,6 +2035,27 @@ class DomainMasks:
         tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...
     ] | None = None
     skew_frame_size: tuple[int, int] | None = None
+
+
+def domain_uv_islands(
+    masks: DomainMasks,
+    padding_px: int = 0,
+) -> tuple[UvIslandCrop, ...]:
+    """Return this domain's UV islands, rasterising them at most once."""
+    if (
+        masks.foreground_islands is not None
+        and masks.foreground_island_padding_px == padding_px
+    ):
+        return masks.foreground_islands
+    islands = mirrored_uv_island_crops(
+        masks.mirrored_uv,
+        masks.mirror,
+        padding_px,
+        masks.mirrored_xyz,
+    )
+    masks.foreground_islands = islands
+    masks.foreground_island_padding_px = padding_px
+    return islands
 
 
 def domain_mask_components(
@@ -2063,8 +2092,17 @@ def mirrored_uv_island_crops(
     triangles: tuple[np.ndarray, ...],
     mirror_mask: np.ndarray,
     padding_px: int = 0,
+    surfaces: tuple[np.ndarray, ...] = (),
 ) -> tuple[UvIslandCrop, ...]:
-    """Rasterise topological islands once and retain only their padded crops."""
+    """Rasterise topological islands once and retain only their padded crops.
+
+    ``surfaces`` carries the same triangles' world-metre corners, index for
+    index and corner for corner.  When it is supplied, two triangles only join
+    across a UV corner if their meshes meet there too: an atlas can pack the
+    charts of two separate surfaces so that they share a UV vertex, and the
+    Lexus LC500 does exactly that, which without the surface test hands the
+    detector one island covering two unrelated pieces of geometry.
+    """
     height, width = mirror_mask.shape[:2]
     padding = max(int(padding_px), 0)
     if not triangles:
@@ -2087,14 +2125,26 @@ def mirrored_uv_island_crops(
         if left != right:
             parents[right] = left
 
-    owner: dict[tuple[int, int], int] = {}
+    surface_corners = surfaces if len(surfaces) == len(triangles) else ()
+    owner: dict[tuple[int, ...], int] = {}
     for index, triangle in enumerate(triangles):
         points = np.asarray(triangle, dtype=float).reshape(-1, 2)
-        for u, v in points:
+        corners = (
+            np.asarray(surface_corners[index], dtype=float).reshape(-1, 3)
+            if surface_corners
+            else ()
+        )
+        matched = len(corners) == len(points)
+        for corner, (u, v) in enumerate(points):
             key = (
                 int(round(float(u) * 100_000_000)),
                 int(round(float(v) * 100_000_000)),
             )
+            if matched:
+                key += tuple(
+                    int(round(float(value) * SURFACE_WELD_KEYS_PER_METRE))
+                    for value in corners[corner]
+                )
             previous = owner.get(key)
             if previous is None:
                 owner[key] = index
@@ -2122,17 +2172,20 @@ def mirrored_uv_island_crops(
 def mirrored_uv_island_masks(
     triangles: tuple[np.ndarray, ...],
     mirror_mask: np.ndarray,
+    surfaces: tuple[np.ndarray, ...] = (),
 ) -> tuple[np.ndarray, ...]:
     """Rasterise topological UV islands separately for foreground detection.
 
     Connected pixels are not a sufficient island definition: distinct atlas
     islands can touch at an edge (or after rasterisation) while still carrying
-    unrelated controls.  Build components from shared UV vertices instead,
-    then clip each result to the already conflict-filtered mirror mask.
+    unrelated controls.  Build components from shared UV vertices instead --
+    and, when ``surfaces`` gives the matching world corners, only where the
+    meshes are joined there as well -- then clip each result to the already
+    conflict-filtered mirror mask.
     """
     height, width = mirror_mask.shape[:2]
     masks: list[np.ndarray] = []
-    for crop in mirrored_uv_island_crops(triangles, mirror_mask):
+    for crop in mirrored_uv_island_crops(triangles, mirror_mask, 0, surfaces):
         island = np.zeros((height, width), dtype=bool)
         x0, y0, x1, y1 = crop.bounds
         island[y0:y1, x0:x1] = crop.mask
@@ -5087,16 +5140,10 @@ def build_rhd_texture(
     )
     if full_domain_region is not None:
         foreground_islands: tuple[UvIslandCrop, ...] = ()
-    elif island_cache_reused:
-        foreground_islands = masks.foreground_islands or ()
     else:
-        foreground_islands = mirrored_uv_island_crops(
-            masks.mirrored_uv,
-            mirror_mask,
-            config.detection_crop_padding_px,
+        foreground_islands = domain_uv_islands(
+            masks, config.detection_crop_padding_px
         )
-        masks.foreground_islands = foreground_islands
-        masks.foreground_island_padding_px = config.detection_crop_padding_px
     phase_timings.append(
         {
             "phase": "prepare_uv_islands",

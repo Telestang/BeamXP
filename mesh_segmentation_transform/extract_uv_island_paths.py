@@ -92,6 +92,45 @@ def _uv_at(values: list[float], stride: int, index: int) -> tuple[float, float]:
     return values[offset], values[offset + 1]
 
 
+# Corners land on the same surface point when they land in the same cell of this
+# grid.  It matches ``mirror_texture_for_rhd.SURFACE_WELD_KEYS_PER_METRE`` so the
+# harness previews the islands the exporter will actually work on.
+SURFACE_WELD_KEYS_PER_UNIT = 100_000
+
+
+def _position_source(
+    mesh: ET.Element,
+    vertex_ref: str,
+    ns: dict[str, str],
+) -> tuple[list[float], int] | None:
+    """Resolve the POSITION array a primitive's VERTEX input points at."""
+    vertices_id = vertex_ref[1:] if vertex_ref.startswith("#") else vertex_ref
+    vertices = (
+        mesh.find(f"c:vertices[@id='{vertices_id}']", ns)
+        if ns
+        else mesh.find(f"vertices[@id='{vertices_id}']")
+    )
+    if vertices is None:
+        return None
+    for node in _children(vertices, "input", ns):
+        if node.get("semantic") != "POSITION":
+            continue
+        try:
+            values, stride = _find_source(mesh, node.get("source", ""), ns)
+        except KeyError:
+            return None
+        return values, max(stride, 3)
+    return None
+
+
+def _surface_key(values: list[float], stride: int, index: int) -> tuple[int, int, int]:
+    offset = index * stride
+    return tuple(
+        int(round(values[offset + axis] * SURFACE_WELD_KEYS_PER_UNIT))
+        for axis in range(3)
+    )
+
+
 def _clip_polygon_axis(
     polygon: list[tuple[float, float]],
     axis: int,
@@ -151,10 +190,21 @@ def _uv_polygon_to_pixels(
 def _triangles_for_material(
     root: ET.Element,
     material: str,
-) -> tuple[list[list[tuple[float, float]]], dict[str, object]]:
+) -> tuple[
+    list[list[tuple[float, float]]],
+    list[list[tuple[int, int, int] | None]],
+    dict[str, object],
+]:
+    """Return a material's UV triangles and, per corner, its surface point.
+
+    The surface keys are what stop two charts that merely share a UV vertex
+    from being read as one island.  A corner whose POSITION cannot be resolved
+    gets ``None``, which falls back to grouping on the UV alone.
+    """
     ns = _namespace(root)
     geometries = root.findall(".//c:library_geometries/c:geometry", ns) if ns else root.findall(".//library_geometries/geometry")
     triangles: list[list[tuple[float, float]]] = []
+    surfaces: list[list[tuple[int, int, int] | None]] = []
     geometry_count = 0
     uv_min = [float("inf"), float("inf")]
     uv_max = [float("-inf"), float("-inf")]
@@ -175,19 +225,36 @@ def _triangles_for_material(
             tex_offset = int(tex_input.get("offset", "0"))
             primitive_stride = max(int(node.get("offset", "0")) for node in inputs) + 1
             values, tex_stride = _find_source(mesh, tex_input.get("source", ""), ns)
+            vertex_inputs = [node for node in inputs if node.get("semantic") == "VERTEX"]
+            position = (
+                _position_source(mesh, vertex_inputs[0].get("source", ""), ns)
+                if vertex_inputs
+                else None
+            )
+            vertex_offset = (
+                int(vertex_inputs[0].get("offset", "0")) if vertex_inputs else 0
+            )
             index_node = _child(primitive, "p", ns)
             indices = [int(value) for value in (index_node.text or "").split()] if index_node is not None else []
             for start in range(0, len(indices), primitive_stride * 3):
                 triangle: list[tuple[float, float]] = []
+                surface: list[tuple[int, int, int] | None] = []
                 for corner in range(3):
-                    tex_index = indices[start + corner * primitive_stride + tex_offset]
+                    base = start + corner * primitive_stride
+                    tex_index = indices[base + tex_offset]
                     u, v = _uv_at(values, tex_stride, tex_index)
                     uv_min[0] = min(uv_min[0], u)
                     uv_min[1] = min(uv_min[1], v)
                     uv_max[0] = max(uv_max[0], u)
                     uv_max[1] = max(uv_max[1], v)
                     triangle.append((u, v))
+                    surface.append(
+                        _surface_key(position[0], position[1], indices[base + vertex_offset])
+                        if position is not None
+                        else None
+                    )
                 triangles.append(triangle)
+                surfaces.append(surface)
                 geometry_used = True
         if geometry_used:
             geometry_count += 1
@@ -195,7 +262,7 @@ def _triangles_for_material(
     if not triangles:
         raise ValueError(f"No triangles found for material: {material}")
 
-    return triangles, {
+    return triangles, surfaces, {
         "geometries": geometry_count,
         "triangles": len(triangles),
         "uv_min": uv_min,
@@ -369,7 +436,7 @@ def uv_island_mask(
     Callers that only need the mask can avoid writing any files.
     """
     width, height = size
-    triangles, stats = _triangles_for_material(root, material)
+    triangles, _surfaces, stats = _triangles_for_material(root, material)
     occupied, filled_polygons = _rasterise_triangles(triangles, width, height)
     return occupied > 0, {**stats, "filled_clipped_polygons": filled_polygons}
 
@@ -521,11 +588,15 @@ def uv_island_masks(
     """Rasterise each topological UV island into its own tight crop.
 
     Raster connected-components are deliberately not used: two islands can
-    touch in an atlas without sharing a UV vertex.  Region fitting callers need
-    this stricter separation so a box can never span those unrelated islands.
+    touch in an atlas without sharing a UV vertex.  Nor is a shared UV vertex
+    on its own enough -- an atlas can pack two separate surfaces so that their
+    charts meet exactly, and the Lexus LC500 does -- so a corner only joins two
+    triangles when the mesh is continuous through it as well.  Region fitting
+    callers need this stricter separation so a box can never span unrelated
+    islands.
     """
     width, height = size
-    triangles, stats = _triangles_for_material(root, material)
+    triangles, surfaces, stats = _triangles_for_material(root, material)
     parents = list(range(len(triangles)))
 
     def find(index: int) -> int:
@@ -539,10 +610,14 @@ def uv_island_masks(
         if left != right:
             parents[right] = left
 
-    owner: dict[tuple[int, int], int] = {}
+    owner: dict[tuple[int, ...], int] = {}
     for index, triangle in enumerate(triangles):
-        for u, v in triangle:
+        surface = surfaces[index] if index < len(surfaces) else ()
+        for corner, (u, v) in enumerate(triangle):
             key = (int(round(u * 100_000_000)), int(round(v * 100_000_000)))
+            point = surface[corner] if corner < len(surface) else None
+            if point is not None:
+                key += point
             previous = owner.get(key)
             if previous is None:
                 owner[key] = index
