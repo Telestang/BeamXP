@@ -267,6 +267,156 @@ class GeneratedLightPatternTests(unittest.TestCase):
         )
 
 
+# Two bulbs shaped like the real ones: a low beam whose cookie is chosen by
+# $lightPattern, and a high beam that hard-codes the one symmetric high cookie
+# the game ships. Which of the two a lamp slot holds is the whole question --
+# the circuit name answers nothing, as wendover's driving lamps prove by
+# running the reflector bulb off "highbeam".
+PATTERN_BULB = (
+    '"reflector_bulb": {\n'
+    '"slotType": "reflector_bulb",\n'
+    '"props": [\n'
+    '  ["func", "mesh", "idRef:", "idX:", "idY:"],\n'
+    '  ["$electric", "SPOTLIGHT", "$nodeRef", "$nodeX", "$nodeY",\n'
+    '   {"cookieName":"$= $lightPattern == \'RHD\' and \'rhd.png\' or \'us.png\'"}]\n'
+    "]\n"
+    "}"
+)
+PLAIN_BULB = (
+    '"high_bulb": {\n'
+    '"slotType": "high_bulb",\n'
+    '"props": [\n'
+    '  ["func", "mesh", "idRef:", "idX:", "idY:"],\n'
+    '  ["$electric", "SPOTLIGHT", "$nodeRef", "$nodeX", "$nodeY",\n'
+    '   {"cookieName":"$= $cookieName ~= nil and $cookieName or \'high.png\'"}]\n'
+    "]\n"
+    "}"
+)
+
+
+def bulb_context(part_bodies: dict[str, str]) -> core.VehicleContext:
+    return context_with_parts(
+        {
+            part_id: (body, f"{part_id}.jbeam")
+            for part_id, body in part_bodies.items()
+        },
+        {"parts": set(), "main_part": "", "part_instances": []},
+    )
+
+
+class LightPatternBulbTests(unittest.TestCase):
+    # A lamp part with no $lightPattern anywhere: the low beam mounts the
+    # pattern-reading bulb, the high beam the symmetric one.
+    LAMP_PART = (
+        '"acme_headlight_R": {\n'
+        '"slotType": "acme_headlight_R",\n'
+        '"slots2": [\n'
+        '  ["name", "allowTypes", "denyTypes", "default", "description"],\n'
+        '  ["acme_low_bulb", ["reflector_bulb"], [], "reflector_bulb", "Low Beam",\n'
+        '   {"coreSlot":true, "variables":{"$electric":"lowbeam_filament", "$nodeRef":"he4r"}}],\n'
+        '  ["acme_high_bulb", ["high_bulb"], [], "high_bulb", "High Beam",\n'
+        '   {"coreSlot":true, "variables":{"$electric":"highbeam_filament", "$nodeRef":"he4r"}}]\n'
+        "]\n"
+        "}"
+    )
+
+    def setUp(self) -> None:
+        self.context = bulb_context(
+            {
+                "acme_headlight_R": self.LAMP_PART,
+                "reflector_bulb": PATTERN_BULB,
+                "high_bulb": PLAIN_BULB,
+            }
+        )
+        self.bulbs = core.light_pattern_bulb_slot_types(self.context)
+
+    def test_only_bulbs_that_read_the_pattern_are_indexed(self) -> None:
+        self.assertEqual(self.bulbs, frozenset({"reflector_bulb"}))
+
+    def test_unset_pattern_still_marks_the_part_handed(self) -> None:
+        self.assertNotIn("$lightPattern", self.LAMP_PART)
+        self.assertTrue(
+            generation_impl._part_has_handed_light_slots(self.LAMP_PART, self.bulbs)
+        )
+        # Without the bulbs -- no vehicles/common on disk -- the old reading is
+        # all there is, and it cannot see this part.
+        self.assertFalse(
+            generation_impl._part_has_handed_light_slots(self.LAMP_PART, frozenset())
+        )
+
+    def test_clone_inserts_the_pattern_only_where_the_bulb_reads_it(self) -> None:
+        cloned = core.clone_part_for_target(
+            self.LAMP_PART,
+            "acme_headlight_R",
+            core.HAND_RHD,
+            None,
+            {}, {}, {}, {}, {}, {},
+            light_pattern_slot_types=self.bulbs,
+        )
+        self.assertEqual(cloned.count('"$lightPattern":"RHD"'), 1)
+        low, high = cloned.split('"acme_high_bulb"')
+        self.assertIn('"$lightPattern":"RHD"', low)
+        self.assertNotIn("$lightPattern", high)
+        core.parse_beamng_json("{" + cloned + "}", label="acme_headlight_R")
+
+    def test_authored_pattern_is_retargeted_in_place(self) -> None:
+        authored = self.LAMP_PART.replace(
+            '"variables":{"$electric":"lowbeam_filament"',
+            '"variables":{"$lightPattern":"US", "$electric":"lowbeam_filament"',
+        )
+        cloned = core.clone_part_for_target(
+            authored,
+            "acme_headlight_R",
+            core.HAND_RHD,
+            None,
+            {}, {}, {}, {}, {}, {},
+            light_pattern_slot_types=self.bulbs,
+        )
+        self.assertEqual(cloned.count("$lightPattern"), 1)
+        self.assertIn('"$lightPattern":"RHD"', cloned)
+
+    def test_a_mounting_part_is_not_mistaken_for_a_bulb(self) -> None:
+        # acme_headlight_R names $lightPattern in its slots2 once converted, but
+        # it sets the variable rather than reading it, so it must never be
+        # indexed as a bulb -- that would make its parent slot look handed.
+        context = bulb_context(
+            {
+                "acme_headlight_R": self.LAMP_PART.replace(
+                    '"$electric":"lowbeam_filament"',
+                    '"$lightPattern":"RHD", "$electric":"lowbeam_filament"',
+                ),
+                "reflector_bulb": PATTERN_BULB,
+            }
+        )
+        self.assertEqual(
+            core.light_pattern_bulb_slot_types(context),
+            frozenset({"reflector_bulb"}),
+        )
+
+    def test_fog_lamp_with_a_plain_bulb_is_left_alone(self) -> None:
+        foglight = (
+            '"acme_foglight": {\n'
+            '"slotType": "acme_foglight",\n'
+            '"slots2": [\n'
+            '  ["name", "allowTypes", "denyTypes", "default", "description"],\n'
+            '  ["acme_fog_bulb", ["high_bulb"], [], "high_bulb", "Fog",\n'
+            '   {"variables":{"$electric":"foglight_filament"}}]\n'
+            "]\n"
+            "}"
+        )
+        self.assertFalse(
+            generation_impl._part_has_handed_light_slots(foglight, self.bulbs)
+        )
+        self.assertEqual(
+            core.apply_light_pattern_to_bulb_slots(
+                core.transform_helpers.extract_named_array(foglight, "slots2"),
+                core.HAND_RHD,
+                self.bulbs,
+            ),
+            core.transform_helpers.extract_named_array(foglight, "slots2"),
+        )
+
+
 class GeneratedCameraTests(unittest.TestCase):
     CAMERA_ARRAY = (
         "[\n"

@@ -1103,41 +1103,19 @@ def rewrite_child_slot_defaults(
     """
     if not child_part_map:
         return array_text
-
-    out: list[str] = []
-    cursor = 0
-    idx = 1 if array_text.startswith("[") else 0
-    while idx < len(array_text):
-        if array_text[idx] != "[":
-            idx += 1
-            continue
-        try:
-            end = transform_helpers.find_matching(array_text, idx, "[", "]")
-        except ValueError:
-            idx += 1
-            continue
-        row = array_text[idx : end + 1]
-        out.append(array_text[cursor:idx])
-        out.append(
-            _rewrite_slot_default_row(
-                row,
-                child_part_map,
-                default_column,
-                child_slot_suffix,
-            )
-        )
-        cursor = end + 1
-        idx = end + 1
-    out.append(array_text[cursor:])
-    return "".join(out)
+    return _rewrite_top_level_rows(
+        array_text,
+        lambda row: _rewrite_slot_default_row(
+            row,
+            child_part_map,
+            default_column,
+            child_slot_suffix,
+        ),
+    )
 
 
-def _rewrite_slot_default_row(
-    row: str,
-    child_part_map: dict[str, str],
-    default_column: int,
-    child_slot_suffix: str | None = None,
-) -> str:
+def _slot_row_columns(row: str) -> list[tuple[int, int]]:
+    """Span of each top-level column in one ``[...]`` row, brackets excluded."""
     columns: list[tuple[int, int]] = []
     start = 1 if row.startswith("[") else 0
     depth = 0
@@ -1168,6 +1146,16 @@ def _rewrite_slot_default_row(
         if ch == "," and depth == 0:
             columns.append((start, idx))
             start = idx + 1
+    return columns
+
+
+def _rewrite_slot_default_row(
+    row: str,
+    child_part_map: dict[str, str],
+    default_column: int,
+    child_slot_suffix: str | None = None,
+) -> str:
+    columns = _slot_row_columns(row)
     if default_column >= len(columns):
         return row
 
@@ -2895,12 +2883,102 @@ def part_has_relocatable_trigger(
 
 
 def rewrite_light_pattern_for_target(part_body: str, target_hand: str) -> str:
+    """Point every authored ``$lightPattern`` at the target hand.
+
+    The blunt half of the beam-pattern conversion, and the only half that works
+    without the game's ``vehicles/common`` on disk: it can retarget a value the
+    vehicle wrote but it cannot know which rows should have one. See
+    :func:`apply_light_pattern_to_bulb_slots` for the half that can.
+    """
     pattern = "RHD" if target_hand == HAND_RHD else "LHD"
     return re.sub(
         r'("\$lightPattern"\s*:\s*")(?:LHD|RHD|US)(")',
         rf"\g<1>{pattern}\2",
         part_body,
     )
+
+
+# A slots2 row names the parts that may fill it in two places -- the allowTypes
+# list and the default -- and either is enough to say which bulb a lamp slot
+# will end up holding.
+_SLOT2_ALLOW_TYPES_COLUMN = 1
+_SLOT2_DEFAULT_COLUMN = 3
+
+
+def slot_row_part_candidates(row: str) -> set[str]:
+    """The part ids and slot types one slots2 row can be filled by."""
+    columns = _slot_row_columns(row)
+    names: set[str] = set()
+    for column in (_SLOT2_ALLOW_TYPES_COLUMN, _SLOT2_DEFAULT_COLUMN):
+        if column < len(columns):
+            start, end = columns[column]
+            names.update(re.findall(r'"((?:[^"\\]|\\.)*)"', row[start:end]))
+    return names
+
+
+def part_needs_light_pattern(part_body: str, pattern_slot_types: frozenset[str]) -> bool:
+    """Whether this part mounts a bulb whose beam pattern is handed."""
+    if not pattern_slot_types:
+        return False
+    array_text = transform_helpers.extract_named_array(part_body, "slots2")
+    if not array_text:
+        return False
+    return any(
+        slot_row_part_candidates(row) & pattern_slot_types
+        for row in _top_level_bracket_spans(array_text)
+    )
+
+
+def apply_light_pattern_to_bulb_slots(
+    array_text: str,
+    target_hand: str,
+    pattern_slot_types: frozenset[str],
+) -> str:
+    """Give every pattern-reading bulb slot the target hand's ``$lightPattern``.
+
+    An unset ``$lightPattern`` is not a lamp that opts out of the question. The
+    bulb picks its cookie with
+
+        "$= ... $lightPattern == 'LHD' and '...reflector_lhd_eu...'
+             or $lightPattern == 'RHD' and '...reflector_rhd...'
+             or $lightPattern == 'US'  and '...sealed_beam_low...'
+             or '...sealed_beam_low...'"
+
+    so nil falls through to the US pattern: an unset row is a US row. Rewriting
+    only what the vehicle happened to author therefore left whole headlights
+    behind -- etki, pessima and wl40 set the variable nowhere -- and, where a
+    vehicle set it on some lamps and not others, converted only those. Wendover
+    is exactly that: ``$lightPattern`` on the low beams, nothing on the bullbar
+    driving lamps, which is how a conversion came to change the dipped beam and
+    leave the full beam shining the American way.
+
+    Which rows this touches comes from the bulbs themselves rather than from the
+    circuit name, because the circuit does not decide it: wendover's driving
+    lamps run a reflector low-beam bulb off ``"$electric":"highbeam"``, while the
+    separate high-beam bulbs every modern car uses hard-code one symmetric
+    ``BNG_light_cookie_high`` and would gain nothing from being touched.
+    """
+    if not pattern_slot_types:
+        return array_text
+    pattern = "RHD" if target_hand == HAND_RHD else "LHD"
+
+    def rewrite_row(row: str) -> str:
+        if not (slot_row_part_candidates(row) & pattern_slot_types):
+            return row
+        if '"$lightPattern"' in row:
+            return re.sub(
+                r'("\$lightPattern"\s*:\s*)"(?:[^"\\]|\\.)*"',
+                rf'\g<1>"{pattern}"',
+                row,
+            )
+        opening = re.search(r'"variables"\s*:\s*\{', row)
+        if opening is None:
+            # No variables map means no $electric either, so this row mounts no
+            # working lamp and there is nothing for a pattern to describe.
+            return row
+        return f'{row[:opening.end()]}"$lightPattern":"{pattern}", {row[opening.end():]}'
+
+    return _rewrite_top_level_rows(array_text, rewrite_row)
 
 
 # A turn-signal repeater is not authored in the part that carries it. The lamp
@@ -2947,6 +3025,33 @@ def _top_level_bracket_spans(array_text: str) -> list[str]:
         spans.append(array_text[idx : end + 1])
         idx = end + 1
     return spans
+
+
+def _rewrite_top_level_rows(array_text: str, rewrite_row) -> str:
+    """Rebuild a jbeam array with ``rewrite_row`` applied to each ``[...]`` row.
+
+    Everything between rows -- the standing ``{...}`` modifiers, the comments,
+    the whitespace -- is copied through byte for byte, which is what keeps a
+    rewritten part diffable against the one it came from.
+    """
+    out: list[str] = []
+    cursor = 0
+    idx = 1 if array_text.startswith("[") else 0
+    while idx < len(array_text):
+        if array_text[idx] != "[":
+            idx += 1
+            continue
+        try:
+            end = transform_helpers.find_matching(array_text, idx, "[", "]")
+        except ValueError:
+            idx += 1
+            continue
+        out.append(array_text[cursor:idx])
+        out.append(rewrite_row(array_text[idx : end + 1]))
+        cursor = end + 1
+        idx = end + 1
+    out.append(array_text[cursor:])
+    return "".join(out)
 
 
 def _slot_row_variables(row: str) -> dict[str, str]:
@@ -3094,24 +3199,7 @@ def rewrite_light_slot_placements(
             )
         return out
 
-    out: list[str] = []
-    cursor = 0
-    idx = 1 if array_text.startswith("[") else 0
-    while idx < len(array_text):
-        if array_text[idx] != "[":
-            idx += 1
-            continue
-        try:
-            end = transform_helpers.find_matching(array_text, idx, "[", "]")
-        except ValueError:
-            idx += 1
-            continue
-        out.append(array_text[cursor:idx])
-        out.append(rewrite_row(array_text[idx : end + 1]))
-        cursor = end + 1
-        idx = end + 1
-    out.append(array_text[cursor:])
-    return "".join(out)
+    return _rewrite_top_level_rows(array_text, rewrite_row)
 
 
 def clone_part_for_target(
@@ -3133,6 +3221,7 @@ def clone_part_for_target(
     mirror_plane_sources: dict[str, str] | None = None,
     trigger_follows: TriggerFollowMap | None = None,
     light_slot_placements_map: dict[str, dict[str, object]] | None = None,
+    light_pattern_slot_types: frozenset[str] = frozenset(),
 ) -> str:
     new_part_id = new_part_id or generated_part_name(source_part_id, target_hand)
     out = transform_helpers.replace_first(part_body, f'"{source_part_id}"', f'"{new_part_id}"')
@@ -3200,14 +3289,18 @@ def clone_part_for_target(
     out = transform_helpers.replace_array_region(
         out,
         "slots2",
-        lambda text: rewrite_light_slot_placements(
-            rewrite_child_slot_defaults(
-                text,
-                child_part_map or {},
-                3,
-                suffix_for_hand(target_hand),
+        lambda text: apply_light_pattern_to_bulb_slots(
+            rewrite_light_slot_placements(
+                rewrite_child_slot_defaults(
+                    text,
+                    child_part_map or {},
+                    3,
+                    suffix_for_hand(target_hand),
+                ),
+                light_slot_placements_map or {},
             ),
-            light_slot_placements_map or {},
+            target_hand,
+            light_pattern_slot_types,
         ),
     )
     out = rewrite_light_pattern_for_target(out, target_hand)
@@ -3219,4 +3312,4 @@ def clone_part_for_target(
     )
     return out
 
-__all__ = ['twinned_trigger_ids', 'trigger_placement_frame', 'trigger_sphere_mesh', 'trigger_shape_mesh', 'trigger_box_centre', 'trigger_box_extents', 'trigger_box_size_vector', '_trigger_row_shape', '_trigger_row_vector', '_trigger_row_size', 'trigger_box_axes', 'trigger_box_corners', 'TRIGGER_BOX_TRIANGLES', '_trigger_row_centre', 'iter_trigger_rows', 'target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'LIGHT_PLACEMENT_KEYS', 'light_slot_placements', 'mirrored_light_placement', 'deform_group_flexbody_meshes', 'rewrite_light_slot_placements', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'frame_axis_anchors', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']
+__all__ = ['twinned_trigger_ids', 'trigger_placement_frame', 'trigger_sphere_mesh', 'trigger_shape_mesh', 'trigger_box_centre', 'trigger_box_extents', 'trigger_box_size_vector', '_trigger_row_shape', '_trigger_row_vector', '_trigger_row_size', 'trigger_box_axes', 'trigger_box_corners', 'TRIGGER_BOX_TRIANGLES', '_trigger_row_centre', 'iter_trigger_rows', 'target_hand_for', 'suffix_for_hand', 'signed_delta_for_target', 'generated_mesh_name', 'generated_part_name', 'generated_variant_part_name', 'generated_dae_output_path', 'source_object_position', 'target_object_position', 'mirrored_object_position', 'format_inline_vector', 'vector_pattern', 'replace_inline_vector', 'insert_inline_vector_near_key', 'replace_or_append_inline_vector', 'transform_flexbody_row', 'flexbody_row_can_carry_transform', 'rewrite_flexbody_meshes_with_transforms', 'replace_or_append_prop_translation_global', 'replace_or_append_prop_rotation_global', 'rewrite_flexbody_meshes', 'rewrite_prop_meshes_with_globals', 'mirror_row_mesh', 'rewrite_mirror_rows', 'swap_token_pair', 'mirror_lateral_node_id', 'build_node_mirror_map', 'mirror_camera_reference', 'rewrite_internal_camera_line', 'CAMERA_HAND_FLAG_RE', 'CAMERA_DRIVER_ROW_RE', 'rewrite_internal_cameras', 'part_has_transformable_internal_camera', 'rewrite_child_slot_defaults', 'rewrite_light_pattern_for_target', 'slot_row_part_candidates', 'part_needs_light_pattern', 'apply_light_pattern_to_bulb_slots', 'LIGHT_PLACEMENT_KEYS', 'light_slot_placements', 'mirrored_light_placement', 'deform_group_flexbody_meshes', 'rewrite_light_slot_placements', 'clone_part_for_target', 'TRIGGER_SECTIONS', 'trigger_frame', 'mirror_trigger_offset', 'mirror_trigger_vector', 'local_to_world', 'world_to_local', 'trigger_column_names', 'rewrite_triggers', 'triggers_needing_manual_review', 'part_has_relocatable_trigger', 'hydro_driven_nodes', 'frame_axis_anchors', 'generate_trigger_frame_twins', 'note_trigger_frames_in_part', 'build_lateral_name_map', 'relocated_reference', 'mirror_quoted_references', 'mirror_node_rows', 'mirror_flexbody_group_lists', 'relocate_slot_rows', 'relocate_part_for_slot']

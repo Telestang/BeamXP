@@ -1200,6 +1200,7 @@ def _relocation_clone_body(
             for mesh, row in authored_mirror_rows(context).items()
             if mesh in meshes
         },
+        light_pattern_slot_types=light_pattern_bulb_slot_types(context),
     )
     return relocate_part_for_slot(
         body,
@@ -1310,7 +1311,69 @@ def swapped_light_slot_placements(
     return out
 
 
-def _part_has_handed_light_slots(part_body: str) -> bool:
+_LIGHT_PATTERN_SLOT_ATTR = "_light_pattern_bulb_slot_types"
+
+
+def light_pattern_bulb_slot_types(context: VehicleContext) -> frozenset[str]:
+    """Bulb parts whose beam pattern is handed, plus the slot types they fill.
+
+    ``$lightPattern`` is not read by the part that mounts a lamp. It is read by
+    the bulb the slot pulls in -- vehicles/common/lightEmitters -- whose one
+    prop row chooses its cookie from it:
+
+        "cookieName":"$= ... $lightPattern == 'LHD' and '...reflector_lhd_eu...'
+                          or $lightPattern == 'RHD' and '...reflector_rhd...' ..."
+
+    So the question "is this lamp handed" is answered by the bulb, and only by
+    the bulb. Checking the props array rather than the whole body is what keeps
+    a headlight part -- which mentions ``$lightPattern`` in its own slots2 rows
+    -- out of the set: it sets the variable, it does not read it.
+
+    Bulbs that ignore it are absent, and they are the majority: every fog lamp,
+    and every separate high-beam bulb, which share one symmetric
+    ``BNG_light_cookie_high``. A conversion therefore never clones a part for a
+    lamp that would shine identically either way.
+
+    Cached as a plain attribute for the same reasons as ``_slot_type_part_index``.
+    """
+    part_index = context.part_body_index
+    cached = getattr(context, _LIGHT_PATTERN_SLOT_ATTR, None)
+    if cached is not None and cached[0] is part_index and cached[1] == len(part_index):
+        return cached[2]
+
+    names: set[str] = set()
+    for part_id, (part_body, _filename) in part_index.items():
+        props = transform_helpers.extract_named_array(part_body, "props")
+        if not props or "$lightPattern" not in props:
+            continue
+        names.add(part_id)
+        names.update(transform_helpers.extract_part_slot_types(part_body))
+    slot_types = frozenset(names)
+    setattr(context, _LIGHT_PATTERN_SLOT_ATTR, (part_index, len(part_index), slot_types))
+    return slot_types
+
+
+def _part_has_handed_light_slots(
+    part_body: str,
+    pattern_slot_types: frozenset[str] = frozenset(),
+) -> bool:
+    """Whether a part mounts a lamp whose beam pattern has to change hands.
+
+    A bulb slot that resolves to a pattern-reading bulb is handed whether or not
+    the vehicle bothered to set the variable, because BeamNG's cookie expression
+    falls through to the US pattern when ``$lightPattern`` is nil -- an unset row
+    is a US row. etki, pessima and wl40 ship their headlights with the variable
+    set nowhere; wendover sets it on the low beams and not on the bullbar
+    driving lamps, which is how a conversion came to change the dipped beam and
+    leave the full beam alone.
+
+    The older reading -- a beam ``$electric`` beside an authored
+    ``$lightPattern`` -- stays as the fallback for when the bulbs cannot be
+    resolved at all, which is what happens when the game's vehicles/common is
+    not on disk.
+    """
+    if part_needs_light_pattern(part_body, pattern_slot_types):
+        return True
     has_beam_electric = re.search(
         r'"\$electric"\s*:\s*"(?:lowbeam|highbeam|lowhighbeam)',
         part_body,
@@ -1332,12 +1395,13 @@ def _part_needs_generated_clone(
     node_positions: dict[str, tuple[float, float, float]] | None = None,
     owners: TriggerOwners | None = None,
     trigger_follows: TriggerFollowMap | None = None,
+    pattern_slot_types: frozenset[str] = frozenset(),
 ) -> bool:
     part_meshes = part_meshes if part_meshes is not None else part_mesh_names_for_context(context, source_part_id)
     return (
         any(mesh in object_modes for mesh in part_meshes)
         or part_has_transformable_internal_camera(part_body, node_mirror_map)
-        or _part_has_handed_light_slots(part_body)
+        or _part_has_handed_light_slots(part_body, pattern_slot_types)
         or part_has_relocatable_trigger(
             part_body, node_positions or {}, owners, trigger_follows
         )
@@ -1347,10 +1411,11 @@ def _part_needs_generated_clone(
 def _part_needs_generated_ancestors(
     part_body: str,
     node_mirror_map: dict[str, str],
+    pattern_slot_types: frozenset[str] = frozenset(),
 ) -> bool:
     return (
         part_has_transformable_internal_camera(part_body, node_mirror_map)
-        or _part_has_handed_light_slots(part_body)
+        or _part_has_handed_light_slots(part_body, pattern_slot_types)
     )
 
 
@@ -1378,6 +1443,7 @@ def _generated_clone_plan(
     can be the only handed thing in a part, so the answer has to reach the
     clone decision or it never reaches the output.
     """
+    pattern_slot_types = light_pattern_bulb_slot_types(context)
     generated_parts: dict[str, str] = {}
     bridge_required_parts: set[str] = set()
     parts_with_child_slots: set[str] = set()
@@ -1456,11 +1522,14 @@ def _generated_clone_plan(
             node_positions if in_trim else None,
             owners if in_trim else None,
             trigger_follows,
+            pattern_slot_types,
         ):
             generated_parts[source_part_id] = generated_variant_part_name(
                 source_part_id, target_hand, config_name
             )
-            if _part_needs_generated_ancestors(part_body, node_mirror_map):
+            if _part_needs_generated_ancestors(
+                part_body, node_mirror_map, pattern_slot_types
+            ):
                 bridge_required_parts.add(source_part_id)
 
     changed = True
@@ -1737,6 +1806,7 @@ def write_generated_jbeam_and_configs(
                     mirror_plane_sources,
                     part_trigger_follows,
                     part_light_placements,
+                    light_pattern_bulb_slot_types(context),
                 )
             )
 
@@ -2851,4 +2921,4 @@ def preview_trigger_boxes(
     boxes.sort(key=lambda box: (str(box["id"]), tuple(box["at"])))
     return boxes
 
-__all__ = ['converted_trigger_corners', 'preview_trigger_boxes', 'authored_trigger_placements', 'authored_trigger_positions', 'trigger_modes_for_part', 'trigger_owners_for_config', 'trigger_owners_for_part', 'generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload', 'swapped_light_slot_placements']
+__all__ = ['converted_trigger_corners', 'preview_trigger_boxes', 'authored_trigger_placements', 'authored_trigger_positions', 'trigger_modes_for_part', 'trigger_owners_for_config', 'trigger_owners_for_part', 'generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload', 'swapped_light_slot_placements', 'light_pattern_bulb_slot_types']
