@@ -284,8 +284,8 @@ class VariantWorkflowMixin:
         self.preview_output_hover = None
         self._remember_preview_output()
         self._schedule_mesh_scene(immediate=True)
-        # The x/y/z columns and the box viewer both show the previewed trim's
-        # positions, so they have to follow the Config dropdown.
+        # The detail line's position and the box viewer both show the previewed
+        # trim's positions, so they have to follow the Config dropdown.
         self._refresh_box_preview()
         self._invalidate_slot_usage()
         self._refresh_parts()
@@ -470,8 +470,8 @@ class VariantWorkflowMixin:
     def _refresh_box_preview(self, *, force: bool = False) -> None:
         """Re-point the placed-geometry data at the previewed trim.
 
-        Feeds the fallback box viewer and the table's x/y/z columns (the GPU
-        scene builds its own geometry per config). Updated in place because
+        Feeds the fallback box viewer and the selected row's reported position
+        (the GPU scene builds its own geometry per config). Updated in place because
         ModelPreview holds the dict by reference, and skipped when the trim has
         not changed since it costs a pass over every mesh."""
         if self.context is None:
@@ -496,8 +496,8 @@ class VariantWorkflowMixin:
     def _variant_position_note(self, object_id: str) -> str:
         """Where else this part's geometry sits, for the marked (*) rows.
 
-        Geometry centres, matching the x/y/z columns -- quoting pivots here
-        would contradict them."""
+        Geometry centres, matching the position the detail line reports --
+        quoting pivots here would contradict it."""
         if self.context is None:
             return ""
         baked = (self.context.preview_by_id.get(object_id) or {}).get("center")

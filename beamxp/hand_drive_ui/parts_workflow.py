@@ -604,15 +604,14 @@ class PartsWorkflowMixin:
                 list(ids),
                 vehicle_numbering,
             )
-            flexbody_meshes, prop_meshes, _all_meshes = cls._cached_selected_mesh_roles(
-                context,
-                selected_variants,
-            )
+            # No column reports the flexbody/prop split any more, but resolving
+            # it here still earns its keep: it fills the context's role cache off
+            # the UI thread, and the recommendation and mesh-swap paths read that
+            # cache on it.
+            cls._cached_selected_mesh_roles(context, selected_variants)
             return {
                 "rows": table_rows,
                 "label_universe": [object_id for object_id in ids if object_id in context.objects],
-                "flexbody_meshes": flexbody_meshes,
-                "prop_meshes": prop_meshes,
                 "vehicle_numbering": vehicle_numbering,
                 "vehicle_instance_keys": instance_keys,
             }
@@ -725,8 +724,8 @@ class PartsWorkflowMixin:
                 self._refresh_triggers()
                 self._refresh_derived_output_summary()
                 return
-            # The x/y/z columns read placed geometry, so make sure it matches the
-            # trim on screen before the rows are built.
+            # The detail line's position reads placed geometry, so make sure it
+            # matches the trim on screen before the rows are built.
             self._refresh_box_preview()
             key = self._part_table_snapshot_key()
             snapshot = self.part_table_snapshot if self.part_table_snapshot_key == key else None
@@ -747,8 +746,6 @@ class PartsWorkflowMixin:
         parts = self.conversion.setdefault("parts", {})
         table_rows = list(snapshot.get("rows") or [])
         label_universe = list(snapshot.get("label_universe") or [])
-        flexbody_meshes = set(snapshot.get("flexbody_meshes") or set())
-        prop_meshes = set(snapshot.get("prop_meshes") or set())
         vehicle_numbering = snapshot.get("vehicle_numbering")
         instance_keys = snapshot.get("vehicle_instance_keys")
         if isinstance(vehicle_numbering, dict) and isinstance(instance_keys, dict):
@@ -809,7 +806,6 @@ class PartsWorkflowMixin:
                 if child_override
                 else self._swap_source_label(object_id, settings)
             )
-            part_type = part_type_label(object_id, flexbody_meshes, prop_meshes)
             if (
                 query
                 and query not in object_id.lower()
@@ -825,7 +821,6 @@ class PartsWorkflowMixin:
                 and query not in str(row.get("slot_path") or "").lower()
                 and query not in str(row.get("part_id") or "").lower()
                 and query not in mode
-                and query not in part_type.lower()
             ):
                 continue
             displayed.append(row_id)
@@ -836,7 +831,6 @@ class PartsWorkflowMixin:
                 text=display_label,
                 tags=self._row_tags(row_index),
                 values=(
-                    part_type,
                     yn_label(settings.get("viewerVisible", True)),
                     yn_label(settings.get("viewerSolo")),
                     yn_label(object_id in active_ids),
@@ -852,7 +846,6 @@ class PartsWorkflowMixin:
                         manual_delta=self.manual_delta_enabled.get(),
                     ),
                     yn_label(settings.get("steeringRef")),
-                    *position_labels(*self._table_position(row_id)),
                 ),
             )
             row_index += 1

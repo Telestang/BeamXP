@@ -325,15 +325,15 @@ class LayoutMixin:
             "left": "Left Part",
             "right": "Right Part",
         }
-        widths = {
-            "left": 360,
-            "right": 360,
-        }
+        # Equal, modest widths: the pair is one relationship read left to right,
+        # so neither side deserves more room than the other. Asking for less
+        # than the pane is wide keeps the table inside it, and stretch then
+        # hands the slack to both columns evenly, so they stay halves.
         for col in columns:
             self.slot_tree.heading(col, text=headings[col], anchor="w")
             self.slot_tree.column(
                 col,
-                width=widths[col],
+                width=160,
                 minwidth=44,
                 stretch=True,
                 anchor="w",
@@ -386,6 +386,17 @@ class LayoutMixin:
             state="disabled",
         )
         self.clear_triggers_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        # One button for the whole table: a box is only ever in the way as a
+        # set, so there is nothing a per-row switch would say. Fixed width so
+        # the header doesn't shuffle when the label flips.
+        self.toggle_triggers_button = ttk.Button(
+            header,
+            text="Hide" if self.triggers_visible else "Show",
+            command=self._toggle_triggers_visible,
+            width=6,
+            state="disabled",
+        )
+        self.toggle_triggers_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
         self.trigger_filter_var.trace_add("write", lambda *_args: self._refresh_triggers())
 
         frame = ttk.Frame(holder)
@@ -473,14 +484,13 @@ class LayoutMixin:
         frame.rowconfigure(0, weight=1)
 
         columns = (
-            "parttype", "visible", "solo", "active", "mode", "textureCorrection",
-            "source", "children", "offset", "steering", "x", "y", "z",
+            "visible", "solo", "active", "mode", "textureCorrection",
+            "source", "children", "offset", "steering",
         )
         self.part_tree = ttk.Treeview(frame, columns=columns, show=("tree", "headings"), selectmode="extended")
         self.part_tree.heading("#0", text="Mesh", anchor="w")
         self.part_tree.column("#0", width=250, minwidth=150, stretch=True, anchor="w")
         headings = {
-            "parttype": "Role",
             "mode": "Transform",
             "source": "Source",
             "children": "Children",
@@ -489,13 +499,9 @@ class LayoutMixin:
             "visible": "Visible",
             "solo": "Solo",
             "active": "Active",
-            "x": "X",
-            "y": "Y",
-            "z": "Z",
             "textureCorrection": "Texture Fix",
         }
         widths = {
-            "parttype": 112,
             "mode": 118,
             "textureCorrection": 88,
             "source": 170,
@@ -505,9 +511,6 @@ class LayoutMixin:
             "visible": 70,
             "solo": 60,
             "active": 64,
-            "x": 82,
-            "y": 82,
-            "z": 82,
         }
         for col in columns:
             self.part_tree.heading(

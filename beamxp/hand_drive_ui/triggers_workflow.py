@@ -196,8 +196,14 @@ class TriggersWorkflowMixin:
         return actions
 
     def _trigger_label(self, row: dict[str, object]) -> str:
-        at = row.get("centre") or row["at"]
-        return f"{row['label']}  ({at[0]:+.2f}, {at[1]:+.2f}, {at[2]:+.2f})"
+        """The Trigger cell: the box's name alone.
+
+        Rows are keyed by position, but the position is not shown: two boxes at
+        different places are already told apart by the "#1"/"#2" the row label
+        carries, and the coordinates only cost the column the width its names
+        need. Click a row and the preview says where it is.
+        """
+        return str(row["label"])
 
     def _trigger_mode_label(self, row: dict[str, object]) -> str:
         mode = row.get("mode")
@@ -634,6 +640,33 @@ class TriggersWorkflowMixin:
         self._select_trigger_row(str(row["id"]))
         self._update_detail()
         self.status_var.set(f"{row['label']} back to the recommendation")
+
+    def _toggle_triggers_visible(self) -> None:
+        """Show or hide every trigger box in the preview.
+
+        The boxes sit over the cabin geometry they label, so they are worth
+        getting out of the way while a mesh underneath is being judged. Only
+        the drawing changes: the rows, their transforms and the build are
+        untouched, and a hidden box stops being pickable rather than becoming
+        an invisible click target.
+        """
+        self.triggers_visible = not self.triggers_visible
+        self._apply_trigger_visibility()
+        self.status_var.set(
+            "Trigger boxes shown" if self.triggers_visible else "Trigger boxes hidden"
+        )
+
+    def _apply_trigger_visibility(self) -> None:
+        """Push the toggle to the button label and the viewer."""
+        if hasattr(self, "toggle_triggers_button"):
+            self.toggle_triggers_button.configure(
+                text="Hide" if self.triggers_visible else "Show"
+            )
+        viewer = getattr(self, "viewer", None)
+        # The box-viewer fallback draws no trigger boxes at all, so it has
+        # nothing to switch off.
+        if viewer is not None and hasattr(viewer, "set_triggers_visible"):
+            viewer.set_triggers_visible(self.triggers_visible)
 
     def _clear_trigger_modes(self) -> None:
         core.clear_trigger_modes(self.conversion)

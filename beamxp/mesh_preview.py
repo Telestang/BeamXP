@@ -663,7 +663,6 @@ FRAGMENT_SHADER = """
 uniform vec3 palette[10];
 uniform vec3 background;
 uniform float dimmed_opacity;
-uniform float global_opacity;
 uniform float alpha_scale;
 in vec3 v_viewpos;
 in float v_color;
@@ -684,11 +683,9 @@ void main() {
     vec3 color = base * (0.38 + 0.62 * diffuse) + rim;
     // Dimmed (out-of-filter) parts recede toward the background but stay solid.
     color = mix(background, color, mix(1.0, dimmed_opacity, dimmed));
-    // Global opacity is a REAL alpha: the fragment is blended against whatever
-    // is behind it (grid, back faces, other parts) by GL_BLEND, so lowering it
-    // makes geometry genuinely see-through instead of merely darker.
-    // alpha_scale is the trigger pass painting itself half see-through.
-    frag = vec4(color, global_opacity * alpha_scale);
+    // alpha_scale is the trigger pass painting itself half see-through; every
+    // other pass leaves it at 1.0 and so draws fully opaque.
+    frag = vec4(color, alpha_scale);
 }
 """
 
@@ -814,9 +811,7 @@ class GLRenderer:
         self.prog["palette"].write(np.asarray(palette, dtype=np.float32).tobytes())
         self.prog["background"].write(np.asarray(PREVIEW_BACKGROUND, dtype=np.float32).tobytes())
         self.prog["dimmed_opacity"].value = DIMMED_OPACITY
-        self.prog["global_opacity"].value = 1.0
         self.prog["alpha_scale"].value = 1.0
-        self._global_opacity = 1.0
         self.outline_prog["color"].write(np.asarray(OUTLINE_COLOR, dtype=np.float32).tobytes())
         self.size = (0, 0)
         self.samples = 4
@@ -1035,10 +1030,15 @@ class GLRenderer:
         self._vbo_dimmed.write(flags.tobytes())
 
     def _name_visible(self, name: str) -> bool:
-        if self.scene is None or self._visible_names is None:
+        if self.scene is None:
             return True
+        # Asked before the "no filter yet" shortcut: the boxes have their own
+        # switch, so a hidden one must not pick up an outline just because the
+        # mesh filter has not been set.
         if name in self.scene.trigger_names:
             return self._triggers_visible
+        if self._visible_names is None:
+            return True
         mesh = self.scene.alias_to_mesh.get(name, name)
         row = self.scene.pick_to_row.get(name, "")
         return name in self._visible_names or mesh in self._visible_names or row in self._visible_names
@@ -1090,11 +1090,6 @@ class GLRenderer:
                     buffer.write(data.tobytes())
                 setattr(self, attr, data.size)
             self._rebuild_outline_indices()
-
-    def set_global_opacity(self, opacity: float) -> None:
-        opacity = max(0.0, min(1.0, float(opacity)))
-        self._global_opacity = opacity
-        self.prog["global_opacity"].value = opacity
 
     def _rebuild_outline_indices(self) -> None:
         if self.scene is None or self._ibo_outline is None:
@@ -1190,8 +1185,8 @@ class GLRenderer:
         self.prog["background"].write(np.asarray(background, dtype=np.float32).tobytes())
         self.ctx.enable(self._moderngl.DEPTH_TEST)
         self.ctx.disable(self._moderngl.CULL_FACE)
-        # Standard src-alpha over-blending so global_opacity acts as a real alpha
-        # (result = alpha*fragment + (1-alpha)*whatever is already in the buffer).
+        # Standard src-alpha over-blending so the half see-through trigger pass
+        # blends over what is already in the buffer instead of replacing it.
         self.ctx.enable(self._moderngl.BLEND)
         self.ctx.blend_func = (self._moderngl.SRC_ALPHA, self._moderngl.ONE_MINUS_SRC_ALPHA)
 
@@ -1203,15 +1198,10 @@ class GLRenderer:
 
         vao = self._vao_stock if show_stock else self._vao_conv
         if vao is not None and self._index_count:
-            # While translucent, stop writing depth so near surfaces don't occlude
-            # the geometry behind them - that occlusion is what made low opacity
-            # look "darker but solid" rather than see-through. At full opacity we
-            # keep depth writes for correct solid sorting.
-            fbo.depth_mask = self._global_opacity >= 0.999
+            # Solid geometry: depth writes stay on for correct sorting.
             self.prog["mvp"].write(mvp.T.copy().tobytes())
             self.prog["view"].write(view.astype(np.float32).T.copy().tobytes())
             vao.render(mode=self._moderngl.TRIANGLES, vertices=self._index_count)
-            fbo.depth_mask = True
 
         # Trigger boxes last and half see-through, with depth writes off. Last
         # so they blend over the geometry they surround rather than depending
@@ -1355,7 +1345,7 @@ class MeshPreview:
         self.selected_ids: set[str] = set()
         self.dimmed_ids: set[str] = set()
         self.show_stock = False
-        self.global_opacity = 1.0
+        self.triggers_visible = True
         self.status_text = "no config previewed yet"
         self._scene_seen_before = False
 
@@ -1383,18 +1373,6 @@ class MeshPreview:
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#888888").pack(side="left", padx=(10, 0))
         ttk.Button(toolbar, text="Reset", command=self.reset_view, width=8).pack(side="right")
         ttk.Button(toolbar, text="Focus", command=self.focus_selected, width=8).pack(side="right", padx=(0, 6))
-        self.opacity_var = tk.DoubleVar(value=100.0)
-        self.opacity_scale = ttk.Scale(
-            toolbar,
-            from_=0.0,
-            to=100.0,
-            orient="horizontal",
-            variable=self.opacity_var,
-            command=self._opacity_changed,
-            length=120,
-        )
-        self.opacity_scale.pack(side="right", padx=(0, 8))
-        ttk.Label(toolbar, text="Opacity").pack(side="right", padx=(0, 4))
         self.stock_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             toolbar,
@@ -1483,16 +1461,18 @@ class MeshPreview:
             self.renderer.set_dimmed(self.dimmed_ids)
             self.request_render()
 
-    def _toggle_stock(self) -> None:
-        self.show_stock = bool(self.stock_var.get())
+    def set_triggers_visible(self, visible: bool) -> None:
+        """Draw the trigger boxes, or leave them out of the index buffers.
+
+        The renderer keeps the flag, so it outlives a scene rebuild: a box
+        hidden before a new config was previewed stays hidden after it.
+        """
+        self.triggers_visible = bool(visible)
+        self.renderer.set_triggers_visible(self.triggers_visible)
         self.request_render()
 
-    def _opacity_changed(self, value: str) -> None:
-        try:
-            self.global_opacity = max(0.0, min(1.0, float(value) / 100.0))
-        except ValueError:
-            return
-        self.renderer.set_global_opacity(self.global_opacity)
+    def _toggle_stock(self) -> None:
+        self.show_stock = bool(self.stock_var.get())
         self.request_render()
 
     # --- camera -----------------------------------------------------------

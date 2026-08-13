@@ -171,6 +171,10 @@ class HandDriveToolApp(
         self.trigger_rows_by_iid: dict[str, dict[str, object]] = {}
         self.trigger_owner_cache: tuple[object, object] | None = None
         self._trigger_box_cache: tuple[object, list] | None = None
+        # Whether the trigger boxes are drawn in the preview. A view toggle, so
+        # it lives here rather than in the conversion, and it survives a vehicle
+        # change the way the parts table's Visible column does not.
+        self.triggers_visible = True
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._configure_theme()

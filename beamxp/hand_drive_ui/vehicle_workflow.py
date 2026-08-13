@@ -169,6 +169,7 @@ class VehicleWorkflowMixin:
         self.clear_slot_pairs_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.reset_trigger_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.clear_triggers_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.toggle_triggers_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.show_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.hide_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
         self.active_only_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
@@ -257,6 +258,9 @@ class VehicleWorkflowMixin:
             self._refresh_box_preview()
             self.viewer = ModelPreview(self.viewer_holder, self.box_preview_by_id)
         self.viewer.grid(row=0, column=0, sticky="nsew")
+        # A fresh viewer starts with the boxes drawn, so carry the toggle over:
+        # loading another vehicle must not put back what was hidden.
+        self._apply_trigger_visibility()
 
     def _sync_delta_to_ui(self) -> None:
         delta = self.conversion.get("delta", {})

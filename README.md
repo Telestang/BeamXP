@@ -464,7 +464,7 @@ Changes are intended to be inspectable before building the mod.
 - Click a part in the viewport to select it.
 - `Ctrl+Click` adds/removes parts, meshes, or triggers from the current selection.
 - `H` / `Shift+H` hides or unhides selected parts.
-- The opacity control can make the vehicle body transparent for inspecting buried interior parts.
+- The Triggers table's Hide/Show button takes every trigger box out of the preview, for a clear view of the cabin geometry underneath.
 - The original-layout option removes the hand-drive transforms while keeping the currently selected configuration context.
 - Meshes are colour-coded by transform:
   - grey — unchanged;
@@ -472,8 +472,6 @@ Changes are intended to be inspectable before building the mod.
   - orange — **Mirror**;
   - pink — **Swap Mesh**.
 - Trigger boxes are shown as semi-transparent wire meshes and use the same transform colour coding.
-
-![Lowering the opacity reveals the converted interior through the bodywork](Screenshots/sunburst2_transparent_tool.png)
 
 ---
 
