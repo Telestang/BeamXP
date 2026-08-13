@@ -13,7 +13,7 @@ import math
 import re
 import shutil
 import zipfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -1488,14 +1488,51 @@ def prune_unused_texture_correction_assets(
     }
 
 
+class TextureCorrectionMaterials(dict[str, str]):
+    """Alias -> corrected material, with the per-mesh overrides one atlas needs.
+
+    Reads as the flat union it has always been, so reporting and the glowMap
+    pass see every corrected material.  ``for_part`` narrows it to one source
+    mesh, which matters only where a texture was corrected more than once: the
+    LC500's two interiors both fill ``lc500_interior`` with ``coreSlot:true``
+    and both paint ``lc500_screens``, but they disagree about every texel of
+    screen.dds, so each needs its own answer under the same alias.  Retargeting
+    both meshes off the flat map hands the second whichever correction was
+    minted first, which is the wrong atlas rather than merely an uncorrected
+    one.
+
+    A mesh no scoped entry names keeps only the unscoped aliases -- it was not
+    part of that texture's correction, so it stays on the shipped texture.
+    """
+
+    def __init__(
+        self,
+        shared: Mapping[str, str] | None = None,
+        by_part: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> None:
+        self.shared: dict[str, str] = dict(shared or {})
+        self.by_part: dict[str, dict[str, str]] = {
+            str(key): dict(value) for key, value in (by_part or {}).items()
+        }
+        super().__init__(self.shared)
+        for scoped in self.by_part.values():
+            for alias, material in scoped.items():
+                self.setdefault(alias, material)
+
+    def for_part(self, part_key: str) -> dict[str, str]:
+        if not self.by_part:
+            return dict(self)
+        return {**self.shared, **self.by_part.get(part_key, {})}
+
+
 def _prepare_texture_correction_materials(
     job_dir: Path,
     target_dir: Path,
     output_root: Path,
-) -> dict[str, str]:
+) -> TextureCorrectionMaterials:
     manifest = job_dir / "rhd_materials.json"
     if not manifest.is_file():
-        return {}
+        return TextureCorrectionMaterials()
     document = json.loads(manifest.read_text(encoding="utf-8"))
     entries = document.get("materials", []) if isinstance(document, dict) else []
     material_file = target_dir / "beamxp_texture_correction.materials.json"
@@ -1508,7 +1545,8 @@ def _prepare_texture_correction_materials(
         except Exception:
             existing = {}
 
-    alias_to_material: dict[str, str] = {}
+    shared: dict[str, str] = {}
+    by_part: dict[str, dict[str, str]] = {}
     used_names = {str(key).lower() for key in existing}
     base_names: dict[str, str] = {}
     for key in existing:
@@ -1537,8 +1575,20 @@ def _prepare_texture_correction_materials(
         material_name = _texture_correction_material_name(
             variant_aliases[0], used_names, base_names
         )
+        # ``partKeys`` is present only where the exporter corrected one texture
+        # more than once, and names the meshes this copy was corrected for.
+        part_keys = [
+            str(key)
+            for key in (entry.get("partKeys") or [])
+            if isinstance(key, str) and key.strip()
+        ]
         for alias in variant_aliases:
-            alias_to_material.setdefault(_normalise_material_alias(alias), material_name)
+            normalised = _normalise_material_alias(alias)
+            if part_keys:
+                for part_key in part_keys:
+                    by_part.setdefault(part_key, {}).setdefault(normalised, material_name)
+            else:
+                shared.setdefault(normalised, material_name)
 
         by_source, by_stage = _entry_corrected_texture_outputs(
             job_dir,
@@ -1560,9 +1610,10 @@ def _prepare_texture_correction_materials(
                 by_stage,
             )
 
-    if alias_to_material:
+    materials = TextureCorrectionMaterials(shared, by_part)
+    if materials:
         material_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-    return alias_to_material
+    return materials
 
 
 def _texture_correction_switch_base_aliases(job_dir: Path) -> set[str]:
@@ -3282,13 +3333,8 @@ def integrate_texture_correction_artifacts(
         )
         switch_base_aliases = _texture_correction_switch_base_aliases(output_directory)
         glow_switch_base_aliases.update(switch_base_aliases)
-        collada_alias_to_material = {
-            alias: material
-            for alias, material in alias_to_material.items()
-            if alias not in switch_base_aliases
-        }
         if alias_to_material:
-            glow_material_alias_sets.append(alias_to_material)
+            glow_material_alias_sets.append(dict(alias_to_material))
         detail = json.loads(report_path.read_text(encoding="utf-8"))
         for dae_export in detail.get("dae_exports", []):
             if not isinstance(dae_export, dict):
@@ -3297,6 +3343,14 @@ def integrate_texture_correction_artifacts(
             if not isinstance(source_part, dict):
                 continue
             source_mesh = str(source_part.get("key") or source_part.get("node_id") or "")
+            # Where one texture needed correcting twice, the alias means a
+            # different corrected material per mesh; ask for this mesh's.
+            part_alias_to_material = alias_to_material.for_part(source_mesh)
+            collada_alias_to_material = {
+                alias: material
+                for alias, material in part_alias_to_material.items()
+                if alias not in switch_base_aliases
+            }
             rows = dae_export.get("generated_flexbody_rows", [])
             split_nodes = [
                 str(row.get("node_id") or "")
@@ -3366,7 +3420,7 @@ def integrate_texture_correction_artifacts(
                     "targetDae": str(target_dae),
                     "appendedNodes": appended,
                     "retargetedNodes": retargeted,
-                    "materialAliases": sorted(alias_to_material),
+                    "materialAliases": sorted(part_alias_to_material),
                     "colladaMaterialAliases": sorted(collada_alias_to_material),
                     "switchBaseAliases": sorted(switch_base_aliases),
                 }

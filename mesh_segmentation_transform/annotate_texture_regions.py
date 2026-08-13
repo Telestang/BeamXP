@@ -3054,6 +3054,17 @@ def build_uv_domain_index(uv_mask: np.ndarray | None) -> UvDomainIndex | None:
     return UvDomainIndex(island_labels=labels)
 
 
+def box_island_bits(bits: np.ndarray, box: tuple[int, int, int, int]) -> int:
+    """Union of the UV charts a box stands on, as a bit set."""
+    x, y, w, h = box
+    height, width = bits.shape[:2]
+    x0, y0 = max(int(x), 0), max(int(y), 0)
+    x1, y1 = min(int(x) + int(w), width), min(int(y) + int(h), height)
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    return int(np.bitwise_or.reduce(bits[y0:y1, x0:x1].ravel()))
+
+
 def union_region_group_candidates(
     boxes: np.ndarray,
     image: np.ndarray,
@@ -3064,6 +3075,7 @@ def union_region_group_candidates(
     raster_tolerance: bool = True,
     defer_domain_validation: bool = False,
     circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
+    island_bits: np.ndarray | None = None,
 ) -> list[GroupCandidate]:
     """Group boxes by overlap/proximity and retain exact membership."""
     candidates = [
@@ -3084,6 +3096,7 @@ def union_region_group_candidates(
         raster_tolerance=raster_tolerance,
         defer_domain_validation=defer_domain_validation,
         circle_cache=circle_cache,
+        island_bits=island_bits,
     )
 
 
@@ -3096,6 +3109,7 @@ def strict_region_recovery_candidates(
     *,
     include_overlap: bool = False,
     circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
+    island_bits: np.ndarray | None = None,
 ) -> list[GroupCandidate]:
     """Regroup valid recovery units without ever growing outside the domain."""
     candidates = [
@@ -3114,6 +3128,7 @@ def strict_region_recovery_candidates(
         raster_tolerance=False,
         defer_domain_validation=True,
         circle_cache=circle_cache,
+        island_bits=island_bits,
     )
 
 
@@ -3160,6 +3175,7 @@ def _merge_region_group_candidates(
     contrast_response: np.ndarray | None = None,
     contrast_threshold: float | None = None,
     relief_bridge_response: np.ndarray | None = None,
+    island_bits: np.ndarray | None = None,
     preserve_nested_pairs: bool = False,
     preserve_overlapping_pairs: bool = False,
     circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
@@ -3435,12 +3451,43 @@ def _merge_region_group_candidates(
         high_coverage = float(high.mean())
         return high_coverage <= float(max_high_coverage)
 
+    island_bit_cache: dict[tuple[int, int, int, int], int] = {}
+
+    def islands_share(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        """Whether two boxes stand on a common UV chart.
+
+        Charts are coalesced into one detection consumer only because they can
+        share atlas texels, and a shared texel has exactly one answer.  That is
+        not a reason to let a mark on one chart pull in a mark on another: they
+        are different surfaces that merely landed near each other in the atlas.
+        Crossing a chart boundary therefore vetoes the join.
+        """
+        if island_bits is None:
+            return True
+        left = island_bit_cache.get(first)
+        if left is None:
+            left = box_island_bits(island_bits, first)
+            island_bit_cache[first] = left
+        right = island_bit_cache.get(second)
+        if right is None:
+            right = box_island_bits(island_bits, second)
+            island_bit_cache[second] = right
+        if not left or not right:
+            # A box standing on no recorded chart says nothing either way.
+            return True
+        return bool(left & right)
+
     def bridge_is_continuous(
         first: tuple[int, int, int, int],
         second: tuple[int, int, int, int],
     ) -> bool:
         """Accept only corridors clear of both colour and relief barriers."""
         return (
+            islands_share(first, second)
+            and (
             bridge_is_clear(
                 first, second,
                 contrast_response,
@@ -3456,7 +3503,7 @@ def _merge_region_group_candidates(
                 0.0,
                 config.relief_bridge_min_cross_axis_coverage,
             )
-        )
+        ))
 
     # Neighbour search over a uniform grid whose cell is the merge distance, so
     # two expanded boxes that overlap always share at least one cell.  Pairs are
@@ -3841,6 +3888,11 @@ class DetectionState:
     contrast_response: np.ndarray | None = None
     contrast_threshold: float | None = None
     relief_bridge_response: np.ndarray | None = None
+    # Which member UV chart owns each pixel, one bit per chart, when this view
+    # is a coalesced consumer of several.  Grouping refuses a join whose two
+    # sides share no chart: coalescing exists because charts can share texels,
+    # not as a licence to merge marks that merely sit near each other.
+    island_bits: np.ndarray | None = None
     # The edge front end and the relief-aware filters all need the same
     # thresholded (but deliberately not component-closed) edge pixels.  Keep
     # that per-island mask beside its response so later filters do not repeat
@@ -3864,6 +3916,7 @@ class DetectionState:
             contrast_response=self.contrast_response,
             contrast_threshold=self.contrast_threshold,
             relief_bridge_response=self.relief_bridge_response,
+            island_bits=self.island_bits,
             relief_edge_mask=self.relief_edge_mask,
             circle_radii=self.circle_radii,
         )
@@ -3943,6 +3996,7 @@ def _step_mser(
         # plus normal-map path.  The Laplacian was just computed above, so
         # retain it rather than re-running a normal-map pass per UV island.
         relief_bridge_response=edge_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=edge_mask_cache,
     ), DetectionStage(
         key="mser",
@@ -3993,6 +4047,7 @@ def _step_stroke_width(
         contrast_response=state.contrast_response,
         contrast_threshold=state.contrast_threshold,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="stroke_width",
@@ -4024,6 +4079,7 @@ def _step_box_filter(
         contrast_response=state.contrast_response,
         contrast_threshold=state.contrast_threshold,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="box_filter",
@@ -4063,6 +4119,7 @@ def _step_overlap_box_group(
         contrast_response=state.contrast_response,
         contrast_threshold=state.contrast_threshold,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="overlap_box_group",
@@ -4104,6 +4161,7 @@ def _step_grouped(
         contrast_response=state.contrast_response,
         contrast_threshold=state.contrast_threshold,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         defer_domain_validation=True,
     )
     groups = [candidate.bounds for candidate in candidates]
@@ -4112,6 +4170,7 @@ def _step_grouped(
         contrast_response=state.contrast_response,
         contrast_threshold=state.contrast_threshold,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="grouped",
@@ -4136,6 +4195,7 @@ def _step_pattern_group(
     groups, rejected = filter_groups_by_pattern(image, state.groups, config)
     return DetectionState(
         state.boxes, groups, relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="pattern_group",
@@ -4275,6 +4335,7 @@ def _step_rotated_bounds(
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=mask,
     ), DetectionStage(
         key="rotated_bounds",
@@ -4353,6 +4414,7 @@ def _step_region_flatness(
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="region_flatness",
@@ -4490,6 +4552,7 @@ def _step_relief_glyph_structure(
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=mask,
     ), DetectionStage(
         key="relief_glyph_structure",
@@ -4563,6 +4626,7 @@ def _step_ring_smoothness(
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="ring_smoothness",
@@ -4666,6 +4730,7 @@ def _step_blob_shape(
     return DetectionState(
         state.boxes, kept, rotations=rotations, feature_hulls=hulls,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="blob_shape",
@@ -4718,6 +4783,7 @@ def _step_feature_extension(
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="feature_extension",
@@ -4788,6 +4854,7 @@ def _step_text_line(
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=mask,
     ), DetectionStage(
         key="text_line",
@@ -4814,6 +4881,7 @@ def _step_size(
     return DetectionState(
         state.boxes, groups, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="size",
@@ -4949,6 +5017,7 @@ def _step_region_domain(
                 domain,
                 include_overlap=candidate_overlap_members_recovered > 0,
                 circle_cache=state.circle_radii,
+                island_bits=state.island_bits,
             )
             kept_candidates.extend(recovered)
             strict_recovery_groups += len(recovered)
@@ -4963,6 +5032,7 @@ def _step_region_domain(
             raster_tolerance=False,
             defer_domain_validation=True,
             circle_cache=state.circle_radii,
+            island_bits=state.island_bits,
         )
         for rebuilt_candidate in rebuilt:
             _rebuilt_radius, rebuilt_coverage = _region_shape_and_coverage(
@@ -4987,6 +5057,7 @@ def _step_region_domain(
                 raster_tolerance=False,
                 defer_domain_validation=True,
                 circle_cache=state.circle_radii,
+                island_bits=state.island_bits,
             )
             rescued_here = 0
             for retry_candidate in retry_candidates:
@@ -5007,6 +5078,7 @@ def _step_region_domain(
     return DetectionState(
         state.boxes, kept, kept_candidates, domain,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="region_domain",
@@ -5140,6 +5212,7 @@ def _step_overlap_group(
         return DetectionState(
             state.boxes, groups, domain=domain,
             relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
             relief_edge_mask=state.relief_edge_mask,
             circle_radii=state.circle_radii,
         ), DetectionStage(
@@ -5277,6 +5350,7 @@ def _step_overlap_group(
     return DetectionState(
         state.boxes, merged, domain=domain,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
         circle_radii=state.circle_radii,
     ), DetectionStage(
@@ -5359,6 +5433,7 @@ def _step_final_padding(
     return DetectionState(
         state.boxes, padded, rotations=list(state.rotations),
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="final_padding",
@@ -5475,6 +5550,7 @@ def _step_relief_text(
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
     ), DetectionStage(
         key="relief_text",
@@ -5753,6 +5829,7 @@ def run_detection(
     initial_contrast_response: np.ndarray | None = None,
     initial_contrast_threshold: float | None = None,
     initial_relief_bridge_response: np.ndarray | None = None,
+    initial_island_bits: np.ndarray | None = None,
     initial_relief_edge_mask: np.ndarray | None = None,
 ) -> DetectionRun:
     """Run the pipeline, resuming from the first step a config change affects.
@@ -5807,6 +5884,7 @@ def run_detection(
                     contrast_response=initial_contrast_response,
                     contrast_threshold=initial_contrast_threshold,
                     relief_bridge_response=initial_relief_bridge_response,
+                    island_bits=initial_island_bits,
                     relief_edge_mask=initial_relief_edge_mask,
                 )
                 start = 1
@@ -5818,6 +5896,7 @@ def run_detection(
                 contrast_response=initial_contrast_response,
                 contrast_threshold=initial_contrast_threshold,
                 relief_bridge_response=initial_relief_bridge_response,
+                island_bits=initial_island_bits,
                 relief_edge_mask=initial_relief_edge_mask,
             )
             start = 1
@@ -5844,6 +5923,7 @@ def run_detection(
             else DetectionState(
                 np.empty((0, 4), dtype=np.int32), [],
                 relief_bridge_response=initial_relief_bridge_response,
+                island_bits=initial_island_bits,
                 relief_edge_mask=initial_relief_edge_mask,
             )
         )

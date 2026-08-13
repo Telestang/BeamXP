@@ -481,10 +481,31 @@ class CroppedDetectionTests(unittest.TestCase):
         merged = rhd._coalesce_overlapping_uv_consumers((first, second))
 
         self.assertEqual(len(merged), 1)
-        self.assertIsInstance(merged[0], rhd.UvIslandCrop)
-        assert isinstance(merged[0], rhd.UvIslandCrop)
-        self.assertEqual(merged[0].bounds, (4, 2, 25, 22))
-        self.assertTrue(merged[0].mask.all())
+        consumer, island_bits = merged[0]
+        self.assertIsInstance(consumer, rhd.UvIslandCrop)
+        assert isinstance(consumer, rhd.UvIslandCrop)
+        self.assertEqual(consumer.bounds, (4, 2, 25, 22))
+        self.assertTrue(consumer.mask.all())
+        # Which chart owns each pixel survives the union, so grouping can still
+        # refuse to reach from one into the other.
+        self.assertIsNotNone(island_bits)
+        assert island_bits is not None
+        self.assertEqual(island_bits.shape, consumer.mask.shape)
+        self.assertEqual(int(island_bits[0, 0]), 0b01)
+        self.assertEqual(int(island_bits[0, -1]), 0b10)
+        self.assertEqual(int(island_bits[0, 10]), 0b11)
+
+    def test_a_lone_uv_consumer_records_no_chart_membership(self) -> None:
+        only = np.zeros((16, 16), dtype=bool)
+        only[2:10, 2:10] = True
+
+        merged = rhd._coalesce_overlapping_uv_consumers((only,))
+
+        self.assertEqual(len(merged), 1)
+        consumer, island_bits = merged[0]
+        self.assertIs(consumer, only)
+        # Nothing was coalesced, so no join could cross anything.
+        self.assertIsNone(island_bits)
 
     def test_topological_islands_do_not_use_raster_connectivity(self) -> None:
         # The almost-coincident boundary rasterises as a shared edge, but the
@@ -1947,7 +1968,9 @@ class MultiPartPreviewTests(unittest.TestCase):
                 ),
                 patch.object(rhd, "material_symbols_for_binding", return_value=("interior-material",)),
                 patch.object(rhd, "extract_archive_member", return_value=source),
-                patch.object(rhd, "build_domain_masks", return_value=masks) as build_masks,
+                patch.object(
+                    rhd, "build_domain_masks", return_value=masks,
+                ) as build_masks,
                 patch.object(rhd, "build_rhd_texture", return_value=texture_result) as build_texture,
                 patch.object(rhd, "write_blender_preview", return_value=None),
                 patch.object(rhd, "sweep_part", return_value=object()),
@@ -1967,9 +1990,12 @@ class MultiPartPreviewTests(unittest.TestCase):
             self.assertIsNotNone(preview.report_path)
             report = json.loads(preview.report_path.read_text(encoding="utf-8"))
 
-        build_masks.assert_called_once()
+        # Each mesh is measured for its own domain, but the two come out equal,
+        # so one correction serves both rather than competing per-part copies.
+        self.assertEqual(build_masks.call_count, 2)
         build_texture.assert_called_once()
         self.assertEqual(build_texture.call_args.kwargs["part_scope"], [dash, console])
+        self.assertEqual(build_texture.call_args.kwargs["part_group_index"], 0)
         self.assertIs(build_texture.call_args.kwargs["masks"], masks)
         self.assertEqual(export_dae.call_count, 2)
         self.assertEqual(len(preview.dae_paths), 2)
@@ -2094,6 +2120,373 @@ class MultiPartPreviewTests(unittest.TestCase):
                 [ValueError("no atlas"), ValueError("no atlas")]
             )
         self.assertIn("No part could be exported", str(caught.exception))
+
+
+class PerMeshCorrectionJobTests(unittest.TestCase):
+    """A correction is scoped to one mesh's use of one material."""
+
+    def _part(self, key: str):
+        return SimpleNamespace(key=key, node_id=key, node_name=key, label=key)
+
+    def _binding(self, material: str, stage_key: str = "baseColorMap"):
+        return SimpleNamespace(
+            dae_material=material,
+            material_key=f"{material}_on",
+            materials_member="vehicles/lc500/main.materials.json",
+            stage_key=stage_key,
+            kind="colour",
+        )
+
+    def _jobs(self, entries):
+        with patch.object(
+            rhd,
+            "material_symbols_for_binding",
+            side_effect=lambda _l, b: (f"{b.dae_material}-material",),
+        ):
+            return rhd.correction_jobs_for_texture(SimpleNamespace(), entries)
+
+    def test_one_mesh_on_one_material_is_one_job(self) -> None:
+        dash = self._part("dash")
+        jobs = self._jobs([(dash, self._binding("interior"))])
+
+        self.assertEqual(len(jobs), 1)
+        self.assertIs(jobs[0].part, dash)
+        self.assertEqual(jobs[0].material, "interior")
+        self.assertEqual(jobs[0].symbols, frozenset({"interior-material"}))
+
+    def test_two_meshes_on_one_material_stay_separate(self) -> None:
+        # Pooling these is what let the LC500 facelift's rigid domain erase the
+        # base interior's mirrored one.
+        binding = self._binding("lc500_screens")
+        jobs = self._jobs(
+            [
+                (self._part("lc500_interior"), binding),
+                (self._part("lc500_interior_facelift"), binding),
+            ]
+        )
+
+        self.assertEqual(
+            [(job.part.key, job.material) for job in jobs],
+            [("lc500_interior", "lc500_screens"),
+             ("lc500_interior_facelift", "lc500_screens")],
+        )
+
+    def test_two_materials_on_one_mesh_stay_separate(self) -> None:
+        # screen.dds carries the 8.9% HVAC strip under lc500_screens and a
+        # full-atlas quad under lc500_centralscreen. Unioning their domains
+        # made the strip flip about the atlas centre instead of itself.
+        interior = self._part("lc500_interior")
+        jobs = self._jobs(
+            [
+                (interior, self._binding("lc500_screens")),
+                (interior, self._binding("lc500_centralscreen")),
+            ]
+        )
+
+        self.assertEqual(
+            [job.material for job in jobs],
+            ["lc500_screens", "lc500_centralscreen"],
+        )
+        self.assertEqual(jobs[0].symbols, frozenset({"lc500_screens-material"}))
+        self.assertEqual(
+            jobs[1].symbols, frozenset({"lc500_centralscreen-material"})
+        )
+
+    def test_stage_keys_of_one_material_share_a_job(self) -> None:
+        # A base colour and its emissive are the same UV layout.
+        interior = self._part("lc500_interior")
+        jobs = self._jobs(
+            [
+                (interior, self._binding("lc500_screens", "baseColorMap")),
+                (interior, self._binding("lc500_screens", "emissiveMap")),
+            ]
+        )
+
+        self.assertEqual(len(jobs), 1)
+
+
+class PerMeshCorrectionOutputTests(unittest.TestCase):
+    """Each job builds its own texture, scoped to its own mesh and material."""
+
+    def _preview(self, entries, mirrored_by_part, layouts=None):
+        parts: list[SimpleNamespace] = []
+        for part, _binding in entries:
+            if not any(part is seen for seen in parts):
+                parts.append(part)
+        calls: list[dict] = []
+        layouts = layouts or {}
+        # Meshes get distinct domains unless the test says they share a layout,
+        # so an identical mask means a real shared unwrap, not a stub artefact.
+        seen_layouts: list[object] = []
+
+        def masks(_loaded, scope, symbols, *_a, **_k):
+            mirror = np.zeros((4, 4), dtype=bool)
+            if mirrored_by_part.get(scope[0].key, True):
+                layout = layouts.get(
+                    scope[0].key, (scope[0].key, frozenset(symbols))
+                )
+                if layout not in seen_layouts:
+                    seen_layouts.append(layout)
+                mirror[seen_layouts.index(layout):] = True
+            return rhd.DomainMasks(
+                mirror=mirror, rigid=np.zeros((4, 4), dtype=bool),
+                conflict_coverage=0.0, mirrored_triangles=1,
+                rigid_triangles=0, parts_analysed=1,
+            )
+
+        def build(*_args, **kwargs):
+            calls.append(kwargs)
+            return rhd.RhdTextureResult(
+                texture_member="vehicles/lc500/textures/screen.dds",
+                size=(4, 4), parts_analysed=1, mirrored_triangles=1,
+                rigid_triangles=0, mirror_coverage=1.0, rigid_coverage=0.0,
+                conflict_coverage=0.0, glyph_regions=0, mirrored_glyph_regions=0,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "screen.dds"
+            Image.new("RGBA", (4, 4)).save(source, format="PNG")
+            with (
+                patch.object(
+                    rhd, "texture_bindings_for_parts",
+                    return_value={"vehicles/lc500/textures/screen.dds": entries},
+                ),
+                patch.object(
+                    rhd, "material_symbols_for_binding",
+                    side_effect=lambda _l, b: (f"{b.dae_material}-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(rhd, "build_domain_masks", side_effect=masks),
+                patch.object(rhd, "build_rhd_texture", side_effect=build),
+                patch.object(rhd, "write_blender_preview", return_value=None),
+                patch.object(rhd, "sweep_part", return_value=object()),
+                patch.object(
+                    rhd, "export_transformed_part_dae",
+                    return_value={"rigid_symmetric_nodes": []},
+                ),
+            ):
+                rhd.export_parts_preview(
+                    SimpleNamespace(), SimpleNamespace(), parts, workspace,
+                    bake=False, log=lambda *_a: None,
+                )
+        return calls
+
+    def _part(self, key: str):
+        return SimpleNamespace(
+            key=key, node_id=key, node_name=key, label=key, instances=[],
+        )
+
+    def _binding(self, material: str):
+        return SimpleNamespace(
+            dae_material=material, material_key=f"{material}_on",
+            materials_member="vehicles/lc500/main.materials.json",
+            stage_key="baseColorMap", kind="colour",
+        )
+
+    def test_a_single_job_keeps_the_names_it_has_always_had(self) -> None:
+        dash = self._part("dash")
+        calls = self._preview([(dash, self._binding("interior"))], {})
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["part_group_index"], 0)
+        self.assertEqual(calls[0]["part_scope"], [dash])
+        self.assertEqual(calls[0]["material_scope"], ("interior",))
+
+    def test_each_mesh_and_material_builds_its_own_texture(self) -> None:
+        interior = self._part("lc500_interior")
+        facelift = self._part("lc500_interior_facelift")
+        calls = self._preview(
+            [
+                (interior, self._binding("lc500_screens")),
+                (interior, self._binding("lc500_centralscreen")),
+                (facelift, self._binding("lc500_screens")),
+            ],
+            {},
+        )
+
+        self.assertEqual(
+            [(c["part_scope"][0].key, c["material_scope"][0]) for c in calls],
+            [
+                ("lc500_interior", "lc500_screens"),
+                ("lc500_interior", "lc500_centralscreen"),
+                ("lc500_interior_facelift", "lc500_screens"),
+            ],
+        )
+        self.assertEqual([c["part_group_index"] for c in calls], [1, 2, 3])
+
+    def test_a_job_with_nothing_mirrored_is_skipped_not_the_texture(self) -> None:
+        interior = self._part("lc500_interior")
+        facelift = self._part("lc500_interior_facelift")
+        calls = self._preview(
+            [
+                (interior, self._binding("lc500_screens")),
+                (facelift, self._binding("lc500_screens")),
+            ],
+            {"lc500_interior_facelift": False},
+        )
+
+        self.assertEqual([c["part_scope"][0].key for c in calls], ["lc500_interior"])
+
+    def test_meshes_sharing_a_uv_layout_share_one_correction(self) -> None:
+        # A left and right panel on one unwrap would correct to the same image
+        # twice, so the equal domains merge into a single build.
+        left = self._part("door_panel_L")
+        right = self._part("door_panel_R")
+        calls = self._preview(
+            [
+                (left, self._binding("interior")),
+                (right, self._binding("interior")),
+            ],
+            {},
+            layouts={"door_panel_L": "shared", "door_panel_R": "shared"},
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["part_scope"], [left, right])
+        self.assertEqual(calls[0]["part_group_index"], 0)
+
+
+class SplitTextureManifestTests(unittest.TestCase):
+    """The manifest has to say which meshes each corrected copy is for."""
+
+    def _result(self, group_index: int, scope: list[str]) -> rhd.RhdTextureResult:
+        stem = "screen" if group_index < 2 else f"screen_{group_index}"
+        report = {
+            "layer_bindings": [
+                {
+                    "dae_material": "lc500_screens",
+                    "material_key": "lc500_screens_on",
+                    "materials_member": "vehicles/lc500/main.materials.json",
+                    "stage_key": "baseColorMap",
+                    "kind": "colour",
+                }
+            ],
+            "source_materials": [
+                {
+                    "key": "lc500_screens_on",
+                    "aliases": ["lc500_screens_on"],
+                    "materialsMember": "vehicles/lc500/main.materials.json",
+                    "material": {"Stages": [{}]},
+                }
+            ],
+            "switch_base_aliases": [],
+            "outputs": {"preview": None},
+        }
+        if group_index:
+            report["part_group"] = group_index
+            report["part_scope"] = scope
+            report["material_scope"] = ["lc500_screens"]
+        return rhd.RhdTextureResult(
+            texture_member="vehicles/lc500/textures/screen.dds",
+            size=(4, 4), parts_analysed=1, mirrored_triangles=1,
+            rigid_triangles=0, mirror_coverage=1.0, rigid_coverage=0.0,
+            conflict_coverage=0.0, glyph_regions=1, mirrored_glyph_regions=1,
+            material_aliases=("lc500_screens", "lc500_screens_on"),
+            png_path=Path(f"{stem}_rhd.png"),
+            dds_path=Path(f"{stem}_rhd.dds"),
+            report=report,
+        )
+
+    def _manifest(self, results: list[rhd.RhdTextureResult]) -> dict:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            rhd.write_blender_preview(output, results, log=lambda *_a: None)
+            return json.loads((output / "rhd_materials.json").read_text())
+
+    def test_an_unscoped_correction_names_no_parts(self) -> None:
+        materials = self._manifest([self._result(0, [])])["materials"]
+
+        self.assertEqual(len(materials), 1)
+        self.assertNotIn("partKeys", materials[0])
+
+    def _tell_tale(self, index: int, dae_material: str) -> rhd.RhdTextureResult:
+        """One of several DAE materials sharing a single materials-JSON entry."""
+        stem = "buttons" if index < 2 else f"buttons_{index}"
+        return rhd.RhdTextureResult(
+            texture_member="vehicles/lc500/faceliftbuttons.png",
+            size=(4, 4), parts_analysed=1, mirrored_triangles=1,
+            rigid_triangles=0, mirror_coverage=1.0, rigid_coverage=0.0,
+            conflict_coverage=0.0, glyph_regions=1, mirrored_glyph_regions=1,
+            material_aliases=(dae_material, "lc500_dashlights"),
+            png_path=Path(f"{stem}_rhd.png"),
+            dds_path=Path(f"{stem}_rhd.dds"),
+            report={
+                "layer_bindings": [
+                    {
+                        "dae_material": dae_material,
+                        "material_key": "lc500_dashlights",
+                        "materials_member": "vehicles/lc500/main.materials.json",
+                        "stage_key": "opacityMap",
+                        "kind": "scalar",
+                    }
+                ],
+                "source_materials": [
+                    {
+                        "key": "lc500_dashlights",
+                        "aliases": [
+                            "lc500_intsignal_L",
+                            "lc500_intsignal_R",
+                            "lc500_inthighbeam",
+                        ],
+                        "materialsMember": "vehicles/lc500/main.materials.json",
+                        "material": {"Stages": [{}]},
+                    }
+                ],
+                "switch_base_aliases": [],
+                "outputs": {"preview": None},
+                "part_group": index,
+                "part_scope": ["lc500_interior"],
+                "material_scope": [dae_material],
+            },
+        )
+
+    def test_materials_sharing_one_json_entry_keep_their_own_textures(self) -> None:
+        # The LC500's turn-signal and high-beam tell-tales are three DAE
+        # materials over one lc500_dashlights entry, each on its own island.
+        # Keyed only on that entry they folded together and two of the three
+        # corrected files were orphaned.
+        materials = self._manifest(
+            [
+                self._tell_tale(1, "lc500_intsignal_L"),
+                self._tell_tale(2, "lc500_intsignal_R"),
+                self._tell_tale(3, "lc500_inthighbeam"),
+            ]
+        )["materials"]
+
+        self.assertEqual(len(materials), 3)
+        self.assertEqual(
+            [entry["maps"]["opacityMap"] for entry in materials],
+            ["buttons_rhd.png", "buttons_2_rhd.png", "buttons_3_rhd.png"],
+        )
+        # A scoped correction must not claim its siblings' aliases, or they
+        # would all retarget onto whichever was minted first.
+        self.assertEqual(
+            [entry["aliases"][0] for entry in materials],
+            ["lc500_intsignal_L", "lc500_intsignal_R", "lc500_inthighbeam"],
+        )
+        for entry in materials:
+            self.assertNotIn(
+                "lc500_inthighbeam",
+                entry["aliases"][1:],
+            )
+
+    def test_two_corrections_of_one_texture_stay_separate_entries(self) -> None:
+        materials = self._manifest(
+            [self._result(1, ["interior"]), self._result(2, ["facelift"])]
+        )["materials"]
+
+        # Same alias, same source material, different meshes and different
+        # files: folding these together is what left the facelift mirrored.
+        self.assertEqual(len(materials), 2)
+        self.assertEqual(
+            [entry["partKeys"] for entry in materials],
+            [["interior"], ["facelift"]],
+        )
+        self.assertEqual(
+            [entry["maps"]["baseColorMap"] for entry in materials],
+            ["screen_rhd.png", "screen_2_rhd.png"],
+        )
 
 
 if __name__ == "__main__":

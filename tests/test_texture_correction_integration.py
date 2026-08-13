@@ -1816,5 +1816,101 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertTrue(dropped_skin_texture)
 
 
+class PartScopedCorrectedMaterialTests(unittest.TestCase):
+    """One atlas corrected twice must bind a different material per mesh."""
+
+    def _entry(self, texture: str, part_keys: list[str] | None) -> dict:
+        entry = {
+            "aliases": ["lc500_screens", "lc500_screens-material"],
+            "maps": {"baseColorMap": texture},
+            "outputMaps": [
+                {
+                    "stageKey": "baseColorMap",
+                    "member": "vehicles/lc500/textures/screen.dds",
+                    "dds": texture,
+                }
+            ],
+        }
+        if part_keys is not None:
+            entry["partKeys"] = part_keys
+        return entry
+
+    def _prepare(self, entries: list[dict]):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            job.mkdir()
+            target = tmp / "vehicles/lc500"
+            for entry in entries:
+                (job / entry["maps"]["baseColorMap"]).write_bytes(b"dds")
+            (job / "rhd_materials.json").write_text(
+                json.dumps({"materials": entries}) + "\n", encoding="utf-8"
+            )
+            return build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+
+    def test_an_unscoped_manifest_still_reads_as_one_flat_map(self) -> None:
+        materials = self._prepare([self._entry("screen_rhd.dds", None)])
+
+        self.assertEqual(materials["lc500_screens"], "lc500_screens_beamxp_tc")
+        # No scope means the answer is the same for every mesh, as before.
+        self.assertEqual(materials.for_part("lc500_interior"), dict(materials))
+        self.assertEqual(materials.for_part("anything_at_all"), dict(materials))
+
+    def test_each_mesh_gets_the_correction_made_for_it(self) -> None:
+        materials = self._prepare(
+            [
+                self._entry("screen_rhd.dds", ["lc500_interior"]),
+                self._entry("screen_2_rhd.dds", ["lc500_interior_facelift"]),
+            ]
+        )
+
+        self.assertEqual(
+            materials.for_part("lc500_interior")["lc500_screens"],
+            "lc500_screens_beamxp_tc",
+        )
+        self.assertEqual(
+            materials.for_part("lc500_interior_facelift")["lc500_screens"],
+            "lc500_screens_beamxp_tc_2",
+        )
+
+    def test_a_mesh_no_correction_names_keeps_the_shipped_texture(self) -> None:
+        # The LC500's facelift: its own domain is entirely rigid, so nothing
+        # was corrected for it. Retargeting it off the flat map would hand it
+        # the base interior's flipped atlas instead of leaving it alone.
+        materials = self._prepare([self._entry("screen_rhd.dds", ["lc500_interior"])])
+
+        self.assertEqual(
+            materials.for_part("lc500_interior")["lc500_screens"],
+            "lc500_screens_beamxp_tc",
+        )
+        self.assertEqual(materials.for_part("lc500_interior_facelift"), {})
+
+    def test_unscoped_aliases_reach_every_mesh_alongside_scoped_ones(self) -> None:
+        trim = {
+            "aliases": ["lc500_trim"],
+            "maps": {"baseColorMap": "trim_rhd.dds"},
+            "outputMaps": [
+                {
+                    "stageKey": "baseColorMap",
+                    "member": "vehicles/lc500/textures/trim.dds",
+                    "dds": "trim_rhd.dds",
+                }
+            ],
+        }
+        materials = self._prepare(
+            [self._entry("screen_rhd.dds", ["lc500_interior"]), trim]
+        )
+
+        facelift = materials.for_part("lc500_interior_facelift")
+        self.assertEqual(facelift, {"lc500_trim": "lc500_trim_beamxp_tc"})
+        self.assertEqual(
+            materials.for_part("lc500_interior"),
+            {
+                "lc500_trim": "lc500_trim_beamxp_tc",
+                "lc500_screens": "lc500_screens_beamxp_tc",
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

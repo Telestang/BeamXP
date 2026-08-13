@@ -2224,6 +2224,19 @@ def resize_uv_island_crops(
     return tuple(resized_islands)
 
 
+@dataclass(slots=True)
+class TextureCorrectionJob:
+    """One mesh's use of one material on a texture: a single UV layout."""
+
+    part: DaePart
+    material: str
+    symbols: frozenset[str]
+
+    @property
+    def label(self) -> str:
+        return f"{self.part.label} / {self.material}"
+
+
 def build_domain_masks(
     loaded: LoadedDae,
     parts: list[DaePart],
@@ -2308,6 +2321,40 @@ def build_domain_masks(
         mirrored_uv=tuple(mirrored_triangles),
         mirrored_xyz=tuple(mirrored_surfaces),
     )
+
+
+def correction_jobs_for_texture(
+    loaded: LoadedDae,
+    entries: list[tuple[DaePart, MaterialTextureLayerBinding]],
+) -> list[TextureCorrectionJob]:
+    """One job per mesh per material painting this texture, in DAE order.
+
+    A UV layout belongs to a mesh's use of a material, not to the image file,
+    so that is the unit a correction is scoped to.  Unioning the domains above
+    that unit is what broke the LC500 twice over: pooling the two interiors let
+    the facelift's rigid domain erase the base interior's mirrored one, and
+    pooling ``lc500_screens`` with ``lc500_centralscreen`` put the HVAC strip's
+    off-centre island inside a full-atlas quad, so the strip was mirrored about
+    the atlas centre instead of about itself and came out displaced.
+
+    Several stage keys of one material -- a base colour and its emissive --
+    share a job, because they share the layout.
+    """
+    jobs: dict[tuple[str, str], TextureCorrectionJob] = {}
+    for part, binding in entries:
+        material = _normalise_material_alias(binding.dae_material)
+        if not material:
+            continue
+        symbols = frozenset(material_symbols_for_binding(loaded, binding))
+        if not symbols:
+            continue
+        key = (part.key, material)
+        existing = jobs.get(key)
+        if existing is None:
+            jobs[key] = TextureCorrectionJob(part, material, symbols)
+        else:
+            jobs[key] = replace(existing, symbols=existing.symbols | symbols)
+    return list(jobs.values())
 
 
 # ---------------------------------------------------------------------------
@@ -3790,6 +3837,9 @@ class DetectionView:
     atlas_shape: tuple[int, int]
     mode: str
     relief_bridge_response: np.ndarray | None = None
+    # Which member chart owns each pixel, when this view is a coalesced
+    # consumer.  None means one chart, so no join can cross anything.
+    island_bits: np.ndarray | None = None
 
 
 def _mask_crop_bounds(
@@ -3986,6 +4036,7 @@ def _build_collage_view(
     crop_mask: np.ndarray,
     config: RhdTextureConfig,
     relief_bridge_response: np.ndarray | None = None,
+    island_bits: np.ndarray | None = None,
 ) -> DetectionView | None:
     """Build a packed island collage, or decline when it cannot save work."""
     height, width = crop_mask.shape[:2]
@@ -4018,6 +4069,10 @@ def _build_collage_view(
         np.zeros((collage_height, collage_width), dtype=relief_bridge_response.dtype)
         if relief_bridge_response is not None else None
     )
+    collage_bits = (
+        np.zeros((collage_height, collage_width), dtype=island_bits.dtype)
+        if island_bits is not None else None
+    )
     for tile in tiles:
         sx0, sy0, sx1, sy1 = tile.source
         dx0, dy0, dx1, dy1 = tile.dest
@@ -4026,6 +4081,8 @@ def _build_collage_view(
         collage_domain[dy0:dy1, dx0:dx1] = domain_mask[sy0:sy1, sx0:sx1]
         if collage_bridge is not None:
             collage_bridge[dy0:dy1, dx0:dx1] = relief_bridge_response[sy0:sy1, sx0:sx1]
+        if collage_bits is not None:
+            collage_bits[dy0:dy1, dx0:dx1] = island_bits[sy0:sy1, sx0:sx1]
     return DetectionView(
         bgr=collage_bgr,
         mirror_mask=collage_mirror,
@@ -4034,6 +4091,7 @@ def _build_collage_view(
         atlas_shape=(height, width),
         mode="collage",
         relief_bridge_response=collage_bridge,
+        island_bits=collage_bits,
     )
 
 
@@ -4044,6 +4102,7 @@ def _build_individual_detection_views(
     crop_mask: np.ndarray,
     config: RhdTextureConfig,
     relief_bridge_response: np.ndarray | None = None,
+    island_bits: np.ndarray | None = None,
 ) -> tuple[DetectionView, ...]:
     """Build one detection view per selected UV island crop."""
     height, width = crop_mask.shape[:2]
@@ -4080,6 +4139,10 @@ def _build_individual_detection_views(
                     relief_bridge_response[y0:y1, x0:x1]
                     if relief_bridge_response is not None else None
                 ),
+                island_bits=(
+                    island_bits[y0:y1, x0:x1]
+                    if island_bits is not None else None
+                ),
             )
         )
     return tuple(views)
@@ -4092,6 +4155,7 @@ def _build_crop_view(
     crop_mask: np.ndarray,
     config: RhdTextureConfig,
     relief_bridge_response: np.ndarray | None = None,
+    island_bits: np.ndarray | None = None,
 ) -> DetectionView:
     height, width = crop_mask.shape[:2]
     crop = _mask_crop_bounds(crop_mask, config.detection_crop_padding_px)
@@ -4110,6 +4174,10 @@ def _build_crop_view(
             relief_bridge_response[y0:y1, x0:x1]
             if relief_bridge_response is not None else None
         ),
+        island_bits=(
+            island_bits[y0:y1, x0:x1]
+            if island_bits is not None else None
+        ),
     )
 
 
@@ -4119,6 +4187,7 @@ def _build_detection_views(
     domain_mask: np.ndarray,
     config: RhdTextureConfig,
     relief_bridge_response: np.ndarray | None = None,
+    island_bits: np.ndarray | None = None,
 ) -> tuple[DetectionView, ...]:
     height, width = domain_mask.shape[:2]
     crop_mask = mirror_mask if bool(mirror_mask.any()) else domain_mask
@@ -4126,22 +4195,25 @@ def _build_detection_views(
         tile = DetectionTile(source=(0, 0, width, height), dest=(0, 0, width, height))
         return (DetectionView(
             bgr, mirror_mask, domain_mask, (tile,), (height, width), "full",
-            relief_bridge_response,
+            relief_bridge_response, island_bits,
         ),)
     if config.detect_island_tiles_individually:
         views = _build_individual_detection_views(
-            bgr, mirror_mask, domain_mask, crop_mask, config, relief_bridge_response
+            bgr, mirror_mask, domain_mask, crop_mask, config,
+            relief_bridge_response, island_bits,
         )
         if views:
             return views
     if config.collage_detection_islands:
         collage = _build_collage_view(
-            bgr, mirror_mask, domain_mask, crop_mask, config, relief_bridge_response
+            bgr, mirror_mask, domain_mask, crop_mask, config,
+            relief_bridge_response, island_bits,
         )
         if collage is not None:
             return (collage,)
     return (_build_crop_view(
-        bgr, mirror_mask, domain_mask, crop_mask, config, relief_bridge_response
+        bgr, mirror_mask, domain_mask, crop_mask, config,
+        relief_bridge_response, island_bits,
     ),)
 
 
@@ -4150,19 +4222,24 @@ def _build_detection_views_for_island(
     island: np.ndarray | UvIslandCrop,
     config: RhdTextureConfig,
     relief_bridge_response: np.ndarray | None = None,
+    island_bits: np.ndarray | None = None,
 ) -> tuple[DetectionView, ...]:
     """Build ordinary detection views without expanding a compact island atlas."""
     if isinstance(island, np.ndarray):
         return _build_detection_views(
-            bgr, island, island, config, relief_bridge_response
+            bgr, island, island, config, relief_bridge_response, island_bits
         )
 
     if not config.crop_detection_to_domain:
         full = np.zeros(bgr.shape[:2], dtype=bool)
         x0, y0, x1, y1 = island.bounds
         full[y0:y1, x0:x1] = island.mask
+        full_bits = None
+        if island_bits is not None:
+            full_bits = np.zeros(bgr.shape[:2], dtype=island_bits.dtype)
+            full_bits[y0:y1, x0:x1] = island_bits
         return _build_detection_views(
-            bgr, full, full, config, relief_bridge_response
+            bgr, full, full, config, relief_bridge_response, full_bits
         )
 
     x0, y0, x1, y1 = island.bounds
@@ -4171,12 +4248,16 @@ def _build_detection_views_for_island(
         if relief_bridge_response is not None
         else None
     )
+    # ``island_bits`` already arrives in the consumer's own frame, which is
+    # exactly this crop, so it needs no slicing the way the atlas-wide bridge
+    # response does.
     local_views = _build_detection_views(
         bgr[y0:y1, x0:x1],
         island.mask,
         island.mask,
         config,
         local_bridge,
+        island_bits,
     )
     atlas_shape = bgr.shape[:2]
     return tuple(
@@ -4199,15 +4280,62 @@ def _build_detection_views_for_island(
             atlas_shape=atlas_shape,
             mode=view.mode,
             relief_bridge_response=view.relief_bridge_response,
+            island_bits=view.island_bits,
         )
         for view in local_views
     )
 
 
+# One bit per member chart of a coalesced consumer, so "do these two boxes
+# share a chart" is a bitwise AND.  A consumer built from more members than
+# this keeps no membership and grouping falls back to the other barriers.
+ISLAND_MEMBERSHIP_BITS = 64
+
+
+def _island_membership_bits(
+    crops: list[tuple[int, int, np.ndarray]],
+    indices: tuple[int, ...],
+    bounds: tuple[int, int, int, int],
+) -> np.ndarray | None:
+    """Per-pixel set of member charts covering it, one bit each.
+
+    Overlap is why a plain label image will not do: a texel two charts share
+    belongs to both, and a box standing on it may group with either side.
+    """
+    if len(indices) < 2 or len(indices) > ISLAND_MEMBERSHIP_BITS:
+        return None
+    x0, y0, x1, y1 = bounds
+    bits = np.zeros((y1 - y0, x1 - x0), dtype=np.uint64)
+    for bit, index in enumerate(indices):
+        cx, cy, mask = crops[index]
+        height, width = mask.shape[:2]
+        # Clip the member into the coalesced consumer's frame.
+        sx0, sy0 = max(cx, x0), max(cy, y0)
+        sx1, sy1 = min(cx + width, x1), min(cy + height, y1)
+        if sx1 <= sx0 or sy1 <= sy0:
+            continue
+        piece = mask[sy0 - cy : sy1 - cy, sx0 - cx : sx1 - cx]
+        target = bits[sy0 - y0 : sy1 - y0, sx0 - x0 : sx1 - x0]
+        target |= np.where(
+            piece, np.uint64(1) << np.uint64(bit), np.uint64(0)
+        ).astype(np.uint64)
+    return bits
+
+
 def _coalesce_overlapping_uv_consumers(
     islands: tuple[np.ndarray | UvIslandCrop, ...],
-) -> tuple[np.ndarray | UvIslandCrop, ...]:
-    """Union UV placements sharing atlas pixels before detector pipelines run."""
+) -> tuple[tuple[np.ndarray | UvIslandCrop, np.ndarray | None], ...]:
+    """Union UV placements sharing atlas pixels before detector pipelines run.
+
+    Coalescing is unavoidable where charts really do share texels -- one texel
+    can only be corrected one way -- but it must not become a licence to group
+    across charts that merely sit near each other.  One sprawling chart can
+    chain a dozen others into a single consumer through the transitive union,
+    which on the LC500's interior label atlas merged fourteen charts into nine
+    consumers and let one flip region span eight of them.  Each coalesced
+    consumer therefore carries which member chart owns each of its pixels, so
+    grouping can refuse a join that crosses from one chart to another.
+    """
     sources: list[np.ndarray | UvIslandCrop] = []
     crops: list[tuple[int, int, np.ndarray]] = []
     for island in islands:
@@ -4228,15 +4356,16 @@ def _coalesce_overlapping_uv_consumers(
 
     groups = overlapping_mask_crop_groups(tuple(crops))
     merged_crops = merge_overlapping_mask_crops(tuple(crops), groups=groups)
-    result: list[np.ndarray | UvIslandCrop] = []
+    result: list[tuple[np.ndarray | UvIslandCrop, np.ndarray | None]] = []
     for indices, (x, y, mask) in zip(groups, merged_crops):
         if len(indices) == 1:
-            result.append(sources[indices[0]])
+            result.append((sources[indices[0]], None))
             continue
+        bounds = (x, y, x + mask.shape[1], y + mask.shape[0])
         result.append(
-            UvIslandCrop(
-                (x, y, x + mask.shape[1], y + mask.shape[0]),
-                mask,
+            (
+                UvIslandCrop(bounds, mask),
+                _island_membership_bits(crops, indices, bounds),
             )
         )
     return tuple(result)
@@ -4358,6 +4487,7 @@ def _detect_flip_regions_in_view(
             initial_contrast.threshold if initial_contrast is not None else None
         ),
         initial_relief_bridge_response=view.relief_bridge_response,
+        initial_island_bits=view.island_bits,
     )
     final = detection.stages[-1]
     detected = list(final.kept)
@@ -4550,11 +4680,11 @@ def detect_flip_regions_by_uv_island(
     """
     started = time.perf_counter()
     result = RegionDetection(source=source, detected=0)
-    island_masks = _coalesce_overlapping_uv_consumers(island_masks)
+    consumers = _coalesce_overlapping_uv_consumers(island_masks)
 
     if mser_config.box_source == "contrast_gpu":
         indexed_views: list[tuple[int, DetectionView]] = []
-        for index, island in enumerate(island_masks, start=1):
+        for index, (island, island_bits) in enumerate(consumers, start=1):
             if isinstance(island, np.ndarray):
                 has_pixels = bool(island.any())
             else:
@@ -4564,7 +4694,7 @@ def detect_flip_regions_by_uv_island(
             indexed_views.extend(
                 (index, view)
                 for view in _build_detection_views_for_island(
-                    bgr, island, config, relief_bridge_response
+                    bgr, island, config, relief_bridge_response, island_bits
                 )
             )
         detections = detect_local_contrast_gpu_batch(
@@ -4590,7 +4720,7 @@ def detect_flip_regions_by_uv_island(
         result.seconds = time.perf_counter() - started
         return result
 
-    for index, island in enumerate(island_masks, start=1):
+    for index, (island, island_bits) in enumerate(consumers, start=1):
         if isinstance(island, np.ndarray):
             has_pixels = bool(island.any())
         else:
@@ -4599,7 +4729,7 @@ def detect_flip_regions_by_uv_island(
             continue
         if isinstance(island, UvIslandCrop):
             views = _build_detection_views_for_island(
-                bgr, island, config, relief_bridge_response
+                bgr, island, config, relief_bridge_response, island_bits
             )
             partial = RegionDetection(source=f"{source}:uv-island-{index}", detected=0)
             for view in views:
@@ -4863,10 +4993,12 @@ def build_rhd_texture(
     relief_mser_config: MserConfig | None = None,
     part_filter: tuple[str, ...] = (),
     part_scope: list[DaePart] | None = None,
+    material_scope: tuple[str, ...] = (),
     masks: DomainMasks | None = None,
     sweep_cache: dict[str, object] | None = None,
     written_companions: set[str] | None = None,
     detection_session: ProductionDetectionSession[RegionDetection] | None = None,
+    part_group_index: int = 0,
     log=print,
     progress: ProgressCallback | None = None,
 ) -> RhdTextureResult:
@@ -4876,6 +5008,14 @@ def build_rhd_texture(
     layout.  Skins of one layout -- scintilla ships three interior variants --
     share their masks exactly, so recomputing them per skin would repeat every
     sweep and every rasterisation for nothing.
+
+    ``part_group_index`` is 1-based, and non-zero only when one texture is
+    corrected more than once -- for meshes that disagree about it and never
+    appear together.  It both names the output apart from its siblings and
+    marks the result as covering ``part_scope`` alone, so the material wiring
+    downstream binds this copy to these meshes rather than to the alias at
+    large.  Zero, the usual single correction, keeps the file names and the
+    unscoped wiring a texture has always had.
 
     ``detection_session`` shares the one GPU warm-up and exact-input cache
     across every physical material layer in an export.  No detection result is
@@ -4939,6 +5079,17 @@ def build_rhd_texture(
             (part, binding)
             for part, binding in candidates
             if any(token.lower() in part.label.lower() for token in part_filter)
+        ]
+    if material_scope:
+        # A texture file can carry unrelated UV layouts under different
+        # materials.  Correcting one must not see the others' domains.
+        wanted_materials = {
+            _normalise_material_alias(name) for name in material_scope
+        }
+        candidates = [
+            (part, binding)
+            for part, binding in candidates
+            if _normalise_material_alias(binding.dae_material) in wanted_materials
         ]
     if not candidates:
         raise ValueError(f"No part in the DAE resolves to {texture_member}")
@@ -5880,6 +6031,8 @@ def build_rhd_texture(
     )
 
     stem = _texture_stem(texture_member)
+    if part_group_index > 1:
+        stem = f"{stem}_{part_group_index}"
     output_directory.mkdir(parents=True, exist_ok=True)
     png_path = output_directory / f"{stem}_rhd.png"
     dds_path: Path | None = output_directory / f"{stem}_rhd.dds"
@@ -6066,6 +6219,30 @@ def build_rhd_texture(
         ],
         "material_aliases": list(material_aliases),
         "switch_base_aliases": list(switch_base_aliases),
+        # Named only for one of several corrections of this texture. Absent
+        # means the correction speaks for the alias wherever it is bound.
+        **(
+            {
+                "part_group": part_group_index,
+                "part_scope": sorted(
+                    {
+                        key
+                        for part in (part_scope or [])
+                        for key in (str(part.key or ""), str(part.node_id or ""))
+                        if key
+                    }
+                ),
+                "material_scope": sorted(
+                    {
+                        _normalise_material_alias(name)
+                        for name in material_scope
+                        if _normalise_material_alias(name)
+                    }
+                ),
+            }
+            if part_group_index
+            else {}
+        ),
         "source_materials": source_materials,
         "collada_symbols": sorted(symbols),
         "parts_analysed": analysed,
@@ -6429,11 +6606,27 @@ def write_blender_preview(
     Blender reads them without a decoder, and the normal map's preview PNG has
     its z reconstructed, which the shipped two-channel DDS deliberately lacks.
     """
-    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    grouped: dict[tuple[str, str, tuple[str, ...]], dict[str, object]] = {}
     materials: list[dict[str, object]] = []
     for result in results:
         if not result.material_aliases or result.png_path is None:
             continue
+        # Several corrections of one texture reach here sharing a materials-JSON
+        # key: the LC500's turn-signal and high-beam tell-tales are three DAE
+        # materials over one lc500_dashlights entry, each with its own island.
+        # Keying only on that entry folded them together and orphaned every
+        # corrected file but the first, so the mesh and material a correction
+        # was scoped to are part of the key and are carried into the manifest.
+        part_scope = tuple(
+            str(key)
+            for key in result.report.get("part_scope", [])
+            if str(key)
+        ) if isinstance(result.report.get("part_scope"), list) else ()
+        material_scope = tuple(
+            str(name)
+            for name in result.report.get("material_scope", [])
+            if str(name)
+        ) if isinstance(result.report.get("material_scope"), list) else ()
         layer_bindings = result.report.get("layer_bindings", [])
         if isinstance(layer_bindings, list) and layer_bindings:
             source_materials = result.report.get("source_materials", [])
@@ -6454,21 +6647,25 @@ def write_blender_preview(
                 material_key = str(layer.get("material_key") or "")
                 dae_material = str(layer.get("dae_material") or "")
                 stage_key = str(layer.get("stage_key") or "baseColorMap")
-                group_key = (materials_member, material_key)
-                source = source_by_key.get(group_key)
+                source_key = (materials_member, material_key)
+                source = source_by_key.get(source_key)
                 aliases = [dae_material, material_key]
-                if isinstance(source, dict):
+                if isinstance(source, dict) and not material_scope:
+                    # Scoped to one DAE material, the sibling aliases sharing
+                    # this materials-JSON entry belong to other corrections and
+                    # must not be bound to this one's texture.
                     aliases.extend(
                         str(alias) for alias in source.get("aliases", []) if str(alias)
                     )
                 entry = grouped.setdefault(
-                    group_key,
+                    (*source_key, part_scope, material_scope),
                     {
                         "aliases": [],
                         "switchBaseAliases": [],
                         "maps": {},
                         "outputMaps": [],
                         "sourceMaterials": [source] if source is not None else [],
+                        **({"partKeys": list(part_scope)} if part_scope else {}),
                     },
                 )
                 entry_aliases = entry["aliases"]
@@ -6794,8 +6991,11 @@ def export_parts_preview(
     The texture pass is grouped by atlas across the selected mesh set.  If two
     selected meshes share one material texture, their UV domains are unioned and
     detected once, so the output is one corrected texture instead of competing
-    per-part copies.  Work is intentionally scoped to the selected meshes; this
-    is the standalone stepping stone for the production island-scoped pipeline.
+    per-part copies -- unless they genuinely disagree about it, where one mesh
+    mirrors what another rigid-transforms, in which case each side of the
+    disagreement is corrected into its own file.  Work is intentionally scoped
+    to the selected meshes; this is the standalone stepping stone for the
+    production island-scoped pipeline.
 
     Textures are rebuilt before the DAE is written so the DAE can point at the
     corrected base colours rather than the originals; the script then attaches
@@ -6874,93 +7074,113 @@ def export_parts_preview(
     detection_skips: list[dict[str, str]] = []
     for texture_index, (member, entries) in enumerate(bindings_by_texture.items(), start=1):
         texture_name = PurePosixPath(member).name
-        texture_parts: list[DaePart] = []
-        seen_part_keys: set[str] = set()
-        for part, _binding in entries:
-            if part.key in seen_part_keys:
-                continue
-            seen_part_keys.add(part.key)
-            texture_parts.append(part)
-        symbols: set[str] = set()
-        for _part, binding in entries:
-            symbols.update(material_symbols_for_binding(loaded, binding))
-        if not symbols:
-            log(f"\n{PurePosixPath(member).name}")
+        jobs = correction_jobs_for_texture(loaded, entries)
+        if not jobs:
+            log(f"\n{texture_name}")
             log("  ! failed: no COLLADA symbol resolved")
             continue
         log(f"\n{texture_name}")
         try:
             with Image.open(extract_archive_member(archive, member)) as image:
                 size = image.size
-            mask_key = (
-                frozenset(symbols),
-                size,
-                tuple(sorted(part.key for part in texture_parts)),
+            # One domain per mesh per material: that is the unit a UV layout is
+            # actually defined over.  Pooling meshes cost the LC500's base
+            # interior its whole screen atlas to the facelift's rigid domain,
+            # and pooling materials put the HVAC strip's 8.9% island inside
+            # lc500_centralscreen's full-atlas quad, so the strip was flipped
+            # about the atlas rather than about itself.
+            #
+            # This costs texture count where meshes used to share a correction:
+            # scintilla's interior atlas goes from one corrected copy to five,
+            # ardente's from six to twenty-three.  Taken deliberately -- those
+            # copies are small beside the DDS/PNG round trip each correction
+            # already performs, and the alternative is knowingly leaving
+            # correct-looking meshes on a domain that was never theirs.
+            phase_started = time.perf_counter()
+            emit_progress(
+                progress,
+                "begin",
+                "build_domain_masks",
+                f"Building UV masks for {texture_name}",
+                texture=member,
+                texture_index=texture_index,
+                texture_total=len(bindings_by_texture),
+                selected_parts=len(jobs),
             )
-            masks = mask_cache.get(mask_key)
-            if masks is None:
-                phase_started = time.perf_counter()
-                emit_progress(
-                    progress,
-                    "begin",
-                    "build_domain_masks",
-                    f"Building UV masks for {texture_name}",
-                    texture=member,
-                    texture_index=texture_index,
-                    texture_total=len(bindings_by_texture),
-                    selected_parts=len(texture_parts),
+            # Measured separately, then merged only where two domains come out
+            # exactly equal -- a left and right panel over one unwrap.  That is
+            # an identity, not a tolerance, so it can only collapse work that
+            # would have produced the same image twice.
+            merged: dict[tuple[str, bytes], tuple[list[DaePart], DomainMasks]] = {}
+            for job in jobs:
+                mask_key = (frozenset(job.symbols), size, job.part.key)
+                masks = mask_cache.get(mask_key)
+                if masks is None:
+                    masks = build_domain_masks(
+                        loaded, [job.part], set(job.symbols), size,
+                        config, sweep_cache, log, force_mirrored_part_keys,
+                    )
+                    mask_cache[mask_key] = masks
+                if not bool(masks.mirror.any()):
+                    log(f"  {job.label}: nothing mirrored; keeping the original")
+                    detection_skips.append(
+                        {
+                            "texture": member,
+                            "reason": f"no mirrored UV domain for {job.label}",
+                        }
+                    )
+                    continue
+                identity = (
+                    job.material,
+                    masks.mirror.tobytes() + masks.rigid.tobytes(),
                 )
-                masks = build_domain_masks(
-                    loaded,
-                    texture_parts,
-                    symbols,
-                    size,
-                    config,
-                    sweep_cache,
-                    log,
-                    force_mirrored_part_keys,
-                )
-                mask_cache[mask_key] = masks
-                timing = record_phase(
-                    phase_timings,
-                    "build_domain_masks",
-                    phase_started,
-                    texture=member,
-                    texture_index=texture_index,
-                    texture_total=len(bindings_by_texture),
-                    selected_parts=len(texture_parts),
-                    mirrored_triangles=masks.mirrored_triangles,
-                    rigid_triangles=masks.rigid_triangles,
-                )
-                emit_progress(
-                    progress,
-                    "end",
-                    "build_domain_masks",
-                    f"Built UV masks for {texture_name}",
-                    texture=member,
-                    texture_index=texture_index,
-                    texture_total=len(bindings_by_texture),
-                    seconds=timing["seconds"],
-                )
-            if not bool(masks.mirror.any()):
-                log("  nothing mirrored on this selected texture domain; skipped")
-                detection_skips.append(
-                    {"texture": member, "reason": "no mirrored UV domain"}
-                )
-                continue
-            detection_attempted_members.add(member)
-            result = build_rhd_texture(
-                archive, loaded, member, output_directory,
-                config, mser_config, relief_mser_config,
-                part_scope=texture_parts,
-                masks=masks,
-                sweep_cache=sweep_cache,
-                written_companions=written,
-                detection_session=detection_session,
-                log=log,
-                progress=progress,
+                if identity in merged:
+                    merged[identity][0].append(job.part)
+                    log(f"  {job.label}: same UV domain as an earlier mesh here; "
+                        f"sharing one correction")
+                else:
+                    merged[identity] = ([job.part], masks)
+            timing = record_phase(
+                phase_timings,
+                "build_domain_masks",
+                phase_started,
+                texture=member,
+                texture_index=texture_index,
+                texture_total=len(bindings_by_texture),
+                selected_parts=len(jobs),
+                corrections=len(merged),
             )
-            results.append(result)
+            emit_progress(
+                progress,
+                "end",
+                "build_domain_masks",
+                f"Built UV masks for {texture_name}",
+                texture=member,
+                texture_index=texture_index,
+                texture_total=len(bindings_by_texture),
+                seconds=timing["seconds"],
+            )
+            # A texture corrected once keeps the file name it has always had.
+            scoped = len(merged) > 1
+            for index, ((material, _identity), (scope, masks)) in enumerate(
+                merged.items(), start=1
+            ):
+                detection_attempted_members.add(member)
+                results.append(
+                    build_rhd_texture(
+                        archive, loaded, member, output_directory,
+                        config, mser_config, relief_mser_config,
+                        part_scope=scope,
+                        material_scope=(material,),
+                        masks=masks,
+                        sweep_cache=sweep_cache,
+                        written_companions=written,
+                        detection_session=detection_session,
+                        part_group_index=index if scoped else 0,
+                        log=log,
+                        progress=progress,
+                    )
+                )
         except Exception as exc:
             log(f"  ! failed: {type(exc).__name__}: {exc}")
             detection_skips.append(
