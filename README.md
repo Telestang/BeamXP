@@ -2,7 +2,7 @@
 
 **BeamXP (BeamNG Vehicle eXPort Services)** converts BeamNG.drive vehicles between left-hand drive and right-hand drive, with automatic correction of meshes, textures, controls, cameras, mirrors, lighting, configuration parts, and licence plates.
 
-**[Download BeamXP 0.3.0-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.0-alpha-windows.zip)** — extract it anywhere and run the exe.
+**[Download BeamXP 0.3.1-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.1-alpha-windows.zip)** — extract it anywhere and run the exe.
 
 > BeamXP was previously named **BeamHDC (BeamNG Hand Drive Converter)**.
 
@@ -28,7 +28,7 @@ The old **39 trims in 4 minutes 30 seconds** figure is no longer used as a bench
 
 ## Quick Start
 
-1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.0-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
+1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.1-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
 2. Open the app settings and configure:
    - your BeamNG vehicle-content folder;
    - your BeamNG mods folder.
@@ -49,7 +49,63 @@ Enjoying driving from the other side? Star the repo to help other people find it
 
 ---
 
-## What's New in This Release
+## What's New in 0.3.1-alpha
+
+A correctness and performance pass over the texture correction pipeline introduced in 0.3.0, plus lighting, trigger, and mirror fixes found while converting the Lexus LC500 and Civetta Scintilla.
+
+### Texture correction is scoped to the mesh that uses the texture
+
+A UV layout belongs to a **mesh's use of a material**, and that is now the unit a correction is scoped to. Previously corrections were pooled per texture file, which let one trim's layout erase another's, and let a small UV island be mirrored about the whole atlas centre rather than about itself.
+
+- Corrections are emitted per mesh, per material, and merged only where the domains come out byte-identical.
+- A mesh that no correction names stays on the texture it shipped with, instead of inheriting another mesh's corrected copy.
+- Where one material alias corrects into several, each fork now mints its own DAE handle, glow-map entry, and skin variants.
+
+### Glyph detection stays inside its own UV chart
+
+Detection regions no longer sprawl across unrelated charts that merely share atlas space. Two charts are treated as one island only where the **meshes actually meet**, and a glyph merge is refused across a chart boundary.
+
+This is what had been welding neighbouring labels into a single block — mirror-select icons, padlocks, and whole legends stopped existing as separate candidates and so stayed mirrored.
+
+### Builds no longer pay to re-encode untouched textures
+
+Roughly half of a vehicle's planned corrections turn out to be no-ops, and each was still doing a full PNG write and BC7 encode to arrive back at its own input.
+
+- Empty correction plans now emit nothing. On a Scintilla build this removed 215s from a 629s texture pass.
+- The **block-encoder profile is a build setting** (basic / fast / veryfast), beside the Blender path in Build Settings, and rides in `conversion.json`.
+- Alpha-searching encoder variants are chosen by reading the image rather than assumed, which is free speed on the two thirds of interior textures that are fully opaque.
+- The inspection PNG beside each corrected DDS is no longer written during a build — that alone was 3.39 GB against 0.74 GB of shipped DDS on the Scintilla.
+
+### Skins follow the material they skin
+
+A converted vehicle selecting an interior skin rendered the base interior instead — ten of the Scintilla's sixteen trims. Corrected skins are now named so the engine's runtime composition still finds them, and the prune pass keeps a skin exactly when it keeps the base it skins.
+
+### Handed headlight patterns are resolved from the bulb
+
+`$lightPattern` is read by the **bulb** a slot pulls in, not by the part mounting the lamp, and an unset value is a US pattern rather than a lamp opting out. BeamXP now resolves each bulb slot against the bulb it actually mounts and inserts the pattern where it is missing.
+
+Across the stock fleet this converts 316 pattern-reading bulb rows with none left behind, and converts 15 lamp parts that previously converted to nothing — including vehicles such as the Wendover, which had its dipped beam converted but left its full beam shining the American way.
+
+### Live screens belong to the conversion that draws them
+
+A conversion spawned beside its donor left one of the two instrument clusters black, because the render-to-texture tag is global to whichever vehicle asks first. A conversion now ships its own retagged copy of the controller, with a reflected copy of the page, reflected about the window the quad actually samples rather than the middle of the page.
+
+### Fixes
+
+- **Mirrors keep reflecting after texture correction.** A corrected mesh is split into a deforming carrier plus rigid pieces, which left the `mirrors` row naming a mesh that no longer exists. The row now finds the piece holding the reflective surface.
+- **Trigger answers reach the build.** A trigger set to Mirror in the Triggers table could come out unconverted: the table and the build were keying the same box off different node maps, and a part holding only an answered trigger was never cloned. Fourteen of sixteen Scintilla trims failed to recognise their own saved answer.
+- **Accented display names survive.** Config names such as *Velocità* were written as `à`, which BeamNG's SJSON parser does not decode — the vehicle selector showed *Velocitu00e0*. Everything written for the game is now raw UTF-8.
+
+### Interface
+
+- The **Triggers** table drops the coordinates after each name and gains a single Hide/Show control for the whole table; hidden boxes are not drawn, not pickable, and carry no selection outline.
+- **Mesh Transforms** loses the Role and X/Y/Z columns, and the filter no longer matches on hidden role text. The selected row still reports its position in the detail line.
+- **Equivalent Parts** columns start equal and share the pane instead of overflowing it.
+- The preview's opacity slider is gone; trigger-box blending is unchanged.
+
+---
+
+## What's New in 0.3.0-alpha
 
 This release is a major conversion-quality and workflow overhaul.
 
