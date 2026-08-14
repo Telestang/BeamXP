@@ -49,9 +49,9 @@ Enjoying driving from the other side? Star the repo to help other people find it
 
 ---
 
-## What's New in 0.3.1-alpha
+## What's New in 0.3.x
 
-A correctness and performance pass over the texture correction pipeline introduced in 0.3.0, plus lighting, trigger, and mirror fixes found while converting the Lexus LC500 and Civetta Scintilla.
+The 0.3 line is a major conversion-quality and workflow overhaul. It introduced automatic mesh and texture correction, then spent the releases since making that pipeline correct and affordable — much of it found while converting the Lexus LC500 and Civetta Scintilla.
 
 ### Texture correction is scoped to the mesh that uses the texture
 
@@ -92,6 +92,7 @@ A conversion spawned beside its donor left one of the two instrument clusters bl
 
 ### Fixes
 
+- **Texture Fix decides whether a Swap Mesh is corrected.** Swap Mesh hands the object the opposite side's authored mesh, whose texture is already the one that side wants — but any Swap Mesh row sharing an atlas with a corrected mesh was pulled into correction regardless of its own Y/N, and had its whole texture domain flipped. The column is now read. Mirror is unchanged: with no authored counterpart to fall back on, a shared atlas is the only thing it can follow.
 - **Mirrors keep reflecting after texture correction.** A corrected mesh is split into a deforming carrier plus rigid pieces, which left the `mirrors` row naming a mesh that no longer exists. The row now finds the piece holding the reflective surface.
 - **Trigger answers reach the build.** A trigger set to Mirror in the Triggers table could come out unconverted: the table and the build were keying the same box off different node maps, and a part holding only an answered trigger was never cloned. Fourteen of sixteen Scintilla trims failed to recognise their own saved answer.
 - **Accented display names survive.** Config names such as *Velocità* were written as `à`, which BeamNG's SJSON parser does not decode — the vehicle selector showed *Velocitu00e0*. Everything written for the game is now raw UTF-8.
@@ -102,12 +103,6 @@ A conversion spawned beside its donor left one of the two instrument clusters bl
 - **Mesh Transforms** loses the Role and X/Y/Z columns, and the filter no longer matches on hidden role text. The selected row still reports its position in the detail line.
 - **Equivalent Parts** columns start equal and share the pane instead of overflowing it.
 - The preview's opacity slider is gone; trigger-box blending is unchanged.
-
----
-
-## What's New in 0.3.0-alpha
-
-This release is a major conversion-quality and workflow overhaul.
 
 ### Automatic mesh and texture correction
 
