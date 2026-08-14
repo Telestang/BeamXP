@@ -6943,6 +6943,11 @@ class PartPreview:
     # Parts the export skipped, each {"source_part": ..., "error": ...}. A
     # part with no correctable atlas does not stop the rest of the selection.
     failed_parts: tuple[dict[str, object], ...] = ()
+    # Textures that raised rather than being deliberately passed over, each
+    # {"texture": ..., "reason": ...}. Kept apart from the ordinary skips: a
+    # texture with nothing mirrored on it is a finding, one the exporter could
+    # not read at all is a fault, and the caller has to be able to tell.
+    texture_failures: tuple[dict[str, str], ...] = ()
 
 
 def _base_colours_by_alias(results: list[RhdTextureResult]) -> dict[str, Path]:
@@ -7159,6 +7164,7 @@ def export_parts_preview(
     results: list[RhdTextureResult] = []
     detection_attempted_members: set[str] = set()
     detection_skips: list[dict[str, str]] = []
+    texture_failures: list[dict[str, str]] = []
     for texture_index, (member, entries) in enumerate(bindings_by_texture.items(), start=1):
         texture_name = PurePosixPath(member).name
         jobs = correction_jobs_for_texture(loaded, entries)
@@ -7270,7 +7276,7 @@ def export_parts_preview(
                 )
         except Exception as exc:
             log(f"  ! failed: {type(exc).__name__}: {exc}")
-            detection_skips.append(
+            texture_failures.append(
                 {
                     "texture": member,
                     "reason": f"{type(exc).__name__}: {exc}",
@@ -7460,6 +7466,7 @@ def export_parts_preview(
             "candidate_files": sorted(bindings_by_texture),
             "detection_attempted_files": sorted(detection_attempted_members),
             "skipped_candidates": detection_skips,
+            "failed_candidates": texture_failures,
             "source_archive_raster_files_not_candidates": sorted(
                 source_archive_rasters.difference(bindings_by_texture)
             ),
@@ -7541,6 +7548,7 @@ def export_parts_preview(
         report_path=report_path,
         report=report,
         failed_parts=tuple(failed_parts),
+        texture_failures=tuple(texture_failures),
     )
 
 

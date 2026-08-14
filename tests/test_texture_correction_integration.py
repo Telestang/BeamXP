@@ -367,6 +367,42 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             build_pipeline._mirrored_screen_page("<html><head></head></html>"),
         )
 
+    def test_unreadable_textures_are_announced_when_others_corrected(self) -> None:
+        # A mod may reference a texture it does not ship, so this stays
+        # non-fatal -- but it has to reach the caller, not just the log.
+        notice = build_pipeline.unreadable_texture_notice(
+            [{"texture": "vehicles/v/t/a.dds", "reason": "FileNotFoundError: a"}],
+            corrected=5,
+            label="v.dae",
+        )
+
+        self.assertIsNotNone(notice)
+        self.assertIn("could not read 1 texture(s)", notice)
+        self.assertIn("a.dds: FileNotFoundError: a", notice)
+
+    def test_reading_none_of_the_textures_raises(self) -> None:
+        # Andronisk's V60: 26 unreadable textures, zero corrected, and a build
+        # that reported success while every glyph stayed mirrored.
+        failures = [
+            {"texture": f"vehicles/v/t/{name}.dds", "reason": "FileNotFoundError"}
+            for name in "abcd"
+        ]
+
+        with self.assertRaises(RuntimeError) as caught:
+            build_pipeline.unreadable_texture_notice(
+                failures, corrected=0, label="v60_andronisk.dae"
+            )
+
+        message = str(caught.exception)
+        self.assertIn("read none of the 4 texture(s)", message)
+        self.assertIn("v60_andronisk.dae", message)
+        self.assertIn("and 1 more", message)
+
+    def test_no_failures_says_nothing(self) -> None:
+        self.assertIsNone(
+            build_pipeline.unreadable_texture_notice([], corrected=0, label="v.dae")
+        )
+
     def test_extraction_workspace_leaves_a_deep_mod_room_under_max_path(self) -> None:
         # Andronisk's V60 nests its textures 113 characters deep. Under the
         # project directory that came to 295 and Windows refused every one of

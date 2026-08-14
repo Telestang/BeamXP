@@ -544,6 +544,42 @@ def texture_correction_asset_archives(context: VehicleContext) -> list[Path]:
     return paths
 
 
+def unreadable_texture_notice(
+    failures: list[dict[str, str]],
+    corrected: int,
+    label: str,
+    limit: int = 3,
+) -> str | None:
+    """Say that textures could not be read, or raise if none could be.
+
+    A texture the exporter deliberately passes over is a finding; one it could
+    not read at all is a fault, and until now both only reached the log.
+    Andronisk's V60 lost all 26 of its textures to MAX_PATH and still produced
+    a build that reported success, wearing every glyph the wrong way round.
+
+    Correcting some and failing others stays non-fatal -- a mod may reference a
+    texture it does not ship -- but correcting none of them is not a conversion
+    worth shipping, so that raises.
+    """
+    if not failures:
+        return None
+    summary = "; ".join(
+        f"{PurePosixPath(str(failure.get('texture') or '')).name}: "
+        f"{failure.get('reason')}"
+        for failure in failures[:limit]
+    )
+    if len(failures) > limit:
+        summary += f"; and {len(failures) - limit} more"
+    if corrected <= 0:
+        raise RuntimeError(
+            f"Texture correction read none of the {len(failures)} texture(s) "
+            f"it was asked to correct for {label}: {summary}"
+        )
+    return (
+        f"Texture correction could not read {len(failures)} texture(s): {summary}"
+    )
+
+
 def _short_digest(value: str, length: int = 8) -> str:
     return hashlib.blake2b(value.lower().encode("utf-8"), digest_size=8).hexdigest()[:length]
 
@@ -597,6 +633,9 @@ def export_texture_correction_artifacts(
         "jobs": [],
         "missing": [],
         "failures": [],
+        # Textures the exporter could not read at all, as opposed to ones it
+        # read and found nothing to correct on.
+        "textureFailures": [],
     }
     if not selected:
         return report
@@ -787,6 +826,15 @@ def export_texture_correction_artifacts(
                 "\n".join(log_lines) + ("\n" if log_lines else ""),
                 encoding="utf-8",
             )
+            texture_failures = [
+                {
+                    "sourceZip": str(source_zip),
+                    "dae": dae_member,
+                    "texture": str(failure.get("texture") or ""),
+                    "reason": str(failure.get("reason") or ""),
+                }
+                for failure in getattr(preview, "texture_failures", ()) or ()
+            ]
             # A part with no correctable atlas is skipped by the exporter
             # rather than failing its whole DAE, so the meshes it stands for
             # are reported as failures on their own.
@@ -836,16 +884,29 @@ def export_texture_correction_artifacts(
                     "reportPath": str(preview.report_path) if preview.report_path is not None else None,
                     "daePaths": [str(path) for path in preview.dae_paths],
                     "textureCount": len(preview.textures),
+                    "textureFailures": texture_failures,
                     "forceMirroredMeshes": sorted(forced_part_keys),
                     "seconds": round(float(preview.seconds), 6),
                 }
             )
+            if texture_failures:
+                report["textureFailures"].extend(texture_failures)
+                notice = unreadable_texture_notice(
+                    texture_failures, len(preview.textures), Path(dae_member).name
+                )
+                if notice and progress is not None:
+                    progress(notice)
             if progress is not None:
                 skipped = len(getattr(preview, "failed_parts", ()) or ())
                 progress(
                     f"Texture correction finished {len(corrected_meshes)} mesh(es) "
                     f"in {float(preview.seconds):.1f}s"
                     + (f", skipped {skipped}" if skipped else "")
+                    + (
+                        f", {len(texture_failures)} texture(s) unreadable"
+                        if texture_failures
+                        else ""
+                    )
                 )
         except Exception as exc:
             if log_lines:
