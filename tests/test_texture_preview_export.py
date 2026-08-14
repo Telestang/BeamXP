@@ -2122,6 +2122,272 @@ class MultiPartPreviewTests(unittest.TestCase):
         self.assertIn("No part could be exported", str(caught.exception))
 
 
+class UnchangedStageIsNotEncodedTests(unittest.TestCase):
+    """A stage whose plan is empty must not be re-encoded to reproduce itself."""
+
+    def _build(self, detected_regions):
+        dash = part("dash")
+        member = "vehicles/lc500/textures/screen.png"
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="lc500_screen",
+            material_key="lc500_screen",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference=f"/{member}",
+            texture_member=member,
+            stage_key="baseColorMap",
+            kind="colour",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "screen.png"
+            Image.new("RGBA", (4, 4), (0, 0, 0, 255)).save(source)
+            mirror = np.zeros((4, 4), dtype=bool)
+            mirror[:, :2] = True
+            masks = rhd.DomainMasks(
+                mirror=mirror,
+                rigid=~mirror,
+                conflict_coverage=0.0,
+                mirrored_triangles=2,
+                rigid_triangles=2,
+                parts_analysed=1,
+            )
+
+            def detect(*_args, **_kwargs):
+                return rhd.RegionDetection(
+                    source="colour",
+                    detected=len(detected_regions),
+                    regions=list(detected_regions),
+                    rotations=[None] * len(detected_regions),
+                )
+
+            def plan(_mirror, regions, _config, _axis_map, _components=None):
+                # Whatever was detected, nothing survives into a flip step.
+                return [], np.zeros((4, 4), dtype=bool)
+
+            with (
+                patch.object(
+                    rhd, "scoped_parts_using_material", return_value=[(dash, binding)]
+                ),
+                patch.object(
+                    rhd, "material_symbols_for_binding",
+                    return_value=("lc500_screen-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(
+                    rhd, "detect_flip_regions_by_uv_island", side_effect=detect
+                ),
+                patch.object(rhd, "plan_island_flips", side_effect=plan),
+                patch.object(
+                    rhd, "normal_maps_for_layer_bindings", return_value=(),
+                ),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(write_debug_overlays=False),
+                    part_scope=[dash],
+                    masks=masks,
+                    log=lambda *_a: None,
+                )
+            written = sorted(
+                p.name for p in workspace.iterdir() if p.name.startswith("screen_rhd")
+            )
+        return result, written
+
+    def test_an_empty_plan_writes_no_image(self) -> None:
+        result, written = self._build([])
+
+        self.assertEqual(result.island_flips, [])
+        self.assertEqual(result.in_place_flips, [])
+        self.assertIsNone(result.png_path)
+        self.assertIsNone(result.dds_path)
+        # The plan is still recorded -- it is the evidence nothing was needed.
+        self.assertEqual(written, ["screen_rhd.plan.json"])
+        self.assertIsNone(result.report["outputs"]["png"])
+        self.assertIsNone(result.report["outputs"]["dds"])
+
+    def test_a_skipped_stage_reaches_no_manifest_entry(self) -> None:
+        result, _written = self._build([])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            rhd.write_blender_preview(output, [result], log=lambda *_a: None)
+            # No corrected file means no corrected material: the mesh keeps the
+            # texture it shipped with.
+            self.assertFalse((output / "rhd_materials.json").exists())
+
+    def test_a_planned_flip_still_encodes(self) -> None:
+        dash = part("dash")
+        member = "vehicles/lc500/textures/screen.png"
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="lc500_screen",
+            material_key="lc500_screen",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference=f"/{member}",
+            texture_member=member,
+            stage_key="baseColorMap",
+            kind="colour",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "screen.png"
+            Image.new("RGBA", (8, 8), (0, 0, 0, 255)).save(source)
+            mirror = np.ones((8, 8), dtype=bool)
+            masks = rhd.DomainMasks(
+                mirror=mirror,
+                rigid=np.zeros((8, 8), dtype=bool),
+                conflict_coverage=0.0,
+                mirrored_triangles=2,
+                rigid_triangles=0,
+                parts_analysed=1,
+            )
+
+            def detect(*_args, **_kwargs):
+                return rhd.RegionDetection(
+                    source="colour", detected=1,
+                    regions=[(0, 0, 4, 4)], rotations=[None],
+                )
+
+            with (
+                patch.object(
+                    rhd, "scoped_parts_using_material", return_value=[(dash, binding)]
+                ),
+                patch.object(
+                    rhd, "material_symbols_for_binding",
+                    return_value=("lc500_screen-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(
+                    rhd, "detect_flip_regions_by_uv_island", side_effect=detect
+                ),
+                patch.object(rhd, "normal_maps_for_layer_bindings", return_value=()),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(write_debug_overlays=False),
+                    part_scope=[dash],
+                    masks=masks,
+                    log=lambda *_a: None,
+                )
+            names = {p.name for p in workspace.iterdir()}
+
+        self.assertTrue(result.island_flips or result.in_place_flips)
+        self.assertIsNotNone(result.png_path)
+        self.assertIn("screen_rhd.png", names)
+
+
+class PreviewPngTests(unittest.TestCase):
+    """The inspection PNG is scratch; the non-power-of-two PNG is the asset."""
+
+    def _build(self, size, *, write_preview_png):
+        dash = part("dash")
+        member = "vehicles/lc500/textures/screen.png"
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="lc500_screen",
+            material_key="lc500_screen",
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference=f"/{member}",
+            texture_member=member,
+            stage_key="baseColorMap",
+            kind="colour",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "screen.png"
+            Image.new("RGBA", size, (0, 0, 0, 255)).save(source)
+            mirror = np.ones((size[1], size[0]), dtype=bool)
+            masks = rhd.DomainMasks(
+                mirror=mirror,
+                rigid=np.zeros((size[1], size[0]), dtype=bool),
+                conflict_coverage=0.0,
+                mirrored_triangles=2,
+                rigid_triangles=0,
+                parts_analysed=1,
+            )
+
+            def detect(*_args, **_kwargs):
+                return rhd.RegionDetection(
+                    source="colour", detected=1,
+                    regions=[(0, 0, 4, 4)], rotations=[None],
+                )
+
+            with (
+                patch.object(
+                    rhd, "scoped_parts_using_material", return_value=[(dash, binding)]
+                ),
+                patch.object(
+                    rhd, "material_symbols_for_binding",
+                    return_value=("lc500_screen-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(
+                    rhd, "detect_flip_regions_by_uv_island", side_effect=detect
+                ),
+                patch.object(rhd, "normal_maps_for_layer_bindings", return_value=()),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    member,
+                    workspace,
+                    config=rhd.RhdTextureConfig(
+                        write_debug_overlays=False,
+                        write_preview_png=write_preview_png,
+                    ),
+                    part_scope=[dash],
+                    masks=masks,
+                    log=lambda *_a: None,
+                )
+            names = {p.name for p in workspace.iterdir()}
+            sizes = {
+                p.name: p.stat().st_size
+                for p in workspace.iterdir()
+                if p.suffix == ".png"
+            }
+        return result, names, sizes
+
+    def test_a_shipped_dds_needs_no_inspection_png(self) -> None:
+        result, names, _sizes = self._build((64, 64), write_preview_png=False)
+
+        self.assertIsNotNone(result.dds_path)
+        self.assertIsNone(result.png_path)
+        self.assertIn("screen_rhd.dds", names)
+        self.assertNotIn("screen_rhd.png", names)
+
+    def test_the_inspection_png_is_kept_when_asked_for(self) -> None:
+        result, names, _sizes = self._build((64, 64), write_preview_png=True)
+
+        self.assertIsNotNone(result.dds_path)
+        self.assertIsNotNone(result.png_path)
+        self.assertIn("screen_rhd.png", names)
+
+    def test_a_non_power_of_two_ships_its_png_even_unasked(self) -> None:
+        # Block compression has no such size, so here the PNG is the asset.
+        result, names, _sizes = self._build((48, 64), write_preview_png=False)
+
+        self.assertIsNone(result.dds_path)
+        self.assertIsNotNone(result.png_path)
+        self.assertIn("screen_rhd.png", names)
+        self.assertNotIn("screen_rhd.dds", names)
+
+    def test_a_shipped_png_is_deflated_and_a_scratch_one_is_not(self) -> None:
+        # Same pixels either way, so any size difference is the compression.
+        _shipped, _n1, shipped_sizes = self._build((48, 64), write_preview_png=False)
+        self.assertEqual(rhd.SHIPPED_PNG_COMPRESS_LEVEL, 3)
+        with tempfile.TemporaryDirectory() as temporary:
+            reference = Path(temporary) / "raw.png"
+            Image.new("RGBA", (48, 64), (0, 0, 0, 255)).save(
+                reference, compress_level=0
+            )
+            raw_bytes = reference.stat().st_size
+        self.assertLess(shipped_sizes["screen_rhd.png"], raw_bytes)
+
+
 class PerMeshCorrectionJobTests(unittest.TestCase):
     """A correction is scoped to one mesh's use of one material."""
 

@@ -210,6 +210,7 @@ class VehicleWorkflowMixin:
         self._set_load_busy(False)
         self._sync_delta_to_ui()
         self._sync_plate_to_ui()
+        self._sync_texture_quality_to_ui()
         self._replace_viewer()
         self._refresh_all(reset_view=True)
         if not self.variant_detection_complete:
@@ -271,6 +272,32 @@ class VehicleWorkflowMixin:
         magnitude = delta.get("magnitude")
         self.manual_delta_var.set("" if magnitude in (None, "") else fmt_float(abs(float(magnitude))))
         self._manual_delta_toggled(refresh=False)
+
+    def _sync_texture_quality_to_ui(self) -> None:
+        self.conversion["textureQuality"] = core.texture_quality_setting(self.conversion)
+        self._refresh_texture_quality_choices()
+
+    def _refresh_texture_quality_choices(self) -> None:
+        if not hasattr(self, "texture_quality_combo"):
+            return
+        self.texture_quality_to_tier = {
+            core.TEXTURE_QUALITY_LABELS[tier]: tier
+            for tier in core.BC7_QUALITY_TIERS
+        }
+        labels = list(self.texture_quality_to_tier)
+        self.texture_quality_combo.configure(values=labels)
+        current = core.texture_quality_setting(self.conversion)
+        self.texture_quality_var.set(core.TEXTURE_QUALITY_LABELS[current])
+
+    def _texture_quality_changed(self) -> None:
+        tier = self.texture_quality_to_tier.get(
+            self.texture_quality_var.get(), core.DEFAULT_BC7_QUALITY
+        )
+        self.conversion["textureQuality"] = tier
+        self._refresh_texture_quality_choices()
+        self.status_var.set(
+            f"Texture quality: {core.TEXTURE_QUALITY_LABELS[tier]}"
+        )
 
     def _sync_plate_to_ui(self) -> None:
         self.conversion["plate"] = plate_generator.normalized_plate_binding(self.conversion.get("plate"))

@@ -618,6 +618,27 @@ class LayoutMixin:
             pady=(6, 0),
         )
 
+        # Texture correction re-encodes every corrected atlas to BC7, which is
+        # the bulk of a build's time on a vehicle with a big interior.  The
+        # tier trades encode speed against how hard the encoder searches; the
+        # format is BC7 either way, so the game loads all of them the same.
+        ttk.Label(controls, text="Texture quality").grid(
+            row=5, column=0, sticky="w", pady=(6, 0)
+        )
+        self.texture_quality_combo = ttk.Combobox(
+            controls,
+            textvariable=self.texture_quality_var,
+            state="readonly",
+        )
+        self.texture_quality_combo.grid(
+            row=5, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(6, 0)
+        )
+        self.texture_quality_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._texture_quality_changed(),
+        )
+        self._refresh_texture_quality_choices()
+
         buttons = ttk.Frame(parent)
         buttons.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         buttons.columnconfigure((0, 1), weight=1)

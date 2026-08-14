@@ -1914,3 +1914,46 @@ class PartScopedCorrectedMaterialTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextureQualityTierTests(unittest.TestCase):
+    """The build's encoder tier is a user setting; the family is the image's."""
+
+    def test_the_tier_picks_the_alpha_family_from_the_image(self) -> None:
+        from mesh_segmentation_transform.mirror_texture_for_rhd import (
+            resolve_bc7_profile,
+        )
+
+        for tier in ("basic", "fast", "veryfast"):
+            self.assertEqual(resolve_bc7_profile(tier, False), tier)
+            self.assertEqual(resolve_bc7_profile(tier, True), f"alpha_{tier}")
+
+    def test_a_saved_alpha_profile_still_names_its_tier(self) -> None:
+        from mesh_segmentation_transform.mirror_texture_for_rhd import (
+            resolve_bc7_profile,
+        )
+
+        # Projects saved before the tier split stored the full profile name.
+        self.assertEqual(resolve_bc7_profile("alpha_basic", False), "basic")
+        self.assertEqual(resolve_bc7_profile("alpha_basic", True), "alpha_basic")
+
+    def test_the_conversion_setting_is_clamped_to_offered_tiers(self) -> None:
+        self.assertEqual(core.texture_quality_setting({}), core.DEFAULT_BC7_QUALITY)
+        self.assertEqual(
+            core.texture_quality_setting({"textureQuality": "fast"}), "fast"
+        )
+        self.assertEqual(
+            core.texture_quality_setting({"textureQuality": "alpha_veryfast"}),
+            "veryfast",
+        )
+        # ultrafast and slow are not offered; anything unknown falls back.
+        for rejected in ("ultrafast", "slow", "", None, 7):
+            self.assertEqual(
+                core.texture_quality_setting({"textureQuality": rejected}),
+                core.DEFAULT_BC7_QUALITY,
+            )
+
+    def test_every_offered_tier_has_a_label(self) -> None:
+        self.assertEqual(
+            sorted(core.TEXTURE_QUALITY_LABELS), sorted(core.BC7_QUALITY_TIERS)
+        )

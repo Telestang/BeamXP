@@ -126,6 +126,22 @@ ProgressCallback = Callable[[dict[str, object]], None]
 # ---------------------------------------------------------------------------
 
 
+# The BC7 effort tiers offered to the user, fastest last.  ``ultrafast`` is
+# deliberately absent: on scintilla's 4K interior atlas it reached a max
+# per-channel error of 134 against 15 for ``basic``, which is a visible block
+# artefact rather than a quality setting.  ``slow`` is absent at the other end
+# because it costs 3.4x ``basic`` for a texture nobody inspects at that level.
+BC7_QUALITY_TIERS = ("basic", "fast", "veryfast")
+DEFAULT_BC7_QUALITY = "basic"
+
+# Deflate level for a PNG that ships, measured on scintilla's 4096-square
+# interior atlas: level 0 is 67.1 MB in 0.51s, level 1 14.6 MB in 0.57s,
+# level 3 8.8 MB in 0.73s, level 6 8.1 MB in 1.27s, level 9 8.3 MB in 4.48s.
+# Level 3 gives up 8% of level 6's size for 40% of its time, and level 9 is
+# both slower and larger.
+SHIPPED_PNG_COMPRESS_LEVEL = 3
+
+
 @dataclass(frozen=True, slots=True)
 class RhdTextureConfig:
     """Everything tuneable about the flip, in one place."""
@@ -274,10 +290,16 @@ class RhdTextureConfig:
     detection_tile_group_max_area_growth: float = 1.5
     detection_collage_gutter_px: int = 16
 
-    # Block-compression quality for the BC7 profile.  alpha_ultrafast ~5s,
-    # alpha_fast ~30s, alpha_basic ~60s for a 4096 square.  BC4 and BC5 have no
-    # quality setting.
-    bc7_profile: str = "alpha_basic"
+    # BC7 effort tier; the alpha-searching variant of it is chosen per image.
+    # Measured on scintilla's 4096-square interior atlas: basic 10.6s at
+    # 61.9 dB, fast 5.2s at 60.0 dB, veryfast 2.9s at 54.1 dB.  BC4 and BC5
+    # have no quality setting.  See BC7_QUALITY_TIERS.
+    bc7_profile: str = DEFAULT_BC7_QUALITY
+    # Write the uncompressed PNG beside each corrected DDS.  It is an
+    # inspection copy for Blender, which reads PNG without a decoder; a build
+    # that ships the DDS never loads it.  A texture whose size rules out block
+    # compression still writes its PNG, deflated, because there it is the asset.
+    write_preview_png: bool = True
     write_debug_overlays: bool = True
 
 
@@ -3634,6 +3656,23 @@ def _compress_level_blocks(
     return b"".join(executor.map(padded, bands))
 
 
+def resolve_bc7_profile(profile: str, has_alpha: bool) -> str:
+    """Name the ispc profile for one image, from a tier and its alpha.
+
+    The alpha profiles search BC7's alpha modes.  Spending that on an image
+    whose alpha is 255 everywhere buys nothing: on scintilla's opaque AO atlas
+    ``basic`` matched ``alpha_basic``'s worst-case error at 1.4x the speed, and
+    two thirds of that vehicle's interior textures are fully opaque.  The tier
+    is the caller's quality choice; the family is a property of the image.
+    """
+    tier = str(profile or DEFAULT_BC7_QUALITY).strip().lower()
+    if tier.startswith("alpha_"):
+        tier = tier[len("alpha_"):]
+    if not tier:
+        tier = DEFAULT_BC7_QUALITY
+    return f"alpha_{tier}" if has_alpha else tier
+
+
 def write_dds(
     path: Path,
     rgba: np.ndarray,
@@ -3647,13 +3686,19 @@ def write_dds(
     which of its two colour spaces is meant; the rest name themselves in the
     legacy FourCC, exactly as the shipped textures do.
 
+    ``profile`` is an effort tier; whether the alpha-searching variant of it is
+    used is decided here from the image itself.
+
     Large levels are encoded in parallel row bands; the output is byte-for-byte
     what the serial encoder produced.
     """
     import ispc_texcomp
 
     format = DDS_CODECS.get(codec) or DDS_CODECS["bc7"]
-    settings = ispc_texcomp.BC7EncSettings.from_profile(profile)
+    has_alpha = rgba.ndim == 3 and rgba.shape[2] >= 4 and bool((rgba[:, :, 3] < 255).any())
+    settings = ispc_texcomp.BC7EncSettings.from_profile(
+        resolve_bc7_profile(profile, has_alpha)
+    )
 
     # BC4 and BC5 step one and two bytes per texel, not four: their surface is
     # the channels they store, packed, and an RGBA one is read straight across
@@ -6034,64 +6079,102 @@ def build_rhd_texture(
     if part_group_index > 1:
         stem = f"{stem}_{part_group_index}"
     output_directory.mkdir(parents=True, exist_ok=True)
-    png_path = output_directory / f"{stem}_rhd.png"
+    png_path: Path | None = output_directory / f"{stem}_rhd.png"
     dds_path: Path | None = output_directory / f"{stem}_rhd.dds"
-
-    # Stored uncompressed: this is a scratch file for inspecting the result in
-    # Blender, not something that ships, and deflate costs more than the disk.
-    phase_started = time.perf_counter()
-    emit_progress(
-        progress,
-        "begin",
-        "write_base_texture",
-        f"Writing corrected base texture for {texture_name}",
-        texture=texture_member,
-    )
-    Image.fromarray(rgba).save(png_path, compress_level=0)
     preview_path: Path | None = None
-    if layer_kind == "normal":
-        preview_path = output_directory / f"{stem}_rhd.preview.png"
-        Image.fromarray(reconstruct_normal_z(rgba)).save(
-            preview_path, compress_level=0
-        )
-    log(f"  wrote {png_path.name}")
-    if beamng_compressed_texture_size_supported(width, height):
-        info = write_dds(
-            dds_path, rgba, source_dds_codec(texture_path), config.bc7_profile
-        )
-        log(f"  wrote {dds_path.name}  {str(info['codec']).upper()} "
-            f"{info['levels']} mips  {info['bytes']:,} bytes")
-    else:
+
+    # An empty plan leaves the image exactly as it was loaded -- applying it is
+    # a loop over the steps -- so re-encoding it would spend a BC7 pass to
+    # reproduce the input.  Emitting nothing instead leaves this stage on the
+    # shipped texture, which is what the pixels already say: material
+    # retargeting only rewrites a stage that has a corrected counterpart.  On
+    # scintilla 77 of 141 corrections plan no flips and cost 215s of a 629s
+    # pass between them.
+    if not steps:
+        log("  no flip planned; this stage keeps the original texture")
+        png_path = None
         dds_path = None
-        info = {
-            "codec": "png",
-            "levels": 1,
-            "bytes": png_path.stat().st_size,
-        }
-        log(
-            f"  kept {png_path.name} for BeamNG: compressed DDS does not "
-            f"support non-power-of-two size {width}x{height}"
+        info: dict[str, object] = {"codec": "none", "levels": 0, "bytes": 0}
+        record_phase(
+            phase_timings,
+            "write_base_texture",
+            time.perf_counter(),
+            texture=texture_member,
+            png=None,
+            dds=None,
+            codec="none",
+            mip_levels=0,
+            bytes=0,
+            skipped="no flip planned",
         )
-    timing = record_phase(
-        phase_timings,
-        "write_base_texture",
-        phase_started,
-        texture=texture_member,
-        png=str(png_path),
-        dds=str(dds_path) if dds_path is not None else None,
-        codec=str(info["codec"]),
-        mip_levels=info["levels"],
-        bytes=info["bytes"],
-    )
-    emit_progress(
-        progress,
-        "end",
-        "write_base_texture",
-        f"Wrote corrected base texture for {texture_name}",
-        texture=texture_member,
-        seconds=timing["seconds"],
-        codec=str(info["codec"]),
-    )
+    else:
+        phase_started = time.perf_counter()
+        emit_progress(
+            progress,
+            "begin",
+            "write_base_texture",
+            f"Writing corrected base texture for {texture_name}",
+            texture=texture_member,
+        )
+        # BeamNG loads PNG perfectly well, and for a non-power-of-two texture it
+        # is the only thing we can hand it: block compression has no such size.
+        # There the PNG is the shipped asset and is worth deflating.  Where a
+        # DDS can be written the PNG is only an inspection copy for Blender,
+        # which reads it without a decoder -- scratch, uncompressed because
+        # deflate costs more than the disk, and not worth writing at all unless
+        # somebody is going to look at it.  Scintilla wrote 3.39 GB of them for
+        # a build that shipped every corrected texture as DDS.
+        ships_as_dds = beamng_compressed_texture_size_supported(width, height)
+        if ships_as_dds:
+            info = write_dds(
+                dds_path, rgba, source_dds_codec(texture_path), config.bc7_profile
+            )
+            log(f"  wrote {dds_path.name}  {str(info['codec']).upper()} "
+                f"{info['levels']} mips  {info['bytes']:,} bytes")
+            if config.write_preview_png:
+                Image.fromarray(rgba).save(png_path, compress_level=0)
+                log(f"  wrote {png_path.name}")
+            else:
+                png_path = None
+        else:
+            dds_path = None
+            Image.fromarray(rgba).save(
+                png_path, compress_level=SHIPPED_PNG_COMPRESS_LEVEL
+            )
+            info = {
+                "codec": "png",
+                "levels": 1,
+                "bytes": png_path.stat().st_size,
+            }
+            log(
+                f"  kept {png_path.name} for BeamNG: compressed DDS does not "
+                f"support non-power-of-two size {width}x{height}"
+            )
+        if layer_kind == "normal" and config.write_preview_png:
+            preview_path = output_directory / f"{stem}_rhd.preview.png"
+            Image.fromarray(reconstruct_normal_z(rgba)).save(
+                preview_path, compress_level=0
+            )
+        timing = record_phase(
+            phase_timings,
+            "write_base_texture",
+            phase_started,
+            texture=texture_member,
+            png=str(png_path),
+            dds=str(dds_path) if dds_path is not None else None,
+            codec=str(info["codec"]),
+            mip_levels=info["levels"],
+            bytes=info["bytes"],
+        )
+        emit_progress(
+            progress,
+            "end",
+            "write_base_texture",
+            f"Wrote corrected base texture for {texture_name}",
+            texture=texture_member,
+            seconds=timing["seconds"],
+            codec=str(info["codec"]),
+        )
 
     companion_results: list[CompanionResult] = []
     rebuild_companion_maps = (
@@ -6282,7 +6365,7 @@ def build_rhd_texture(
         "relief_regions_added": relief_added,
         "duplicate_regions_removed": duplicate_regions_removed,
         "outputs": {
-            "png": str(png_path),
+            "png": str(png_path) if png_path is not None else None,
             "dds": str(dds_path) if dds_path is not None else None,
             "preview": str(preview_path) if preview_path is not None else None,
         },
@@ -6609,7 +6692,11 @@ def write_blender_preview(
     grouped: dict[tuple[str, str, tuple[str, ...]], dict[str, object]] = {}
     materials: list[dict[str, object]] = []
     for result in results:
-        if not result.material_aliases or result.png_path is None:
+        # A build that ships DDS writes no inspection PNG, so the manifest
+        # names whichever corrected file exists.  Blender prefers the PNG when
+        # it is there; BeamNG is wired from outputMaps, which is DDS-first.
+        corrected_path = result.png_path or result.dds_path
+        if not result.material_aliases or corrected_path is None:
             continue
         # Several corrections of one texture reach here sharing a materials-JSON
         # key: the LC500's turn-signal and high-beam tell-tales are three DAE
@@ -6682,7 +6769,7 @@ def write_blender_preview(
                     if isinstance(result.report.get("outputs"), dict)
                     else None
                 )
-                output_path = Path(str(path)).name if path else result.png_path.name
+                output_path = Path(str(path)).name if path else corrected_path.name
                 maps = entry["maps"]
                 assert isinstance(maps, dict)
                 maps.setdefault(stage_key, output_path)
@@ -6691,7 +6778,7 @@ def write_blender_preview(
                 output_map = {
                     "stageKey": stage_key,
                     "member": result.texture_member,
-                    "png": result.png_path.name,
+                    "png": result.png_path.name if result.png_path is not None else None,
                     "dds": result.dds_path.name if result.dds_path is not None else None,
                 }
                 if output_map not in output_maps:
@@ -6699,12 +6786,12 @@ def write_blender_preview(
             continue
 
         # Compatibility for callers/tests constructing pre-layer result data.
-        maps: dict[str, str] = {"baseColorMap": result.png_path.name}
+        maps: dict[str, str] = {"baseColorMap": corrected_path.name}
         output_maps: list[dict[str, object]] = [
             {
                 "stageKey": "baseColorMap",
                 "member": result.texture_member,
-                "png": result.png_path.name,
+                "png": result.png_path.name if result.png_path is not None else None,
                 "dds": result.dds_path.name if result.dds_path is not None else None,
             }
         ]

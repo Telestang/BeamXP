@@ -128,6 +128,8 @@ class HandDriveToolApp(
             value=bool(self.settings.get("includeAutomationVehicles"))
         )
         self.blender_var = tk.StringVar(value=str(self.settings.get("blenderExecutable") or ""))
+        self.texture_quality_var = tk.StringVar(value="")
+        self.texture_quality_to_tier: dict[str, str] = {}
         self.preview_output_var = tk.StringVar(value="")
         self.derived_output_var = tk.StringVar(value="")
         self.preview_output_to_config: dict[str, str] = {}

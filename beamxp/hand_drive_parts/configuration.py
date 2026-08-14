@@ -425,6 +425,30 @@ def set_variant_build_mode(settings: dict[str, object], mode: str) -> None:
     settings["selected"] = normalized != BUILD_OFF
 
 
+# Kept here rather than imported from the texture tooling: that package pulls
+# in the heavy imaging stack, and the config layer must load without it.
+BC7_QUALITY_TIERS = ("basic", "fast", "veryfast")
+DEFAULT_BC7_QUALITY = "basic"
+
+TEXTURE_QUALITY_LABELS = {
+    "basic": "Basic - best quality (slowest)",
+    "fast": "Fast - a little softer, about half the encode time",
+    "veryfast": "Very fast - softer again, for quick test builds",
+}
+
+
+def normalized_texture_quality(value: object) -> str:
+    """Coerce a saved or imported quality tier to one this build offers."""
+    tier = str(value or "").strip().lower()
+    if tier.startswith("alpha_"):
+        tier = tier[len("alpha_"):]
+    return tier if tier in BC7_QUALITY_TIERS else DEFAULT_BC7_QUALITY
+
+
+def texture_quality_setting(conversion: dict[str, object]) -> str:
+    return normalized_texture_quality(conversion.get("textureQuality"))
+
+
 def base_conversion_config(context: VehicleContext) -> dict[str, object]:
     return {
         "toolVersion": TOOL_VERSION,
@@ -441,6 +465,7 @@ def base_conversion_config(context: VehicleContext) -> dict[str, object]:
         "sidePairs": [],
         "triggers": [],
         "plate": plate_generator.default_plate_binding(),
+        "textureQuality": DEFAULT_BC7_QUALITY,
         "delta": {
             "manual": False,
             "magnitude": None,
@@ -542,6 +567,8 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
     merged["slotPairs"] = normalized_slot_pairs(data.get("slotPairs"))
     merged["sidePairs"] = normalized_side_pairs(data.get("sidePairs"))
     merged["triggers"] = normalized_trigger_modes(data.get("triggers"))
+
+    merged["textureQuality"] = normalized_texture_quality(data.get("textureQuality"))
 
     old_delta = data.get("delta", {})
     if isinstance(old_delta, dict):
@@ -750,4 +777,4 @@ def set_slot_pair(conversion: dict[str, object], slot_type: str, partner: str) -
     conversion["slotPairs"] = normalized_slot_pairs(pairs)
 
 
-__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'TRIGGER_OFFSET_MODES', 'trigger_position_key', 'trigger_offset_value', 'normalized_trigger_modes', 'trigger_mode_map', 'trigger_offset_map', 'set_trigger_mode', 'set_trigger_offset', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
+__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'TRIGGER_OFFSET_MODES', 'trigger_position_key', 'trigger_offset_value', 'normalized_trigger_modes', 'trigger_mode_map', 'trigger_offset_map', 'set_trigger_mode', 'set_trigger_offset', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'BC7_QUALITY_TIERS', 'DEFAULT_BC7_QUALITY', 'TEXTURE_QUALITY_LABELS', 'normalized_texture_quality', 'texture_quality_setting', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']

@@ -550,6 +550,7 @@ def export_texture_correction_artifacts(
     shared_atlas_dependency_targets: dict[str, set[str]] | None = None,
     force_mirrored_dependency_ids: set[str] | None = None,
     texture_member_scope_by_source: dict[tuple[Path, str], set[str]] | None = None,
+    bc7_quality: str | None = None,
 ) -> dict[str, object]:
     """Run the standalone atlas-correction exporter for marked meshes.
 
@@ -596,6 +597,12 @@ def export_texture_correction_artifacts(
         DEFAULT_RHD_CONFIG,
         detect_on_normal_map=True,
         write_debug_overlays=False,
+        # The encoder tier is the user's speed/quality choice for this build.
+        bc7_profile=bc7_quality or DEFAULT_RHD_CONFIG.bc7_profile,
+        # Nothing in a build reads the inspection PNG: materials are wired from
+        # the DDS, and only a Blender preview ever opens the other copy.
+        # Scintilla wrote 3.39 GB of them, against 0.74 GB of shipped DDS.
+        write_preview_png=False,
     )
 
     by_source: dict[tuple[Path, str], list[str]] = {}
@@ -845,6 +852,7 @@ def export_texture_correction_artifacts(
             progress=progress,
             force_mirrored_dependency_ids=deferred_forced_meshes,
             texture_member_scope_by_source=deferred_forced_scope,
+            bc7_quality=bc7_quality,
         )
         for key in ("jobs", "missing", "failures"):
             values = forced_report.get(key, [])
@@ -3667,6 +3675,7 @@ def build_batch(
             progress=emit_progress,
             shared_atlas_dependency_targets=shared_atlas_dependency_targets,
             force_mirrored_dependency_ids=force_mirrored_dependency_ids,
+            bc7_quality=texture_quality_setting(conversion),
         )
         auto_included = texture_correction_report.get("autoIncludedTargets", {})
         if isinstance(auto_included, dict):
