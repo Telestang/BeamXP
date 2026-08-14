@@ -1263,6 +1263,40 @@ def _register_texture_output(
         mapping.setdefault(key, virtual_path)
 
 
+def _corrected_texture_file_name(
+    target_dir: Path,
+    material_name: str,
+    source_name: str,
+) -> str:
+    """Name a corrected texture without spending the whole path budget on it.
+
+    Both halves are named for the same atlas, so the obvious join says it
+    twice. Andronisk's V60 minted a 106-character
+    ``v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_int_v60_andronisk
+    _int_stitch_amber_BC.color_rhd.dds`` which, staged under a project folder
+    already 153 characters deep, came to exactly the 260 Windows refuses.
+
+    The name is only trimmed when it will not fit, so a vehicle whose paths
+    already fit keeps the names it has always written. When it is trimmed, both
+    halves keep their distinguishing end and a digest of the full name keeps
+    two corrections of one atlas apart.
+    """
+    name = f"{safe_id(material_name)}_{source_name}"
+    room = 255 - len(str(target_dir)) - 1
+    if len(name) <= room:
+        return name
+
+    suffix = PurePosixPath(source_name).suffix
+    stem = source_name[: len(source_name) - len(suffix)]
+    digest = _short_digest(name)
+    budget = max(room - len(suffix) - len(digest) - 2, 8)
+    material_room = budget // 2
+    return (
+        f"{safe_id(material_name)[:material_room]}"
+        f"_{stem[-(budget - material_room):]}_{digest}{suffix}"
+    )
+
+
 def _entry_corrected_texture_outputs(
     job_dir: Path,
     target_dir: Path,
@@ -1286,7 +1320,9 @@ def _entry_corrected_texture_outputs(
             source = _material_source_for_beamng(job_dir, relative)
             if not source.is_file():
                 continue
-            destination = target_dir / f"{safe_id(material_name)}_{source.name}"
+            destination = target_dir / _corrected_texture_file_name(
+                target_dir, material_name, source.name
+            )
             shutil.copy2(source, destination)
             virtual_path = _vehicle_virtual_path(output_root, destination)
             _register_texture_output(by_source, member, virtual_path)
@@ -1301,7 +1337,9 @@ def _entry_corrected_texture_outputs(
             source = _material_source_for_beamng(job_dir, relative)
             if not source.is_file():
                 continue
-            destination = target_dir / f"{safe_id(material_name)}_{source.name}"
+            destination = target_dir / _corrected_texture_file_name(
+                target_dir, material_name, source.name
+            )
             shutil.copy2(source, destination)
             virtual_path = _vehicle_virtual_path(output_root, destination)
             by_stage.setdefault(stage_key, virtual_path)

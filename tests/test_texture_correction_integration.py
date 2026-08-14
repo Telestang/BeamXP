@@ -403,6 +403,43 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             build_pipeline.unreadable_texture_notice([], corrected=0, label="v.dae")
         )
 
+    def test_a_corrected_texture_name_is_trimmed_only_when_it_will_not_fit(self) -> None:
+        material = "v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_int"
+        source = "v60_andronisk_int_stitch_amber_BC.color_rhd.dds"
+
+        # A short project keeps the name it has always written.
+        short = Path(r"C:\p\unpacked_output\vehicles\v")
+        self.assertEqual(
+            build_pipeline._corrected_texture_file_name(short, material, source),
+            f"{material}_{source}",
+        )
+
+        # The V60's, staged 153 characters deep, came to exactly 260.
+        deep = Path(
+            r"C:\Users\x\AppData\Local\BeamXP\handedness_conversion_projects"
+            r"\volvo_v60_andronisk_v5.1_01-08-26_v60_andronisk"
+            r"\unpacked_output\vehicles\v60_andronisk"
+        )
+        name = build_pipeline._corrected_texture_file_name(deep, material, source)
+        self.assertLess(len(str(deep / name)), 260)
+        self.assertTrue(name.endswith(".dds"))
+
+    def test_two_corrections_of_one_atlas_keep_distinct_trimmed_names(self) -> None:
+        deep = Path(
+            r"C:\Users\x\AppData\Local\BeamXP\handedness_conversion_projects"
+            r"\volvo_v60_andronisk_v5.1_01-08-26_v60_andronisk"
+            r"\unpacked_output\vehicles\v60_andronisk"
+        )
+        source = "v60_andronisk_int_stitch_amber_BC.color_rhd.dds"
+        first = build_pipeline._corrected_texture_file_name(
+            deep, "v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_int", source
+        )
+        second = build_pipeline._corrected_texture_file_name(
+            deep, "v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_ext", source
+        )
+
+        self.assertNotEqual(first, second)
+
     def test_extraction_workspace_leaves_a_deep_mod_room_under_max_path(self) -> None:
         # Andronisk's V60 nests its textures 113 characters deep. Under the
         # project directory that came to 295 and Windows refused every one of
