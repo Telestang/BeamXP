@@ -1816,6 +1816,66 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertTrue(dropped_skin_texture)
 
 
+class SwapMeshCorrectionOptInTests(unittest.TestCase):
+    """Texture Fix governs whether a Swap Mesh row is corrected at all.
+
+    Swap Mesh hands the object the opposite side's authored mesh, whose texture
+    is already the one that side wants, so a ticked neighbour sharing its atlas
+    must not drag it into a correction. The LC500 is the case: two interiors are
+    ticked, both doors are Swap Mesh and unticked, and all four used to come out
+    corrected -- the doors force-mirrored, in a second pass of their own.
+    """
+
+    LC500_MODES = {
+        "lc500_interior": "mirror",
+        "lc500_interior_facelift": "mirror",
+        "lc500_door_L": "mirrorStructural",
+        "lc500_door_R": "mirrorStructural",
+    }
+    LC500_SOURCES = {"lc500_door_L": "lc500_door_R", "lc500_door_R": "lc500_door_L"}
+
+    def test_an_unticked_swap_mesh_is_not_dragged_in_by_a_ticked_neighbour(self) -> None:
+        targets, forced = core.texture_correction_atlas_dependencies(
+            self.LC500_MODES,
+            self.LC500_SOURCES,
+            {"lc500_interior", "lc500_interior_facelift"},
+        )
+        self.assertNotIn("lc500_door_L", targets)
+        self.assertNotIn("lc500_door_R", targets)
+        # Nothing forced means no deferred structural_mirror pass either.
+        self.assertEqual(forced, set())
+
+    def test_a_ticked_swap_mesh_still_force_mirrors_its_source(self) -> None:
+        targets, forced = core.texture_correction_atlas_dependencies(
+            self.LC500_MODES,
+            self.LC500_SOURCES,
+            {"lc500_interior", "lc500_door_L"},
+        )
+        # The correction is made on the donor the swap reskins from.
+        self.assertEqual(targets["lc500_door_R"], {"lc500_door_L"})
+        self.assertEqual(forced, {"lc500_door_R"})
+
+    def test_mirror_still_follows_a_shared_atlas_without_being_ticked(self) -> None:
+        # Mirror has no authored counterpart to fall back on, so it has to
+        # follow the atlas whether or not its own column was ticked.
+        targets, forced = core.texture_correction_atlas_dependencies(
+            {"dashboard": "mirror", "intmirror": "mirror"},
+            {},
+            {"dashboard"},
+        )
+        self.assertEqual(targets["intmirror"], {"intmirror"})
+        self.assertEqual(forced, set())
+
+    def test_a_mode_that_moves_nothing_is_never_a_dependency(self) -> None:
+        targets, forced = core.texture_correction_atlas_dependencies(
+            {"sill": "translate", "badge": "replaceSource", "boot": "skip"},
+            {},
+            {"sill", "badge", "boot"},
+        )
+        self.assertEqual(targets, {})
+        self.assertEqual(forced, set())
+
+
 class PartScopedCorrectedMaterialTests(unittest.TestCase):
     """One atlas corrected twice must bind a different material per mesh."""
 

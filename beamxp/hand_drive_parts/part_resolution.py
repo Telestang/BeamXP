@@ -1883,6 +1883,43 @@ def active_texture_correction_mesh_ids(
     }
 
 
+def texture_correction_atlas_dependencies(
+    object_modes: dict[str, str],
+    structural_sources: dict[str, str],
+    texture_correction_ids: set[str],
+) -> tuple[dict[str, set[str]], set[str]]:
+    """Meshes a correction must consider beyond the ones it was asked for.
+
+    A mesh sharing atlas texels with a corrected one has a stake in the answer,
+    which is why Mirror is followed here whether or not its own column was
+    ticked: it has no authored counterpart to fall back on, so the atlas is the
+    only thing it can follow.
+
+    Swap Mesh is not followed that way. It hands the object the opposite side's
+    authored mesh, which already carries the texture that side wants, so
+    correcting one is an opt-in rather than something a ticked neighbour can
+    impose. An unticked Swap Mesh row is therefore not a dependency at all: not
+    force-mirrored, and never reaching the deferred structural pass. Leaving it
+    out renders nothing wrongly, because a correction mints its own material and
+    retargets only the meshes it corrected -- a mesh no correction names keeps
+    the texture it shipped with.
+
+    Returns (targets by source mesh, source meshes whose whole domain mirrors).
+    """
+    dependency_targets: dict[str, set[str]] = {}
+    forced_source_ids: set[str] = set()
+    for target_mesh, mode in object_modes.items():
+        if mode not in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
+            continue
+        if mode == MODE_MIRROR_STRUCTURAL and target_mesh not in texture_correction_ids:
+            continue
+        source_mesh = structural_sources.get(target_mesh, target_mesh)
+        dependency_targets.setdefault(source_mesh, set()).add(target_mesh)
+        if mode == MODE_MIRROR_STRUCTURAL:
+            forced_source_ids.add(source_mesh)
+    return dependency_targets, forced_source_ids
+
+
 def texture_flip_mesh_ids(
     context: VehicleContext,
     object_modes: dict[str, str],
@@ -1984,4 +2021,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'mesh_owner_parts', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'mesh_owner_parts', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_correction_atlas_dependencies', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']

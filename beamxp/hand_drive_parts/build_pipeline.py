@@ -3859,15 +3859,12 @@ def build_batch(
             texture_correction_targets.setdefault(source_mesh, set()).add(mesh)
         texture_correction_source_ids = set(texture_correction_targets)
         if texture_correction_source_ids:
-            for target_mesh, mode in object_modes.items():
-                if mode not in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL}:
-                    continue
-                source_mesh = structural_sources.get(target_mesh, target_mesh)
-                shared_atlas_dependency_targets.setdefault(source_mesh, set()).add(
-                    target_mesh
-                )
-                if mode == MODE_MIRROR_STRUCTURAL:
-                    force_mirrored_dependency_ids.add(source_mesh)
+            (
+                shared_atlas_dependency_targets,
+                force_mirrored_dependency_ids,
+            ) = texture_correction_atlas_dependencies(
+                object_modes, structural_sources, texture_correction_ids
+            )
         node_mirror_map = build_node_mirror_map(context.node_positions)
         translated_prop_meshes = {
             mesh for mesh, mode in object_modes.items() if mode == MODE_TRANSLATE and mesh in prop_meshes
