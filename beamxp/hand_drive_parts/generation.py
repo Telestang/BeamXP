@@ -27,6 +27,7 @@ from beamxp.core.beam_json import (
     strip_json_comments,
     zip_json_by_name as _zip_json_by_name,
 )
+from beamxp.core.sjson import encode_beamng_json
 from beamxp.core.constants import (
     ACTION_OPPOSITE,
     ACTION_SKIP,
@@ -499,7 +500,7 @@ def write_converted_config(
     output_vehicle_dir.mkdir(parents=True, exist_ok=True)
     write_text_file(
         output_vehicle_dir / f"{output_config}.pc",
-        json.dumps(pc, indent=2),
+        encode_beamng_json(pc, indent=2),
         encoding="utf-8",
     )
 
@@ -520,7 +521,7 @@ def write_converted_config(
     clear_default_config_flags(info)
     write_text_file(
         output_vehicle_dir / f"info_{output_config}.json",
-        json.dumps(info, indent=2),
+        encode_beamng_json(info, indent=2),
         encoding="utf-8",
     )
     write_mirrored_preview(context, output_vehicle_dir, config_name, output_config)
@@ -1886,7 +1887,7 @@ def write_original_plate_configs(
         variant = context.variants[config_name]
         pc = load_context_pc(context, variant.pc_path)
         output_config = original_plate_output_name(config_name)
-        write_text_file(output_vehicle_dir / f"{output_config}.pc", json.dumps(pc, indent=2), encoding="utf-8")
+        write_text_file(output_vehicle_dir / f"{output_config}.pc", encode_beamng_json(pc, indent=2), encoding="utf-8")
 
         info: dict[str, object] = {}
         if variant.info_path:
@@ -1902,7 +1903,7 @@ def write_original_plate_configs(
         info["Description"] = f"{description} - BeamXP plate configuration" if description else "BeamXP plate configuration"
         info["Config Type"] = "Custom"
         info["Source"] = conversion_source_name(context)
-        write_text_file(output_vehicle_dir / f"info_{output_config}.json", json.dumps(info, indent=2), encoding="utf-8")
+        write_text_file(output_vehicle_dir / f"info_{output_config}.json", encode_beamng_json(info, indent=2), encoding="utf-8")
         write_stock_preview(context, output_vehicle_dir, config_name, output_config)
         generated.append(output_config)
     return generated

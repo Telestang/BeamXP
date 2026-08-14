@@ -27,6 +27,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from beamxp import transform_helpers
+from beamxp.core.sjson import encode_beamng_json
 
 PLATE_SIZE_EU = "EU"
 PLATE_SIZE_US = "US"
@@ -1844,7 +1845,7 @@ def _emit_design(
         _save_png(atlas.image_d, font_dir / "platefont_d.png")
         _save_png(atlas.image_n, font_dir / "platefont_n.png")
         _save_png(atlas.image_s, font_dir / "platefont_s.png")
-        core.write_text_file(font_dir / "platefont.json", json.dumps(atlas.layout, indent=2, ensure_ascii=False), encoding="utf-8")
+        core.write_text_file(font_dir / "platefont.json", encode_beamng_json(atlas.layout, indent=2), encoding="utf-8")
     else:
         atlas = build_font_atlas(font_path, glyphs, spacing, emboss_strength)
 
@@ -1906,7 +1907,7 @@ def _emit_design(
         "version": 2,
         "data": {"format": formats},
     }
-    core.write_text_file(design_dir / "licensePlate.json", json.dumps(design_json, indent=2, ensure_ascii=False), encoding="utf-8")
+    core.write_text_file(design_dir / "licensePlate.json", encode_beamng_json(design_json, indent=2), encoding="utf-8")
 
     if not set_id:
         # Only ever emitted into the vehicle's own folder, so the content hash
@@ -1927,7 +1928,7 @@ def _design_part_body(out: _DesignOutput, size_label: str, *, custom: bool = Fal
         # Distinct from the same set in the universal plates mod, which is
         # offered on the same slot whenever both mods are installed.
         name = f"{name} (bundled)"
-    return json.dumps({
+    return encode_beamng_json({
         "information": {
             "authors": "BeamXP",
             "name": name,
@@ -2852,7 +2853,7 @@ def _plate_part_prefix(part_id: str) -> str:
 
 
 def _force_slot_type(part_body: str, slot_type: str) -> str:
-    encoded = json.dumps(slot_type)
+    encoded = encode_beamng_json(slot_type)
     return re.sub(
         r'("slotType"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|\[[^\]]*\])',
         lambda match: match.group(1) + encoded,
@@ -2862,7 +2863,7 @@ def _force_slot_type(part_body: str, slot_type: str) -> str:
 
 
 def _force_licenseplate_format(part_body: str, fmt: str) -> str:
-    encoded = json.dumps(fmt)
+    encoded = encode_beamng_json(fmt)
     if re.search(r'"licenseplateFormat"\s*:', part_body):
         return re.sub(
             r'("licenseplateFormat"\s*:\s*)"(?:[^"\\]|\\.)*"',
@@ -3439,7 +3440,7 @@ def _rear_material_entry(mesh: str, fmt: str, source_material: dict[str, object]
     base = source_material if isinstance(source_material, dict) else None
     # A source that never reads a plate tag is showing a baked texture; adopting
     # it would leave the rear clone unable to display the registration at all.
-    if base is not None and "@licenseplate-" not in json.dumps(base):
+    if base is not None and "@licenseplate-" not in encode_beamng_json(base):
         base = None
     entry = copy.deepcopy(base if base is not None else _STOCK_PLATE_MATERIAL)
     entry = _retarget_plate_tags(entry, fmt)
@@ -3522,7 +3523,7 @@ def _write_rear_design_compat(output_root: Path) -> None:
 
     core.write_text_file(
         output_root / _REAR_FALLBACK_PATH,
-        json.dumps(_rear_fallback_design(), indent=2),
+        encode_beamng_json(_rear_fallback_design(), indent=2),
         encoding="utf-8",
     )
 
@@ -3691,7 +3692,7 @@ def apply_to_build(
         pc["parts"] = parts
         if cfg is not None:
             pc["licenseName"] = generate_registration(active_pattern(cfg), rng)
-        core.write_text_file(pc_path, json.dumps(pc, indent=2), encoding="utf-8")
+        core.write_text_file(pc_path, encode_beamng_json(pc, indent=2), encoding="utf-8")
         summary["configsUpdated"] += 1
 
     if rear_meshes_used:
@@ -3733,7 +3734,7 @@ def apply_to_build(
         })
         core.write_text_file(
             shared_dir / "bhdc_plate_rear.materials.json",
-            json.dumps(dict(sorted(shared_materials.items())), indent=2),
+            encode_beamng_json(dict(sorted(shared_materials.items())), indent=2),
             encoding="utf-8",
         )
 
@@ -3746,7 +3747,7 @@ def apply_to_build(
         if own_materials:
             core.write_text_file(
                 output_vehicle_dir / "bhdc_plate_rear.materials.json",
-                json.dumps(own_materials, indent=2),
+                encode_beamng_json(own_materials, indent=2),
                 encoding="utf-8",
             )
         _write_rear_design_compat(output_root)
@@ -3806,7 +3807,7 @@ def export_plate_sets(records: list[dict[str, object]], target_zip: Path) -> dic
     mod_info.mkdir(parents=True, exist_ok=True)
     core.write_text_file(
         mod_info / "info.json",
-        json.dumps({
+        encode_beamng_json({
             "name": "BeamXP Plate Sets",
             "version": "1.0.0",
             "authors": "BeamXP",

@@ -31,11 +31,15 @@ The rest of the grammar:
 * ``null`` is Lua ``nil``, so the key is simply absent from the object
 
 Two deliberate deviations from ljson, both documented at their implementation:
-``\\uXXXX`` is decoded (we read back our own ``json.dumps`` output, which
-escapes non-ASCII), and nested ``/*`` is not treated as an error.
+``\\uXXXX`` is decoded (content authored by strict-JSON tooling escapes
+non-ASCII that way), and nested ``/*`` is not treated as an error. Note that
+this leniency is one-way: see :func:`encode_beamng_json` for why nothing we
+write may use that escape.
 """
 
 from __future__ import annotations
+
+import json
 
 # Escapes exactly as ljson's `escapes` table keys them. Note the oddities: a
 # backslash before a literal newline yields a newline, \9 is a tab and \0 is a
@@ -130,9 +134,9 @@ class _Reader:
                 continue
             nxt = s[i + 1] if i + 1 < n else ""
             # Deviation from ljson: it has no \u, so BeamNG reads "é"
-            # literally. We decode it, because this same reader loads the
-            # json.dumps output we write ourselves (ensure_ascii escapes
-            # non-ASCII), and decoding is a superset of what the engine accepts.
+            # literally. We decode it, because content authored by strict-JSON
+            # tooling escapes non-ASCII that way, and decoding is a superset of
+            # what the engine accepts. Reading it is safe; writing it is not.
             if nxt == "u" and len(s) >= i + 6 and all(c in _HEX for c in s[i + 2 : i + 6]):
                 out.append(chr(int(s[i + 2 : i + 6], 16)))
                 i += 6
@@ -289,4 +293,21 @@ def decode(text: str) -> object:
     return out
 
 
-__all__ = ["SJSONError", "decode"]
+def encode_beamng_json(data: object, *, indent: int | None = None) -> str:
+    """Serialise a document the way the reader above will read it back.
+
+    The escape table has no ``\\uXXXX`` (see ``_ESCAPES``), so an escaped
+    non-ASCII character does not survive the round trip through the engine.
+    Python's default ``ensure_ascii=True`` writes ``"Velocit\\u00e0"``, the
+    decoder drops the backslash it does not recognise, and the vehicle selector
+    shows *Velocitu00e0*. The game's own content carries the character as raw
+    UTF-8 and so must anything we write for the game.
+
+    Use this for every file the engine parses -- ``.pc``, ``info_*.json``,
+    ``*.materials.json``, jbeam -- and for any string encoded to be spliced
+    into, or matched against, text the engine will read.
+    """
+    return json.dumps(data, indent=indent, ensure_ascii=False)
+
+
+__all__ = ["SJSONError", "decode", "encode_beamng_json"]

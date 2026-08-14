@@ -38,6 +38,7 @@ from beamxp.core.beam_json import (
     strip_json_comments,
     zip_json_by_name as _zip_json_by_name,
 )
+from beamxp.core.sjson import encode_beamng_json
 from beamxp.core.constants import (
     ACTION_OPPOSITE,
     ACTION_SKIP,

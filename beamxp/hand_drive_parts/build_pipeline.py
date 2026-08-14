@@ -79,6 +79,7 @@ from beamxp.core.files import (
     zip_member_path,
 )
 from beamxp.core.beam_json import parse_beamng_json
+from beamxp.core.sjson import encode_beamng_json
 from beamxp.core.models import (
     BakedMeshSpec,
     BuildResult,
@@ -296,7 +297,7 @@ def write_mod_info(
             {"filename": thumbnail, "thumb_filename": thumbnail, "title": title}
         ]
 
-    write_text_file(mod_info / "info.json", json.dumps(info, indent=2), encoding="utf-8")
+    write_text_file(mod_info / "info.json", encode_beamng_json(info, indent=2), encoding="utf-8")
 
 
 def selected_variant_targets(
@@ -1500,7 +1501,7 @@ def prune_unused_texture_correction_assets(
             continue
 
         def texture_paths(entry: object) -> set[str]:
-            return set(re.findall(r'"([^"]*\.(?:dds|png|jpg|jpeg))"', json.dumps(entry)))
+            return set(re.findall(r'"([^"]*\.(?:dds|png|jpg|jpeg))"', encode_beamng_json(entry)))
 
         still_used = set().union(*(texture_paths(b) for b in keep.values())) if keep else set()
         for name, body in drop.items():
@@ -1514,7 +1515,7 @@ def prune_unused_texture_correction_assets(
                 removed_files.append(reference)
                 candidate.unlink()
         if keep:
-            write_text_file(material_file, json.dumps(keep, indent=2), encoding="utf-8")
+            write_text_file(material_file, encode_beamng_json(keep, indent=2), encoding="utf-8")
         else:
             material_file.unlink()
     return {
@@ -1789,7 +1790,7 @@ def _prepare_texture_correction_materials(
 
     materials = TextureCorrectionMaterials(shared, by_part, switch_forks)
     if materials or switch_forks:
-        material_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        material_file.write_text(encode_beamng_json(existing, indent=2) + "\n", encoding="utf-8")
     return materials
 
 
@@ -2373,7 +2374,7 @@ def _append_texture_correction_glowmap_entries(
                 corrected_base,
                 combined_alias_to_material,
             )
-            additions.append(f'{json.dumps(corrected_base)}:{corrected_value},')
+            additions.append(f'{encode_beamng_json(corrected_base)}:{corrected_value},')
             existing_keys.add(corrected_alias)
 
     # One entry per mesh that had this base corrected. The engine resolves a
@@ -2393,7 +2394,7 @@ def _append_texture_correction_glowmap_entries(
                 fork.name,
                 fork.states,
             )
-            additions.append(f'{json.dumps(fork.name)}:{fork_value},')
+            additions.append(f'{encode_beamng_json(fork.name)}:{fork_value},')
             existing_keys.add(fork_alias)
             break
 
@@ -2533,7 +2534,7 @@ def _upsert_glowmap_entries(
         if replacement is None:
             continue
         out.append(glow_text[cursor:key_start])
-        out.append(f"{json.dumps(key)}:{replacement}")
+        out.append(f"{encode_beamng_json(key)}:{replacement}")
         cursor = end
         consumed.add(key)
     if out:
@@ -2549,7 +2550,7 @@ def _upsert_glowmap_entries(
     prefix = glow_text[:close].rstrip()
     separator = "" if prefix.endswith(("{", ",")) else ","
     additions = "".join(
-        f"\n      {json.dumps(key)}:{value}," for key, value in missing
+        f"\n      {encode_beamng_json(key)}:{value}," for key, value in missing
     )
     return prefix + separator + additions + "\n    " + glow_text[close:]
 
@@ -2583,7 +2584,7 @@ def _upsert_part_glowmap(
         prefix = part_body[:close].rstrip()
         separator = "" if prefix.endswith(("{", ",")) else ","
         rows = "".join(
-            f"\n      {json.dumps(key)}:{value}," for key, value in entries.items()
+            f"\n      {encode_beamng_json(key)}:{value}," for key, value in entries.items()
         )
         updated = (
             prefix
@@ -2739,7 +2740,7 @@ def _runtime_alias(value: object) -> str:
 
 def _replace_jbeam_string_field(object_text: str, field: str, value: str) -> str:
     pattern = re.compile(_JBEAM_STRING_FIELD_RE.format(field=re.escape(field)))
-    replacement = lambda match: match.group(1) + json.dumps(value)
+    replacement = lambda match: match.group(1) + encode_beamng_json(value)
     updated, changed = pattern.subn(replacement, object_text, count=1)
     if changed:
         return updated
@@ -2748,7 +2749,7 @@ def _replace_jbeam_string_field(object_text: str, field: str, value: str) -> str
         return object_text
     prefix = object_text[:close].rstrip()
     separator = "" if prefix.endswith(("{", ",")) else ","
-    return prefix + separator + f" {json.dumps(field)}:{json.dumps(value)}" + object_text[close:]
+    return prefix + separator + f" {encode_beamng_json(field)}:{encode_beamng_json(value)}" + object_text[close:]
 
 
 def _source_beam_navigator_objects(context: VehicleContext) -> dict[str, str]:
@@ -2808,7 +2809,7 @@ def _replace_runtime_alias_in_glow_entry(
         value = match.group(1)
         if _runtime_alias(value) != source_alias:
             return match.group(0)
-        return match.group(0)[: match.group(0).find('"')] + json.dumps(target_alias)
+        return match.group(0)[: match.group(0).find('"')] + encode_beamng_json(target_alias)
 
     return re.sub(r':\s*"(@?(?:[^"\\]|\\.)*)"', replace, value_text)
 
@@ -3073,7 +3074,7 @@ def _rename_controller_file(part_body: str, source: str, target: str) -> str:
         return part_body
     pattern = re.compile(r'(\[\s*)"' + re.escape(source) + r'"(?=\s*[,\]])')
     updated, changed = pattern.subn(
-        lambda match: match.group(1) + json.dumps(target), controller
+        lambda match: match.group(1) + encode_beamng_json(target), controller
     )
     if not changed:
         return part_body
@@ -3258,7 +3259,7 @@ def _upsert_part_glow_entries(part_body: str, entries: dict[str, str]) -> str:
         return part_body
     prefix = part_body[:close].rstrip()
     separator = "" if prefix.endswith(("{", ",")) else ","
-    rows = "".join(f"\n      {json.dumps(key)}:{value}," for key, value in entries.items())
+    rows = "".join(f"\n      {encode_beamng_json(key)}:{value}," for key, value in entries.items())
     return prefix + separator + '\n    "glowMap":{' + rows + "\n    },\n  " + part_body[close:]
 
 
@@ -3287,7 +3288,7 @@ def _patch_runtime_screen_parts(
             or _GENERATED_HAND_PART_RE.search(part_id) is None
             or part_id not in target_meshes
             or not any(
-            json.dumps(mesh) in part_body for mesh in target_meshes
+            encode_beamng_json(mesh) in part_body for mesh in target_meshes
             )
         ):
             continue
@@ -3429,7 +3430,7 @@ def isolate_converted_runtime_screens(
 
     material_path = output_vehicle_dir / "beamxp_runtime_screens.materials.json"
     material_path.write_text(
-        json.dumps(material_definitions, indent=2) + "\n",
+        encode_beamng_json(material_definitions, indent=2) + "\n",
         encoding="utf-8",
     )
     return {

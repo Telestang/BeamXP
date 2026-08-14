@@ -149,9 +149,27 @@ class InteropTests(unittest.TestCase):
         text = json.dumps(payload, indent=2)
         self.assertEqual(parse_beamng_json(text, label="strict.pc"), payload)
 
-    def test_round_trips_our_own_non_ascii_output(self) -> None:
+    def test_reads_escaped_non_ascii_from_content_we_did_not_write(self) -> None:
         payload = {"Configuration": "Ölfilter Spécial — 日本"}
         text = json.dumps(payload, indent=2)  # ensure_ascii escapes to \uXXXX
+        self.assertEqual(parse_beamng_json(text, label="info.json"), payload)
+
+
+class EncodeTests(unittest.TestCase):
+    def test_non_ascii_is_written_raw_not_escaped(self) -> None:
+        # The engine's decoder has no \u escape: it drops the backslash, so
+        # "Velocità" reaches the vehicle selector as "Velocitu00e0".
+        text = sjson.encode_beamng_json({"Configuration": "Velocità"}, indent=2)
+        self.assertIn("Velocità", text)
+        self.assertNotIn("\\u", text)
+
+    def test_encoded_scalar_matches_the_raw_text_it_is_spliced_into(self) -> None:
+        # Splicing into, and searching within, jbeam bodies both depend on this.
+        self.assertEqual(sjson.encode_beamng_json("scintilla_gtà"), '"scintilla_gtà"')
+
+    def test_round_trips_through_our_reader(self) -> None:
+        payload = {"Configuration": "Ölfilter Spécial — 日本", "rows": [["à", 1]]}
+        text = sjson.encode_beamng_json(payload, indent=2)
         self.assertEqual(parse_beamng_json(text, label="info.json"), payload)
 
 
