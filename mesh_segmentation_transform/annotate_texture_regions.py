@@ -942,15 +942,28 @@ def detect_edge_boxes_from_response(
 
 
 def _merge_foreground_boxes(
-    boxes: list[tuple[int, int, int, int]], gap: int,
+    boxes: list[tuple[int, int, int, int]],
+    gap: int,
+    charts: list[int | None] | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Merge nearby foreground components without requiring MSER fragments.
 
     Screen labels often arrive as one component per letter or icon stroke.  A
     small Chebyshev gap joins those into useful rectangular correction regions
     before the normal grouping/filtering pipeline refines them further.
+
+    ``charts`` names the UV chart each component belongs to, and a join across
+    two charts is refused on the same grounds grouping refuses one: charts are
+    coalesced into a single detection consumer only because they can share
+    atlas texels, which is not a reason to let a mark on one chart absorb a
+    mark on another.  Proximity in the atlas says nothing about proximity on
+    the car -- the LC500's door otherwise welds its mirror-select icons, both
+    padlocks and the whole ``AUTO L R`` legend into one box at a gap of six
+    texels, and six separate legends stop existing as candidates before any
+    chart-aware stage gets to see them.
     """
     merged = list(boxes)
+    owners = list(charts) if charts is not None else [None] * len(merged)
     gap = max(int(gap), 0)
     changed = True
     while changed:
@@ -965,10 +978,20 @@ def _merge_foreground_boxes(
                 dy = max(by - ay1, ay - by1, 0)
                 if max(dx, dy) > gap:
                     continue
+                # A component on no recorded chart says nothing either way.
+                if (
+                    owners[left] is not None
+                    and owners[right] is not None
+                    and owners[left] != owners[right]
+                ):
+                    continue
                 x0, y0 = min(ax, bx), min(ay, by)
                 x1, y1 = max(ax1, bx1), max(ay1, by1)
                 merged[left] = (x0, y0, x1 - x0, y1 - y0)
+                if owners[left] is None:
+                    owners[left] = owners[right]
                 merged.pop(right)
+                owners.pop(right)
                 changed = True
                 break
             if changed:
@@ -1216,17 +1239,53 @@ def detect_foreground_boxes(
     return np.asarray(boxes, dtype=np.int32)
 
 
+def _component_chart_owners(
+    labels: np.ndarray,
+    count: int,
+    island_bits: np.ndarray | None,
+) -> list[int | None] | None:
+    """Which UV chart owns each connected component, by texel count.
+
+    A component is not asked which charts it touches but which one it belongs
+    to.  Two charts abutting in the atlas both rasterise their shared boundary
+    row, so a mark can overlap its neighbour by a few texels while plainly
+    belonging to one chart -- the LC500 door's padlock puts 449 texels on its
+    own chart and 3 on the icon chart above it.  Reading that as shared
+    ownership would let the two weld together anyway.
+    """
+    if island_bits is None or count <= 1:
+        return None
+    present = int(np.bitwise_or.reduce(island_bits.ravel()))
+    if not present:
+        return None
+    best = np.zeros(count, dtype=np.int64)
+    owner = np.full(count, -1, dtype=np.int64)
+    for bit in range(int(present).bit_length()):
+        if not (present >> bit) & 1:
+            continue
+        selected = ((island_bits >> np.uint64(bit)) & np.uint64(1)).astype(bool)
+        counts = np.bincount(labels[selected].ravel(), minlength=count)[:count]
+        better = counts > best
+        owner[better] = bit
+        best[better] = counts[better]
+    return [int(value) if value >= 0 else None for value in owner]
+
+
 def detect_opacity_mask_boxes(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
     config: MserConfig,
+    island_bits: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return components declared visible by an authored opacity mask.
 
     Unlike dominant-background detection, this preserves a glyph which fills
     most or all of its UV island.  Production invokes it per topological UV
-    island, so clipping to ``uv_mask`` is sufficient to prevent unrelated
-    neighbouring atlas content from joining.
+    island -- except where several charts were coalesced into one consumer for
+    sharing texels, and then clipping to ``uv_mask`` no longer separates them.
+    ``island_bits`` carries which chart owns each texel, so the merge can stop
+    at a chart boundary rather than weld neighbours that are only adjacent in
+    the atlas.
     """
     if image.ndim != 3 or image.shape[2] < 3:
         return np.empty((0, 4), dtype=np.int32)
@@ -1243,19 +1302,28 @@ def detect_opacity_mask_boxes(
     work = (
         (intensity > max(int(config.opacity_mask_threshold), 0)) & domain
     ).astype(np.uint8)
-    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(work, 8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(work, 8)
     min_area = max(int(config.foreground_min_component_px), 1)
-    boxes = [
-        (int(stats[label, cv2.CC_STAT_LEFT]),
-         int(stats[label, cv2.CC_STAT_TOP]),
-         int(stats[label, cv2.CC_STAT_WIDTH]),
-         int(stats[label, cv2.CC_STAT_HEIGHT]))
+    owners = _component_chart_owners(labels, count, island_bits)
+    kept = [
+        label
         for label in range(1, count)
         if int(stats[label, cv2.CC_STAT_AREA]) >= min_area
         and int(stats[label, cv2.CC_STAT_WIDTH]) > 0
         and int(stats[label, cv2.CC_STAT_HEIGHT]) > 0
     ]
-    boxes = _merge_foreground_boxes(boxes, config.foreground_merge_gap_px)
+    boxes = [
+        (int(stats[label, cv2.CC_STAT_LEFT]),
+         int(stats[label, cv2.CC_STAT_TOP]),
+         int(stats[label, cv2.CC_STAT_WIDTH]),
+         int(stats[label, cv2.CC_STAT_HEIGHT]))
+        for label in kept
+    ]
+    boxes = _merge_foreground_boxes(
+        boxes,
+        config.foreground_merge_gap_px,
+        [owners[label] for label in kept] if owners is not None else None,
+    )
     if not boxes:
         return np.empty((0, 4), dtype=np.int32)
     return np.asarray(boxes, dtype=np.int32)
@@ -3964,10 +4032,17 @@ def _step_mser(
         )
         title = "Foreground-mask boxes"
     elif config.box_source == "opacity_mask":
-        boxes = detect_opacity_mask_boxes(image, uv_mask, config)
+        boxes = detect_opacity_mask_boxes(
+            image, uv_mask, config, state.island_bits
+        )
         detail = (
             "authored opacity-mask foreground, "
             f"threshold {config.opacity_mask_threshold}"
+            + (
+                "; merges stop at a UV chart boundary"
+                if state.island_bits is not None
+                else ""
+            )
         )
         title = "Opacity-mask boxes"
     elif config.box_source in {"contrast", "contrast_gpu"}:
