@@ -367,6 +367,31 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             build_pipeline._mirrored_screen_page("<html><head></head></html>"),
         )
 
+    def test_extraction_workspace_leaves_a_deep_mod_room_under_max_path(self) -> None:
+        # Andronisk's V60 nests its textures 113 characters deep. Under the
+        # project directory that came to 295 and Windows refused every one of
+        # its 26 extractions, so the conversion shipped uncorrected.
+        project = Path(
+            r"C:\Users\x\AppData\Local\BeamXP\handedness_conversion_projects"
+            r"\volvo_v60_andronisk_v5.1_01-08-26_v60_andronisk"
+        )
+        context = SimpleNamespace(project_dir=project)
+        root = build_pipeline.texture_correction_workspace_root(context)
+        archive_dir = root / build_pipeline._short_digest("some/mod/archive.zip")
+        member = (
+            "vehicles/v60_andronisk/texture/v60_andronisk_int_texture/wood"
+            "/v60_andronisk_int_texture_wood_white_BC.color.dds"
+        )
+
+        self.assertLess(len(str(archive_dir / member)), 260)
+        # Scratch, and deliberately not inside the project it belongs to.
+        self.assertNotIn(str(project), str(root))
+        # Two archives in one conversion still get separate directories.
+        self.assertNotEqual(
+            build_pipeline._short_digest("a.zip"),
+            build_pipeline._short_digest("b.zip"),
+        )
+
     def test_non_power_of_two_dds_falls_back_to_generated_png(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)

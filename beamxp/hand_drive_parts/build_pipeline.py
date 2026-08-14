@@ -12,6 +12,7 @@ import json
 import math
 import re
 import shutil
+import tempfile
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -543,6 +544,32 @@ def texture_correction_asset_archives(context: VehicleContext) -> list[Path]:
     return paths
 
 
+def _short_digest(value: str, length: int = 8) -> str:
+    return hashlib.blake2b(value.lower().encode("utf-8"), digest_size=8).hexdigest()[:length]
+
+
+def texture_correction_workspace_root(context: VehicleContext) -> Path:
+    """Where the exporter unpacks the textures it is about to read.
+
+    Deliberately not under the project directory. Every texture is opened by
+    its extracted path, and Windows still refuses one longer than 260
+    characters, so the budget has to cover the project name, this workspace,
+    the archive name and whatever nesting the mod chose. Andronisk's V60 spends
+    113 characters on
+    ``vehicles/v60_andronisk/texture/v60_andronisk_int_texture/wood/...`` alone,
+    which under the project directory came to 265-295 and failed to extract
+    every one of its 26 textures -- the conversion then shipped with nothing
+    corrected at all.
+
+    A short temp root plus a digest of the archive path keeps the fixed part to
+    about 45 characters, leaves the mod its full share, and still gives each
+    archive its own directory. It is scratch: ``clean_dir`` empties it at the
+    start of every export and nothing reads from it afterwards.
+    """
+    root = Path(tempfile.gettempdir()) / "bxw" / _short_digest(str(context.project_dir))
+    return root
+
+
 def export_texture_correction_artifacts(
     context: VehicleContext,
     artifact_root: Path,
@@ -630,7 +657,7 @@ def export_texture_correction_artifacts(
     deferred_forced_scope: dict[tuple[Path, str], set[str]] = {}
 
     output_dir = artifact_root
-    workspace_root = context.project_dir / "build" / "texture_correction_workspace"
+    workspace_root = texture_correction_workspace_root(context)
     clean_dir(workspace_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_cache: dict[Path, object] = {}
@@ -639,7 +666,7 @@ def export_texture_correction_artifacts(
         try:
             archive = archive_cache.get(source_zip)
             if archive is None:
-                archive_workspace = workspace_root / safe_project_segment(source_zip.stem)
+                archive_workspace = workspace_root / _short_digest(str(source_zip))
                 asset_archives = [
                     candidate
                     for candidate in texture_correction_asset_archives(context)
