@@ -14,7 +14,7 @@ import re
 import shutil
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
@@ -1072,15 +1072,11 @@ def _split_material_skin_suffix(name: str) -> tuple[str, str]:
     return name[:index], name[index:]
 
 
-def _texture_correction_material_name(
-    alias: str,
-    used: set[str],
-    base_names: dict[str, str] | None = None,
-) -> str:
-    """The corrected material's name, with any skin suffix left on the end.
+def _texture_correction_material_name(alias: str, used: set[str]) -> str:
+    """Allocate a corrected base material's name.
 
-    A skin has to be named for the material it skins, so the correction suffix
-    goes on the base and the skin suffix stays last:
+    A skin is *not* named here: it has to be named for the material it skins,
+    so the correction suffix goes on the base and the skin suffix stays last,
     ``scintilla_interior_beamxp_tc.skin_interior.luxe``. Suffixing the whole
     alias instead gave ``scintilla_interior.skin_interior.luxe_beamxp_tc`` --
     a material no config could ever ask for, since the mesh binds
@@ -1089,31 +1085,63 @@ def _texture_correction_material_name(
     quite correctly, and every mirrored mesh fell back to the base textures:
     ten of the scintilla's sixteen trims wore the wrong interior.
 
-    ``base_names`` carries the corrected name already chosen for each base
-    alias, so a skin lands on its own base rather than starting a fresh one.
+    Which base a skin belongs to is a question of scope rather than of naming,
+    so the caller pairs them off with :func:`_matching_base_forks`.
     """
-    base_alias, skin_suffix = _split_material_skin_suffix(_normalise_material_alias(alias))
-    skin_suffix = safe_id(skin_suffix)
-    if skin_suffix and base_names is not None:
-        base_name = base_names.get(base_alias)
-        if base_name is not None:
-            candidate = f"{base_name}{skin_suffix}"
-            used.add(candidate.lower())
-            return candidate
+    base_alias = _split_material_skin_suffix(_normalise_material_alias(alias))[0]
     base = safe_id(f"{base_alias}_beamxp_tc") or "beamxp_texture_corrected"
     candidate = base
     counter = 2
-    while f"{candidate}{skin_suffix}".lower() in used:
+    while candidate.lower() in used:
         candidate = f"{base}_{counter}"
         counter += 1
-    if base_names is not None and not skin_suffix:
-        # The newest base wins: where one alias corrects to two materials -- two
-        # layouts sharing a name, which is what the _2 suffix is for -- the
-        # skins named after it belong to the one just allocated.
-        base_names[base_alias] = candidate
-    candidate = f"{candidate}{skin_suffix}"
     used.add(candidate.lower())
     return candidate
+
+
+def _matching_base_forks(
+    forks: Iterable[tuple[tuple[str, ...], str]],
+    part_keys: tuple[str, ...],
+) -> list[str]:
+    """The corrected bases a material scoped to ``part_keys`` should follow.
+
+    Where a base was corrected once per mesh, a name derived from it has to be
+    minted once per mesh too -- one copy cannot serve bases it is not named
+    after. Naming it after whichever base happened to be minted last is how
+    three of the scintilla's four corrected interiors ended up with no skins
+    at all, and the fourth with all of them.
+    """
+    forks = list(forks)
+    if not forks:
+        return []
+    if not part_keys:
+        return list(dict.fromkeys(name for _scope, name in forks))
+    scoped = [
+        name
+        for scope, name in forks
+        if not scope or set(scope) & set(part_keys)
+    ]
+    return list(dict.fromkeys(scoped))
+
+
+def _entry_source_material_for_alias(
+    entry: dict[str, object],
+    alias: str,
+) -> dict[str, object] | None:
+    target = _normalise_material_alias(alias)
+    for item in entry.get("sourceMaterials", []) or []:
+        if not isinstance(item, dict):
+            continue
+        material = item.get("material")
+        if not isinstance(material, dict):
+            continue
+        names = [item.get("key"), *(item.get("aliases") or [])]
+        if any(
+            isinstance(name, str) and _normalise_material_alias(name) == target
+            for name in names
+        ):
+            return copy.deepcopy(material)
+    return None
 
 
 def _vehicle_virtual_path(output_root: Path, path: Path) -> str:
@@ -1496,6 +1524,28 @@ def prune_unused_texture_correction_assets(
     }
 
 
+@dataclass
+class SwitchBaseFork:
+    """One mesh's private name for a material the glowMap switches.
+
+    A glowMap base is not a material anyone authored -- ``lc500_intemissive``
+    appears only as a DAE symbol and a glowMap key, and ``materials.lua``
+    stubs it at load (``if not scenetree.findObject(orgMat) then ...``). What
+    it really is, is the handle by which a mesh and a glowMap entry find each
+    other: ``getMeshesContainingMaterial(orgMat)``.
+
+    Correcting per mesh gives one mesh's copy of a texture, but the handle
+    stayed shared, so a single glowMap entry had to answer for every mesh
+    carrying it and the last correction minted won. Minting a handle per mesh
+    is what gives the entry somewhere per-mesh to attach to.
+    """
+
+    alias: str
+    name: str
+    part_keys: tuple[str, ...] = ()
+    states: dict[str, str] = field(default_factory=dict)
+
+
 class TextureCorrectionMaterials(dict[str, str]):
     """Alias -> corrected material, with the per-mesh overrides one atlas needs.
 
@@ -1517,11 +1567,13 @@ class TextureCorrectionMaterials(dict[str, str]):
         self,
         shared: Mapping[str, str] | None = None,
         by_part: Mapping[str, Mapping[str, str]] | None = None,
+        switch_forks: Iterable[SwitchBaseFork] = (),
     ) -> None:
         self.shared: dict[str, str] = dict(shared or {})
         self.by_part: dict[str, dict[str, str]] = {
             str(key): dict(value) for key, value in (by_part or {}).items()
         }
+        self.switch_forks: list[SwitchBaseFork] = list(switch_forks)
         super().__init__(self.shared)
         for scoped in self.by_part.values():
             for alias, material in scoped.items():
@@ -1531,6 +1583,24 @@ class TextureCorrectionMaterials(dict[str, str]):
         if not self.by_part:
             return dict(self)
         return {**self.shared, **self.by_part.get(part_key, {})}
+
+    def switch_bases_for_part(self, part_key: str) -> dict[str, str]:
+        """The base aliases this mesh should bind instead of the shared name.
+
+        A fork with no part keys speaks for every mesh, exactly as an unscoped
+        correction does; a scoped one binds only the meshes it names, so a
+        mesh nothing corrected keeps the original handle and the stock states.
+        """
+        bases: dict[str, str] = {}
+        for fork in self.switch_forks:
+            if fork.part_keys and part_key not in fork.part_keys:
+                continue
+            if fork.alias in bases and not fork.part_keys:
+                # A fork that names this mesh outranks one speaking for every
+                # mesh: it exists precisely because this mesh differed.
+                continue
+            bases[fork.alias] = fork.name
+        return bases
 
 
 def _prepare_texture_correction_materials(
@@ -1556,14 +1626,16 @@ def _prepare_texture_correction_materials(
     shared: dict[str, str] = {}
     by_part: dict[str, dict[str, str]] = {}
     used_names = {str(key).lower() for key in existing}
-    base_names: dict[str, str] = {}
+    # base alias -> every corrected base minted for it, as (part scope, name).
+    # Correcting per mesh mints several bases under one alias, so a base is
+    # identified by the meshes it was corrected for and not by its alias alone;
+    # anything named after a base has to pick the one its own mesh binds.
+    base_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {}
     for key in existing:
         base_alias, skin_suffix = _split_material_skin_suffix(str(key).lower())
         if not skin_suffix and base_alias.endswith("_beamxp_tc"):
-            base_names.setdefault(base_alias[: -len("_beamxp_tc")], str(key))
+            base_forks.setdefault(base_alias[: -len("_beamxp_tc")], []).append(((), str(key)))
 
-    # Skins are named for the base they skin, so every base has to be named
-    # first -- a manifest lists them in whatever order the exporter found them.
     pending: list[tuple[list[str], dict[str, object] | None, dict[str, object]]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1576,20 +1648,36 @@ def _prepare_texture_correction_materials(
             if variant_aliases:
                 pending.append((variant_aliases, source_material, entry))
 
+    def entry_part_keys(entry: dict[str, object]) -> tuple[str, ...]:
+        # ``partKeys`` is present only where the exporter corrected one texture
+        # more than once, and names the meshes this copy was corrected for.
+        return tuple(
+            sorted(
+                str(key)
+                for key in (entry.get("partKeys") or [])
+                if isinstance(key, str) and key.strip()
+            )
+        )
+
     def is_skin(item: tuple[list[str], dict[str, object] | None, dict[str, object]]) -> bool:
         return bool(_split_material_skin_suffix(_normalise_material_alias(item[0][0]))[1])
 
-    for variant_aliases, source_material, entry in sorted(pending, key=is_skin):
-        material_name = _texture_correction_material_name(
-            variant_aliases[0], used_names, base_names
-        )
-        # ``partKeys`` is present only where the exporter corrected one texture
-        # more than once, and names the meshes this copy was corrected for.
-        part_keys = [
-            str(key)
-            for key in (entry.get("partKeys") or [])
-            if isinstance(key, str) and key.strip()
-        ]
+    # Skins and glowMap bases are both named for a base, so every base has to
+    # be minted first -- a manifest lists them in whatever order the exporter
+    # found them.
+    skins = [item for item in pending if is_skin(item)]
+    # (base alias, part scope) -> the base's own document, if the vehicle
+    # authored one, and the texture maps to retarget it through.
+    switch_sources: dict[
+        tuple[str, tuple[str, ...]],
+        tuple[dict[str, object] | None, dict[str, str], dict[str, str]],
+    ] = {}
+
+    for variant_aliases, source_material, entry in pending:
+        if is_skin((variant_aliases, source_material, entry)):
+            continue
+        material_name = _texture_correction_material_name(variant_aliases[0], used_names)
+        part_keys = entry_part_keys(entry)
         for alias in variant_aliases:
             normalised = _normalise_material_alias(alias)
             if part_keys:
@@ -1597,6 +1685,10 @@ def _prepare_texture_correction_materials(
                     by_part.setdefault(part_key, {}).setdefault(normalised, material_name)
             else:
                 shared.setdefault(normalised, material_name)
+        base_forks.setdefault(
+            _split_material_skin_suffix(_normalise_material_alias(variant_aliases[0]))[0],
+            [],
+        ).append((part_keys, material_name))
 
         by_source, by_stage = _entry_corrected_texture_outputs(
             job_dir,
@@ -1618,8 +1710,85 @@ def _prepare_texture_correction_materials(
                 by_stage,
             )
 
-    materials = TextureCorrectionMaterials(shared, by_part)
-    if materials:
+        for base_alias in entry.get("switchBaseAliases", []) or []:
+            if not isinstance(base_alias, str) or not base_alias.strip():
+                continue
+            switch_sources.setdefault(
+                (_normalise_material_alias(base_alias), part_keys),
+                (_entry_source_material_for_alias(entry, base_alias), by_source, by_stage),
+            )
+
+    switch_forks: list[SwitchBaseFork] = []
+    for base_alias, part_keys in sorted(switch_sources):
+        fork_name = _texture_correction_material_name(base_alias, used_names)
+        # The states are whatever this mesh's corrections came to overall, not
+        # merely the entries that named this base: one glowMap entry can switch
+        # to several materials, and only some of them are corrected per mesh.
+        # Reading them the way the DAE binding does keeps entry and mesh
+        # agreeing about which copy of a texture this mesh got.
+        states = dict(shared)
+        for part_key in part_keys:
+            states.update(by_part.get(part_key, {}))
+        switch_forks.append(SwitchBaseFork(base_alias, fork_name, part_keys, states))
+        base_forks.setdefault(base_alias, []).append((part_keys, fork_name))
+        # A glowMap base is usually a bare handle the engine stubs, but where
+        # the vehicle did author one, the mesh has to keep finding a document
+        # under the name it now binds.
+        source_material, by_source, by_stage = switch_sources[(base_alias, part_keys)]
+        if source_material is not None:
+            existing[fork_name] = _retarget_material_document(
+                copy.deepcopy(source_material),
+                fork_name,
+                by_source,
+                by_stage,
+            )
+
+    for variant_aliases, source_material, entry in skins:
+        base_alias, skin_suffix = _split_material_skin_suffix(
+            _normalise_material_alias(variant_aliases[0])
+        )
+        skin_suffix = safe_id(skin_suffix)
+        part_keys = entry_part_keys(entry)
+        targets = _matching_base_forks(base_forks.get(base_alias, ()), part_keys)
+        if not targets:
+            # Nothing corrected this skin's base, so its meshes still bind the
+            # shipped one and the engine composes the shipped skin. A copy
+            # named after a base no mesh binds could only be pruned.
+            continue
+        by_source, by_stage = _entry_corrected_texture_outputs(
+            job_dir,
+            target_dir,
+            output_root,
+            f"{targets[0]}{skin_suffix}",
+            entry,
+        )
+        for fork_name in targets:
+            material_name = f"{fork_name}{skin_suffix}"
+            if material_name.lower() in used_names:
+                continue
+            used_names.add(material_name.lower())
+            for alias in variant_aliases:
+                normalised = _normalise_material_alias(alias)
+                if part_keys:
+                    for part_key in part_keys:
+                        by_part.setdefault(part_key, {}).setdefault(normalised, material_name)
+                else:
+                    shared.setdefault(normalised, material_name)
+            if source_material is not None:
+                existing[material_name] = _retarget_material_document(
+                    copy.deepcopy(source_material),
+                    material_name,
+                    by_source,
+                    by_stage,
+                )
+            else:
+                existing[material_name] = _fallback_texture_correction_material(
+                    material_name,
+                    by_stage,
+                )
+
+    materials = TextureCorrectionMaterials(shared, by_part, switch_forks)
+    if materials or switch_forks:
         material_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
     return materials
 
@@ -2123,14 +2292,21 @@ def _retarget_unmapped_glowmap_state_entries(
     entries: list[tuple[str, int, int, str]],
     alias_to_material: dict[str, str],
     switch_base_aliases: set[str],
+    forked_bases: set[str] | None = None,
 ) -> tuple[str, int]:
     if not alias_to_material:
         return glow_text, 0
+    forked_bases = forked_bases or set()
     out: list[str] = []
     cursor = 0
     changed = 0
     for key, _start, end, value_text in entries:
         key_alias = _normalise_jbeam_material_alias(key)
+        if key_alias in forked_bases:
+            # This base now has an entry per mesh, so the original is left
+            # speaking for the meshes nothing corrected -- with the stock
+            # states, which are the right ones for an uncorrected mesh.
+            continue
         if key_alias in alias_to_material and key_alias not in switch_base_aliases:
             continue
         value_start = end - len(value_text)
@@ -2156,11 +2332,14 @@ def _append_texture_correction_glowmap_entries(
     glow_text: str,
     material_alias_sets: Iterable[dict[str, str]],
     switch_base_aliases: set[str] | None = None,
+    switch_forks: Iterable[SwitchBaseFork] = (),
 ) -> tuple[str, int]:
     entries = _top_level_jbeam_object_entries(glow_text)
     if not entries:
         return glow_text, 0
     switch_base_aliases = switch_base_aliases or set()
+    switch_forks = list(switch_forks)
+    forked_bases = {fork.alias for fork in switch_forks}
     combined_alias_to_material: dict[str, str] = {}
     for alias_to_material in material_alias_sets:
         for alias, material in alias_to_material.items():
@@ -2172,6 +2351,7 @@ def _append_texture_correction_glowmap_entries(
         entries,
         combined_alias_to_material,
         switch_base_aliases,
+        forked_bases,
     )
     existing_keys = {_normalise_jbeam_material_alias(key) for key, *_ in entries}
     additions: list[str] = []
@@ -2195,6 +2375,28 @@ def _append_texture_correction_glowmap_entries(
             )
             additions.append(f'{json.dumps(corrected_base)}:{corrected_value},')
             existing_keys.add(corrected_alias)
+
+    # One entry per mesh that had this base corrected. The engine resolves a
+    # glowMap key through ``getMeshesContainingMaterial``, which has no
+    # per-mesh axis of its own -- the per-mesh names minted for the DAE are
+    # what supply one.
+    for fork in switch_forks:
+        fork_alias = _normalise_jbeam_material_alias(fork.name)
+        if fork_alias in existing_keys:
+            continue
+        for key, _start, _end, value_text in entries:
+            if _normalise_jbeam_material_alias(key) != fork.alias:
+                continue
+            fork_value = _replace_glow_material_states(
+                value_text,
+                key,
+                fork.name,
+                fork.states,
+            )
+            additions.append(f'{json.dumps(fork.name)}:{fork_value},')
+            existing_keys.add(fork_alias)
+            break
+
     if not additions:
         return updated_glow_text, retargeted_entries
 
@@ -2241,10 +2443,40 @@ def _replace_all_jbeam_object_regions(text: str, key: str, transform) -> str:
     return "".join(out)
 
 
+def _switch_fork_source_glowmap_entries(
+    source_jbeam_texts: Iterable[str],
+    switch_forks: Iterable[SwitchBaseFork],
+) -> dict[str, str]:
+    """Each per-mesh base's entry, read off the source vehicle's glowMap."""
+    switch_forks = list(switch_forks)
+    if not switch_forks:
+        return {}
+    entries: dict[str, str] = {}
+
+    def collect(glow_text: str) -> tuple[str, int]:
+        for key, _start, _end, value_text in _top_level_jbeam_object_entries(glow_text):
+            key_alias = _normalise_jbeam_material_alias(key)
+            for fork in switch_forks:
+                if fork.alias != key_alias or fork.name in entries:
+                    continue
+                entries[fork.name] = _replace_glow_material_states(
+                    value_text,
+                    key,
+                    fork.name,
+                    fork.states,
+                )
+        return glow_text, 0
+
+    for source_text in source_jbeam_texts:
+        _replace_all_jbeam_object_regions(source_text, "glowMap", collect)
+    return entries
+
+
 def _corrected_source_glowmap_entries(
     source_jbeam_texts: Iterable[str],
     material_alias_sets: Iterable[dict[str, str]],
     switch_base_aliases: set[str],
+    forked_bases: set[str] | None = None,
 ) -> dict[str, str]:
     combined: dict[str, str] = {}
     for alias_to_material in material_alias_sets:
@@ -2252,12 +2484,17 @@ def _corrected_source_glowmap_entries(
             combined.setdefault(_normalise_jbeam_material_alias(alias), material)
     if not combined:
         return {}
+    forked_bases = forked_bases or set()
 
     corrected: dict[str, str] = {}
 
     def collect(glow_text: str) -> tuple[str, int]:
         for key, _start, _end, value_text in _top_level_jbeam_object_entries(glow_text):
             key_alias = _normalise_jbeam_material_alias(key)
+            if key_alias in forked_bases:
+                # Carried per mesh instead; under the shared key this would be
+                # one mesh's states answering for every mesh.
+                continue
             updated_value = _replace_glow_material_states(
                 value_text,
                 key,
@@ -2366,6 +2603,8 @@ def _patch_texture_correction_jbeams(
     switch_base_aliases: Iterable[str] = (),
     source_jbeam_texts: Iterable[str] = (),
     mirror_row_targets: dict[str, str] | None = None,
+    switch_forks: Iterable[SwitchBaseFork] = (),
+    part_source_meshes: dict[str, str] | None = None,
 ) -> dict[str, object]:
     patched_files: list[str] = []
     replaced_rows = 0
@@ -2373,11 +2612,32 @@ def _patch_texture_correction_jbeams(
     mirror_row_targets = mirror_row_targets or {}
     material_alias_sets = tuple(material_alias_sets)
     switch_base_aliases = set(switch_base_aliases)
+    switch_forks = list(switch_forks)
+    part_source_meshes = part_source_meshes or {}
+    source_jbeam_texts = tuple(source_jbeam_texts)
+    forked_bases = {fork.alias for fork in switch_forks}
     corrected_source_glow_entries = _corrected_source_glowmap_entries(
         source_jbeam_texts,
         material_alias_sets,
         switch_base_aliases,
+        forked_bases,
     )
+    fork_source_glow_entries = _switch_fork_source_glowmap_entries(
+        source_jbeam_texts,
+        switch_forks,
+    )
+
+    def part_glow_entries(part_name: str, corrected: bool) -> dict[str, str]:
+        entries = dict(corrected_source_glow_entries) if corrected else {}
+        source_mesh = part_source_meshes.get(part_name, "")
+        for fork in switch_forks:
+            value = fork_source_glow_entries.get(fork.name)
+            if value is None:
+                continue
+            if fork.part_keys and source_mesh not in fork.part_keys:
+                continue
+            entries[fork.name] = value
+        return entries
     if not replacements and not material_alias_sets:
         return {
             "files": patched_files,
@@ -2414,14 +2674,20 @@ def _patch_texture_correction_jbeams(
                     text,
                     material_alias_sets,
                     switch_base_aliases,
+                    switch_forks,
                 ),
             )
-        if corrected_source_glow_entries:
-            for part_name in replacements:
+        if corrected_source_glow_entries or fork_source_glow_entries:
+            # Every part carrying a corrected mesh, whether it was split into
+            # pieces or retargeted where it stood.
+            for part_name in dict.fromkeys((*replacements, *part_source_meshes)):
+                entries = part_glow_entries(part_name, part_name in replacements)
+                if not entries:
+                    continue
                 updated, _changed = _upsert_part_glowmap(
                     updated,
                     part_name,
-                    corrected_source_glow_entries,
+                    entries,
                 )
         if updated == original:
             continue
@@ -3319,6 +3585,8 @@ def integrate_texture_correction_artifacts(
     mirror_row_targets: dict[str, str] = {}
     glow_material_alias_sets: list[dict[str, str]] = []
     glow_switch_base_aliases: set[str] = set()
+    glow_switch_forks: list[SwitchBaseFork] = []
+    part_source_meshes: dict[str, str] = {}
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
     structural_sources = structural_sources or {}
@@ -3341,6 +3609,7 @@ def integrate_texture_correction_artifacts(
         )
         switch_base_aliases = _texture_correction_switch_base_aliases(output_directory)
         glow_switch_base_aliases.update(switch_base_aliases)
+        glow_switch_forks.extend(alias_to_material.switch_forks)
         if alias_to_material:
             glow_material_alias_sets.append(dict(alias_to_material))
         detail = json.loads(report_path.read_text(encoding="utf-8"))
@@ -3354,11 +3623,19 @@ def integrate_texture_correction_artifacts(
             # Where one texture needed correcting twice, the alias means a
             # different corrected material per mesh; ask for this mesh's.
             part_alias_to_material = alias_to_material.for_part(source_mesh)
-            collada_alias_to_material = {
+            state_alias_to_material = {
                 alias: material
                 for alias, material in part_alias_to_material.items()
                 if alias not in switch_base_aliases
             }
+            collada_alias_to_material = dict(state_alias_to_material)
+            # A switch base must not be retargeted to one of its own states --
+            # that would bind the lit texture and lose the switch. It is
+            # retargeted to this mesh's own base instead, which is what gives
+            # ``getMeshesContainingMaterial`` a per-mesh answer.
+            collada_alias_to_material.update(
+                alias_to_material.switch_bases_for_part(source_mesh)
+            )
             rows = dae_export.get("generated_flexbody_rows", [])
             split_nodes = [
                 str(row.get("node_id") or "")
@@ -3399,14 +3676,19 @@ def integrate_texture_correction_artifacts(
                         appended,
                         piece_materials,
                         {
+                            # The states only. A per-mesh base is a renamed
+                            # handle rather than a corrected texture, and the
+                            # glass is picked out by which piece carries no
+                            # corrected texture.
                             _normalise_material_alias(name)
-                            for name in collada_alias_to_material.values()
+                            for name in state_alias_to_material.values()
                         },
                     )
                     for target_mesh in row_target_meshes:
                         for hand in hands:
                             name = generated_mesh_name(target_mesh, hand)
                             row_replacements[name] = appended
+                            part_source_meshes[name] = source_mesh
                             if glass:
                                 mirror_row_targets[name] = glass
             retargeted: list[str] = []
@@ -3421,6 +3703,14 @@ def integrate_texture_correction_artifacts(
                     },
                     collada_alias_to_material,
                 )
+                # A mesh retargeted in place is bound to this mesh's own base
+                # just as a split one is, so its part needs the same glowMap
+                # entry. The LC500's doors come through here.
+                for target_mesh in structural_target_meshes:
+                    for hand in hands:
+                        part_source_meshes[generated_mesh_name(target_mesh, hand)] = (
+                            source_mesh
+                        )
             dae_patches.append(
                 {
                     "sourceMesh": source_mesh,
@@ -3441,6 +3731,8 @@ def integrate_texture_correction_artifacts(
         glow_switch_base_aliases,
         context.jbeam_texts.values(),
         mirror_row_targets,
+        glow_switch_forks,
+        part_source_meshes,
     )
     return {
         "enabled": True,
@@ -3448,6 +3740,15 @@ def integrate_texture_correction_artifacts(
         "jbeamPatch": jbeam_patch,
         "rowReplacements": row_replacements,
         "mirrorRowTargets": mirror_row_targets,
+        "switchBaseForks": [
+            {
+                "alias": fork.alias,
+                "material": fork.name,
+                "partKeys": list(fork.part_keys),
+                "states": dict(fork.states),
+            }
+            for fork in glow_switch_forks
+        ],
     }
 
 
