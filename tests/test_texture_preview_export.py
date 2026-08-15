@@ -2755,5 +2755,59 @@ class SplitTextureManifestTests(unittest.TestCase):
         )
 
 
+class MaterialAliasOrderTests(unittest.TestCase):
+    """Aliases must come out in the same order whatever the hash seed.
+
+    They are assembled from a set of COLLADA symbols, and Python randomises
+    string hashing per process. A pooled correction pass and a serial one over
+    the V60 agreed on all 59 plans except the order of this one field, because
+    the pool's workers hashed differently from the parent.
+    """
+
+    def _binding(self, material: str, key: str):
+        return SimpleNamespace(dae_material=material, material_key=key)
+
+    def test_the_binding_leads_and_the_symbols_follow_in_order(self) -> None:
+        candidates = [(SimpleNamespace(key="dash"), self._binding("buttons", "buttons_off"))]
+        symbols = {"buttons-material", "buttons_off-material", "aaa-material"}
+
+        self.assertEqual(
+            rhd.material_aliases_for_candidates(candidates, symbols),
+            (
+                "buttons",
+                "buttons_off",
+                "aaa-material",
+                "buttons-material",
+                "buttons_off-material",
+            ),
+        )
+
+    def test_the_order_does_not_follow_the_sets_iteration(self) -> None:
+        # Sets of these strings iterate differently per process; building the
+        # same aliases from equal sets constructed differently must not.
+        candidates = [(SimpleNamespace(key="dash"), self._binding("m", "m_off"))]
+        forward = {f"sym{index}-material" for index in range(12)}
+        backward = {f"sym{index}-material" for index in reversed(range(12))}
+        self.assertEqual(
+            rhd.material_aliases_for_candidates(candidates, forward),
+            rhd.material_aliases_for_candidates(candidates, backward),
+        )
+
+    def test_a_name_is_kept_at_its_first_appearance(self) -> None:
+        candidates = [
+            (SimpleNamespace(key="a"), self._binding("m", "m_off")),
+            (SimpleNamespace(key="b"), self._binding("m", "m_on")),
+        ]
+        aliases = rhd.material_aliases_for_candidates(candidates, {"m-material"})
+        self.assertEqual(aliases, ("m", "m_off", "m-material", "m_on"))
+        self.assertEqual(len(aliases), len(set(aliases)))
+
+    def test_an_empty_name_is_dropped(self) -> None:
+        candidates = [(SimpleNamespace(key="a"), self._binding("m", ""))]
+        self.assertEqual(
+            rhd.material_aliases_for_candidates(candidates, {"m-material"}),
+            ("m", "m-material"),
+        )
+
 if __name__ == "__main__":
     unittest.main()

@@ -1092,6 +1092,37 @@ def _records_by_normalised_alias(
     return records
 
 
+def material_aliases_for_candidates(
+    candidates: list[tuple[DaePart, MaterialTextureLayerBinding]],
+    symbols: set[str] | frozenset[str],
+) -> tuple[str, ...]:
+    """Every name this correction answers to, in an order that does not drift.
+
+    The binding's own names come first and the COLLADA symbols after, each kept
+    at its first appearance.  The symbols are sorted because they arrive as a
+    set and Python randomises string hashing per process: splatting them raw
+    ordered the aliases differently from one run to the next.  Invisible while
+    every correction ran in one process, and plainly visible the moment they
+    run in several.
+
+    The material an alias names does not depend on the order, but the manifest
+    written from it, the material names minted off it and any diff of two
+    builds all do.
+    """
+    return tuple(
+        dict.fromkeys(
+            value
+            for _part, binding in candidates
+            for value in (
+                binding.dae_material,
+                binding.material_key,
+                *sorted(symbols),
+            )
+            if value
+        )
+    )
+
+
 def material_aliases_for_parts(
     loaded: LoadedDae,
     parts: list[DaePart],
@@ -6236,18 +6267,7 @@ def build_rhd_texture(
         )
         log(f"  wrote {overlay_path.name}")
 
-    material_aliases = tuple(
-        dict.fromkeys(
-            value
-            for _part, binding in candidates
-            for value in (
-                binding.dae_material,
-                binding.material_key,
-                *symbols,
-            )
-            if value
-        )
-    )
+    material_aliases = material_aliases_for_candidates(candidates, symbols)
     switch_base_aliases = tuple(
         dict.fromkeys(
             binding.dae_material
