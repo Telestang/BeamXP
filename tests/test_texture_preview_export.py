@@ -2755,6 +2755,116 @@ class SplitTextureManifestTests(unittest.TestCase):
         )
 
 
+class ParallelTextureCorrectionTests(unittest.TestCase):
+    """Planning every correction before running any must not reorder the log.
+
+    Corrections used to follow their texture's heading immediately. They are
+    now planned for every texture first so the pass can be spread over
+    processes, which without care lists every heading and then every
+    correction. Each texture holds its lines and replays them with its own.
+    """
+
+    def _part(self, key: str):
+        return SimpleNamespace(
+            key=key, node_id=key, node_name=key, label=key, instances=[],
+        )
+
+    def _binding(self, material: str):
+        return SimpleNamespace(
+            dae_material=material, material_key=f"{material}_on",
+            materials_member="vehicles/lc500/main.materials.json",
+            stage_key="baseColorMap", kind="colour",
+        )
+
+    def test_each_texture_heading_still_precedes_its_own_corrections(self) -> None:
+        dash = self._part("dash")
+        bindings = {
+            "vehicles/lc500/textures/a.dds": [(dash, self._binding("a"))],
+            "vehicles/lc500/textures/b.dds": [(dash, self._binding("b"))],
+        }
+
+        def masks(*_args, **_kwargs):
+            return rhd.DomainMasks(
+                mirror=np.ones((4, 4), dtype=bool),
+                rigid=np.zeros((4, 4), dtype=bool),
+                conflict_coverage=0.0, mirrored_triangles=1,
+                rigid_triangles=0, parts_analysed=1,
+            )
+
+        def build(*_args, **kwargs):
+            kwargs["log"](f"    corrected {kwargs['material_scope'][0]}")
+            return rhd.RhdTextureResult(
+                texture_member="vehicles/lc500/textures/a.dds",
+                size=(4, 4), parts_analysed=1, mirrored_triangles=1,
+                rigid_triangles=0, mirror_coverage=1.0, rigid_coverage=0.0,
+                conflict_coverage=0.0, glyph_regions=0, mirrored_glyph_regions=0,
+            )
+
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "a.dds"
+            Image.new("RGBA", (4, 4)).save(source, format="PNG")
+            with (
+                patch.object(
+                    rhd, "texture_bindings_for_parts", return_value=bindings,
+                ),
+                patch.object(
+                    rhd, "material_symbols_for_binding",
+                    side_effect=lambda _l, b: (f"{b.dae_material}-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(rhd, "build_domain_masks", side_effect=masks),
+                patch.object(rhd, "build_rhd_texture", side_effect=build),
+                patch.object(rhd, "write_blender_preview", return_value=None),
+                patch.object(rhd, "sweep_part", return_value=object()),
+                patch.object(
+                    rhd, "export_transformed_part_dae",
+                    return_value={"rigid_symmetric_nodes": []},
+                ),
+            ):
+                rhd.export_parts_preview(
+                    SimpleNamespace(), SimpleNamespace(), [dash], workspace,
+                    bake=False, log=lines.append,
+                )
+
+        interesting = [
+            line for line in lines
+            if line.strip().startswith(("a.dds", "b.dds", "corrected"))
+        ]
+        self.assertEqual(
+            interesting,
+            ["\na.dds", "    corrected a", "\nb.dds", "    corrected b"],
+        )
+
+
+class TextureWorkerCountTests(unittest.TestCase):
+    """One means this process; zero means choose; anything else is taken as is."""
+
+    def _config(self, workers: int):
+        return replace(rhd.DEFAULT_RHD_CONFIG, texture_job_workers=workers)
+
+    def test_the_default_keeps_the_pass_in_this_process(self) -> None:
+        # A pool puts the work beyond reach of anything that patched
+        # build_rhd_texture, so the exporter stays serial until asked.
+        self.assertEqual(rhd.DEFAULT_RHD_CONFIG.texture_job_workers, 1)
+        self.assertEqual(
+            rhd.texture_correction_worker_count(self._config(1), 40), 1
+        )
+
+    def test_a_count_is_never_more_than_there_is_work(self) -> None:
+        self.assertEqual(rhd.texture_correction_worker_count(self._config(8), 3), 3)
+        self.assertEqual(rhd.texture_correction_worker_count(self._config(0), 1), 1)
+        self.assertEqual(rhd.texture_correction_worker_count(self._config(8), 0), 1)
+
+    def test_zero_chooses_and_a_negative_count_is_refused(self) -> None:
+        chosen = rhd.texture_correction_worker_count(self._config(0), 40)
+        self.assertGreaterEqual(chosen, 1)
+        self.assertLessEqual(chosen, 4)
+        self.assertEqual(rhd.texture_correction_worker_count(self._config(-3), 40), 1)
+
+
+
 class MaterialAliasOrderTests(unittest.TestCase):
     """Aliases must come out in the same order whatever the hash seed.
 

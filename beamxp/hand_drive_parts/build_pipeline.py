@@ -664,6 +664,11 @@ def export_texture_correction_artifacts(
         DEFAULT_RHD_CONFIG,
         detect_on_normal_map=True,
         write_debug_overlays=False,
+        # Correct several atlases at once. The exporter defaults to serial
+        # because a pool puts the work beyond reach of anything that patched
+        # build_rhd_texture, which the tuning harness and much of the suite do;
+        # a build patches nothing, so it opts in and lets the count be chosen.
+        texture_job_workers=0,
         # The encoder tier is the user's speed/quality choice for this build.
         bc7_profile=bc7_quality or DEFAULT_RHD_CONFIG.bc7_profile,
         # Nothing in a build reads the inspection PNG: materials are wired from

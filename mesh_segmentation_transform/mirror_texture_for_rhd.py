@@ -60,9 +60,10 @@ import struct
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
+from collections.abc import Mapping
 from typing import Callable
 
 import cv2
@@ -289,6 +290,16 @@ class RhdTextureConfig:
     detection_tile_group_gap_px: int = 32
     detection_tile_group_max_area_growth: float = 1.5
     detection_collage_gutter_px: int = 16
+
+    # How many processes correct textures at once.  One -- the default -- keeps
+    # the whole pass in this process; zero picks a count; anything higher is
+    # taken literally.  It defaults to serial because a pool moves the work out
+    # of reach of anything that patched ``build_rhd_texture``, which the tuning
+    # harness and much of the test suite do; the build opts in explicitly.
+    # Threads were measured and do not serve: the hot path is Python looping
+    # over small array calls, so three of them scaled 1.32x while each job
+    # inflated from 32 s to 73 s.
+    texture_job_workers: int = 1
 
     # BC7 effort tier; the alpha-searching variant of it is chosen per image.
     # Measured on scintilla's 4096-square interior atlas: basic 10.6s at
@@ -1101,9 +1112,10 @@ def material_aliases_for_candidates(
     The binding's own names come first and the COLLADA symbols after, each kept
     at its first appearance.  The symbols are sorted because they arrive as a
     set and Python randomises string hashing per process: splatting them raw
-    ordered the aliases differently from one run to the next.  Invisible while
-    every correction ran in one process, and plainly visible the moment they
-    run in several.
+    ordered the aliases differently from one run to the next.  That was
+    invisible while every correction ran in this process and plainly visible
+    once they run in several -- a pooled pass and a serial one over the V60
+    agreed on all 59 plans except the order of this one field.
 
     The material an alias names does not depend on the order, but the manifest
     written from it, the material names minted off it and any diff of two
@@ -7083,6 +7095,122 @@ def _generated_mesh_rows_from_export(
     return rows
 
 
+@dataclass(slots=True)
+class TextureCorrectionTask:
+    """One correction, stated small enough to hand another process.
+
+    ``LoadedDae`` pickles to 129 MB, so a worker rebuilds it from the DAE the
+    parent already extracted rather than receiving it per task.  ``DaePart`` is
+    a plain record of a key, a matrix and its geometry instances -- it holds no
+    reference back to the document -- so the scope itself travels, and a worker
+    resolves geometry through its own ``loaded``.
+    """
+
+    member: str
+    material: str
+    part_scope: tuple[DaePart, ...]
+    masks: DomainMasks
+    part_group_index: int
+
+
+@dataclass(slots=True)
+class TextureCorrectionTaskOutcome:
+    """What one task produced, with its log held back for ordered replay."""
+
+    result: RhdTextureResult | None
+    log_lines: list[str]
+    error: str | None
+
+
+_TEXTURE_WORKER: dict[str, object] = {}
+
+
+def _texture_worker_init(
+    archive: VehicleArchive,
+    dae_path: str,
+    config: RhdTextureConfig,
+    mser_config: MserConfig,
+    relief_mser_config: MserConfig,
+) -> None:
+    """Give this process its own DAE and its own extraction workspace.
+
+    The workspace is private because ``extract_archive_member`` writes the
+    member straight to its final path: two processes wanting one map -- and a
+    normal map is read by every layer of its material -- would otherwise race,
+    and on Windows a replace onto a file another process holds open fails
+    outright.  Re-extracting is cheap beside a job, and the page cache absorbs
+    most of it.
+    """
+    workspace = Path(tempfile.mkdtemp(prefix="beamxp_rhd_worker_"))
+    _TEXTURE_WORKER["archive"] = replace(archive, workspace=workspace)
+    _TEXTURE_WORKER["loaded"] = load_dae(Path(dae_path))
+    _TEXTURE_WORKER["config"] = config
+    _TEXTURE_WORKER["mser_config"] = mser_config
+    _TEXTURE_WORKER["relief_mser_config"] = relief_mser_config
+    # One session per process: the cross-layer cache is exact-input keyed, so
+    # splitting it costs repeated work on duplicate atlases and nothing else.
+    _TEXTURE_WORKER["session"] = ProductionDetectionSession()
+
+
+def _run_texture_correction_task(
+    task: TextureCorrectionTask,
+    output_directory: Path,
+    context: Mapping[str, object],
+) -> TextureCorrectionTaskOutcome:
+    """Run one correction, capturing its log instead of emitting it.
+
+    ``context`` is a worker's own archive, DAE and session, or the caller's
+    when the pass stays in-process; taking it explicitly keeps the serial path
+    off the module global and re-entrant.
+    """
+    lines: list[str] = []
+    try:
+        result = build_rhd_texture(
+            context["archive"],
+            context["loaded"],
+            task.member,
+            output_directory,
+            context["config"],
+            context["mser_config"],
+            context["relief_mser_config"],
+            part_scope=list(task.part_scope),
+            material_scope=(task.material,),
+            masks=task.masks,
+            detection_session=context["session"],
+            part_group_index=task.part_group_index,
+            log=lines.append,
+        )
+        return TextureCorrectionTaskOutcome(result, lines, None)
+    except Exception as exc:
+        return TextureCorrectionTaskOutcome(
+            None, lines, f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _run_texture_correction_task_in_worker(
+    task: TextureCorrectionTask,
+    output_directory: Path,
+) -> TextureCorrectionTaskOutcome:
+    """Pool entry point: the context is whatever this process was initialised with."""
+    return _run_texture_correction_task(task, output_directory, _TEXTURE_WORKER)
+
+
+def texture_correction_worker_count(config: RhdTextureConfig, tasks: int) -> int:
+    """How many processes to correct textures with.
+
+    Zero means choose one.  The encoder already fans BC7 across every core, so
+    over-subscribing buys nothing and costs memory: each worker holds its own
+    ``LoadedDae`` plus a texture, its masks and its response fields, which on a
+    4096 atlas is several hundred megabytes.
+    """
+    requested = int(config.texture_job_workers)
+    if requested < 0:
+        return 1
+    if requested == 0:
+        requested = max(1, min((os.cpu_count() or 1) // 2, 4))
+    return max(1, min(requested, tasks))
+
+
 def export_parts_preview(
     archive: VehicleArchive,
     loaded: LoadedDae,
@@ -7166,7 +7294,12 @@ def export_parts_preview(
 
     sweep_cache: dict[str, object] = {}
     mask_cache: dict[tuple, DomainMasks] = {}
-    written: set[str] = set()
+    # No companion set: ``build_rhd_texture`` keeps its companion container
+    # empty because every stage map is a first-class texture job now, so
+    # nothing replays a plan onto another image and nothing needs de-duping
+    # across corrections. Reviving companions means revisiting this pass --
+    # ``written_companions`` was the one piece of state a correction mutated
+    # for the next one to read, which a pool cannot share.
     detection_session: ProductionDetectionSession[RegionDetection] = (
         ProductionDetectionSession()
     )
@@ -7185,8 +7318,19 @@ def export_parts_preview(
     detection_attempted_members: set[str] = set()
     detection_skips: list[dict[str, str]] = []
     texture_failures: list[dict[str, str]] = []
+    # Every correction is planned before any is run, so the pass can be spread
+    # over processes.  A texture's heading and mask coverage are written during
+    # planning but belong above that texture's corrections, which no longer
+    # follow immediately, so each texture holds its own lines until its tasks
+    # come back and the two are replayed together.
+    planned: list[tuple[str, list[str], list[TextureCorrectionTask]]] = []
+    outer_log = log
     for texture_index, (member, entries) in enumerate(bindings_by_texture.items(), start=1):
         texture_name = PurePosixPath(member).name
+        held: list[str] = []
+        log = held.append
+        tasks: list[TextureCorrectionTask] = []
+        planned.append((member, held, tasks))
         jobs = correction_jobs_for_texture(loaded, entries)
         if not jobs:
             log(f"\n{texture_name}")
@@ -7279,19 +7423,13 @@ def export_parts_preview(
                 merged.items(), start=1
             ):
                 detection_attempted_members.add(member)
-                results.append(
-                    build_rhd_texture(
-                        archive, loaded, member, output_directory,
-                        config, mser_config, relief_mser_config,
-                        part_scope=scope,
-                        material_scope=(material,),
+                tasks.append(
+                    TextureCorrectionTask(
+                        member=member,
+                        material=material,
+                        part_scope=tuple(scope),
                         masks=masks,
-                        sweep_cache=sweep_cache,
-                        written_companions=written,
-                        detection_session=detection_session,
                         part_group_index=index if scoped else 0,
-                        log=log,
-                        progress=progress,
                     )
                 )
         except Exception as exc:
@@ -7302,6 +7440,92 @@ def export_parts_preview(
                     "reason": f"{type(exc).__name__}: {exc}",
                 }
             )
+
+    log = outer_log
+    every_task = [task for _member, _held, tasks in planned for task in tasks]
+    workers = texture_correction_worker_count(config, len(every_task))
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "correct_textures",
+        f"Correcting {len(every_task)} texture job(s) on {workers} worker(s)",
+        texture_jobs=len(every_task),
+        workers=workers,
+    )
+
+    def consume(member: str, outcome: TextureCorrectionTaskOutcome) -> None:
+        for line in outcome.log_lines:
+            log(line)
+        if outcome.result is not None:
+            results.append(outcome.result)
+            return
+        log(f"  ! failed: {outcome.error}")
+        texture_failures.append({"texture": member, "reason": str(outcome.error)})
+
+    # Outcomes are consumed in submission order, so the log, the result order
+    # and therefore every output name are exactly what a serial pass produced.
+    outcomes: dict[int, TextureCorrectionTaskOutcome] = {}
+    if workers > 1:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_texture_worker_init,
+            initargs=(
+                archive,
+                str(loaded.path),
+                config,
+                mser_config,
+                relief_mser_config,
+            ),
+        ) as pool:
+            futures = {
+                index: pool.submit(
+                    _run_texture_correction_task_in_worker, task, output_directory
+                )
+                for index, task in enumerate(every_task)
+            }
+            for index, future in futures.items():
+                outcomes[index] = future.result()
+    else:
+        # In-process deliberately: this is the path the tuning harness and the
+        # equivalence tests drive, and the one a worker has to match.
+        context = {
+            "archive": archive,
+            "loaded": loaded,
+            "config": config,
+            "mser_config": mser_config,
+            "relief_mser_config": relief_mser_config,
+            "session": detection_session,
+        }
+        for index, task in enumerate(every_task):
+            outcomes[index] = _run_texture_correction_task(
+                task, output_directory, context
+            )
+
+    consumed = 0
+    for member, held, tasks in planned:
+        for line in held:
+            log(line)
+        for _task in tasks:
+            consume(member, outcomes[consumed])
+            consumed += 1
+
+    timing = record_phase(
+        phase_timings,
+        "correct_textures",
+        phase_started,
+        texture_jobs=len(every_task),
+        workers=workers,
+    )
+    emit_progress(
+        progress,
+        "end",
+        "correct_textures",
+        f"Corrected {len(results)} texture job(s)",
+        texture_jobs=len(every_task),
+        workers=workers,
+        seconds=timing["seconds"],
+    )
 
     phase_started = time.perf_counter()
     emit_progress(
