@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import threading
 import unittest
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import numpy as np
 
 from mesh_segmentation_transform.annotate_texture_regions import (
     LocalContrastDetection,
+    _merge_foreground_boxes,
     MserConfig,
     run_detection,
 )
@@ -161,3 +163,111 @@ class ProductionTextureDetectionTests(unittest.TestCase):
         assert result.relief is not None
         self.assertEqual(result.relief.value, "relief")
         self.assertGreaterEqual(result.wall_seconds, 0.0)
+
+
+def _merge_foreground_boxes_pairwise(boxes, gap, charts=None):
+    """The restart-per-join form the closure sweep replaced, kept as the oracle."""
+    merged = list(boxes)
+    owners = list(charts) if charts is not None else [None] * len(merged)
+    gap = max(int(gap), 0)
+    changed = True
+    while changed:
+        changed = False
+        for left, first in enumerate(merged):
+            ax, ay, aw, ah = first
+            ax1, ay1 = ax + aw, ay + ah
+            for right in range(left + 1, len(merged)):
+                bx, by, bw, bh = merged[right]
+                bx1, by1 = bx + bw, by + bh
+                dx = max(bx - ax1, ax - bx1, 0)
+                dy = max(by - ay1, ay - by1, 0)
+                if max(dx, dy) > gap:
+                    continue
+                if (
+                    owners[left] is not None
+                    and owners[right] is not None
+                    and owners[left] != owners[right]
+                ):
+                    continue
+                x0, y0 = min(ax, bx), min(ay, by)
+                x1, y1 = max(ax1, bx1), max(ay1, by1)
+                merged[left] = (x0, y0, x1 - x0, y1 - y0)
+                if owners[left] is None:
+                    owners[left] = owners[right]
+                merged.pop(right)
+                owners.pop(right)
+                changed = True
+                break
+            if changed:
+                break
+    return merged
+
+
+class ForegroundBoxMergeTests(unittest.TestCase):
+    """The closure sweep has to be the pairwise merge, only cheaper.
+
+    The pairwise form restarts its whole double loop after every join, so it
+    costs one O(n^2) sweep per merge. A local-contrast response over a grained
+    atlas arrives as thousands of components: the V60's white-wood dash spent
+    743 of its 789 seconds there, against 0.05 s for the GPU response the
+    components came from.
+    """
+
+    def test_it_returns_what_the_pairwise_merge_returned(self) -> None:
+        rng = random.Random(20260815)
+        for _ in range(200):
+            count = rng.randint(0, 40)
+            extent = rng.choice((40, 120, 600))
+            boxes = [
+                (
+                    rng.randint(0, extent),
+                    rng.randint(0, extent),
+                    rng.randint(1, 20),
+                    rng.randint(1, 20),
+                )
+                for _ in range(count)
+            ]
+            gap = rng.choice((0, 1, 2, 6, 16))
+            for charts in (None, [rng.randint(0, 3) for _ in range(count)]):
+                self.assertEqual(
+                    _merge_foreground_boxes(boxes, gap, charts),
+                    _merge_foreground_boxes_pairwise(boxes, gap, charts),
+                    f"gap {gap}, charts {charts is not None}, {count} boxes",
+                )
+
+    def test_a_chart_a_component_lacks_still_takes_the_ordered_merge(self) -> None:
+        # A component on no chart adopts the first one it joins, so which join
+        # happens first decides what it can join next. That is order-dependent
+        # and stays on the pairwise path.
+        boxes = [(0, 0, 4, 4), (6, 0, 4, 4), (12, 0, 4, 4)]
+        charts: list[int | None] = [1, None, 2]
+        self.assertEqual(
+            _merge_foreground_boxes(boxes, 3, charts),
+            _merge_foreground_boxes_pairwise(boxes, 3, charts),
+        )
+
+    def test_a_chain_closes_however_its_links_are_ordered(self) -> None:
+        # Letters reach their neighbours, not the far end of the word: the ends
+        # are 6 apart at a gap of 2 and only join through the middle. Listing
+        # the links out of order is the case the sweep has to keep iterating
+        # for, and each group keeps the lowest index it was built from.
+        chain = [(0, 0, 2, 2), (4, 0, 2, 2), (8, 0, 2, 2)]
+        for order in ((0, 1, 2), (2, 0, 1), (1, 2, 0), (2, 1, 0)):
+            boxes = [chain[index] for index in order]
+            self.assertEqual(
+                _merge_foreground_boxes(boxes, 2),
+                [(0, 0, 10, 2)],
+                f"order {order}",
+            )
+            self.assertEqual(
+                _merge_foreground_boxes(boxes, 2),
+                _merge_foreground_boxes_pairwise(boxes, 2),
+            )
+
+    def test_charts_keep_neighbouring_marks_apart(self) -> None:
+        # Two marks a few texels apart in the atlas but on different charts are
+        # not one mark. The LC500's door welded its mirror-select icons, both
+        # padlocks and the whole AUTO L R legend into one box without this.
+        boxes = [(0, 0, 4, 4), (6, 0, 4, 4)]
+        self.assertEqual(len(_merge_foreground_boxes(boxes, 4, [1, 1])), 1)
+        self.assertEqual(len(_merge_foreground_boxes(boxes, 4, [1, 2])), 2)

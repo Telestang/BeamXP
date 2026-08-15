@@ -962,9 +962,15 @@ def _merge_foreground_boxes(
     texels, and six separate legends stop existing as candidates before any
     chart-aware stage gets to see them.
     """
-    merged = list(boxes)
-    owners = list(charts) if charts is not None else [None] * len(merged)
     gap = max(int(gap), 0)
+    if charts is None or None not in charts:
+        # Nothing here can adopt a chart it did not already have, so the
+        # closure is confluent and the cheap sweep below reaches the same
+        # partition.  See _merge_foreground_boxes_by_closure.
+        return _merge_foreground_boxes_by_closure(boxes, gap, charts)
+
+    merged = list(boxes)
+    owners = list(charts)
     changed = True
     while changed:
         changed = False
@@ -997,6 +1003,77 @@ def _merge_foreground_boxes(
             if changed:
                 break
     return merged
+
+
+def _merge_foreground_boxes_by_closure(
+    boxes: list[tuple[int, int, int, int]],
+    gap: int,
+    charts: list[int | None] | None,
+) -> list[tuple[int, int, int, int]]:
+    """The same merge, without rescanning every pair after every join.
+
+    The pairwise form restarts its whole double loop each time two boxes join,
+    so it costs one O(n^2) sweep per merge.  A local-contrast response over a
+    grained atlas arrives as thousands of components: the V60's white-wood dash
+    spent 743 of its 789 seconds here, against 0.05 s for the GPU response the
+    components came from.
+
+    Merging only ever *adds* adjacency -- a box grows to its union, so anything
+    that was within ``gap`` of either half is still within ``gap`` of the whole,
+    and no available join is ever lost.  With every chart already known the
+    guard cannot change either, so the closure is confluent: every order of
+    merging reaches the same partition.  That lets each box absorb all of its
+    current neighbours at once, and lets a sweep that changed nothing end the
+    whole thing.  Absorbing only higher indices keeps each group represented by
+    its lowest one, which is the slot the pairwise form left it in, so the
+    returned list matches element for element.
+    """
+    count = len(boxes)
+    if count < 2:
+        return list(boxes)
+    data = np.asarray(boxes, dtype=np.int64).reshape(count, 4)
+    x0 = data[:, 0].copy()
+    y0 = data[:, 1].copy()
+    x1 = x0 + data[:, 2]
+    y1 = y0 + data[:, 3]
+    owner = (
+        np.asarray([int(value) for value in charts], dtype=np.int64)
+        if charts is not None
+        else None
+    )
+    alive = np.ones(count, dtype=bool)
+    later = np.arange(count)
+
+    changed = True
+    while changed:
+        changed = False
+        for left in range(count):
+            if not alive[left]:
+                continue
+            while True:
+                near = alive & (later > left)
+                if owner is not None:
+                    near &= owner == owner[left]
+                if not near.any():
+                    break
+                dx = np.maximum(np.maximum(x0 - x1[left], x0[left] - x1), 0)
+                dy = np.maximum(np.maximum(y0 - y1[left], y0[left] - y1), 0)
+                near &= np.maximum(dx, dy) <= gap
+                if not near.any():
+                    break
+                x0[left] = min(int(x0[left]), int(x0[near].min()))
+                y0[left] = min(int(y0[left]), int(y0[near].min()))
+                x1[left] = max(int(x1[left]), int(x1[near].max()))
+                y1[left] = max(int(y1[left]), int(y1[near].max()))
+                alive &= ~near
+                changed = True
+
+    return [
+        (int(x0[index]), int(y0[index]),
+         int(x1[index] - x0[index]), int(y1[index] - y0[index]))
+        for index in range(count)
+        if alive[index]
+    ]
 
 
 def _refine_foreground_internal_details(
