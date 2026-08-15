@@ -2699,6 +2699,34 @@ def _upsert_glowmap_entries(
     return prefix + separator + additions + "\n    " + glow_text[close:]
 
 
+def _jbeam_part_carrying_mesh(text: str, mesh_name: str) -> str | None:
+    """The part whose ``flexbodies`` or ``props`` bind ``mesh_name``.
+
+    ``glowMap`` is merged across every installed part, so a mesh's entry only
+    has to ride the part the mesh itself does -- but that part is not named
+    for its mesh. Andronisk's ``v60_andronisk_doorpanel_FL`` rides in
+    ``v60_andronisk_door_FL``, so looking the mesh name up as a part name found
+    nothing and wrote no entry at all: the door panel stayed bound to a forked
+    switch base with no states behind it, and its window switches lit as bare
+    white blocks with the glyphs missing. Only the dash was spared, and only
+    because a part happens to share its mesh's name.
+    """
+    token = encode_beamng_json(mesh_name)
+    for part_name, _key_start, _end, value_text in _top_level_jbeam_object_entries(text):
+        carried = False
+
+        def scan(array_text: str) -> tuple[str, int]:
+            nonlocal carried
+            carried = carried or token in array_text
+            return array_text, 0
+
+        for section in ("flexbodies", "props"):
+            _replace_all_jbeam_array_regions(value_text, section, scan)
+        if carried:
+            return part_name
+    return None
+
+
 def _upsert_part_glowmap(
     text: str,
     part_name: str,
@@ -2749,7 +2777,7 @@ def _patch_texture_correction_jbeams(
     source_jbeam_texts: Iterable[str] = (),
     mirror_row_targets: dict[str, str] | None = None,
     switch_forks: Iterable[SwitchBaseFork] = (),
-    part_source_meshes: dict[str, str] | None = None,
+    generated_mesh_sources: dict[str, str] | None = None,
 ) -> dict[str, object]:
     patched_files: list[str] = []
     replaced_rows = 0
@@ -2758,7 +2786,7 @@ def _patch_texture_correction_jbeams(
     material_alias_sets = tuple(material_alias_sets)
     switch_base_aliases = set(switch_base_aliases)
     switch_forks = list(switch_forks)
-    part_source_meshes = part_source_meshes or {}
+    generated_mesh_sources = generated_mesh_sources or {}
     source_jbeam_texts = tuple(source_jbeam_texts)
     forked_bases = {fork.alias for fork in switch_forks}
     corrected_source_glow_entries = _corrected_source_glowmap_entries(
@@ -2772,9 +2800,9 @@ def _patch_texture_correction_jbeams(
         switch_forks,
     )
 
-    def part_glow_entries(part_name: str, corrected: bool) -> dict[str, str]:
+    def mesh_glow_entries(mesh_name: str, corrected: bool) -> dict[str, str]:
         entries = dict(corrected_source_glow_entries) if corrected else {}
-        source_mesh = part_source_meshes.get(part_name, "")
+        source_mesh = generated_mesh_sources.get(mesh_name, "")
         for fork in switch_forks:
             value = fork_source_glow_entries.get(fork.name)
             if value is None:
@@ -2824,14 +2852,20 @@ def _patch_texture_correction_jbeams(
             )
         if corrected_source_glow_entries or fork_source_glow_entries:
             # Every part carrying a corrected mesh, whether it was split into
-            # pieces or retargeted where it stood.
-            for part_name in dict.fromkeys((*replacements, *part_source_meshes)):
-                entries = part_glow_entries(part_name, part_name in replacements)
+            # pieces or retargeted where it stood. The owner is read off the
+            # text as it arrived: a split mesh's row has already been replaced
+            # by its pieces by the time the glow pass runs.
+            by_part: dict[str, dict[str, str]] = {}
+            for mesh_name in dict.fromkeys((*replacements, *generated_mesh_sources)):
+                entries = mesh_glow_entries(mesh_name, mesh_name in replacements)
                 if not entries:
                     continue
+                owner = _jbeam_part_carrying_mesh(original, mesh_name) or mesh_name
+                by_part.setdefault(owner, {}).update(entries)
+            for owner, entries in by_part.items():
                 updated, _changed = _upsert_part_glowmap(
                     updated,
-                    part_name,
+                    owner,
                     entries,
                 )
         if updated == original:
@@ -3731,7 +3765,7 @@ def integrate_texture_correction_artifacts(
     glow_material_alias_sets: list[dict[str, str]] = []
     glow_switch_base_aliases: set[str] = set()
     glow_switch_forks: list[SwitchBaseFork] = []
-    part_source_meshes: dict[str, str] = {}
+    generated_mesh_sources: dict[str, str] = {}
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
     structural_sources = structural_sources or {}
@@ -3833,7 +3867,7 @@ def integrate_texture_correction_artifacts(
                         for hand in hands:
                             name = generated_mesh_name(target_mesh, hand)
                             row_replacements[name] = appended
-                            part_source_meshes[name] = source_mesh
+                            generated_mesh_sources[name] = source_mesh
                             if glass:
                                 mirror_row_targets[name] = glass
             retargeted: list[str] = []
@@ -3853,7 +3887,7 @@ def integrate_texture_correction_artifacts(
                 # entry. The LC500's doors come through here.
                 for target_mesh in structural_target_meshes:
                     for hand in hands:
-                        part_source_meshes[generated_mesh_name(target_mesh, hand)] = (
+                        generated_mesh_sources[generated_mesh_name(target_mesh, hand)] = (
                             source_mesh
                         )
             dae_patches.append(
@@ -3877,7 +3911,7 @@ def integrate_texture_correction_artifacts(
         context.jbeam_texts.values(),
         mirror_row_targets,
         glow_switch_forks,
-        part_source_meshes,
+        generated_mesh_sources,
     )
     return {
         "enabled": True,
