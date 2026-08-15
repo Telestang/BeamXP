@@ -2970,6 +2970,7 @@ def inscribed_circle_radius(
     uv_mask: np.ndarray | None,
     group: tuple[int, int, int, int],
     config: MserConfig,
+    domain_index: UvDomainIndex | None = None,
 ) -> int | None:
     """Return an inscribed-circle radius when the corners it drops are empty.
 
@@ -3008,7 +3009,7 @@ def inscribed_circle_radius(
     # A circle is only worth having if it is the tighter region.
     if math.pi * radius**2 >= w * h:
         return None
-    if not _circle_keeps_uv_coverage(uv_mask, group, radius, config):
+    if not _circle_keeps_uv_coverage(uv_mask, group, radius, config, domain_index):
         return None
     centre_x = (x + w / 2.0) - cx
     centre_y = (y + h / 2.0) - cy
@@ -3048,6 +3049,7 @@ def cached_inscribed_circle_radius(
     group: tuple[int, int, int, int],
     config: MserConfig,
     cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None,
+    domain_index: UvDomainIndex | None = None,
 ) -> int | None:
     """Memoise the pure circle test for one detection run.
 
@@ -3055,12 +3057,20 @@ def cached_inscribed_circle_radius(
     rebuilds.  The circle decision includes colour and UV work, so it is much
     more expensive than the dictionary lookup; the cached value is exact for a
     fixed image, UV mask and immutable configuration.
+
+    ``domain_index`` is the same island labelling every other caller already
+    shares.  Without it the circle's coverage check relabelled the whole atlas
+    for each candidate it judged -- the one thing ``UvDomainIndex`` exists to
+    stop.  It is not called ``domain`` because ``inscribed_circle_radius``
+    already binds that name to the cropped mask.
     """
     if cache is None:
-        return inscribed_circle_radius(image, uv_mask, group, config)
+        return inscribed_circle_radius(image, uv_mask, group, config, domain_index)
     key = (config, group)
     if key not in cache:
-        cache[key] = inscribed_circle_radius(image, uv_mask, group, config)
+        cache[key] = inscribed_circle_radius(
+            image, uv_mask, group, config, domain_index
+        )
     return cache[key]
 
 
@@ -4435,9 +4445,10 @@ def _step_rotated_bounds(
     unadopted = 0
     edge_unadopted = 0
     edge_adopted = 0
+    domain = state.domain or build_uv_domain_index(uv_mask)
     for group in state.groups:
         if cached_inscribed_circle_radius(
-            image, uv_mask, group, config, state.circle_radii,
+            image, uv_mask, group, config, state.circle_radii, domain,
         ) is not None:
             kept.append(group)
             rotations.append(None)
@@ -5059,7 +5070,7 @@ def _region_shape_and_coverage(
 ) -> tuple[int | None, float]:
     """Infer a region's circle, then measure that circle or its rectangle."""
     radius = cached_inscribed_circle_radius(
-        image, uv_mask, group, config, circle_cache,
+        image, uv_mask, group, config, circle_cache, domain,
     )
     if radius is not None:
         x, y, w, h = group
@@ -5471,7 +5482,7 @@ def _step_overlap_group(
         elif cardinal_spread(indices, bounds) < 3:
             continue
         radius = cached_inscribed_circle_radius(
-            image, uv_mask, bounds, config, state.circle_radii,
+            image, uv_mask, bounds, config, state.circle_radii, domain,
         )
         if radius is None:
             continue
@@ -5534,9 +5545,10 @@ def _step_final_padding(
     adjusted = 0
     image_height, image_width = image.shape[:2]
 
+    domain = state.domain or build_uv_domain_index(uv_mask)
     for group in state.groups:
         radius = cached_inscribed_circle_radius(
-            image, uv_mask, group, config, state.circle_radii,
+            image, uv_mask, group, config, state.circle_radii, domain,
         )
         x, y, w, h = group
 
@@ -6098,6 +6110,7 @@ def run_detection(
                 circles=tuple(
                     cached_inscribed_circle_radius(
                         image, uv_mask, group, config, state.circle_radii,
+                        state.domain,
                     )
                     for group in stage.kept
                 ),
