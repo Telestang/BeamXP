@@ -1858,6 +1858,24 @@ def _prepare_texture_correction_materials(
             states.update(by_part.get(part_key, {}))
         switch_forks.append(SwitchBaseFork(base_alias, fork_name, part_keys, states))
         base_forks.setdefault(base_alias, []).append((part_keys, fork_name))
+
+        # The fork name is what the DAE binds for this mesh, so it has to name
+        # a material as well as a glowMap key. Minting the name without the
+        # document left Andronisk's door panel bound to
+        # v60_andronisk_int_buttons_beamxp_tc_3, which nothing defined: no base
+        # texture, and a trigger resolving to nothing, so its switches lit as
+        # bare emissive blocks with the glyphs missing.
+        fork_source, fork_by_source, fork_by_stage = switch_sources[
+            (base_alias, part_keys)
+        ]
+        if fork_source is not None:
+            existing[fork_name] = _retarget_material_document(
+                fork_source, fork_name, fork_by_source, fork_by_stage
+            )
+        else:
+            existing[fork_name] = _fallback_texture_correction_material(
+                fork_name, fork_by_stage
+            )
         # A glowMap base is usually a bare handle the engine stubs, but where
         # the vehicle did author one, the mesh has to keep finding a document
         # under the name it now binds.

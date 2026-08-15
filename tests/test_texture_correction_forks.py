@@ -98,6 +98,28 @@ class ForkedSwitchBaseTests(unittest.TestCase):
             interior["lc500_intemissive"], door["lc500_intemissive"]
         )
 
+    def test_every_forked_base_a_mesh_binds_also_names_a_material(self) -> None:
+        # The fork name is what the DAE binds, so minting it without writing
+        # the document leaves the mesh bound to nothing. Andronisk's door panel
+        # bound v60_andronisk_int_buttons_beamxp_tc_3, which no material
+        # defined, and its switches lit as bare blocks with no glyphs.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            materials = self._lc500_forks(tmp)
+            document = json.loads(
+                (tmp / "vehicles/lc500" / "beamxp_texture_correction.materials.json")
+                .read_text(encoding="utf-8")
+            )
+
+        bound = {
+            name
+            for part in ("lc500_interior", "lc500_door_L")
+            for name in materials.switch_bases_for_part(part).values()
+        }
+        self.assertTrue(bound)
+        for name in sorted(bound):
+            self.assertIn(name, document, f"{name} is bound but defines no material")
+
     def test_a_mesh_nothing_corrected_keeps_the_shipped_base(self) -> None:
         # lc500_steer carries the same material and was never corrected, so it
         # has to keep the original name for the stock entry to still find it.
