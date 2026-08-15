@@ -1448,10 +1448,70 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertIn("ardente_interior_beamxp_tc", materials)
         self.assertIn("ardente_interior_on_beamxp_tc", materials)
         self.assertNotIn("emissiveMap", materials["ardente_interior_beamxp_tc"]["Stages"][0])
+        # The lit state reads the corrected emissive image. Which material's
+        # name the copy carries is not part of the contract: one corrected
+        # image is copied in once and every material naming it shares that
+        # copy, so the prefix belongs to whichever minted it first.
         self.assertIn(
-            "ardente_interior_on_beamxp_tc_ardente_interior_g.color_rhd.dds",
+            "ardente_interior_g.color_rhd.dds",
             materials["ardente_interior_on_beamxp_tc"]["Stages"][0]["emissiveMap"],
         )
+
+    def test_one_corrected_image_is_copied_in_once(self) -> None:
+        # Every material naming a corrected image used to get its own copy of
+        # it. Andronisk's V60 shipped 504.7 MB of corrected DDS holding 219.3
+        # MB of distinct images: one fabric atlas copied once per skin, its
+        # normal copied again beside it, and a switch base's off and on states
+        # copied apart although they are one file.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            target = tmp / "vehicles/scintilla"
+            job.mkdir()
+            (job / "interior_b.color_rhd.dds").write_bytes(b"colour")
+            (job / "interior_nm.normal_rhd.dds").write_bytes(b"normal")
+
+            def entry(alias: str) -> dict:
+                return {
+                    "aliases": [alias],
+                    "maps": {
+                        "baseColorMap": "interior_b.color_rhd.dds",
+                        "normalMap": "interior_nm.normal_rhd.dds",
+                    },
+                }
+
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            entry("scintilla_interior"),
+                            entry("scintilla_interior.skin_interior.luxe"),
+                            entry("scintilla_interior.skin_interior.race"),
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+            copied = sorted(path.name for path in target.glob("*.dds"))
+            materials = json.loads(
+                (target / "beamxp_texture_correction.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        # Two distinct images in, two files out, however many materials name them.
+        self.assertEqual(len(copied), 2)
+        self.assertEqual(len(materials), 3)
+        colour = {
+            body["Stages"][0]["baseColorMap"] for body in materials.values()
+        }
+        normal = {body["Stages"][0]["normalMap"] for body in materials.values()}
+        self.assertEqual(len(colour), 1)
+        self.assertEqual(len(normal), 1)
+        self.assertNotEqual(colour, normal)
 
     def test_switch_base_alias_maps_to_corrected_off_state_material(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

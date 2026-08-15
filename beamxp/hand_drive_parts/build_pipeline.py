@@ -1297,16 +1297,52 @@ def _corrected_texture_file_name(
     )
 
 
+def _shared_corrected_texture(
+    source: Path,
+    target_dir: Path,
+    output_root: Path,
+    material_name: str,
+    shared: dict[tuple[str, str], str],
+) -> str:
+    """Copy one corrected texture in, reusing the copy already made of it.
+
+    A corrected image was copied once per material that named it, and several
+    materials routinely name one image: a switch base's off and on states are
+    the same corrected file, and every skin of a trim carries its base's normal
+    and roughness unchanged. Andronisk's V60 shipped 504.7 MB of corrected DDS
+    holding 219.3 MB of distinct images -- one fabric atlas copied five times,
+    once per skin, and its normal five times beside it.
+
+    Keyed on the exporter's own output file, so what collapses is exactly the
+    copies of one corrected image. Keying on content instead would also fold
+    together maps that merely happen to match, leaving a normal map reading a
+    file named for a colour one.
+    """
+    key = (str(target_dir), str(source))
+    existing = shared.get(key)
+    if existing is not None:
+        return existing
+    destination = target_dir / _corrected_texture_file_name(
+        target_dir, material_name, source.name
+    )
+    shutil.copy2(source, destination)
+    virtual_path = _vehicle_virtual_path(output_root, destination)
+    shared[key] = virtual_path
+    return virtual_path
+
+
 def _entry_corrected_texture_outputs(
     job_dir: Path,
     target_dir: Path,
     output_root: Path,
     material_name: str,
     entry: dict[str, object],
+    shared_textures: dict[tuple[str, str], str] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     target_dir.mkdir(parents=True, exist_ok=True)
     by_source: dict[str, str] = {}
     by_stage: dict[str, str] = {}
+    shared = {} if shared_textures is None else shared_textures
     output_maps = entry.get("outputMaps")
     if isinstance(output_maps, list):
         for item in output_maps:
@@ -1320,11 +1356,9 @@ def _entry_corrected_texture_outputs(
             source = _material_source_for_beamng(job_dir, relative)
             if not source.is_file():
                 continue
-            destination = target_dir / _corrected_texture_file_name(
-                target_dir, material_name, source.name
+            virtual_path = _shared_corrected_texture(
+                source, target_dir, output_root, material_name, shared
             )
-            shutil.copy2(source, destination)
-            virtual_path = _vehicle_virtual_path(output_root, destination)
             _register_texture_output(by_source, member, virtual_path)
             if isinstance(stage_key, str):
                 by_stage.setdefault(stage_key, virtual_path)
@@ -1337,11 +1371,9 @@ def _entry_corrected_texture_outputs(
             source = _material_source_for_beamng(job_dir, relative)
             if not source.is_file():
                 continue
-            destination = target_dir / _corrected_texture_file_name(
-                target_dir, material_name, source.name
+            virtual_path = _shared_corrected_texture(
+                source, target_dir, output_root, material_name, shared
             )
-            shutil.copy2(source, destination)
-            virtual_path = _vehicle_virtual_path(output_root, destination)
             by_stage.setdefault(stage_key, virtual_path)
             _register_texture_output(by_source, relative, virtual_path)
     return by_source, by_stage
@@ -1799,6 +1831,9 @@ def _prepare_texture_correction_materials(
         tuple[str, tuple[str, ...]],
         tuple[dict[str, object] | None, dict[str, str], dict[str, str]],
     ] = {}
+    # Copied content -> the one path every material naming it shares. Spans
+    # states and skins, because that is where the copies repeat.
+    shared_textures: dict[tuple[str, str], str] = {}
 
     for variant_aliases, source_material, entry in pending:
         if is_skin((variant_aliases, source_material, entry)):
@@ -1823,6 +1858,7 @@ def _prepare_texture_correction_materials(
             output_root,
             material_name,
             entry,
+            shared_textures,
         )
         if source_material is not None:
             existing[material_name] = _retarget_material_document(
@@ -1906,6 +1942,7 @@ def _prepare_texture_correction_materials(
             output_root,
             f"{targets[0]}{skin_suffix}",
             entry,
+            shared_textures,
         )
         for fork_name in targets:
             material_name = f"{fork_name}{skin_suffix}"
