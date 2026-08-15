@@ -2919,5 +2919,142 @@ class MaterialAliasOrderTests(unittest.TestCase):
             ("m", "m-material"),
         )
 
+class PoolFailureFallbackTests(unittest.TestCase):
+    """A correction a worker loses is done again here, and said out loud.
+
+    Four workers hold four GL contexts on one card, and a correction that
+    cannot get one raises rather than degrading. Dropping it silently would
+    ship the mesh on an uncorrected atlas looking like nothing had gone wrong.
+    """
+
+    def _part(self, key: str):
+        return SimpleNamespace(
+            key=key, node_id=key, node_name=key, label=key, instances=[],
+        )
+
+    def _binding(self, material: str):
+        return SimpleNamespace(
+            dae_material=material, material_key=f"{material}_on",
+            materials_member="vehicles/lc500/main.materials.json",
+            stage_key="baseColorMap", kind="colour",
+        )
+
+    class _FakeFuture:
+        def __init__(self, outcome):
+            self._outcome = outcome
+
+        def result(self):
+            return self._outcome
+
+    def _fake_pool(self, outcome_for_worker):
+        test = self
+
+        class FakePool:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def submit(self, _fn, task, _directory):
+                return test._FakeFuture(outcome_for_worker(task))
+
+        return FakePool
+
+    def _run(self, outcome_for_worker, build_side_effect, workers=2):
+        dash = self._part("dash")
+        bindings = {
+            "vehicles/lc500/textures/a.dds": [(dash, self._binding("a"))],
+            "vehicles/lc500/textures/b.dds": [(dash, self._binding("b"))],
+        }
+
+        def masks(*_args, **_kwargs):
+            return rhd.DomainMasks(
+                mirror=np.ones((4, 4), dtype=bool),
+                rigid=np.zeros((4, 4), dtype=bool),
+                conflict_coverage=0.0, mirrored_triangles=1,
+                rigid_triangles=0, parts_analysed=1,
+            )
+
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "a.dds"
+            Image.new("RGBA", (4, 4)).save(source, format="PNG")
+            with (
+                patch.object(rhd, "texture_bindings_for_parts", return_value=bindings),
+                patch.object(
+                    rhd, "material_symbols_for_binding",
+                    side_effect=lambda _l, b: (f"{b.dae_material}-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(rhd, "build_domain_masks", side_effect=masks),
+                patch.object(rhd, "build_rhd_texture", side_effect=build_side_effect),
+                patch.object(rhd, "write_blender_preview", return_value=None),
+                patch.object(rhd, "sweep_part", return_value=object()),
+                patch.object(
+                    rhd, "export_transformed_part_dae",
+                    return_value={"rigid_symmetric_nodes": []},
+                ),
+                patch.object(
+                    rhd, "ProcessPoolExecutor", self._fake_pool(outcome_for_worker),
+                ),
+                patch.object(rhd, "_texture_worker_init", lambda *_a, **_k: None),
+            ):
+                preview = rhd.export_parts_preview(
+                    SimpleNamespace(),
+                    # The pool branch reads loaded.path to tell a worker which
+                    # DAE to rebuild; the serial branch never does.
+                    SimpleNamespace(path=workspace / "vehicle.dae", parts=[dash]),
+                    [dash], workspace,
+                    replace(
+                        rhd.DEFAULT_RHD_CONFIG, texture_job_workers=workers,
+                    ),
+                    bake=False, log=lines.append,
+                )
+        return preview, lines
+
+    def _result(self):
+        return rhd.RhdTextureResult(
+            texture_member="vehicles/lc500/textures/a.dds",
+            size=(4, 4), parts_analysed=1, mirrored_triangles=1,
+            rigid_triangles=0, mirror_coverage=1.0, rigid_coverage=0.0,
+            conflict_coverage=0.0, glyph_regions=0, mirrored_glyph_regions=0,
+        )
+
+    def test_a_correction_a_worker_lost_is_recovered_in_process(self) -> None:
+        def worker_fails(_task):
+            return rhd.TextureCorrectionTaskOutcome(
+                None, [], "LocalContrastGpuUnavailable: no GL context"
+            )
+
+        preview, lines = self._run(worker_fails, lambda *_a, **k: self._result())
+        text = chr(10).join(lines)
+
+        self.assertIn("failed on a worker", text)
+        self.assertIn("running them again on the serial path", text)
+        self.assertIn("recovered on the serial path", text)
+        self.assertNotIn("FAILED, uncorrected", text)
+        self.assertEqual(len(preview.textures), 2)
+
+    def test_a_failure_that_survives_the_retry_is_reported_not_hidden(self) -> None:
+        def worker_fails(_task):
+            return rhd.TextureCorrectionTaskOutcome(None, [], "ValueError: bad atlas")
+
+        def build_also_fails(*_args, **_kwargs):
+            raise ValueError("bad atlas")
+
+        preview, lines = self._run(worker_fails, build_also_fails)
+        text = chr(10).join(lines)
+
+        self.assertIn("running them again on the serial path", text)
+        self.assertIn("FAILED, uncorrected", text)
+        self.assertNotIn("recovered on the serial path", text)
+        self.assertEqual(preview.textures, [])
+
+
 if __name__ == "__main__":
     unittest.main()

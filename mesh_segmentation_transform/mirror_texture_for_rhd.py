@@ -7195,19 +7195,29 @@ def _run_texture_correction_task_in_worker(
     return _run_texture_correction_task(task, output_directory, _TEXTURE_WORKER)
 
 
+TEXTURE_JOB_WORKER_DEFAULT = 4
+
+
 def texture_correction_worker_count(config: RhdTextureConfig, tasks: int) -> int:
     """How many processes to correct textures with.
 
-    Zero means choose one.  The encoder already fans BC7 across every core, so
-    over-subscribing buys nothing and costs memory: each worker holds its own
-    ``LoadedDae`` plus a texture, its masks and its response fields, which on a
-    4096 atlas is several hundred megabytes.
+    Zero means choose, which lands on four unless the machine has fewer cores.
+    Four is measured rather than assumed: on the V60 six workers came out at
+    223.9 s against four at 220.0 s over the whole vehicle, and 203.9 s against
+    205.5 s over the heavy atlases alone -- no gain either way, for 106 MiB more
+    VRAM at the 95th percentile.  What is saturated is the one GPU, busy in 99%
+    of samples at both counts, so further workers queue behind it rather than
+    adding throughput.  The encoder already fans BC7 across every core too.
+
+    A machine with a bigger GPU may well do better; that is what the setting is
+    for, since VRAM cannot be read portably -- moderngl exposes no memory at
+    all and the queries are vendor extensions.
     """
     requested = int(config.texture_job_workers)
     if requested < 0:
         return 1
     if requested == 0:
-        requested = max(1, min((os.cpu_count() or 1) // 2, 4))
+        requested = max(1, min(os.cpu_count() or 1, TEXTURE_JOB_WORKER_DEFAULT))
     return max(1, min(requested, tasks))
 
 
@@ -7460,9 +7470,22 @@ def export_parts_preview(
         if outcome.result is not None:
             results.append(outcome.result)
             return
-        log(f"  ! failed: {outcome.error}")
+        # Survived the serial retry as well, so it is the work and not the
+        # pool. The mesh will ship on the uncorrected atlas; say so plainly
+        # rather than leaving it to be noticed in-game.
+        log(f"  ! FAILED, uncorrected: {outcome.error}")
         texture_failures.append({"texture": member, "reason": str(outcome.error)})
 
+    # In-process context: the path the tuning harness and the equivalence tests
+    # drive, the one a worker has to match, and the one a failed task retries on.
+    context = {
+        "archive": archive,
+        "loaded": loaded,
+        "config": config,
+        "mser_config": mser_config,
+        "relief_mser_config": relief_mser_config,
+        "session": detection_session,
+    }
     # Outcomes are consumed in submission order, so the log, the result order
     # and therefore every output name are exactly what a serial pass produced.
     outcomes: dict[int, TextureCorrectionTaskOutcome] = {}
@@ -7486,17 +7509,31 @@ def export_parts_preview(
             }
             for index, future in futures.items():
                 outcomes[index] = future.result()
+
+        # A worker fails for reasons the same work in this process may not
+        # have: four of them hold four GL contexts on one card, and a texture
+        # correction that cannot get one raises rather than degrading. Losing
+        # the correction silently would ship a mesh on an uncorrected atlas
+        # looking like nothing went wrong, so the pass says so and does the
+        # work again here, alone, where the contention it lost to is gone.
+        lost = [index for index, outcome in outcomes.items() if outcome.error]
+        if lost:
+            log(
+                f"\n  ! {len(lost)} correction(s) failed on a worker; "
+                f"running them again on the serial path"
+            )
+            for index in lost:
+                task = every_task[index]
+                log(f"    retrying {PurePosixPath(task.member).name}: "
+                    f"{outcomes[index].error}")
+                retried = _run_texture_correction_task(
+                    task, output_directory, context
+                )
+                if retried.error is None:
+                    log(f"    {PurePosixPath(task.member).name}: "
+                        f"recovered on the serial path")
+                outcomes[index] = retried
     else:
-        # In-process deliberately: this is the path the tuning harness and the
-        # equivalence tests drive, and the one a worker has to match.
-        context = {
-            "archive": archive,
-            "loaded": loaded,
-            "config": config,
-            "mser_config": mser_config,
-            "relief_mser_config": relief_mser_config,
-            "session": detection_session,
-        }
         for index, task in enumerate(every_task):
             outcomes[index] = _run_texture_correction_task(
                 task, output_directory, context
