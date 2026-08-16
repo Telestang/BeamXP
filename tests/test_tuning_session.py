@@ -96,6 +96,65 @@ class SessionFileTests(unittest.TestCase):
         self.assertEqual(pipelines["relief_edge"]["mser:delta"], "7")
         self.assertEqual(pipelines["relief_edge"]["relief:mode"], "shaded")
 
+    def test_shared_parameters_round_trip_outside_the_pipelines(self) -> None:
+        """UV island symmetry belongs to the texture, not to a detection path."""
+        save_session(
+            {
+                "vehicle": "C:/vehicles/vivace.zip",
+                "pipelines": {"colour_foreground": {"mser:delta": "12"}},
+                "shared": {"uv:min_uv_island_symmetry": "0.9"},
+            }
+        )
+
+        session = load_session()
+
+        self.assertEqual(session["shared"], {"uv:min_uv_island_symmetry": "0.9"})
+        self.assertEqual(session["pipelines"]["colour_foreground"], {"mser:delta": "12"})
+
+    def test_a_shared_parameter_is_never_written_into_a_pipeline(self) -> None:
+        """Otherwise the per-path copy outlives the shared one and wins later."""
+        save_session(
+            {
+                "vehicle": "C:/vehicles/vivace.zip",
+                "pipelines": {
+                    "colour_foreground": {
+                        "mser:delta": "12",
+                        "uv:min_uv_island_symmetry": "0.5",
+                    }
+                },
+                "shared": {"uv:min_uv_island_symmetry": "0.9"},
+            }
+        )
+
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["pipelines"]["colour_foreground"], {"mser:delta": "12"})
+        self.assertEqual(payload["shared"], {"uv:min_uv_island_symmetry": "0.9"})
+
+    def test_a_shared_parameter_left_in_an_old_session_is_hoisted(self) -> None:
+        """Sessions written before the split kept it per pipeline."""
+        self.path.write_text(
+            json.dumps(
+                {
+                    "pipelines": {
+                        "colour_foreground": {
+                            "mser:delta": "12",
+                            "uv:min_uv_island_symmetry": "0.9",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        session = load_session()
+
+        self.assertEqual(session["shared"]["uv:min_uv_island_symmetry"], "0.9")
+
+    def test_a_session_with_nothing_shared_grows_no_empty_object(self) -> None:
+        save_session({"vehicle": "C:/vehicles/vivace.zip"})
+        self.assertNotIn("shared", load_session())
+
     def test_legacy_display_label_parameters_are_loaded_for_migration(self) -> None:
         self.path.write_text(
             json.dumps({"parameters": {SOURCE_RELIEF: {"mser:delta": "7"}}}),
@@ -184,7 +243,10 @@ class SourceDefaultTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG.contrast_merge_gap_px, 0)
         self.assertTrue(DEFAULT_CONFIG.enable_feature_extension_filter)
         self.assertEqual(DEFAULT_CONFIG.feature_extension_context_px, 12)
-        self.assertEqual(DEFAULT_CONFIG.feature_extension_min_ratio, 0.25)
+        # Promoted 2026-08-16 from the colour+relief-edge session, along with
+        # min_region_uv_coverage below.
+        self.assertEqual(DEFAULT_CONFIG.feature_extension_min_ratio, 0.03)
+        self.assertEqual(DEFAULT_CONFIG.min_region_uv_coverage, 0.98)
 
     def test_colour_and_normal_detection_defaults_are_separate(self) -> None:
         self.assertEqual(DEFAULT_CONFIG.box_source, "foreground")
@@ -244,6 +306,77 @@ class SourceDefaultTests(unittest.TestCase):
             config.min_blob_region_area_px,
             DEFAULT_RELIEF_DETECTION_CONFIG.min_blob_region_area_px,
         )
+
+
+class SharedParameterTests(unittest.TestCase):
+    """UV island symmetry is one value for every detection path at once.
+
+    It is read off the UV mask, no detector touches it, and a threshold that
+    describes an island describes it whichever image is being searched.  Held
+    per pipeline it silently reverted whenever the source changed.
+    """
+
+    def _app(self):
+        from mesh_segmentation_transform.annotate_texture_tuning_app import TuningApp
+
+        app = object.__new__(TuningApp)
+        app.parameter_vars = {"delta": FakeVariable("5")}
+        app.symmetry_parameter_vars = {"min_uv_island_symmetry": FakeVariable("0.98")}
+        app.relief_parameter_vars = {}
+        app.rhd_parameter_vars = {}
+        app.mode_parameters = {}
+        app.session = {}
+        app.active_source = SOURCE_COLOUR
+        return app
+
+    def test_the_shared_store_is_left_out_of_the_per_pipeline_capture(self) -> None:
+        app = self._app()
+        app.symmetry_parameter_vars["min_uv_island_symmetry"].set("0.9")
+
+        captured = app._capture_parameters()
+
+        self.assertIn("mser:delta", captured)
+        self.assertNotIn("uv:min_uv_island_symmetry", captured)
+        self.assertEqual(
+            app._capture_shared_parameters(), {"uv:min_uv_island_symmetry": "0.9"}
+        )
+
+    def test_switching_source_does_not_disturb_the_shared_widgets(self) -> None:
+        app = self._app()
+        app.symmetry_parameter_vars["min_uv_island_symmetry"].set("0.9")
+
+        app._apply_parameters({
+            "mser:delta": "7",
+            "uv:min_uv_island_symmetry": "0.5",
+        })
+
+        self.assertEqual(app.parameter_vars["delta"].get(), "7")
+        self.assertEqual(
+            app.symmetry_parameter_vars["min_uv_island_symmetry"].get(), "0.9"
+        )
+
+    def test_the_remembered_shared_value_is_restored_at_startup(self) -> None:
+        app = self._app()
+        app.session = {"shared": {"uv:min_uv_island_symmetry": "0.87"}}
+
+        app._apply_shared_parameters()
+
+        self.assertEqual(
+            app.symmetry_parameter_vars["min_uv_island_symmetry"].get(), "0.87"
+        )
+
+
+class FakeVariable:
+    """Stands in for tk.Variable, which needs a live interpreter."""
+
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    def get(self) -> object:
+        return self._value
+
+    def set(self, value: object) -> None:
+        self._value = value
 
 
 class ParameterSectionTests(unittest.TestCase):

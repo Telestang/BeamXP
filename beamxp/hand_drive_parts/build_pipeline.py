@@ -12,6 +12,7 @@ import json
 import math
 import re
 import shutil
+import tempfile
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -543,6 +544,68 @@ def texture_correction_asset_archives(context: VehicleContext) -> list[Path]:
     return paths
 
 
+def unreadable_texture_notice(
+    failures: list[dict[str, str]],
+    corrected: int,
+    label: str,
+    limit: int = 3,
+) -> str | None:
+    """Say that textures could not be read, or raise if none could be.
+
+    A texture the exporter deliberately passes over is a finding; one it could
+    not read at all is a fault, and until now both only reached the log.
+    Andronisk's V60 lost all 26 of its textures to MAX_PATH and still produced
+    a build that reported success, wearing every glyph the wrong way round.
+
+    Correcting some and failing others stays non-fatal -- a mod may reference a
+    texture it does not ship -- but correcting none of them is not a conversion
+    worth shipping, so that raises.
+    """
+    if not failures:
+        return None
+    summary = "; ".join(
+        f"{PurePosixPath(str(failure.get('texture') or '')).name}: "
+        f"{failure.get('reason')}"
+        for failure in failures[:limit]
+    )
+    if len(failures) > limit:
+        summary += f"; and {len(failures) - limit} more"
+    if corrected <= 0:
+        raise RuntimeError(
+            f"Texture correction read none of the {len(failures)} texture(s) "
+            f"it was asked to correct for {label}: {summary}"
+        )
+    return (
+        f"Texture correction could not read {len(failures)} texture(s): {summary}"
+    )
+
+
+def _short_digest(value: str, length: int = 8) -> str:
+    return hashlib.blake2b(value.lower().encode("utf-8"), digest_size=8).hexdigest()[:length]
+
+
+def texture_correction_workspace_root(context: VehicleContext) -> Path:
+    """Where the exporter unpacks the textures it is about to read.
+
+    Deliberately not under the project directory. Every texture is opened by
+    its extracted path, and Windows still refuses one longer than 260
+    characters, so the budget has to cover the project name, this workspace,
+    the archive name and whatever nesting the mod chose. Andronisk's V60 spends
+    113 characters on
+    ``vehicles/v60_andronisk/texture/v60_andronisk_int_texture/wood/...`` alone,
+    which under the project directory came to 265-295 and failed to extract
+    every one of its 26 textures -- the conversion then shipped with nothing
+    corrected at all.
+
+    A short temp root plus a digest of the archive path keeps the fixed part to
+    about 45 characters, leaves the mod its full share, and still gives each
+    archive its own directory. It is scratch: ``clean_dir`` empties it at the
+    start of every export and nothing reads from it afterwards.
+    """
+    root = Path(tempfile.gettempdir()) / "bxw" / _short_digest(str(context.project_dir))
+    return root
+
+
 def export_texture_correction_artifacts(
     context: VehicleContext,
     artifact_root: Path,
@@ -550,6 +613,7 @@ def export_texture_correction_artifacts(
     progress: Callable[[str], None] | None = None,
     shared_atlas_dependency_targets: dict[str, set[str]] | None = None,
     force_mirrored_dependency_ids: set[str] | None = None,
+    whole_mesh_mirror_ids: set[str] | None = None,
     texture_member_scope_by_source: dict[tuple[Path, str], set[str]] | None = None,
     bc7_quality: str | None = None,
 ) -> dict[str, object]:
@@ -570,6 +634,9 @@ def export_texture_correction_artifacts(
         "jobs": [],
         "missing": [],
         "failures": [],
+        # Textures the exporter could not read at all, as opposed to ones it
+        # read and found nothing to correct on.
+        "textureFailures": [],
     }
     if not selected:
         return report
@@ -598,6 +665,11 @@ def export_texture_correction_artifacts(
         DEFAULT_RHD_CONFIG,
         detect_on_normal_map=True,
         write_debug_overlays=False,
+        # Correct several atlases at once. The exporter defaults to serial
+        # because a pool puts the work beyond reach of anything that patched
+        # build_rhd_texture, which the tuning harness and much of the suite do;
+        # a build patches nothing, so it opts in and lets the count be chosen.
+        texture_job_workers=0,
         # The encoder tier is the user's speed/quality choice for this build.
         bc7_profile=bc7_quality or DEFAULT_RHD_CONFIG.bc7_profile,
         # Nothing in a build reads the inspection PNG: materials are wired from
@@ -615,6 +687,11 @@ def export_texture_correction_artifacts(
         by_source.setdefault((source_zip, obj.dae_path), []).append(mesh_id)
     dependency_targets = shared_atlas_dependency_targets or {}
     forced_dependency_ids = force_mirrored_dependency_ids or set()
+    # Whole-mesh mirrors force the sweep the same way a structural pair does,
+    # but unlike one they have no reason to be deferred into their own export:
+    # nothing about them can erase another mesh's mirrored domain, because a
+    # forced part contributes mirrored triangles and never rigid ones.
+    whole_mesh_mirror_ids = whole_mesh_mirror_ids or set()
     scoped_members_by_source = texture_member_scope_by_source or {}
     dependencies_by_source: dict[tuple[Path, str], list[str]] = {}
     for mesh_id in dependency_targets:
@@ -630,7 +707,7 @@ def export_texture_correction_artifacts(
     deferred_forced_scope: dict[tuple[Path, str], set[str]] = {}
 
     output_dir = artifact_root
-    workspace_root = context.project_dir / "build" / "texture_correction_workspace"
+    workspace_root = texture_correction_workspace_root(context)
     clean_dir(workspace_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_cache: dict[Path, object] = {}
@@ -639,7 +716,7 @@ def export_texture_correction_artifacts(
         try:
             archive = archive_cache.get(source_zip)
             if archive is None:
-                archive_workspace = workspace_root / safe_project_segment(source_zip.stem)
+                archive_workspace = workspace_root / _short_digest(str(source_zip))
                 asset_archives = [
                     candidate
                     for candidate in texture_correction_asset_archives(context)
@@ -730,8 +807,12 @@ def export_texture_correction_artifacts(
                 dependency_targets.get(dependency_mesh, ())
             )
         wanted_meshes = sorted(set(wanted_meshes))
+        # ``texture_parts`` is what the correction actually scopes jobs to, so
+        # that is where a whole-mesh mirror has to be named to reach the sweep.
+        scoped_part_keys = {part.key for part in texture_parts}
         forced_part_keys = (
             set(wanted_meshes).intersection(forced_dependency_ids)
+            | (scoped_part_keys & whole_mesh_mirror_ids)
             | forced_texture_part_keys
         )
         matched_meshes = [mesh for mesh in wanted_meshes if mesh not in set(missing)]
@@ -760,6 +841,15 @@ def export_texture_correction_artifacts(
                 "\n".join(log_lines) + ("\n" if log_lines else ""),
                 encoding="utf-8",
             )
+            texture_failures = [
+                {
+                    "sourceZip": str(source_zip),
+                    "dae": dae_member,
+                    "texture": str(failure.get("texture") or ""),
+                    "reason": str(failure.get("reason") or ""),
+                }
+                for failure in getattr(preview, "texture_failures", ()) or ()
+            ]
             # A part with no correctable atlas is skipped by the exporter
             # rather than failing its whole DAE, so the meshes it stands for
             # are reported as failures on their own.
@@ -809,16 +899,29 @@ def export_texture_correction_artifacts(
                     "reportPath": str(preview.report_path) if preview.report_path is not None else None,
                     "daePaths": [str(path) for path in preview.dae_paths],
                     "textureCount": len(preview.textures),
+                    "textureFailures": texture_failures,
                     "forceMirroredMeshes": sorted(forced_part_keys),
                     "seconds": round(float(preview.seconds), 6),
                 }
             )
+            if texture_failures:
+                report["textureFailures"].extend(texture_failures)
+                notice = unreadable_texture_notice(
+                    texture_failures, len(preview.textures), Path(dae_member).name
+                )
+                if notice and progress is not None:
+                    progress(notice)
             if progress is not None:
                 skipped = len(getattr(preview, "failed_parts", ()) or ())
                 progress(
                     f"Texture correction finished {len(corrected_meshes)} mesh(es) "
                     f"in {float(preview.seconds):.1f}s"
                     + (f", skipped {skipped}" if skipped else "")
+                    + (
+                        f", {len(texture_failures)} texture(s) unreadable"
+                        if texture_failures
+                        else ""
+                    )
                 )
         except Exception as exc:
             if log_lines:
@@ -852,6 +955,7 @@ def export_texture_correction_artifacts(
             deferred_forced_meshes,
             progress=progress,
             force_mirrored_dependency_ids=deferred_forced_meshes,
+            whole_mesh_mirror_ids=whole_mesh_mirror_ids,
             texture_member_scope_by_source=deferred_forced_scope,
             bc7_quality=bc7_quality,
         )
@@ -1175,16 +1279,86 @@ def _register_texture_output(
         mapping.setdefault(key, virtual_path)
 
 
+def _corrected_texture_file_name(
+    target_dir: Path,
+    material_name: str,
+    source_name: str,
+) -> str:
+    """Name a corrected texture without spending the whole path budget on it.
+
+    Both halves are named for the same atlas, so the obvious join says it
+    twice. Andronisk's V60 minted a 106-character
+    ``v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_int_v60_andronisk
+    _int_stitch_amber_BC.color_rhd.dds`` which, staged under a project folder
+    already 153 characters deep, came to exactly the 260 Windows refuses.
+
+    The name is only trimmed when it will not fit, so a vehicle whose paths
+    already fit keeps the names it has always written. When it is trimmed, both
+    halves keep their distinguishing end and a digest of the full name keeps
+    two corrections of one atlas apart.
+    """
+    name = f"{safe_id(material_name)}_{source_name}"
+    room = 255 - len(str(target_dir)) - 1
+    if len(name) <= room:
+        return name
+
+    suffix = PurePosixPath(source_name).suffix
+    stem = source_name[: len(source_name) - len(suffix)]
+    digest = _short_digest(name)
+    budget = max(room - len(suffix) - len(digest) - 2, 8)
+    material_room = budget // 2
+    return (
+        f"{safe_id(material_name)[:material_room]}"
+        f"_{stem[-(budget - material_room):]}_{digest}{suffix}"
+    )
+
+
+def _shared_corrected_texture(
+    source: Path,
+    target_dir: Path,
+    output_root: Path,
+    material_name: str,
+    shared: dict[tuple[str, str], str],
+) -> str:
+    """Copy one corrected texture in, reusing the copy already made of it.
+
+    A corrected image was copied once per material that named it, and several
+    materials routinely name one image: a switch base's off and on states are
+    the same corrected file, and every skin of a trim carries its base's normal
+    and roughness unchanged. Andronisk's V60 shipped 504.7 MB of corrected DDS
+    holding 219.3 MB of distinct images -- one fabric atlas copied five times,
+    once per skin, and its normal five times beside it.
+
+    Keyed on the exporter's own output file, so what collapses is exactly the
+    copies of one corrected image. Keying on content instead would also fold
+    together maps that merely happen to match, leaving a normal map reading a
+    file named for a colour one.
+    """
+    key = (str(target_dir), str(source))
+    existing = shared.get(key)
+    if existing is not None:
+        return existing
+    destination = target_dir / _corrected_texture_file_name(
+        target_dir, material_name, source.name
+    )
+    shutil.copy2(source, destination)
+    virtual_path = _vehicle_virtual_path(output_root, destination)
+    shared[key] = virtual_path
+    return virtual_path
+
+
 def _entry_corrected_texture_outputs(
     job_dir: Path,
     target_dir: Path,
     output_root: Path,
     material_name: str,
     entry: dict[str, object],
+    shared_textures: dict[tuple[str, str], str] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     target_dir.mkdir(parents=True, exist_ok=True)
     by_source: dict[str, str] = {}
     by_stage: dict[str, str] = {}
+    shared = {} if shared_textures is None else shared_textures
     output_maps = entry.get("outputMaps")
     if isinstance(output_maps, list):
         for item in output_maps:
@@ -1198,9 +1372,9 @@ def _entry_corrected_texture_outputs(
             source = _material_source_for_beamng(job_dir, relative)
             if not source.is_file():
                 continue
-            destination = target_dir / f"{safe_id(material_name)}_{source.name}"
-            shutil.copy2(source, destination)
-            virtual_path = _vehicle_virtual_path(output_root, destination)
+            virtual_path = _shared_corrected_texture(
+                source, target_dir, output_root, material_name, shared
+            )
             _register_texture_output(by_source, member, virtual_path)
             if isinstance(stage_key, str):
                 by_stage.setdefault(stage_key, virtual_path)
@@ -1213,9 +1387,9 @@ def _entry_corrected_texture_outputs(
             source = _material_source_for_beamng(job_dir, relative)
             if not source.is_file():
                 continue
-            destination = target_dir / f"{safe_id(material_name)}_{source.name}"
-            shutil.copy2(source, destination)
-            virtual_path = _vehicle_virtual_path(output_root, destination)
+            virtual_path = _shared_corrected_texture(
+                source, target_dir, output_root, material_name, shared
+            )
             by_stage.setdefault(stage_key, virtual_path)
             _register_texture_output(by_source, relative, virtual_path)
     return by_source, by_stage
@@ -1673,6 +1847,9 @@ def _prepare_texture_correction_materials(
         tuple[str, tuple[str, ...]],
         tuple[dict[str, object] | None, dict[str, str], dict[str, str]],
     ] = {}
+    # Copied content -> the one path every material naming it shares. Spans
+    # states and skins, because that is where the copies repeat.
+    shared_textures: dict[tuple[str, str], str] = {}
 
     for variant_aliases, source_material, entry in pending:
         if is_skin((variant_aliases, source_material, entry)):
@@ -1697,6 +1874,7 @@ def _prepare_texture_correction_materials(
             output_root,
             material_name,
             entry,
+            shared_textures,
         )
         if source_material is not None:
             existing[material_name] = _retarget_material_document(
@@ -1732,6 +1910,24 @@ def _prepare_texture_correction_materials(
             states.update(by_part.get(part_key, {}))
         switch_forks.append(SwitchBaseFork(base_alias, fork_name, part_keys, states))
         base_forks.setdefault(base_alias, []).append((part_keys, fork_name))
+
+        # The fork name is what the DAE binds for this mesh, so it has to name
+        # a material as well as a glowMap key. Minting the name without the
+        # document left Andronisk's door panel bound to
+        # v60_andronisk_int_buttons_beamxp_tc_3, which nothing defined: no base
+        # texture, and a trigger resolving to nothing, so its switches lit as
+        # bare emissive blocks with the glyphs missing.
+        fork_source, fork_by_source, fork_by_stage = switch_sources[
+            (base_alias, part_keys)
+        ]
+        if fork_source is not None:
+            existing[fork_name] = _retarget_material_document(
+                fork_source, fork_name, fork_by_source, fork_by_stage
+            )
+        else:
+            existing[fork_name] = _fallback_texture_correction_material(
+                fork_name, fork_by_stage
+            )
         # A glowMap base is usually a bare handle the engine stubs, but where
         # the vehicle did author one, the mesh has to keep finding a document
         # under the name it now binds.
@@ -1762,6 +1958,7 @@ def _prepare_texture_correction_materials(
             output_root,
             f"{targets[0]}{skin_suffix}",
             entry,
+            shared_textures,
         )
         for fork_name in targets:
             material_name = f"{fork_name}{skin_suffix}"
@@ -2555,6 +2752,34 @@ def _upsert_glowmap_entries(
     return prefix + separator + additions + "\n    " + glow_text[close:]
 
 
+def _jbeam_part_carrying_mesh(text: str, mesh_name: str) -> str | None:
+    """The part whose ``flexbodies`` or ``props`` bind ``mesh_name``.
+
+    ``glowMap`` is merged across every installed part, so a mesh's entry only
+    has to ride the part the mesh itself does -- but that part is not named
+    for its mesh. Andronisk's ``v60_andronisk_doorpanel_FL`` rides in
+    ``v60_andronisk_door_FL``, so looking the mesh name up as a part name found
+    nothing and wrote no entry at all: the door panel stayed bound to a forked
+    switch base with no states behind it, and its window switches lit as bare
+    white blocks with the glyphs missing. Only the dash was spared, and only
+    because a part happens to share its mesh's name.
+    """
+    token = encode_beamng_json(mesh_name)
+    for part_name, _key_start, _end, value_text in _top_level_jbeam_object_entries(text):
+        carried = False
+
+        def scan(array_text: str) -> tuple[str, int]:
+            nonlocal carried
+            carried = carried or token in array_text
+            return array_text, 0
+
+        for section in ("flexbodies", "props"):
+            _replace_all_jbeam_array_regions(value_text, section, scan)
+        if carried:
+            return part_name
+    return None
+
+
 def _upsert_part_glowmap(
     text: str,
     part_name: str,
@@ -2605,7 +2830,7 @@ def _patch_texture_correction_jbeams(
     source_jbeam_texts: Iterable[str] = (),
     mirror_row_targets: dict[str, str] | None = None,
     switch_forks: Iterable[SwitchBaseFork] = (),
-    part_source_meshes: dict[str, str] | None = None,
+    generated_mesh_sources: dict[str, str] | None = None,
 ) -> dict[str, object]:
     patched_files: list[str] = []
     replaced_rows = 0
@@ -2614,7 +2839,7 @@ def _patch_texture_correction_jbeams(
     material_alias_sets = tuple(material_alias_sets)
     switch_base_aliases = set(switch_base_aliases)
     switch_forks = list(switch_forks)
-    part_source_meshes = part_source_meshes or {}
+    generated_mesh_sources = generated_mesh_sources or {}
     source_jbeam_texts = tuple(source_jbeam_texts)
     forked_bases = {fork.alias for fork in switch_forks}
     corrected_source_glow_entries = _corrected_source_glowmap_entries(
@@ -2628,9 +2853,9 @@ def _patch_texture_correction_jbeams(
         switch_forks,
     )
 
-    def part_glow_entries(part_name: str, corrected: bool) -> dict[str, str]:
+    def mesh_glow_entries(mesh_name: str, corrected: bool) -> dict[str, str]:
         entries = dict(corrected_source_glow_entries) if corrected else {}
-        source_mesh = part_source_meshes.get(part_name, "")
+        source_mesh = generated_mesh_sources.get(mesh_name, "")
         for fork in switch_forks:
             value = fork_source_glow_entries.get(fork.name)
             if value is None:
@@ -2680,14 +2905,20 @@ def _patch_texture_correction_jbeams(
             )
         if corrected_source_glow_entries or fork_source_glow_entries:
             # Every part carrying a corrected mesh, whether it was split into
-            # pieces or retargeted where it stood.
-            for part_name in dict.fromkeys((*replacements, *part_source_meshes)):
-                entries = part_glow_entries(part_name, part_name in replacements)
+            # pieces or retargeted where it stood. The owner is read off the
+            # text as it arrived: a split mesh's row has already been replaced
+            # by its pieces by the time the glow pass runs.
+            by_part: dict[str, dict[str, str]] = {}
+            for mesh_name in dict.fromkeys((*replacements, *generated_mesh_sources)):
+                entries = mesh_glow_entries(mesh_name, mesh_name in replacements)
                 if not entries:
                     continue
+                owner = _jbeam_part_carrying_mesh(original, mesh_name) or mesh_name
+                by_part.setdefault(owner, {}).update(entries)
+            for owner, entries in by_part.items():
                 updated, _changed = _upsert_part_glowmap(
                     updated,
-                    part_name,
+                    owner,
                     entries,
                 )
         if updated == original:
@@ -3567,6 +3798,23 @@ def _runtime_aliases_in_source_materials(context: VehicleContext) -> tuple[str, 
     return tuple(aliases)
 
 
+def baked_mesh_copies_by_target(
+    baked_shared_specs: Iterable[BakedMeshSpec],
+) -> dict[tuple[str, str], list[str]]:
+    """Per-row baked copies, keyed by the mesh and hand they were minted for.
+
+    ``baked_mesh_output_name`` appends the config, owning part and row index to
+    the generated name, so one configured mesh can hold several copies and none
+    of them answers to ``generated_mesh_name``.
+    """
+    copies: dict[tuple[str, str], list[str]] = {}
+    for spec in baked_shared_specs:
+        copies.setdefault((spec.configured_mesh, spec.target_hand), []).append(
+            spec.output_mesh
+        )
+    return copies
+
+
 def integrate_texture_correction_artifacts(
     context: VehicleContext,
     output_root: Path,
@@ -3576,6 +3824,9 @@ def integrate_texture_correction_artifacts(
     *,
     texture_correction_targets: dict[str, set[str]] | None = None,
     structural_sources: dict[str, str] | None = None,
+    prop_meshes: set[str] | None = None,
+    flexbody_meshes: set[str] | None = None,
+    baked_mesh_copies: dict[tuple[str, str], list[str]] | None = None,
 ) -> dict[str, object]:
     jobs = texture_correction_report.get("jobs", [])
     if not isinstance(jobs, list) or not jobs:
@@ -3587,10 +3838,13 @@ def integrate_texture_correction_artifacts(
     glow_material_alias_sets: list[dict[str, str]] = []
     glow_switch_base_aliases: set[str] = set()
     glow_switch_forks: list[SwitchBaseFork] = []
-    part_source_meshes: dict[str, str] = {}
+    generated_mesh_sources: dict[str, str] = {}
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
     structural_sources = structural_sources or {}
+    prop_meshes = prop_meshes or set()
+    flexbody_meshes = flexbody_meshes or set()
+    baked_mesh_copies = baked_mesh_copies or {}
     for job in jobs:
         if not isinstance(job, dict):
             continue
@@ -3650,10 +3904,25 @@ def integrate_texture_correction_artifacts(
                 for target_mesh in target_meshes
                 if structural_sources.get(target_mesh) == source_mesh
             ]
+            # A prop row names one mesh and the engine spawns exactly that one
+            # (``vehicleObj:addProp``, lua/common/jbeam/sections/meshs.lua), so
+            # it cannot be repointed at a split the way a flexbody row can. Its
+            # row already names a whole-mesh copy -- usually a per-row baked
+            # one -- so the correction rides on that copy's materials instead,
+            # the same way a structural mirror's does. A mesh bound as both
+            # keeps the split, which is the binding that can carry one.
+            prop_target_meshes = [
+                target_mesh
+                for target_mesh in target_meshes
+                if target_mesh not in structural_target_meshes
+                and target_mesh in prop_meshes
+                and target_mesh not in flexbody_meshes
+            ]
             row_target_meshes = [
                 target_mesh
                 for target_mesh in target_meshes
                 if target_mesh not in structural_target_meshes
+                and target_mesh not in prop_target_meshes
             ]
             appended: list[str] = []
             if row_target_meshes:
@@ -3666,6 +3935,10 @@ def integrate_texture_correction_artifacts(
                         generated_mesh_name(target_mesh, hand)
                         for target_mesh in row_target_meshes
                         for hand in hands
+                        # Dropping a node a prop still binds would leave the
+                        # engine with nothing to spawn; that mesh keeps its
+                        # whole-mesh copy and is retargeted below instead.
+                        if target_mesh not in prop_meshes
                     },
                 )
                 if appended:
@@ -3689,29 +3962,38 @@ def integrate_texture_correction_artifacts(
                         for hand in hands:
                             name = generated_mesh_name(target_mesh, hand)
                             row_replacements[name] = appended
-                            part_source_meshes[name] = source_mesh
+                            generated_mesh_sources[name] = source_mesh
                             if glass:
                                 mirror_row_targets[name] = glass
             retargeted: list[str] = []
-            if structural_target_meshes:
+            retarget_target_meshes = structural_target_meshes + prop_target_meshes
+            if retarget_target_meshes:
+                # A prop's row usually names a per-row baked copy rather than
+                # the shared ``_xp_rhd`` one -- a mirrored prop is baked
+                # unconditionally, because its node triad is left-handed and
+                # baseRotationGlobal cannot express a reflection -- so the
+                # copies have to be retargeted by the names they were minted
+                # with, not by the name they were minted from.
+                retarget_nodes = {
+                    name
+                    for target_mesh in retarget_target_meshes
+                    for hand in hands
+                    for name in (
+                        generated_mesh_name(target_mesh, hand),
+                        *baked_mesh_copies.get((target_mesh, hand), ()),
+                    )
+                }
                 retargeted = _retarget_texture_correction_generated_nodes(
                     target_dae,
                     source_dae,
-                    {
-                        generated_mesh_name(target_mesh, hand)
-                        for target_mesh in structural_target_meshes
-                        for hand in hands
-                    },
+                    retarget_nodes,
                     collada_alias_to_material,
                 )
                 # A mesh retargeted in place is bound to this mesh's own base
                 # just as a split one is, so its part needs the same glowMap
                 # entry. The LC500's doors come through here.
-                for target_mesh in structural_target_meshes:
-                    for hand in hands:
-                        part_source_meshes[generated_mesh_name(target_mesh, hand)] = (
-                            source_mesh
-                        )
+                for name in retarget_nodes:
+                    generated_mesh_sources[name] = source_mesh
             dae_patches.append(
                 {
                     "sourceMesh": source_mesh,
@@ -3719,6 +4001,7 @@ def integrate_texture_correction_artifacts(
                     "targetDae": str(target_dae),
                     "appendedNodes": appended,
                     "retargetedNodes": retargeted,
+                    "propTargetMeshes": prop_target_meshes,
                     "materialAliases": sorted(part_alias_to_material),
                     "colladaMaterialAliases": sorted(collada_alias_to_material),
                     "switchBaseAliases": sorted(switch_base_aliases),
@@ -3733,7 +4016,7 @@ def integrate_texture_correction_artifacts(
         context.jbeam_texts.values(),
         mirror_row_targets,
         glow_switch_forks,
-        part_source_meshes,
+        generated_mesh_sources,
     )
     return {
         "enabled": True,
@@ -3818,6 +4101,9 @@ def build_batch(
     texture_correction_source_ids: set[str] = set()
     shared_atlas_dependency_targets: dict[str, set[str]] = {}
     force_mirrored_dependency_ids: set[str] = set()
+    whole_mesh_mirror_ids: set[str] = set()
+    flexbody_meshes: set[str] = set()
+    prop_meshes: set[str] = set()
     if generated_variant_targets:
         object_modes = active_part_modes(conversion)
         # A vehicle whose every converted trim is fully covered by an authored
@@ -3864,6 +4150,9 @@ def build_batch(
                 force_mirrored_dependency_ids,
             ) = texture_correction_atlas_dependencies(
                 object_modes, structural_sources, texture_correction_ids
+            )
+            whole_mesh_mirror_ids = whole_mesh_mirror_correction_ids(
+                object_modes, structural_sources, prop_meshes, flexbody_meshes
             )
         node_mirror_map = build_node_mirror_map(context.node_positions)
         translated_prop_meshes = {
@@ -3974,6 +4263,7 @@ def build_batch(
             progress=emit_progress,
             shared_atlas_dependency_targets=shared_atlas_dependency_targets,
             force_mirrored_dependency_ids=force_mirrored_dependency_ids,
+            whole_mesh_mirror_ids=whole_mesh_mirror_ids,
             bc7_quality=texture_quality_setting(conversion),
         )
         auto_included = texture_correction_report.get("autoIncludedTargets", {})
@@ -3993,6 +4283,9 @@ def build_batch(
             set(generated_variant_targets.values()),
             texture_correction_targets=texture_correction_targets,
             structural_sources=structural_sources,
+            prop_meshes=prop_meshes,
+            flexbody_meshes=flexbody_meshes,
+            baked_mesh_copies=baked_mesh_copies_by_target(baked_shared_specs),
         )
         texture_correction_report["pruned"] = prune_unused_texture_correction_assets(
             output_root, output_vehicle_dir
@@ -4125,4 +4418,4 @@ def build_batch(
         texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'integrate_texture_correction_artifacts', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'baked_mesh_copies_by_target', 'integrate_texture_correction_artifacts', 'build_batch']

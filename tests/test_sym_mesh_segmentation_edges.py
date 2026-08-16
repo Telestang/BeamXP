@@ -19,6 +19,7 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
     analyse_symmetry_sweep,
     build_topology,
     measure_perimeter_symmetry,
+    measure_region_depth_ratio,
     pseudo_aspect_ratio_from_area_perimeter,
 )
 
@@ -140,6 +141,40 @@ def _touching_symmetric_regions_topology():
     return build_topology(vertices, triangles, source_faces)
 
 
+def _stalk_topology(length: float):
+    """A square-section tube standing off a collar, like a wiper stalk.
+
+    The collar is the only boundary loop, so the perimeter is symmetric about
+    every plane through its centre no matter how long the tube behind it is.
+    """
+    half = 0.01
+    vertices = [
+        [-half, 0.0, -half],
+        [half, 0.0, -half],
+        [half, 0.0, half],
+        [-half, 0.0, half],
+        [-half, length, -half],
+        [half, length, -half],
+        [half, length, half],
+        [-half, length, half],
+    ]
+    triangles = []
+    for first, second in ((0, 1), (1, 2), (2, 3), (3, 0)):
+        triangles.append([first, second, second + 4])
+        triangles.append([first, second + 4, first + 4])
+    triangles.append([4, 5, 6])
+    triangles.append([4, 6, 7])
+    source_faces = [
+        SourceFaceRef(0, "test", 0, triangle_index)
+        for triangle_index in range(len(triangles))
+    ]
+    return build_topology(
+        np.array(vertices, dtype=float),
+        np.array(triangles, dtype=np.int64),
+        source_faces,
+    )
+
+
 def _candidate_for_faces(topology, key: tuple[int, int], faces: tuple[int, ...]) -> IslandCandidate:
     boundary = _candidate_union_boundary(topology, faces)
     measurement = measure_perimeter_symmetry(
@@ -161,6 +196,7 @@ def _candidate_for_faces(topology, key: tuple[int, int], faces: tuple[int, ...])
             area,
             boundary.perimeter,
         ),
+        depth_ratio=measure_region_depth_ratio(topology, faces, boundary.loops),
         boundary_edges=boundary.edges,
         boundary_loops=boundary.loops,
         perimeter=boundary.perimeter,
@@ -224,6 +260,7 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
                 threshold_steps=2,
                 min_region_faces=1,
                 max_pseudo_aspect_ratio=10.0,
+                max_depth_ratio=0.35,
                 symmetry_tolerance_metres=0.001,
                 direct_symmetry_tolerance_metres=0.0005,
                 sample_spacing_metres=0.05,
@@ -271,6 +308,7 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             threshold=30.0,
             fallback_carrier_faces=set(),
             max_pseudo_aspect_ratio=10.0,
+            max_depth_ratio=0.35,
             edge_lookup=edge_lookup,
         )
 
@@ -307,11 +345,85 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             threshold=30.0,
             fallback_carrier_faces={0, 1},
             max_pseudo_aspect_ratio=10.0,
+            max_depth_ratio=0.35,
             edge_lookup=edge_lookup,
         )
 
         self.assertFalse(region.eligible)
         self.assertEqual(region.role, "main carrier")
+
+    def test_flat_panel_is_shallow_against_its_own_perimeter(self) -> None:
+        topology = _open_square_topology()
+
+        ratio = measure_region_depth_ratio(topology, (0, 1), ((0, 1, 2, 3),))
+
+        self.assertAlmostEqual(ratio, 0.0)
+
+    def test_stalk_perimeter_is_symmetric_but_the_region_is_deep(self) -> None:
+        topology = _stalk_topology(length=0.12)
+        faces = tuple(range(len(topology.triangles)))
+        boundary = _candidate_union_boundary(topology, faces)
+
+        measurement = measure_perimeter_symmetry(
+            topology.vertices,
+            boundary.loops,
+            sample_spacing=0.002,
+            rms_tolerance=0.001,
+            direct_rms_tolerance=0.0005,
+        )
+        ratio = measure_region_depth_ratio(topology, faces, boundary.loops)
+
+        self.assertTrue(measurement.passed)
+        self.assertGreater(ratio, 0.35)
+
+    def test_deep_region_is_rejected_before_symmetry_testing(self) -> None:
+        topology = _stalk_topology(length=0.12)
+        faces = tuple(range(len(topology.triangles)))
+        edge_lookup = {
+            edge: (adjacent, topology.edge_angles.get(edge))
+            for edge, adjacent in topology.edge_faces.items()
+        }
+
+        region = _classify_region(
+            topology,
+            island_index=2,
+            is_main=False,
+            faces=faces,
+            active=set(faces),
+            threshold=120.0,
+            fallback_carrier_faces=set(),
+            max_pseudo_aspect_ratio=10.0,
+            max_depth_ratio=0.35,
+            edge_lookup=edge_lookup,
+        )
+
+        self.assertFalse(region.eligible)
+        self.assertEqual(region.role, "deep/rejected")
+
+    def test_shallow_facia_still_reaches_symmetry_testing(self) -> None:
+        # The same collar, 6 mm proud instead of 120 mm: a switch pack, not a stalk.
+        topology = _stalk_topology(length=0.006)
+        faces = tuple(range(len(topology.triangles)))
+        edge_lookup = {
+            edge: (adjacent, topology.edge_angles.get(edge))
+            for edge, adjacent in topology.edge_faces.items()
+        }
+
+        region = _classify_region(
+            topology,
+            island_index=2,
+            is_main=False,
+            faces=faces,
+            active=set(faces),
+            threshold=120.0,
+            fallback_carrier_faces=set(),
+            max_pseudo_aspect_ratio=10.0,
+            max_depth_ratio=0.35,
+            edge_lookup=edge_lookup,
+        )
+
+        self.assertTrue(region.eligible)
+        self.assertEqual(region.role, "candidate")
 
     def test_curved_host_can_adopt_close_projected_child(self) -> None:
         topology = _curved_host_with_child_topology()
@@ -388,6 +500,7 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             sample_spacing=0.25,
             rms_tolerance=1e-9,
             direct_rms_tolerance=1e-9,
+            max_depth_ratio=0.35,
         )
 
         self.assertEqual(len(merged), 1)

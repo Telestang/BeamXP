@@ -38,12 +38,14 @@ from mesh_segmentation_transform.mirror_texture_for_rhd import (
     apply_masked_rotated_flip,
     companion_boundary_blend_px,
     deduplicate_region_detections,
+    exchangeable_share,
     merge_region_sets,
     normal_map_relief,
     reconstruct_normal_z,
     rescale_plan,
     rotated_axis_alignment_degrees,
     rotated_axis_for_surface_axis,
+    rotated_exchangeable_share,
     source_dds_codec,
     write_blender_preview,
     write_dds,
@@ -295,6 +297,59 @@ class NormalChannelNegationTests(unittest.TestCase):
         )
         self.assertIsNotNone(alignment)
         self.assertLess(alignment, DEFAULT_RHD_CONFIG.rotated_axis_snap_degrees)
+
+
+class ExchangeableShareTests(unittest.TestCase):
+    """What a region risks tearing is measured over what it can write.
+
+    ``apply_masked_flip`` exchanges only texels whose partner is also inside the
+    stencil, and never touches anything outside it, so a texel the material
+    does not paint at all cannot tear. Counting the region's whole rectangle
+    instead cost the Andronisk door panel its gear-selector "2": the detection
+    box overhangs that glyph's UV island by 5%, and the overhang alone put it
+    under the 0.98 floor while only 11 of its 2,397 painted texels really
+    lacked a partner.
+    """
+
+    def island_overhung_by_its_region(self) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        """A symmetric island a little smaller than the box detected over it."""
+        domain = np.zeros((20, 20), dtype=bool)
+        domain[3:17, 3:17] = True
+        return domain, (1, 1, 18, 18)
+
+    def test_an_overhanging_region_is_judged_on_the_island_it_paints(self) -> None:
+        domain, bounds = self.island_overhung_by_its_region()
+        self.assertLess(exchangeable_share(domain, bounds, "horizontal"), 0.98)
+        self.assertEqual(
+            exchangeable_share(domain, bounds, "horizontal", domain), 1.0
+        )
+
+    def test_a_region_split_between_mirrored_and_rigid_still_scores_low(self) -> None:
+        # The half outside the mirror mask is inside the domain and does tear,
+        # so narrowing the denominator must not excuse it.
+        domain = np.zeros((20, 20), dtype=bool)
+        domain[3:17, 3:17] = True
+        mirror = np.zeros_like(domain)
+        mirror[3:17, 3:10] = True
+        share = exchangeable_share(mirror, (1, 1, 18, 18), "horizontal", domain)
+        self.assertLess(share, 0.98)
+
+    def test_a_stencil_that_paints_nothing_here_exchanges_nothing(self) -> None:
+        domain = np.zeros((20, 20), dtype=bool)
+        domain[3:17, 3:17] = True
+        self.assertEqual(
+            exchangeable_share(domain, (0, 0, 2, 2), "horizontal", domain), 0.0
+        )
+
+    def test_the_rotated_measure_narrows_the_same_way(self) -> None:
+        domain = np.zeros((20, 20), dtype=bool)
+        domain[3:17, 3:17] = True
+        # Centred on the island, so only the overhang separates the two answers.
+        corners = ((1.0, 1.0), (18.0, 1.0), (18.0, 18.0), (1.0, 18.0))
+        self.assertLess(rotated_exchangeable_share(domain, corners, "long"), 0.98)
+        self.assertEqual(
+            rotated_exchangeable_share(domain, corners, "long", domain), 1.0
+        )
 
 
 class PlanRescalingTests(unittest.TestCase):

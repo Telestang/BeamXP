@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing
+
 from beamxp.hand_drive_ui.app import HandDriveToolApp, main, parse_args, validate_source
 from beamxp.hand_drive_ui.recommendation_common import (
     HANDED_PATTERNS,
@@ -26,4 +28,9 @@ __all__ = sorted(name for name in globals() if not name.startswith("__"))
 
 
 if __name__ == "__main__":
+    # Texture correction spreads its atlases over a process pool, and Windows
+    # starts those by spawning this entry point again. In a PyInstaller build
+    # that means re-running the executable, which without this would raise a
+    # second copy of the whole tool per worker instead of a worker.
+    multiprocessing.freeze_support()
     main()

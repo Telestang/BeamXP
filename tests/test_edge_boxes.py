@@ -11,6 +11,7 @@ there, for one convolution instead of a region search.
 
 from __future__ import annotations
 
+import random
 import unittest
 from dataclasses import replace
 
@@ -25,6 +26,7 @@ from mesh_segmentation_transform.annotate_texture_regions import (
     detect_mser_boxes,
     edge_response,
     run_detection,
+    STEP_INDEX,
 )
 
 
@@ -429,10 +431,10 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         run = run_detection(image, None, config, initial_boxes=boxes)
 
-        self.assertEqual(run.stages[3].key, "overlap_box_group")
-        self.assertEqual(run.stages[3].circles, ())
-        self.assertEqual(run.stages[4].key, "grouped")
-        self.assertEqual(run.stages[4].circles, (16,))
+        self.assertEqual(run.stages[STEP_INDEX["overlap_box_group"]].key, "overlap_box_group")
+        self.assertEqual(run.stages[STEP_INDEX["overlap_box_group"]].circles, ())
+        self.assertEqual(run.stages[STEP_INDEX["grouped"]].key, "grouped")
+        self.assertEqual(run.stages[STEP_INDEX["grouped"]].circles, (16,))
 
     def test_local_contrast_also_collapses_nested_overlap_before_proximity(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
@@ -537,7 +539,7 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         run = run_detection(image, None, config, initial_boxes=boxes)
 
-        self.assertEqual(run.stages[4].kept, tuple(tuple(box) for box in boxes))
+        self.assertEqual(run.stages[STEP_INDEX["grouped"]].kept, tuple(tuple(box) for box in boxes))
 
     def test_proximity_grouping_keeps_a_thin_box_on_the_same_centreline(self) -> None:
         image = np.full((128, 256, 3), 128, dtype=np.uint8)
@@ -555,7 +557,7 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         run = run_detection(image, None, config, initial_boxes=boxes)
 
-        self.assertEqual(run.stages[4].kept, ((10, 10, 160, 80),))
+        self.assertEqual(run.stages[STEP_INDEX["grouped"]].kept, ((10, 10, 160, 80),))
 
     def test_nested_detail_is_absorbed_only_by_overlap_grouping(self) -> None:
         """Initial grouping receives the already-collapsed overlap candidate."""
@@ -574,9 +576,9 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         run = run_detection(image, None, config, initial_boxes=boxes)
 
-        self.assertEqual(run.stages[3].kept, ((10, 10, 180, 100),))
-        self.assertEqual(run.stages[3].adjusted, 1)
-        self.assertEqual(run.stages[4].kept, ((10, 10, 180, 100),))
+        self.assertEqual(run.stages[STEP_INDEX["overlap_box_group"]].kept, ((10, 10, 180, 100),))
+        self.assertEqual(run.stages[STEP_INDEX["overlap_box_group"]].adjusted, 1)
+        self.assertEqual(run.stages[STEP_INDEX["grouped"]].kept, ((10, 10, 180, 100),))
 
     def test_domain_recovery_splits_failed_initial_groups_to_overlap_groups(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
@@ -1301,6 +1303,65 @@ class MagicFeatureFilterTests(unittest.TestCase):
         self.assertEqual(stage.rejected, (groups[0],))
         self.assertEqual(stage.kept, (groups[1],))
 
+    def _dark_trim(self) -> np.ndarray:
+        """Near-black trim, the ground both a stitch and a legend sit on."""
+        return np.full((128, 128, 3), 20, dtype=np.uint8)
+
+    def test_blob_stage_judges_regions_the_size_of_a_stitch_dash(self) -> None:
+        """The area floor used to exempt the one shape that is plainly a blob.
+
+        At 512 px^2 the floor was larger than most stitch dashes, so the filter
+        never looked at them: measured over both V60 stitch atlases, 97 of 97
+        dashes fill their hull at 1.09-1.15 with a colour range of 0.0-1.0, and
+        every one was skipped on size alone.
+        """
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_blob_shape,
+        )
+
+        image = self._dark_trim()
+        # Flat-painted, the way a stitch is drawn: one solid colour, no blend
+        # into the trim at any edge.
+        image[56:78, 60:70] = (70, 70, 70)
+        group = (57, 53, 16, 28)
+        config = replace(DEFAULT_CONFIG, enable_blob_shape_filter=True)
+
+        self.assertLess(group[2] * group[3], 512)
+        _state, stage = _step_blob_shape(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), [group])
+        )
+
+        self.assertEqual(stage.rejected, (group,))
+        self.assertNotIn("skipped", stage.detail)
+
+    def test_a_small_antialiased_mark_survives_the_lowered_floor(self) -> None:
+        """What keeps real marks is the colour range, never the area floor.
+
+        A cursor arrowhead is exactly as hull-filling as a stitch dash -- the
+        scintilla cluster's four all read 1.09 -- and is kept because its edges
+        blend into the trim behind it, ranging 82-84 where a flat-painted dash
+        ranges 0-1.
+        """
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_blob_shape,
+        )
+
+        image = self._dark_trim()
+        arrow = np.array([[64, 56], [73, 73], [55, 73]], dtype=np.int32)
+        cv2.fillPoly(image, [arrow], (235, 235, 235), lineType=cv2.LINE_AA)
+        group = (54, 55, 21, 19)  # the size the real ones are
+        config = replace(DEFAULT_CONFIG, enable_blob_shape_filter=True)
+
+        self.assertLess(group[2] * group[3], 512)
+        _state, stage = _step_blob_shape(
+            image, None, config, DetectionState(np.empty((0, 4), np.int32), [group])
+        )
+
+        self.assertEqual(stage.kept, (group,))
+        self.assertEqual(stage.rejected, ())
+
     def test_blob_stage_keeps_blob_like_regions_with_internal_detail(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
             DetectionState,
@@ -1933,6 +1994,11 @@ MARKS_CONFIG = replace(
     enable_box_feature_filter=False, enable_rotated_bounds_filter=True,
     enable_blob_shape_filter=False, enable_feature_extension_filter=False,
     merge_distance_px=18,
+    # These fixtures are flat-painted bars and strokes on a uniform ground, and
+    # a long straight stroke matches itself at every shift along its own
+    # length, so the recurrence filter reads them as repeating material.  These
+    # tests are about rotated-outline plumbing, not about that judgement.
+    enable_repeat_texture_filter=False,
 )
 
 
@@ -2182,3 +2248,96 @@ class TextLineTests(unittest.TestCase):
         )
         stage = next(s for s in run.stages if s.key == "text_line")
         self.assertEqual(len(stage.rotations), len(stage.kept))
+
+
+class SharedUvDomainIndexTests(unittest.TestCase):
+    """Handing the circle test the shared labelling must decide nothing new.
+
+    ``circle_uv_coverage`` relabelled the whole atlas whenever it was given no
+    index, and the circle test never had one to give: on the V60's stitch
+    normal that was a 4096-square connected-components pass 11,662 times over,
+    11.9 ms each. ``UvDomainIndex`` exists to stop exactly that, and computes
+    the identical ``cv2.connectedComponents(mask, connectivity=8)``.
+
+    A filter that changes nothing on one vehicle can still change another, so
+    this is pinned as the equivalence it is rather than by any one car's
+    output.
+    """
+
+    def _island_mask(self, rng, height, width):
+        mask = np.zeros((height, width), dtype=bool)
+        for _ in range(rng.randint(1, 5)):
+            x0 = rng.randrange(width - 20)
+            y0 = rng.randrange(height - 20)
+            mask[y0:y0 + rng.randint(8, 20), x0:x0 + rng.randint(8, 20)] = True
+        return mask
+
+    def test_the_index_decides_what_relabelling_decided(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            build_uv_domain_index,
+            box_uv_coverage,
+            circle_uv_coverage,
+            inscribed_circle_radius,
+        )
+
+        rng = random.Random(20260815)
+        values = np.random.default_rng(20260815)
+        circles = 0
+        for trial in range(120):
+            extent = rng.choice((48, 96, 160))
+            mask = self._island_mask(rng, extent, extent)
+            image = values.integers(0, 255, (extent, extent, 3), dtype=np.uint8)
+            if trial % 2:
+                # a flat field is where a circle is actually findable
+                image[:] = 40
+            index = build_uv_domain_index(mask)
+            for _ in range(6):
+                size = rng.randint(6, 30)
+                group = (
+                    rng.randrange(max(extent - size, 1)),
+                    rng.randrange(max(extent - size, 1)),
+                    size,
+                    size,
+                )
+                relabelled = inscribed_circle_radius(
+                    image, mask, group, DEFAULT_CONFIG, None
+                )
+                shared = inscribed_circle_radius(
+                    image, mask, group, DEFAULT_CONFIG, index
+                )
+                self.assertEqual(relabelled, shared, f"radius for {group}")
+                if relabelled is not None:
+                    circles += 1
+                centre = (group[0] + group[2] / 2.0, group[1] + group[3] / 2.0)
+                self.assertEqual(
+                    circle_uv_coverage(mask, centre, group[2] / 2.0, None),
+                    circle_uv_coverage(mask, centre, group[2] / 2.0, index),
+                    f"circle coverage for {group}",
+                )
+                self.assertEqual(
+                    box_uv_coverage(mask, group, image.shape, None),
+                    box_uv_coverage(mask, group, image.shape, index),
+                    f"box coverage for {group}",
+                )
+        # the equivalence is worthless if no circle was ever found
+        self.assertGreater(circles, 0)
+
+    def test_the_crop_local_mask_does_not_shadow_the_shared_index(self) -> None:
+        # inscribed_circle_radius already binds `domain` to the cropped mask,
+        # so an index parameter of that name is clobbered before the coverage
+        # call reads it and the whole thing raises on an ndarray.
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            build_uv_domain_index,
+            inscribed_circle_radius,
+        )
+
+        image = np.full((64, 64, 3), 128, dtype=np.uint8)
+        mask = np.zeros((64, 64), dtype=bool)
+        mask[10:50, 10:50] = True
+        index = build_uv_domain_index(mask)
+        config = replace(DEFAULT_CONFIG, enable_circular_groups=True)
+
+        self.assertEqual(
+            inscribed_circle_radius(image, mask, (18, 18, 20, 20), config, index),
+            inscribed_circle_radius(image, mask, (18, 18, 20, 20), config, None),
+        )

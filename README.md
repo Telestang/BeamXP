@@ -2,7 +2,7 @@
 
 **BeamXP (BeamNG Vehicle eXPort Services)** converts BeamNG.drive vehicles between left-hand drive and right-hand drive, with automatic correction of meshes, textures, controls, cameras, mirrors, lighting, configuration parts, and licence plates.
 
-**[Download BeamXP 0.3.1-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.1-alpha-windows.zip)** — extract it anywhere and run the exe.
+**[Download BeamXP 0.3.2-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.2-alpha-windows.zip)** — extract it anywhere and run the exe.
 
 > BeamXP was previously named **BeamHDC (BeamNG Hand Drive Converter)**.
 
@@ -28,7 +28,7 @@ The old **39 trims in 4 minutes 30 seconds** figure is no longer used as a bench
 
 ## Quick Start
 
-1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.1-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
+1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.2-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
 2. Open the app settings and configure:
    - your BeamNG vehicle-content folder;
    - your BeamNG mods folder.
@@ -52,6 +52,52 @@ Enjoying driving from the other side? Star the repo to help other people find it
 ## What's New in 0.3.x
 
 The 0.3 line is a major conversion-quality and workflow overhaul. It introduced automatic mesh and texture correction, then spent the releases since making that pipeline correct and affordable — much of it found while converting the Lexus LC500 and Civetta Scintilla.
+
+### Repeating material is no longer mistaken for lettering
+
+Stitching, woven carbon and perforated trim were being detected as marks and
+mirrored. They are not marks, and no earlier stage could say so — a stitch dash
+is a genuine high-contrast shape on plain leather, and the existing periodic
+test could not separate a woven panel from bare trim, because what it really
+measures is smoothness.
+
+Detection now asks the blunter question the false positives share: **does this
+patch of texture occur again and again nearby?** A tile is correlated against
+its surroundings and the recurrences counted. Either the box's own content
+repeats — a stitch dash with thirty siblings along one seam, a scrap of weave
+that tiles its panel — or the material around it repeats in more than one
+direction, which is what catches a moulding pip that is unique in itself but
+sits in the middle of carbon.
+
+- Recurrence is counted against the **whole atlas**, not the UV island crop that
+  detection runs on. A V60 seam scoring 13 recurrences over the atlas scores 1
+  inside a 96 px island crop, which is why material has to be judged at the
+  scale it exists on.
+- On the scintilla interior cluster every legend, dial and pictogram scores 1 or
+  2 recurrences, against 7–13 for stitching and 51–64 for woven carbon, so the
+  margin either side of the threshold is wide.
+- Replayed over every region previous builds actually flipped, it takes two, and
+  neither is a mark: a strip of carpet weave topped with overlock stitching, and
+  a patch of dashboard with no content in it at all.
+
+### Blob shape now judges marks the size of a stitch dash
+
+The blob filter skipped anything under 512 px², which is larger than most stitch
+dashes — so the one shape on an interior atlas that is unambiguously a solid
+blob was the one shape it never looked at. Measured across both V60 stitch
+atlases, 97 of 97 dashes fill their hull with a colour range of essentially
+zero, and every one was being skipped on size alone.
+
+The floor is now 48 px². What keeps real marks is the colour-range test, not the
+floor: a cursor arrowhead is just as hull-filling as a dash, but its edges blend
+into the fascia where a flat-painted dash does not.
+
+### UV island symmetry is one setting, not one per detection path
+
+The symmetry threshold in the tuning harness was remembered separately for each
+detection source, so tuning it on one and switching to another silently restored
+the old value. It is read off the UV mask and no detector touches it, so it is
+now shared across every path at once.
 
 ### Texture correction is scoped to the mesh that uses the texture
 

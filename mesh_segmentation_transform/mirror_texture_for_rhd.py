@@ -60,9 +60,10 @@ import struct
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
+from collections.abc import Mapping
 from typing import Callable
 
 import cv2
@@ -78,6 +79,7 @@ from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     LocalContrastDetection,
     MserConfig,
     SHAPE_ROTATED,
+    build_repeat_texture_index,
     detect_local_contrast_gpu_batch,
     run_detection,
 )
@@ -153,6 +155,15 @@ class RhdTextureConfig:
     threshold_steps: int = 10
     min_region_faces: int = 6
     max_pseudo_aspect_ratio: float = 20.0
+    # A symmetric perimeter says nothing about what sits behind it: the collar
+    # where a wiper stalk meets the column shroud is a circle, and a circle is
+    # symmetric about every plane through its centre, so the stalk was accepted
+    # and rotated end for end into its mirrored position.  Candidates must also
+    # be shallow against their own perimeter plane, which keeps the fasciae we
+    # want (radio surrounds, switch packs, vent bezels, badges) and drops the
+    # protrusions we do not.  Measured fasciae sit around 0.1-0.2; a stalk is
+    # several times its collar diameter, so the exact cut is not delicate.
+    max_candidate_depth_ratio: float = 0.35
     symmetry_tolerance_metres: float = 0.001
     direct_symmetry_tolerance_metres: float = 0.0005
     sample_spacing_metres: float = 0.002
@@ -289,6 +300,16 @@ class RhdTextureConfig:
     detection_tile_group_gap_px: int = 32
     detection_tile_group_max_area_growth: float = 1.5
     detection_collage_gutter_px: int = 16
+
+    # How many processes correct textures at once.  One -- the default -- keeps
+    # the whole pass in this process; zero picks a count; anything higher is
+    # taken literally.  It defaults to serial because a pool moves the work out
+    # of reach of anything that patched ``build_rhd_texture``, which the tuning
+    # harness and much of the test suite do; the build opts in explicitly.
+    # Threads were measured and do not serve: the hot path is Python looping
+    # over small array calls, so three of them scaled 1.32x while each job
+    # inflated from 32 s to 73 s.
+    texture_job_workers: int = 1
 
     # BC7 effort tier; the alpha-searching variant of it is chosen per image.
     # Measured on scintilla's 4096-square interior atlas: basic 10.6s at
@@ -1092,6 +1113,38 @@ def _records_by_normalised_alias(
     return records
 
 
+def material_aliases_for_candidates(
+    candidates: list[tuple[DaePart, MaterialTextureLayerBinding]],
+    symbols: set[str] | frozenset[str],
+) -> tuple[str, ...]:
+    """Every name this correction answers to, in an order that does not drift.
+
+    The binding's own names come first and the COLLADA symbols after, each kept
+    at its first appearance.  The symbols are sorted because they arrive as a
+    set and Python randomises string hashing per process: splatting them raw
+    ordered the aliases differently from one run to the next.  That was
+    invisible while every correction ran in this process and plainly visible
+    once they run in several -- a pooled pass and a serial one over the V60
+    agreed on all 59 plans except the order of this one field.
+
+    The material an alias names does not depend on the order, but the manifest
+    written from it, the material names minted off it and any diff of two
+    builds all do.
+    """
+    return tuple(
+        dict.fromkeys(
+            value
+            for _part, binding in candidates
+            for value in (
+                binding.dae_material,
+                binding.material_key,
+                *sorted(symbols),
+            )
+            if value
+        )
+    )
+
+
 def material_aliases_for_parts(
     loaded: LoadedDae,
     parts: list[DaePart],
@@ -1647,6 +1700,7 @@ def sweep_part(
         config.threshold_steps,
         config.min_region_faces,
         config.max_pseudo_aspect_ratio,
+        config.max_candidate_depth_ratio,
         config.symmetry_tolerance_metres,
         config.direct_symmetry_tolerance_metres,
         config.sample_spacing_metres,
@@ -2659,13 +2713,26 @@ def exchangeable_share(
     stencil: np.ndarray,
     bounds: tuple[int, int, int, int],
     axis: str,
+    within: np.ndarray | None = None,
 ) -> float:
-    """Share of a rectangle whose texels can legally swap with their partner.
+    """Share of a region's writable texels that can legally swap with partners.
 
     A texel may only move if the position it swaps with is also inside the
     mirrored domain.  Where that fails the texel keeps its original content
     while its neighbours move, which does not leave the glyph backwards -- it
     breaks it.  Measuring the share first lets the caller decline.
+
+    ``within`` says which of the rectangle's texels are writable at all --
+    normally the material domain.  ``apply_masked_flip`` only ever writes
+    through the stencil, so a texel this mesh's material never paints cannot
+    tear and must not count against the region.  Dividing by the whole
+    rectangle instead cost the Andronisk door panel its gear-selector "2": the
+    detection box overhangs that glyph's UV island by 5%, and the overhang
+    alone scored it 0.94 against a 0.98 floor, while only 11 of the 2,397
+    texels actually painted there lacked a partner.  Declined on a mesh the
+    exporter mirrors regardless, the glyph shipped reading backwards.  A
+    region genuinely split between mirrored and rigid geometry still scores
+    low, because those texels are inside the domain and do tear.
     """
     x, y, w, h = bounds
     height, width = stencil.shape[:2]
@@ -2675,7 +2742,14 @@ def exchangeable_share(
         return 0.0
     mask = stencil[y0:y1, x0:x1]
     flip = np.fliplr if axis == "horizontal" else np.flipud
-    return float((mask & flip(mask)).mean())
+    exchangeable = mask & flip(mask)
+    if within is None:
+        return float(exchangeable.mean())
+    writable = within[y0:y1, x0:x1]
+    paintable = int(writable.sum())
+    if paintable <= 0:
+        return 0.0
+    return float((exchangeable & writable).sum()) / float(paintable)
 
 
 def _boundary_alpha(write_mask: np.ndarray, blend_px: float) -> np.ndarray | None:
@@ -3009,8 +3083,13 @@ def rotated_exchangeable_share(
     stencil: np.ndarray,
     corners: tuple[tuple[float, float], ...],
     rotated_axis: str,
+    within: np.ndarray | None = None,
 ) -> float:
-    """Share of a rotated rectangle whose reflected partner is also legal."""
+    """Share of a rotated rectangle whose reflected partner is also legal.
+
+    ``within`` narrows the rectangle to the texels that are writable at all,
+    for the reason ``exchangeable_share`` gives.
+    """
     axes = _rotated_rectangle_axes(corners)
     if axes is None:
         return 0.0
@@ -3034,6 +3113,8 @@ def rotated_exchangeable_share(
     inside = (np.abs(local_long) <= long_half + 0.5) & (
         np.abs(local_short) <= short_half + 0.5
     )
+    if within is not None:
+        inside = inside & within[y0:y1, x0:x1]
     if not bool(inside.any()):
         return 0.0
 
@@ -4455,6 +4536,33 @@ def _clamp_bounds_to_atlas(
     return x0, y0, x1 - x0, y1 - y0
 
 
+def _repeat_texture_for_view(
+    index,
+    view: DetectionView,
+):
+    """Address the atlas-wide recurrence index in one view's coordinates.
+
+    A view is a crop, a single island tile, or a collage of several, and the
+    tiles already carry the mapping back to the atlas.  Recurrence has to be
+    counted on the atlas: a stitched seam sliced into island crops shows one or
+    two dashes per crop and reads as unique in every one of them.
+    """
+    if index is None:
+        return None
+    return index.for_view(
+        tuple(
+            (
+                (dx0, dy0, dx1 - dx0, dy1 - dy0),
+                sx0 - dx0,
+                sy0 - dy0,
+            )
+            for sx0, sy0, _sx1, _sy1, dx0, dy0, dx1, dy1 in (
+                (*tile.source, *tile.dest) for tile in view.tiles
+            )
+        )
+    )
+
+
 def _map_bounds_from_detection_view(
     bounds: tuple[int, int, int, int],
     view: DetectionView,
@@ -4512,6 +4620,7 @@ def _detect_flip_regions_in_view(
     source: str,
     log=print,
     initial_contrast: LocalContrastDetection | None = None,
+    repeat_texture=None,
 ) -> RegionDetection:
     """Run detection and post-filters on one crop/collage/tile view."""
     started = time.perf_counter()
@@ -4533,6 +4642,7 @@ def _detect_flip_regions_in_view(
         ),
         initial_relief_bridge_response=view.relief_bridge_response,
         initial_island_bits=view.island_bits,
+        initial_repeat_texture=_repeat_texture_for_view(repeat_texture, view),
     )
     final = detection.stages[-1]
     detected = list(final.kept)
@@ -4688,9 +4798,17 @@ def detect_flip_regions(
     result = RegionDetection(source=source, detected=0)
     started = time.perf_counter()
     result.work_views = [_view_report(view) for view in views]
+    # One recurrence index for the whole atlas, shared by every view and by
+    # the match cache inside it.  Views are crops, and a crop cannot show that
+    # a texture repeats.
+    repeat_texture = (
+        build_repeat_texture_index(bgr, mser_config)
+        if mser_config.enable_repeat_texture_filter
+        else None
+    )
     for view in views:
         partial = _detect_flip_regions_in_view(
-            view, config, mser_config, source, log
+            view, config, mser_config, source, log, repeat_texture=repeat_texture,
         )
         result.detected += partial.detected
         result.regions.extend(partial.regions)
@@ -4726,6 +4844,14 @@ def detect_flip_regions_by_uv_island(
     started = time.perf_counter()
     result = RegionDetection(source=source, detected=0)
     consumers = _coalesce_overlapping_uv_consumers(island_masks)
+    # One recurrence index for the whole atlas, shared by every view and by
+    # the match cache inside it.  Views are crops, and a crop cannot show that
+    # a texture repeats.
+    repeat_texture = (
+        build_repeat_texture_index(bgr, mser_config)
+        if mser_config.enable_repeat_texture_filter
+        else None
+    )
 
     if mser_config.box_source == "contrast_gpu":
         indexed_views: list[tuple[int, DetectionView]] = []
@@ -4755,6 +4881,7 @@ def detect_flip_regions_by_uv_island(
                 f"{source}:uv-island-{index}",
                 log,
                 contrast,
+                repeat_texture=repeat_texture,
             )
             result.detected += partial.detected
             result.regions.extend(partial.regions)
@@ -4779,7 +4906,8 @@ def detect_flip_regions_by_uv_island(
             partial = RegionDetection(source=f"{source}:uv-island-{index}", detected=0)
             for view in views:
                 view_result = _detect_flip_regions_in_view(
-                    view, config, mser_config, partial.source, log
+                    view, config, mser_config, partial.source, log,
+                    repeat_texture=repeat_texture,
                 )
                 partial.detected += view_result.detected
                 partial.regions.extend(view_result.regions)
@@ -5951,11 +6079,11 @@ def build_rhd_texture(
         else:
             if rotation is not None and rotated_axis is not None:
                 exchangeable = rotated_exchangeable_share(
-                    mirror_mask, rotation, rotated_axis
+                    mirror_mask, rotation, rotated_axis, domain_mask
                 )
             else:
                 exchangeable = exchangeable_share(
-                    mirror_mask, (x, y, w, h), axis
+                    mirror_mask, (x, y, w, h), axis, domain_mask
                 )
             stencil = STENCIL_MIRROR
         if (
@@ -5963,14 +6091,16 @@ def build_rhd_texture(
             and exchangeable < config.min_region_exchangeable
         ):
             other = "vertical" if axis == "horizontal" else "horizontal"
-            alternative = exchangeable_share(mirror_mask, (x, y, w, h), other)
+            alternative = exchangeable_share(
+                mirror_mask, (x, y, w, h), other, domain_mask
+            )
             if rotation is not None and rotated_axis is not None:
                 domain_exchangeable = rotated_exchangeable_share(
-                    domain_mask, rotation, rotated_axis
+                    domain_mask, rotation, rotated_axis, domain_mask
                 )
             else:
                 domain_exchangeable = exchangeable_share(
-                    domain_mask, (x, y, w, h), axis
+                    domain_mask, (x, y, w, h), axis, domain_mask
                 )
             if domain_exchangeable >= config.min_region_exchangeable:
                 expanded += 1
@@ -6236,18 +6366,7 @@ def build_rhd_texture(
         )
         log(f"  wrote {overlay_path.name}")
 
-    material_aliases = tuple(
-        dict.fromkeys(
-            value
-            for _part, binding in candidates
-            for value in (
-                binding.dae_material,
-                binding.material_key,
-                *symbols,
-            )
-            if value
-        )
-    )
+    material_aliases = material_aliases_for_candidates(candidates, symbols)
     switch_base_aliases = tuple(
         dict.fromkeys(
             binding.dae_material
@@ -6943,6 +7062,11 @@ class PartPreview:
     # Parts the export skipped, each {"source_part": ..., "error": ...}. A
     # part with no correctable atlas does not stop the rest of the selection.
     failed_parts: tuple[dict[str, object], ...] = ()
+    # Textures that raised rather than being deliberately passed over, each
+    # {"texture": ..., "reason": ...}. Kept apart from the ordinary skips: a
+    # texture with nothing mirrored on it is a finding, one the exporter could
+    # not read at all is a fault, and the caller has to be able to tell.
+    texture_failures: tuple[dict[str, str], ...] = ()
 
 
 def _base_colours_by_alias(results: list[RhdTextureResult]) -> dict[str, Path]:
@@ -7058,6 +7182,132 @@ def _generated_mesh_rows_from_export(
     return rows
 
 
+@dataclass(slots=True)
+class TextureCorrectionTask:
+    """One correction, stated small enough to hand another process.
+
+    ``LoadedDae`` pickles to 129 MB, so a worker rebuilds it from the DAE the
+    parent already extracted rather than receiving it per task.  ``DaePart`` is
+    a plain record of a key, a matrix and its geometry instances -- it holds no
+    reference back to the document -- so the scope itself travels, and a worker
+    resolves geometry through its own ``loaded``.
+    """
+
+    member: str
+    material: str
+    part_scope: tuple[DaePart, ...]
+    masks: DomainMasks
+    part_group_index: int
+
+
+@dataclass(slots=True)
+class TextureCorrectionTaskOutcome:
+    """What one task produced, with its log held back for ordered replay."""
+
+    result: RhdTextureResult | None
+    log_lines: list[str]
+    error: str | None
+
+
+_TEXTURE_WORKER: dict[str, object] = {}
+
+
+def _texture_worker_init(
+    archive: VehicleArchive,
+    dae_path: str,
+    config: RhdTextureConfig,
+    mser_config: MserConfig,
+    relief_mser_config: MserConfig,
+) -> None:
+    """Give this process its own DAE and its own extraction workspace.
+
+    The workspace is private because ``extract_archive_member`` writes the
+    member straight to its final path: two processes wanting one map -- and a
+    normal map is read by every layer of its material -- would otherwise race,
+    and on Windows a replace onto a file another process holds open fails
+    outright.  Re-extracting is cheap beside a job, and the page cache absorbs
+    most of it.
+    """
+    workspace = Path(tempfile.mkdtemp(prefix="beamxp_rhd_worker_"))
+    _TEXTURE_WORKER["archive"] = replace(archive, workspace=workspace)
+    _TEXTURE_WORKER["loaded"] = load_dae(Path(dae_path))
+    _TEXTURE_WORKER["config"] = config
+    _TEXTURE_WORKER["mser_config"] = mser_config
+    _TEXTURE_WORKER["relief_mser_config"] = relief_mser_config
+    # One session per process: the cross-layer cache is exact-input keyed, so
+    # splitting it costs repeated work on duplicate atlases and nothing else.
+    _TEXTURE_WORKER["session"] = ProductionDetectionSession()
+
+
+def _run_texture_correction_task(
+    task: TextureCorrectionTask,
+    output_directory: Path,
+    context: Mapping[str, object],
+) -> TextureCorrectionTaskOutcome:
+    """Run one correction, capturing its log instead of emitting it.
+
+    ``context`` is a worker's own archive, DAE and session, or the caller's
+    when the pass stays in-process; taking it explicitly keeps the serial path
+    off the module global and re-entrant.
+    """
+    lines: list[str] = []
+    try:
+        result = build_rhd_texture(
+            context["archive"],
+            context["loaded"],
+            task.member,
+            output_directory,
+            context["config"],
+            context["mser_config"],
+            context["relief_mser_config"],
+            part_scope=list(task.part_scope),
+            material_scope=(task.material,),
+            masks=task.masks,
+            detection_session=context["session"],
+            part_group_index=task.part_group_index,
+            log=lines.append,
+        )
+        return TextureCorrectionTaskOutcome(result, lines, None)
+    except Exception as exc:
+        return TextureCorrectionTaskOutcome(
+            None, lines, f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _run_texture_correction_task_in_worker(
+    task: TextureCorrectionTask,
+    output_directory: Path,
+) -> TextureCorrectionTaskOutcome:
+    """Pool entry point: the context is whatever this process was initialised with."""
+    return _run_texture_correction_task(task, output_directory, _TEXTURE_WORKER)
+
+
+TEXTURE_JOB_WORKER_DEFAULT = 4
+
+
+def texture_correction_worker_count(config: RhdTextureConfig, tasks: int) -> int:
+    """How many processes to correct textures with.
+
+    Zero means choose, which lands on four unless the machine has fewer cores.
+    Four is measured rather than assumed: on the V60 six workers came out at
+    223.9 s against four at 220.0 s over the whole vehicle, and 203.9 s against
+    205.5 s over the heavy atlases alone -- no gain either way, for 106 MiB more
+    VRAM at the 95th percentile.  What is saturated is the one GPU, busy in 99%
+    of samples at both counts, so further workers queue behind it rather than
+    adding throughput.  The encoder already fans BC7 across every core too.
+
+    A machine with a bigger GPU may well do better; that is what the setting is
+    for, since VRAM cannot be read portably -- moderngl exposes no memory at
+    all and the queries are vendor extensions.
+    """
+    requested = int(config.texture_job_workers)
+    if requested < 0:
+        return 1
+    if requested == 0:
+        requested = max(1, min(os.cpu_count() or 1, TEXTURE_JOB_WORKER_DEFAULT))
+    return max(1, min(requested, tasks))
+
+
 def export_parts_preview(
     archive: VehicleArchive,
     loaded: LoadedDae,
@@ -7141,7 +7391,12 @@ def export_parts_preview(
 
     sweep_cache: dict[str, object] = {}
     mask_cache: dict[tuple, DomainMasks] = {}
-    written: set[str] = set()
+    # No companion set: ``build_rhd_texture`` keeps its companion container
+    # empty because every stage map is a first-class texture job now, so
+    # nothing replays a plan onto another image and nothing needs de-duping
+    # across corrections. Reviving companions means revisiting this pass --
+    # ``written_companions`` was the one piece of state a correction mutated
+    # for the next one to read, which a pool cannot share.
     detection_session: ProductionDetectionSession[RegionDetection] = (
         ProductionDetectionSession()
     )
@@ -7159,8 +7414,20 @@ def export_parts_preview(
     results: list[RhdTextureResult] = []
     detection_attempted_members: set[str] = set()
     detection_skips: list[dict[str, str]] = []
+    texture_failures: list[dict[str, str]] = []
+    # Every correction is planned before any is run, so the pass can be spread
+    # over processes.  A texture's heading and mask coverage are written during
+    # planning but belong above that texture's corrections, which no longer
+    # follow immediately, so each texture holds its own lines until its tasks
+    # come back and the two are replayed together.
+    planned: list[tuple[str, list[str], list[TextureCorrectionTask]]] = []
+    outer_log = log
     for texture_index, (member, entries) in enumerate(bindings_by_texture.items(), start=1):
         texture_name = PurePosixPath(member).name
+        held: list[str] = []
+        log = held.append
+        tasks: list[TextureCorrectionTask] = []
+        planned.append((member, held, tasks))
         jobs = correction_jobs_for_texture(loaded, entries)
         if not jobs:
             log(f"\n{texture_name}")
@@ -7253,29 +7520,136 @@ def export_parts_preview(
                 merged.items(), start=1
             ):
                 detection_attempted_members.add(member)
-                results.append(
-                    build_rhd_texture(
-                        archive, loaded, member, output_directory,
-                        config, mser_config, relief_mser_config,
-                        part_scope=scope,
-                        material_scope=(material,),
+                tasks.append(
+                    TextureCorrectionTask(
+                        member=member,
+                        material=material,
+                        part_scope=tuple(scope),
                         masks=masks,
-                        sweep_cache=sweep_cache,
-                        written_companions=written,
-                        detection_session=detection_session,
                         part_group_index=index if scoped else 0,
-                        log=log,
-                        progress=progress,
                     )
                 )
         except Exception as exc:
             log(f"  ! failed: {type(exc).__name__}: {exc}")
-            detection_skips.append(
+            texture_failures.append(
                 {
                     "texture": member,
                     "reason": f"{type(exc).__name__}: {exc}",
                 }
             )
+
+    log = outer_log
+    every_task = [task for _member, _held, tasks in planned for task in tasks]
+    workers = texture_correction_worker_count(config, len(every_task))
+    phase_started = time.perf_counter()
+    emit_progress(
+        progress,
+        "begin",
+        "correct_textures",
+        f"Correcting {len(every_task)} texture job(s) on {workers} worker(s)",
+        texture_jobs=len(every_task),
+        workers=workers,
+    )
+
+    def consume(member: str, outcome: TextureCorrectionTaskOutcome) -> None:
+        for line in outcome.log_lines:
+            log(line)
+        if outcome.result is not None:
+            results.append(outcome.result)
+            return
+        # Survived the serial retry as well, so it is the work and not the
+        # pool. The mesh will ship on the uncorrected atlas; say so plainly
+        # rather than leaving it to be noticed in-game.
+        log(f"  ! FAILED, uncorrected: {outcome.error}")
+        texture_failures.append({"texture": member, "reason": str(outcome.error)})
+
+    # In-process context: the path the tuning harness and the equivalence tests
+    # drive, the one a worker has to match, and the one a failed task retries on.
+    context = {
+        "archive": archive,
+        "loaded": loaded,
+        "config": config,
+        "mser_config": mser_config,
+        "relief_mser_config": relief_mser_config,
+        "session": detection_session,
+    }
+    # Outcomes are consumed in submission order, so the log, the result order
+    # and therefore every output name are exactly what a serial pass produced.
+    outcomes: dict[int, TextureCorrectionTaskOutcome] = {}
+    if workers > 1:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_texture_worker_init,
+            initargs=(
+                archive,
+                str(loaded.path),
+                config,
+                mser_config,
+                relief_mser_config,
+            ),
+        ) as pool:
+            futures = {
+                index: pool.submit(
+                    _run_texture_correction_task_in_worker, task, output_directory
+                )
+                for index, task in enumerate(every_task)
+            }
+            for index, future in futures.items():
+                outcomes[index] = future.result()
+
+        # A worker fails for reasons the same work in this process may not
+        # have: four of them hold four GL contexts on one card, and a texture
+        # correction that cannot get one raises rather than degrading. Losing
+        # the correction silently would ship a mesh on an uncorrected atlas
+        # looking like nothing went wrong, so the pass says so and does the
+        # work again here, alone, where the contention it lost to is gone.
+        lost = [index for index, outcome in outcomes.items() if outcome.error]
+        if lost:
+            log(
+                f"\n  ! {len(lost)} correction(s) failed on a worker; "
+                f"running them again on the serial path"
+            )
+            for index in lost:
+                task = every_task[index]
+                log(f"    retrying {PurePosixPath(task.member).name}: "
+                    f"{outcomes[index].error}")
+                retried = _run_texture_correction_task(
+                    task, output_directory, context
+                )
+                if retried.error is None:
+                    log(f"    {PurePosixPath(task.member).name}: "
+                        f"recovered on the serial path")
+                outcomes[index] = retried
+    else:
+        for index, task in enumerate(every_task):
+            outcomes[index] = _run_texture_correction_task(
+                task, output_directory, context
+            )
+
+    consumed = 0
+    for member, held, tasks in planned:
+        for line in held:
+            log(line)
+        for _task in tasks:
+            consume(member, outcomes[consumed])
+            consumed += 1
+
+    timing = record_phase(
+        phase_timings,
+        "correct_textures",
+        phase_started,
+        texture_jobs=len(every_task),
+        workers=workers,
+    )
+    emit_progress(
+        progress,
+        "end",
+        "correct_textures",
+        f"Corrected {len(results)} texture job(s)",
+        texture_jobs=len(every_task),
+        workers=workers,
+        seconds=timing["seconds"],
+    )
 
     phase_started = time.perf_counter()
     emit_progress(
@@ -7460,6 +7834,7 @@ def export_parts_preview(
             "candidate_files": sorted(bindings_by_texture),
             "detection_attempted_files": sorted(detection_attempted_members),
             "skipped_candidates": detection_skips,
+            "failed_candidates": texture_failures,
             "source_archive_raster_files_not_candidates": sorted(
                 source_archive_rasters.difference(bindings_by_texture)
             ),
@@ -7541,6 +7916,7 @@ def export_parts_preview(
         report_path=report_path,
         report=report,
         failed_parts=tuple(failed_parts),
+        texture_failures=tuple(texture_failures),
     )
 
 

@@ -1920,6 +1920,38 @@ def texture_correction_atlas_dependencies(
     return dependency_targets, forced_source_ids
 
 
+def whole_mesh_mirror_correction_ids(
+    object_modes: dict[str, str],
+    structural_sources: dict[str, str],
+    prop_meshes: set[str],
+    flexbody_meshes: set[str],
+) -> set[str]:
+    """Source meshes a correction must treat as mirrored end to end.
+
+    A flexbody row can be swapped for the correction's split pieces, so a
+    Mirror flexbody ships the sweep's answer: a mirrored husk plus rotated
+    perimeter-symmetric candidates, and the candidates' texels are rightly
+    left alone. A prop cannot. ``vehicleObj:addProp`` in
+    ``lua/common/jbeam/sections/meshs.lua`` spawns exactly the one mesh the row
+    names, so a Mirror prop ships a whole-mesh reflection instead -- a per-row
+    baked copy for the usual case (``mesh_placement.add_baked_shared_mesh``,
+    which bakes props unconditionally because their node triad is left-handed),
+    otherwise the reflected ``_xp_rhd`` copy. Every texel it paints is
+    therefore mirrored, and letting the sweep call some of them rigid leaves
+    those glyphs unflipped under geometry that gets reflected anyway.
+
+    A mesh bound as both keeps the split, which is the binding that can carry
+    one.
+    """
+    return {
+        structural_sources.get(mesh, mesh)
+        for mesh, mode in object_modes.items()
+        if mode == MODE_MIRROR
+        and mesh in prop_meshes
+        and mesh not in flexbody_meshes
+    }
+
+
 def texture_flip_mesh_ids(
     context: VehicleContext,
     object_modes: dict[str, str],
@@ -2021,4 +2053,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'mesh_owner_parts', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_correction_atlas_dependencies', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'mesh_owner_parts', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_correction_atlas_dependencies', 'whole_mesh_mirror_correction_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']

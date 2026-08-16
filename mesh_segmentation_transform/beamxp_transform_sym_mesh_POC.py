@@ -251,6 +251,7 @@ class ActiveRegion:
     faces: tuple[int, ...]
     area: float
     pseudo_aspect_ratio: float
+    depth_ratio: float
     boundary: RegionBoundary
     role: str
     eligible: bool
@@ -308,6 +309,7 @@ class AcceptedCandidate:
     faces: tuple[int, ...]
     area: float
     pseudo_aspect_ratio: float
+    depth_ratio: float
     boundary_edges: tuple[tuple[int, int], ...]
     boundary_loops: tuple[tuple[int, ...], ...]
     perimeter: float
@@ -329,6 +331,7 @@ class IslandCandidate:
     faces: tuple[int, ...]
     area: float
     pseudo_aspect_ratio: float
+    depth_ratio: float
     boundary_edges: tuple[tuple[int, int], ...]
     boundary_loops: tuple[tuple[int, ...], ...]
     perimeter: float
@@ -358,6 +361,7 @@ class SymmetrySweepResult:
     thresholds: tuple[float, ...]
     min_region_faces: int
     max_pseudo_aspect_ratio: float
+    max_depth_ratio: float
     symmetry_tolerance_metres: float
     direct_symmetry_tolerance_metres: float
     sample_spacing_metres: float
@@ -2504,6 +2508,77 @@ def pseudo_aspect_ratio_from_area_perimeter(area: float, perimeter: float) -> fl
     return float((-c + math.sqrt(discriminant)) * 0.5)
 
 
+def _perimeter_plane_frame(
+    vertices: np.ndarray,
+    loops: tuple[tuple[int, ...], ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Fit a plane to the closed perimeter and return its centroid and axes.
+
+    Each loop vertex is weighted by half of its two adjacent edges, so the fit
+    describes the perimeter's shape rather than wherever the author happened to
+    tessellate it finely. The returned axes are ascending by variance: the first
+    is the perimeter-plane normal, the other two span the plane itself.
+    """
+    positions: list[np.ndarray] = []
+    weights: list[np.ndarray] = []
+    for loop in loops:
+        if len(loop) < 3:
+            continue
+        loop_points = vertices[np.asarray(loop, dtype=np.int64)]
+        edges = np.linalg.norm(np.roll(loop_points, -1, axis=0) - loop_points, axis=1)
+        positions.append(loop_points)
+        weights.append(0.5 * (edges + np.roll(edges, 1)))
+
+    if not positions:
+        return None
+    points = np.concatenate(positions, axis=0)
+    weight = np.concatenate(weights, axis=0)
+    total_weight = float(weight.sum())
+    if total_weight <= 1e-15:
+        return None
+
+    centroid = (points * weight[:, None]).sum(axis=0) / total_weight
+    centred = points - centroid
+    covariance = (centred * weight[:, None]).T @ centred / total_weight
+    _, eigenvectors = np.linalg.eigh(covariance)
+    return centroid, eigenvectors[:, 0], eigenvectors[:, 1], eigenvectors[:, 2]
+
+
+def measure_region_depth_ratio(
+    topology: Topology,
+    faces: tuple[int, ...],
+    loops: tuple[tuple[int, ...], ...],
+) -> float:
+    """How far a region stands off its own perimeter plane, relative to its size.
+
+    Perimeter symmetry alone cannot tell a fascia from a protrusion: a wiper
+    stalk leaves a circular perimeter where it meets the column shroud, and a
+    circle is symmetric about every plane through its centre, so the stalk
+    passes the symmetry test and is then rotated end for end into its own
+    mirrored position. What separates the two is depth. A radio surround, a
+    switch pack or a vent bezel is shallow against the plane of its own
+    perimeter; a stalk, a lever or a cup holder well runs away from it.
+
+    The ratio compares the extent along the perimeter-plane normal with the side
+    of the equivalent square in the plane, so an elongated but shallow trim
+    strip is not punished for being narrow across one axis.
+    """
+    frame = _perimeter_plane_frame(topology.vertices, loops)
+    if frame is None or not faces:
+        return float("inf")
+
+    centroid, normal, first_axis, second_axis = frame
+    vertex_indices = np.unique(topology.triangles[np.asarray(faces, dtype=np.int64)])
+    points = topology.vertices[vertex_indices] - centroid
+    depth = float(np.ptp(points @ normal))
+    facade = math.sqrt(
+        float(np.ptp(points @ first_axis)) * float(np.ptp(points @ second_axis))
+    )
+    if facade <= 1e-15:
+        return float("inf")
+    return depth / facade
+
+
 def _classify_region(
     topology: Topology,
     island_index: int,
@@ -2513,6 +2588,7 @@ def _classify_region(
     threshold: float,
     fallback_carrier_faces: set[int],
     max_pseudo_aspect_ratio: float,
+    max_depth_ratio: float,
     edge_lookup: dict[tuple[int, int], tuple[tuple[int, ...], float | None]],
 ) -> ActiveRegion:
     boundary = _region_boundary(topology, faces, active, threshold, edge_lookup)
@@ -2523,6 +2599,7 @@ def _classify_region(
     )
     role = "candidate"
     eligible = True
+    depth_ratio = float("nan")
     if len(faces) == 0:
         role, eligible = "empty", False
     elif not boundary.edges:
@@ -2535,12 +2612,18 @@ def _classify_region(
         role, eligible = "main carrier", False
     elif pseudo_aspect_ratio > max_pseudo_aspect_ratio:
         role, eligible = "thin/rejected", False
+    else:
+        # Only regions that survive the cheap filters are worth measuring.
+        depth_ratio = measure_region_depth_ratio(topology, faces, boundary.loops)
+        if depth_ratio > max_depth_ratio:
+            role, eligible = "deep/rejected", False
     return ActiveRegion(
         region_index=0,
         island_index=island_index,
         faces=faces,
         area=area,
         pseudo_aspect_ratio=pseudo_aspect_ratio,
+        depth_ratio=depth_ratio,
         boundary=boundary,
         role=role,
         eligible=eligible,
@@ -2964,6 +3047,7 @@ def _resolve_touching_symmetric_unions(
     sample_spacing: float,
     rms_tolerance: float,
     direct_rms_tolerance: float,
+    max_depth_ratio: float,
 ) -> tuple[list[IslandCandidate], dict[tuple[int, int], tuple[int, int]]]:
     """Merge same-island accepted regions that share topology boundary edges."""
     if len(candidates) < 2:
@@ -3029,6 +3113,16 @@ def _resolve_touching_symmetric_unions(
             survivors.extend(group)
             continue
 
+        # Two shallow neighbours can wrap a corner into something that is not,
+        # so the union earns its own depth measurement rather than inheriting
+        # the members' verdicts.
+        union_depth_ratio = measure_region_depth_ratio(
+            topology, union_host_faces, boundary.loops
+        )
+        if union_depth_ratio > max_depth_ratio:
+            survivors.extend(group)
+            continue
+
         union_area = float(topology.face_areas[list(union_host_faces)].sum())
         group.sort(
             key=lambda candidate: (
@@ -3065,6 +3159,7 @@ def _resolve_touching_symmetric_unions(
             union_area,
             boundary.perimeter,
         )
+        host.depth_ratio = union_depth_ratio
         host.boundary_edges = boundary.edges
         host.boundary_loops = boundary.loops
         host.perimeter = boundary.perimeter
@@ -3104,6 +3199,7 @@ def analyse_symmetry_sweep(
     threshold_steps: int,
     min_region_faces: int,
     max_pseudo_aspect_ratio: float,
+    max_depth_ratio: float,
     symmetry_tolerance_metres: float,
     direct_symmetry_tolerance_metres: float,
     sample_spacing_metres: float,
@@ -3183,6 +3279,7 @@ def analyse_symmetry_sweep(
                         threshold,
                         fallback_carrier_faces,
                         max_pseudo_aspect_ratio,
+                        max_depth_ratio,
                         edge_lookups[island_offset],
                     )
                     if (
@@ -3244,6 +3341,7 @@ def analyse_symmetry_sweep(
                         faces=all_faces,
                         area=region.area,
                         pseudo_aspect_ratio=region.pseudo_aspect_ratio,
+                        depth_ratio=region.depth_ratio,
                         boundary_edges=region.boundary.edges,
                         boundary_loops=region.boundary.loops,
                         perimeter=region.boundary.perimeter,
@@ -3286,6 +3384,7 @@ def analyse_symmetry_sweep(
                         threshold,
                         fallback_carrier_faces,
                         max_pseudo_aspect_ratio,
+                        max_depth_ratio,
                         edge_lookups[island_offset],
                     )
                 )
@@ -3322,6 +3421,7 @@ def analyse_symmetry_sweep(
         sample_spacing_metres,
         symmetry_tolerance_metres,
         direct_symmetry_tolerance_metres,
+        max_depth_ratio,
     )
     accepted_candidates, absorbed_key_to_host_key = _resolve_late_host_adoptions(
         topology, accepted_candidates, premerge_id_by_key
@@ -3356,6 +3456,7 @@ def analyse_symmetry_sweep(
             faces=candidate.faces,
             area=candidate.area,
             pseudo_aspect_ratio=candidate.pseudo_aspect_ratio,
+            depth_ratio=candidate.depth_ratio,
             boundary_edges=candidate.boundary_edges,
             boundary_loops=candidate.boundary_loops,
             perimeter=candidate.perimeter,
@@ -3427,6 +3528,7 @@ def analyse_symmetry_sweep(
         thresholds=thresholds,
         min_region_faces=min_region_faces,
         max_pseudo_aspect_ratio=max_pseudo_aspect_ratio,
+        max_depth_ratio=max_depth_ratio,
         symmetry_tolerance_metres=symmetry_tolerance_metres,
         direct_symmetry_tolerance_metres=direct_symmetry_tolerance_metres,
         sample_spacing_metres=sample_spacing_metres,
@@ -5087,6 +5189,7 @@ def _candidate_json(candidate: AcceptedCandidate) -> dict[str, object]:
         "area_square_metres": candidate.area,
         "perimeter_metres": candidate.perimeter,
         "pseudo_aspect_ratio": candidate.pseudo_aspect_ratio,
+        "perimeter_plane_depth_ratio": candidate.depth_ratio,
         "boundary_edge_count": len(candidate.boundary_edges),
         "boundary_loop_count": len(candidate.boundary_loops),
         "symmetry": {
@@ -5158,6 +5261,7 @@ def write_report(
             "thresholds_descending": list(result.thresholds),
             "minimum_region_faces": result.min_region_faces,
             "maximum_pseudo_aspect_ratio": result.max_pseudo_aspect_ratio,
+            "maximum_perimeter_plane_depth_ratio": result.max_depth_ratio,
             "symmetry_rms_tolerance_metres": result.symmetry_tolerance_metres,
             "symmetry_rms_tolerance_millimetres": result.symmetry_tolerance_metres * 1000.0,
             "direct_symmetry_rms_tolerance_metres": result.direct_symmetry_tolerance_metres,
@@ -5170,10 +5274,11 @@ def write_report(
             "recursion": "passing host faces and confidently adopted whole child islands are removed globally, then the same threshold is segmented again until no further host passes",
             "main_island": "largest surface-area island; explicit fallback carrier regions are not tested",
             "shape_filter": "before symmetry testing, the candidate's area and closed-boundary perimeter are mapped to the equivalent rectangle aspect ratio; candidates above the configured maximum pseudo aspect ratio are rejected as thin bands",
+            "depth_filter": "a plane is fitted to the closed perimeter by arc-length weighted PCA; the region's extent along that plane normal is divided by the side of its equivalent in-plane square, and candidates above the configured maximum are rejected as protrusions rather than fasciae, because a protrusion with a symmetric perimeter (a stalk leaving a circular collar) would otherwise be rotated end for end into its mirrored position",
             "symmetry_scope": "closed perimeter samples only; interior triangles, normals, materials and UVs are ignored",
             "plane": "first pass resamples complete closed perimeters at a fixed physical spacing; PCA gives the best-fit perimeter-plane normal; crossing it with global Z gives the deterministic vertical mirror-plane normal through the sample centroid",
             "comparison": "second pass inserts exact mirror-plane crossings, walks opposite half-perimeters in opposite directions, resamples sibling positions at equal travelled arc distance, reflects one half and averages the full 3-D squared sibling residuals",
-            "acceptance": "candidate pseudo aspect ratio must not exceed the configured maximum, initial post-reflection RMS must not exceed the outer tolerance, and final RMS must not exceed the stricter direct threshold; candidates initially below the direct threshold use the deterministic plane unchanged",
+            "acceptance": "candidate pseudo aspect ratio and perimeter-plane depth ratio must not exceed their configured maxima, initial post-reflection RMS must not exceed the outer tolerance, and final RMS must not exceed the stricter direct threshold; candidates initially below the direct threshold use the deterministic plane unchanged",
             "borderline_tilt_correction": "candidates initially between the direct and outer RMS thresholds sweep the original mirror-plane normal about global Y over +/-6 degrees, refine the local minimum, and pass only if the corrected final RMS reaches the direct threshold; composing that reflection with the global X reflection applies the corresponding double-angle rigid correction",
             "touching_union_recovery": "after the sweep, accepted symmetric segmentations in the same geometric island that share boundary edges are grouped when their union has a closed symmetric perimeter; the parent is retained with the largest available union perimeter and absorbs the touching symmetric children",
             "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host and at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal; only one direct child generation is used",
@@ -5253,6 +5358,7 @@ class SymmetrySweepProbeApp(tk.Tk):
         self.steps_var = tk.StringVar(value="10")
         self.min_faces_var = tk.StringVar(value="6")
         self.max_pseudo_aspect_var = tk.StringVar(value="20")
+        self.max_depth_ratio_var = tk.StringVar(value="0.35")
         self.tolerance_var = tk.StringVar(value="1")
         self.direct_tolerance_var = tk.StringVar(value="0.5")
         self.spacing_var = tk.StringVar(value="2.0")
@@ -5319,6 +5425,7 @@ class SymmetrySweepProbeApp(tk.Tk):
             ("Steps", self.steps_var, 6),
             ("Minimum faces", self.min_faces_var, 7),
             ("Max aspect", self.max_pseudo_aspect_var, 7),
+            ("Max depth", self.max_depth_ratio_var, 7),
             ("RMS tol. (mm)", self.tolerance_var, 7),
             ("Direct RMS (mm)", self.direct_tolerance_var, 7),
             ("Sample spacing (mm)", self.spacing_var, 7),
@@ -5331,7 +5438,7 @@ class SymmetrySweepProbeApp(tk.Tk):
                 row=row, column=column + 1, padx=(5, 12), pady=(7 if row else 0, 0)
             )
         self.run_button = ttk.Button(params, text="Run symmetry sweep", command=self._start_analysis)
-        self.run_button.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(7, 0))
+        self.run_button.grid(row=3, column=0, columnspan=8, sticky="ew", pady=(7, 0))
 
         left = ttk.Frame(outer)
         left.grid(row=2, column=0, columnspan=2, sticky="nsew")
@@ -5341,18 +5448,20 @@ class SymmetrySweepProbeApp(tk.Tk):
 
         columns = (
             "id", "island", "angle", "faces", "children", "loops",
-            "initial_rms", "rms", "ytilt", "max", "ap", "area",
+            "initial_rms", "rms", "ytilt", "max", "ap", "depth", "area",
         )
         self.tree = ttk.Treeview(left, columns=columns, show="headings", height=20)
         headings = {
             "id": "ID", "island": "Island", "angle": "Accepted °", "faces": "Faces",
             "children": "Children",
             "loops": "Loops", "initial_rms": "Initial RMS", "rms": "Final RMS",
-            "ytilt": "Plane Y°", "max": "Max mm", "ap": "Aspect", "area": "Area m²",
+            "ytilt": "Plane Y°", "max": "Max mm", "ap": "Aspect", "depth": "Depth",
+            "area": "Area m²",
         }
         widths = {
             "id": 38, "island": 48, "angle": 72, "faces": 58, "children": 58, "loops": 48,
-            "initial_rms": 76, "rms": 70, "ytilt": 66, "max": 70, "ap": 70, "area": 78,
+            "initial_rms": 76, "rms": 70, "ytilt": 66, "max": 70, "ap": 70, "depth": 70,
+            "area": 78,
         }
         for column in columns:
             self.tree.heading(column, text=headings[column])
@@ -5641,13 +5750,14 @@ class SymmetrySweepProbeApp(tk.Tk):
             f"{binding.dae_material} via {binding.material_key} in {binding.materials_member}"
         )
 
-    def _parameters(self) -> tuple[float, float, int, int, float, float, float, float] | None:
+    def _parameters(self) -> tuple[float, float, int, int, float, float, float, float, float] | None:
         try:
             maximum = float(self.crease_max_var.get())
             minimum = float(self.crease_min_var.get())
             steps = int(self.steps_var.get())
             min_faces = int(self.min_faces_var.get())
             max_pseudo_aspect_ratio = float(self.max_pseudo_aspect_var.get())
+            max_depth_ratio = float(self.max_depth_ratio_var.get())
             tolerance_mm = float(self.tolerance_var.get())
             direct_tolerance_mm = float(self.direct_tolerance_var.get())
             spacing_mm = float(self.spacing_var.get())
@@ -5666,6 +5776,12 @@ class SymmetrySweepProbeApp(tk.Tk):
         if not (1.0 <= max_pseudo_aspect_ratio <= 10_000.0):
             messagebox.showerror(APP_NAME, "Maximum pseudo aspect ratio must be between 1 and 10000.")
             return None
+        if not (0.0 < max_depth_ratio <= 100.0):
+            messagebox.showerror(
+                APP_NAME,
+                "Maximum perimeter-plane depth ratio must be greater than 0 and no more than 100.",
+            )
+            return None
         if not (0.001 <= tolerance_mm <= 100.0):
             messagebox.showerror(APP_NAME, "RMS symmetry tolerance must be between 0.001 mm and 100 mm.")
             return None
@@ -5680,7 +5796,7 @@ class SymmetrySweepProbeApp(tk.Tk):
             return None
         return (
             maximum, minimum, steps, min_faces, max_pseudo_aspect_ratio,
-            tolerance_mm / 1000.0, direct_tolerance_mm / 1000.0,
+            max_depth_ratio, tolerance_mm / 1000.0, direct_tolerance_mm / 1000.0,
             spacing_mm / 1000.0,
         )
 
@@ -5697,7 +5813,7 @@ class SymmetrySweepProbeApp(tk.Tk):
             return
         (
             maximum, minimum, steps, min_faces, max_pseudo_aspect_ratio,
-            tolerance, direct_tolerance, spacing,
+            max_depth_ratio, tolerance, direct_tolerance, spacing,
         ) = parameters
         self.result = None
         self.tree.delete(*self.tree.get_children())
@@ -5714,6 +5830,7 @@ class SymmetrySweepProbeApp(tk.Tk):
                 steps,
                 min_faces,
                 max_pseudo_aspect_ratio,
+                max_depth_ratio,
                 tolerance,
                 direct_tolerance,
                 spacing,
@@ -5795,6 +5912,7 @@ class SymmetrySweepProbeApp(tk.Tk):
                     f"{candidate.measurement.mirror_plane_y_tilt_degrees:.3f}",
                     f"{candidate.measurement.max_error * 1000.0:.4f}",
                     f"{candidate.pseudo_aspect_ratio:.3f}",
+                    f"{candidate.depth_ratio:.3f}",
                     f"{candidate.area:.6g}",
                 ),
             )

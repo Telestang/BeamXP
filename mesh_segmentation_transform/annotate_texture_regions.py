@@ -31,6 +31,7 @@ import json
 import math
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
@@ -349,7 +350,24 @@ class MserConfig:
     # A filled pill, rectangle or dot has feature/hull fill close to one; text
     # and symbols leave more empty hull space.  Reject blobs, keep the rest.
     enable_blob_shape_filter:          bool = True  # default: True
-    min_blob_region_area_px:           int = 512  # default: 512
+    # Regions smaller than this are not judged at all.  It was 512, which is
+    # larger than most stitch dashes, so the one thing on an interior atlas that
+    # is unambiguously a blob was the one thing this filter never looked at:
+    # measured over both V60 stitch atlases, 97 of 97 dashes fill their hull
+    # (1.09-1.15) with a colour range of 0.0-1.0, and every one was skipped on
+    # size alone.
+    #
+    # What keeps real marks is the colour-range test below, not this floor.  A
+    # small solid arrowhead is just as hull-filling as a dash -- the scintilla
+    # cluster's four cursor arrows all read 1.09 -- but its edges are
+    # antialiased against the fascia, so it ranges 82-84 where a flat-painted
+    # dash ranges 0-1.  Across the 177 regions the shipped plans in
+    # segmentation_outputs actually flipped, only two would change hands at this
+    # floor, and both are themselves false positives: a 12x11 scrap of hatching
+    # on the ardente dash and a 12x12 patch of shading gradient on the scintilla
+    # badges.  48 sits below the smallest dash measured (56) and above the point
+    # where ``region_feature_min_px`` declines to fit a hull at all.
+    min_blob_region_area_px:           int = 48  # default: 48
     max_blob_hull_fill:                float = 0.95  # default: 0.95
     min_blob_internal_colour_variation: float = 48.0  # default: 48.0
 
@@ -390,6 +408,72 @@ class MserConfig:
     pattern_min_window_px:       int   = 48  # default: 48
     pattern_min_period_px:       int   = 4  # default: 4
     pattern_max_period_px:       int   = 160  # default: 160
+
+    # Repeating material, applied to raw boxes before anything groups them.
+    # ``max_pattern_autocorrelation`` above asks whether a finished group looks
+    # periodic; this asks the blunter question the false positives actually
+    # share -- does this patch of texture occur again and again nearby?  Woven
+    # carbon, perforated leather and a run of seam stitching all answer yes,
+    # while a badge or a legend occurs once.  Autocorrelation could not tell
+    # them apart: measured over the volvo stitch atlas and both scintilla
+    # interiors it scores plain trim and a woven panel within the same band,
+    # because what it really measures is smoothness.  Counting recurrences
+    # does separate them, and it separates them the same way a person does.
+    #
+    # Two pieces of evidence, either of which condemns a box:
+    #
+    #   * the box's own content recurs -- a stitch dash with thirty identical
+    #     siblings strung along the same seam, or a scrap of weave that tiles
+    #     the panel it sits on;
+    #   * the material *around* the box recurs, in more than one direction.
+    #     A moulding pip on a carbon panel is unique in itself, so only its
+    #     surroundings give it away.  More than one direction is the whole
+    #     point: a legend that merely sits near a woven strip has one patterned
+    #     neighbour, and a mark embedded in the weave has several.
+    #
+    # On by default.  Replayed against the 206 regions the shipped plans under
+    # segmentation_outputs actually flipped, it takes two, and neither was a
+    # mark: a strip of ardente carpet weave topped by a run of overlock
+    # stitching, which is precisely what this filter is for, and a 63x24 patch
+    # of dashboard at a dead-flat (27,27,27) with no content in it at all.
+    # Both were being flipped for nothing.
+    #
+    # Costs a normalised cross-correlation per probe.  Raise
+    # ``repeat_texture_decimation`` before switching it off if that matters.
+    enable_repeat_texture_filter: bool = True  # default: True
+    # Downsampling applied before any of it.  A 4k interior atlas is far finer
+    # than the patterns being counted, and halving it cuts the correlation to a
+    # quarter of the work at no measured cost in separation.  Every length
+    # below is in atlas pixels regardless.
+    repeat_texture_decimation:   int   = 2  # default: 2 (1 disables)
+    # Structure coarser than this is panel shading, not material, and it swamps
+    # the correlation if it is left in.
+    repeat_texture_highpass_px:  int   = 12  # default: 12
+    # The patch compared against its neighbourhood.  Big enough to be
+    # distinctive, small enough to sit inside one stitch or one weave cell.
+    repeat_texture_tile_px:      int   = 48  # default: 48
+    # How far to look for recurrences, as a multiple of the box's long side and
+    # then clamped.  A pattern has to be seen several times over to count.
+    repeat_texture_search_scale: float = 6.0  # default: 6.0
+    repeat_texture_min_search_px: int  = 256  # default: 256
+    repeat_texture_max_search_px: int  = 384  # default: 384
+    # Correlation at which two patches are called the same patch.
+    repeat_texture_match_threshold: float = 0.7  # default: 0.7
+    # A patch with nothing in it correlates with every other empty patch, so
+    # the probe is abandoned below this standard deviation of high-passed level.
+    repeat_texture_min_tile_contrast: float = 2.0  # default: 2.0
+    # Recurrences of the box's own content needed to condemn it.  Measured on
+    # the scintilla interior cluster, every legend, dial and pictogram scored
+    # 1 or 2 -- itself, and at most one lookalike -- while stitching scored 9
+    # to 22 and woven carbon 51 to 64.  Four leaves a wide margin either side.
+    repeat_texture_min_repeats:  int   = 4  # default: 4
+    # The surroundings are judged harder than the box, because a probe that
+    # lands on a neighbouring panel is answering about the wrong material.
+    repeat_texture_context_repeats: int = 12  # default: 12
+    repeat_texture_context_directions: int = 2  # default: 2 (of four probed)
+    # Ring probes are pushed this far past the box's own corner, so a long
+    # moulding pip cannot have every probe land back on itself.
+    repeat_texture_context_margin_px: int = 24  # default: 24
 
     # Grouping
     # Boxes are expanded by this many pixels on every side before the
@@ -467,6 +551,12 @@ DEFAULT_COLOUR_CONFIG = replace(
     contrast_min_component_px=24,
     contrast_merge_gap_px=0,
     enable_feature_extension_filter=True,
+    # Promoted 2026-08-16 from the tuning harness's saved colour+relief-edge
+    # session, which is the path production runs: `_production_layer_detection_config`
+    # puts the colour layer on contrast_gpu with relief-edge grouping, so that
+    # pipeline's tuning is what these defaults are for.
+    feature_extension_min_ratio=0.03,
+    min_region_uv_coverage=0.98,
 )
 DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     DEFAULT_COLOUR_CONFIG,
@@ -495,6 +585,14 @@ DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     box_min_feature_px=15,
     merge_distance_px=21,
     final_max_aspect=20.0,
+    # Pinned rather than inherited: the colour preset above was retuned in
+    # 2026-08-16's promotion and the relief path was not, so without these two
+    # it would follow the colour path by accident.
+    # ``feature_extension_min_ratio`` is inert while
+    # ``enable_feature_extension_filter`` is off above, but a pin that only
+    # holds while a neighbouring switch stays off is not a pin.
+    min_region_uv_coverage=1.0,
+    feature_extension_min_ratio=0.25,
 )
 DEFAULT_CONFIG = DEFAULT_COLOUR_CONFIG
 
@@ -508,7 +606,9 @@ class UvIslandSymmetryConfig:
     """
 
     enable_uv_island_symmetry: bool = True
-    min_uv_island_symmetry: float = 0.98
+    # Promoted 2026-08-16 from the harness's shared session value.  Shared, not
+    # per pipeline: this is read off the UV mask and no detector touches it.
+    min_uv_island_symmetry: float = 0.95
     blue_colour: tuple[int, int, int] = (255, 0, 0)  # BGR
     blue_thickness: int = 1
 
@@ -962,9 +1062,15 @@ def _merge_foreground_boxes(
     texels, and six separate legends stop existing as candidates before any
     chart-aware stage gets to see them.
     """
-    merged = list(boxes)
-    owners = list(charts) if charts is not None else [None] * len(merged)
     gap = max(int(gap), 0)
+    if charts is None or None not in charts:
+        # Nothing here can adopt a chart it did not already have, so the
+        # closure is confluent and the cheap sweep below reaches the same
+        # partition.  See _merge_foreground_boxes_by_closure.
+        return _merge_foreground_boxes_by_closure(boxes, gap, charts)
+
+    merged = list(boxes)
+    owners = list(charts)
     changed = True
     while changed:
         changed = False
@@ -997,6 +1103,77 @@ def _merge_foreground_boxes(
             if changed:
                 break
     return merged
+
+
+def _merge_foreground_boxes_by_closure(
+    boxes: list[tuple[int, int, int, int]],
+    gap: int,
+    charts: list[int | None] | None,
+) -> list[tuple[int, int, int, int]]:
+    """The same merge, without rescanning every pair after every join.
+
+    The pairwise form restarts its whole double loop each time two boxes join,
+    so it costs one O(n^2) sweep per merge.  A local-contrast response over a
+    grained atlas arrives as thousands of components: the V60's white-wood dash
+    spent 743 of its 789 seconds here, against 0.05 s for the GPU response the
+    components came from.
+
+    Merging only ever *adds* adjacency -- a box grows to its union, so anything
+    that was within ``gap`` of either half is still within ``gap`` of the whole,
+    and no available join is ever lost.  With every chart already known the
+    guard cannot change either, so the closure is confluent: every order of
+    merging reaches the same partition.  That lets each box absorb all of its
+    current neighbours at once, and lets a sweep that changed nothing end the
+    whole thing.  Absorbing only higher indices keeps each group represented by
+    its lowest one, which is the slot the pairwise form left it in, so the
+    returned list matches element for element.
+    """
+    count = len(boxes)
+    if count < 2:
+        return list(boxes)
+    data = np.asarray(boxes, dtype=np.int64).reshape(count, 4)
+    x0 = data[:, 0].copy()
+    y0 = data[:, 1].copy()
+    x1 = x0 + data[:, 2]
+    y1 = y0 + data[:, 3]
+    owner = (
+        np.asarray([int(value) for value in charts], dtype=np.int64)
+        if charts is not None
+        else None
+    )
+    alive = np.ones(count, dtype=bool)
+    later = np.arange(count)
+
+    changed = True
+    while changed:
+        changed = False
+        for left in range(count):
+            if not alive[left]:
+                continue
+            while True:
+                near = alive & (later > left)
+                if owner is not None:
+                    near &= owner == owner[left]
+                if not near.any():
+                    break
+                dx = np.maximum(np.maximum(x0 - x1[left], x0[left] - x1), 0)
+                dy = np.maximum(np.maximum(y0 - y1[left], y0[left] - y1), 0)
+                near &= np.maximum(dx, dy) <= gap
+                if not near.any():
+                    break
+                x0[left] = min(int(x0[left]), int(x0[near].min()))
+                y0[left] = min(int(y0[left]), int(y0[near].min()))
+                x1[left] = max(int(x1[left]), int(x1[near].max()))
+                y1[left] = max(int(y1[left]), int(y1[near].max()))
+                alive &= ~near
+                changed = True
+
+    return [
+        (int(x0[index]), int(y0[index]),
+         int(x1[index] - x0[index]), int(y1[index] - y0[index]))
+        for index in range(count)
+        if alive[index]
+    ]
 
 
 def _refine_foreground_internal_details(
@@ -2757,6 +2934,399 @@ def filter_boxes_by_feature(
     )
 
 
+# ---------------------------------------------------------------------------
+# Repeating material
+# ---------------------------------------------------------------------------
+
+
+# Sizes numpy's FFT factorises well.  Rounding a 279 px correlation up to 512
+# rather than 288 costs three times the work for nothing, and this stage runs
+# once per probe per box.
+_FFT_SIZES = tuple(
+    sorted(
+        2**two * 3**three * 5**five
+        for two in range(15)
+        for three in range(10)
+        for five in range(7)
+        if 2**two * 3**three * 5**five <= 16384
+    )
+)
+
+
+def _fft_size(length: int) -> int:
+    """Return the smallest 2-3-5 smooth transform length that fits."""
+    for size in _FFT_SIZES:
+        if size >= length:
+            return size
+    return length
+
+
+def _summed_area(array: np.ndarray) -> np.ndarray:
+    """Return an integral image with a zero first row and column."""
+    table = np.zeros((array.shape[0] + 1, array.shape[1] + 1), dtype=np.float64)
+    np.cumsum(np.cumsum(array, axis=0, dtype=np.float64), axis=1, out=table[1:, 1:])
+    return table
+
+
+def _window_totals(table: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Return every height x width window sum from an integral image."""
+    return (
+        table[height:, width:]
+        - table[:-height, width:]
+        - table[height:, :-width]
+        + table[:-height, :-width]
+    )
+
+
+def moving_average(array: np.ndarray, radius: int) -> np.ndarray:
+    """Separable box blur with edge replication.
+
+    numpy rather than ``cv2.blur``: this is two cumulative sums, and the
+    OpenCV dependency is on its way out rather than being extended.
+    """
+    if radius < 1:
+        return array.astype(np.float32)
+    size = radius * 2 + 1
+    padded = np.pad(array.astype(np.float64), radius, mode="edge")
+    down = np.cumsum(padded, axis=0)
+    down = np.vstack([np.zeros((1, padded.shape[1])), down])
+    rows = (down[size:, :] - down[:-size, :]) / size
+    across = np.cumsum(rows, axis=1)
+    across = np.hstack([np.zeros((rows.shape[0], 1)), across])
+    return ((across[:, size:] - across[:, :-size]) / size).astype(np.float32)
+
+
+def _decimate(array: np.ndarray, factor: int) -> np.ndarray:
+    """Average non-overlapping factor x factor blocks."""
+    if factor <= 1:
+        return array
+    height = array.shape[0] // factor * factor
+    width = array.shape[1] // factor * factor
+    if height == 0 or width == 0:
+        return array
+    trimmed = array[:height, :width]
+    return trimmed.reshape(
+        height // factor, factor, width // factor, factor
+    ).mean(axis=(1, 3)).astype(np.float32)
+
+
+@dataclass(slots=True)
+class RepeatTextureIndex:
+    """The decimated, high-passed view every recurrence probe reads.
+
+    Built once per detection run and shared by reference.  ``matches`` caches
+    correlation counts by quantised probe, because a chain of stitch boxes asks
+    almost the same question a few dozen times over.
+    """
+
+    detail: np.ndarray
+    decimation: int
+    # Where the view being detected sits on that atlas, as (view rect, atlas dx,
+    # atlas dy) per rectangle.  Empty means the view *is* the atlas.
+    #
+    # Detection runs on a crop -- one UV island for the harness, one view of a
+    # correction job for production -- and a crop is the wrong scope for this
+    # question entirely.  Whether a texture repeats is a property of the
+    # material, not of the island that happens to consume it, and the crops are
+    # small: measured on the volvo stitch atlas, a seam that scores 13
+    # recurrences over the atlas scores 3 inside a 128 px island crop and 1
+    # inside a 96 px one, which is why the filter looked inert on real parts
+    # while passing on whole atlases.  So the index is built once from the
+    # atlas and each view addresses it through its own placement.
+    placements: tuple[tuple[tuple[int, int, int, int], int, int], ...] = ()
+    matches: dict[tuple[int, int, int, int, int, int, int], int] = field(
+        default_factory=dict
+    )
+
+    def for_view(
+        self,
+        placements: Sequence[tuple[tuple[int, int, int, int], int, int]],
+    ) -> "RepeatTextureIndex":
+        """Return this atlas index addressed in one view's coordinates.
+
+        The field and the match cache are shared by reference: two islands cut
+        from the same trim ask identical questions, and answering them once is
+        most of what makes the atlas-wide scope affordable.
+        """
+        return RepeatTextureIndex(
+            detail=self.detail,
+            decimation=self.decimation,
+            placements=tuple(placements),
+            matches=self.matches,
+        )
+
+    def atlas_point(self, x: int, y: int) -> tuple[int, int] | None:
+        """Map a point in view coordinates onto the atlas, or None if it is
+        outside every placed rectangle."""
+        if not self.placements:
+            return x, y
+        for (rx, ry, rw, rh), dx, dy in self.placements:
+            if rx <= x < rx + rw and ry <= y < ry + rh:
+                return x + dx, y + dy
+        return None
+
+
+def build_repeat_texture_index(
+    image: np.ndarray,
+    config: MserConfig,
+) -> RepeatTextureIndex:
+    """Prepare the shared high-passed field the recurrence probes read.
+
+    ``image`` should be the whole atlas rather than the crop being detected;
+    see ``RepeatTextureIndex.placements``.
+
+    Decimation comes first and the high-pass radius is reduced with it, so the
+    configured radius keeps meaning the same distance on the atlas.
+    """
+    decimation = max(int(config.repeat_texture_decimation), 1)
+    channels = image[:, :, :3].astype(np.float32)
+    # BT.601 luma, BGR order, matching the cvtColor the rest of the file uses.
+    luma = _decimate(
+        channels @ np.asarray([0.114, 0.587, 0.299], dtype=np.float32), decimation
+    )
+    radius = max(int(config.repeat_texture_highpass_px) // (2 * decimation), 1)
+    smooth = moving_average(moving_average(luma, radius), radius)
+    return RepeatTextureIndex(detail=luma - smooth, decimation=decimation)
+
+
+def normalised_match(
+    search: np.ndarray,
+    template: np.ndarray,
+    min_energy: float = 0.5,
+) -> np.ndarray:
+    """Return normalised cross-correlation of a template over a search area.
+
+    The usual FFT formulation, with the usual trap guarded: dividing by a
+    near-zero local standard deviation turns an empty patch of trim into a
+    perfect match for anything.  A position has to carry at least
+    ``min_energy`` of the template's own signal before its score is believed,
+    which is what stops a legend on plain fascia counting its own background
+    as thirty recurrences.
+    """
+    search = search.astype(np.float64)
+    template = template.astype(np.float64)
+    tile_height, tile_width = template.shape
+    height, width = search.shape
+    if height < tile_height or width < tile_width:
+        return np.empty((0, 0), dtype=np.float32)
+
+    area = tile_height * tile_width
+    template = template - template.mean()
+    template_norm = float(np.sqrt(float((template**2).sum())))
+    if template_norm < 1e-8:
+        return np.zeros(
+            (height - tile_height + 1, width - tile_width + 1), dtype=np.float32
+        )
+
+    totals = _window_totals(_summed_area(search), tile_height, tile_width)
+    squares = _window_totals(_summed_area(search**2), tile_height, tile_width)
+    variance = np.maximum(squares - totals**2 / area, 0.0)
+
+    shape = (
+        _fft_size(height + tile_height - 1),
+        _fft_size(width + tile_width - 1),
+    )
+    # Zero padding past the linear-correlation length keeps the wrap-around
+    # out of the valid block, which then starts at zero shift.
+    correlation = np.fft.irfft2(
+        np.fft.rfft2(search, shape) * np.conj(np.fft.rfft2(template, shape)),
+        shape,
+    )[: height - tile_height + 1, : width - tile_width + 1]
+
+    local_norm = np.sqrt(variance)
+    believable = local_norm >= template_norm * min_energy
+    denominator = local_norm * template_norm
+    with np.errstate(divide="ignore", invalid="ignore"):
+        response = np.where(
+            believable & (denominator > 1e-8), correlation / denominator, 0.0
+        )
+    return np.clip(response, -1.0, 1.0).astype(np.float32)
+
+
+def count_match_peaks(
+    response: np.ndarray,
+    threshold: float,
+    separation: int,
+    limit: int,
+) -> int:
+    """Count well-separated positions where the template matched.
+
+    Greedy non-maximum suppression: a peak claims a square around itself so a
+    single broad match is one recurrence rather than a hundred.  ``limit`` caps
+    the walk -- once a patch has recurred that many times the verdict cannot
+    change, and a field of woven carbon would otherwise run the loop until the
+    whole search window was consumed.
+    """
+    if response.size == 0:
+        return 0
+    work = response.copy()
+    separation = max(separation, 1)
+    found = 0
+    for _ in range(max(limit, 1)):
+        flat = int(np.argmax(work))
+        row, column = divmod(flat, work.shape[1])
+        if float(work[row, column]) < threshold:
+            break
+        found += 1
+        work[
+            max(row - separation, 0) : row + separation + 1,
+            max(column - separation, 0) : column + separation + 1,
+        ] = -1.0
+    return found
+
+
+def _probe_recurrences(
+    index: RepeatTextureIndex,
+    centre: tuple[int, int],
+    search_bounds: tuple[int, int, int, int],
+    tile_px: int,
+    config: MserConfig,
+) -> int:
+    """Return how often the tile at ``centre`` recurs inside the search area.
+
+    Coordinates arrive in atlas pixels and are reduced here, so every caller
+    and every configured length stays in one unit.
+    """
+    step = index.decimation
+    detail = index.detail
+    tile = max(int(tile_px) // step, 4)
+    half = tile // 2
+    centre_x, centre_y = centre[0] // step, centre[1] // step
+    x0, y0, x1, y1 = (value // step for value in search_bounds)
+
+    # The extent belongs in the key as much as the origin does: two boxes can
+    # share a probe centre and a clamped origin while asking about search areas
+    # of different sizes, and answering the second from the first is wrong.
+    key = (centre_x, centre_y, x0, y0, x1 - x0, y1 - y0, tile)
+    cached = index.matches.get(key)
+    if cached is not None:
+        return cached
+
+    top, left = centre_y - half, centre_x - half
+    if (
+        top < 0
+        or left < 0
+        or top + half * 2 > detail.shape[0]
+        or left + half * 2 > detail.shape[1]
+    ):
+        # Explicit rather than relying on the shape check below: a negative
+        # slice bound wraps in Python instead of clipping, so the tile would be
+        # taken from the far side of the atlas.
+        index.matches[key] = 0
+        return 0
+    template = detail[top : top + half * 2, left : left + half * 2]
+    if float(template.std()) < config.repeat_texture_min_tile_contrast:
+        # Nothing in it to recognise again; say nothing rather than everything.
+        index.matches[key] = 0
+        return 0
+
+    search = detail[y0:y1, x0:x1]
+    found = count_match_peaks(
+        normalised_match(search, template),
+        config.repeat_texture_match_threshold,
+        max(half, 2),
+        # One more than the strictest threshold in play, so the walk stops as
+        # soon as the answer is settled.
+        max(config.repeat_texture_min_repeats, config.repeat_texture_context_repeats)
+        + 1,
+    )
+    index.matches[key] = found
+    return found
+
+
+def repeat_texture_evidence(
+    index: RepeatTextureIndex,
+    box: tuple[int, int, int, int],
+    config: MserConfig,
+) -> tuple[int, int]:
+    """Return (recurrences of the box, patterned directions around it).
+
+    ``box`` is in the detected view's coordinates; everything after the first
+    step happens on the atlas, so a seam is counted against the whole run of
+    stitching rather than the slice of it one UV island happens to hold.
+    """
+    x, y, width, height = box
+    placed = index.atlas_point(x + width // 2, y + height // 2)
+    if placed is None:
+        return 0, 0
+    centre = placed
+    shape = (
+        index.detail.shape[0] * index.decimation,
+        index.detail.shape[1] * index.decimation,
+    )
+    span = max(
+        int(round(max(width, height) * max(config.repeat_texture_search_scale, 1.0))),
+        max(config.repeat_texture_min_search_px, 16),
+    )
+    span = min(span, max(config.repeat_texture_max_search_px, 16))
+    half = span // 2
+    bounds = (
+        max(centre[0] - half, 0),
+        max(centre[1] - half, 0),
+        min(centre[0] + half, shape[1]),
+        min(centre[1] + half, shape[0]),
+    )
+
+    own = _probe_recurrences(
+        index, centre, bounds, config.repeat_texture_tile_px, config
+    )
+    if own >= config.repeat_texture_min_repeats:
+        # Already condemned; the surroundings cannot change that.
+        return own, 0
+
+    margin = max(config.repeat_texture_context_margin_px, 1)
+    reach_x = width // 2 + config.repeat_texture_tile_px // 2 + margin
+    reach_y = height // 2 + config.repeat_texture_tile_px // 2 + margin
+    directions = 0
+    for offset in (
+        (reach_x, 0),
+        (-reach_x, 0),
+        (0, reach_y),
+        (0, -reach_y),
+    ):
+        neighbour = (centre[0] + offset[0], centre[1] + offset[1])
+        if (
+            _probe_recurrences(
+                index, neighbour, bounds, config.repeat_texture_tile_px, config
+            )
+            >= config.repeat_texture_context_repeats
+        ):
+            directions += 1
+    return own, directions
+
+
+def filter_boxes_by_repeat_texture(
+    image: np.ndarray,
+    boxes: np.ndarray,
+    config: MserConfig,
+    index: RepeatTextureIndex | None = None,
+) -> tuple[np.ndarray, list[tuple[int, int, int, int]], RepeatTextureIndex | None]:
+    """Drop boxes that are made of, or embedded in, repeating material."""
+    if not config.enable_repeat_texture_filter or len(boxes) == 0:
+        return np.asarray(boxes, dtype=np.int32).reshape(-1, 4).copy(), [], index
+
+    if index is None:
+        index = build_repeat_texture_index(image, config)
+
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    for raw in boxes:
+        box = (int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
+        own, directions = repeat_texture_evidence(index, box, config)
+        if (
+            own >= config.repeat_texture_min_repeats
+            or directions >= config.repeat_texture_context_directions
+        ):
+            rejected.append(box)
+            continue
+        kept.append(box)
+    return (
+        np.asarray(kept, dtype=np.int32) if kept else np.empty((0, 4), dtype=np.int32),
+        rejected,
+        index,
+    )
+
+
 def repeating_pattern_score(window: np.ndarray, config: MserConfig) -> float:
     """Return how strongly a patch revives its own correlation at a shift.
 
@@ -2893,6 +3463,7 @@ def inscribed_circle_radius(
     uv_mask: np.ndarray | None,
     group: tuple[int, int, int, int],
     config: MserConfig,
+    domain_index: UvDomainIndex | None = None,
 ) -> int | None:
     """Return an inscribed-circle radius when the corners it drops are empty.
 
@@ -2931,7 +3502,7 @@ def inscribed_circle_radius(
     # A circle is only worth having if it is the tighter region.
     if math.pi * radius**2 >= w * h:
         return None
-    if not _circle_keeps_uv_coverage(uv_mask, group, radius, config):
+    if not _circle_keeps_uv_coverage(uv_mask, group, radius, config, domain_index):
         return None
     centre_x = (x + w / 2.0) - cx
     centre_y = (y + h / 2.0) - cy
@@ -2971,6 +3542,7 @@ def cached_inscribed_circle_radius(
     group: tuple[int, int, int, int],
     config: MserConfig,
     cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None,
+    domain_index: UvDomainIndex | None = None,
 ) -> int | None:
     """Memoise the pure circle test for one detection run.
 
@@ -2978,12 +3550,20 @@ def cached_inscribed_circle_radius(
     rebuilds.  The circle decision includes colour and UV work, so it is much
     more expensive than the dictionary lookup; the cached value is exact for a
     fixed image, UV mask and immutable configuration.
+
+    ``domain_index`` is the same island labelling every other caller already
+    shares.  Without it the circle's coverage check relabelled the whole atlas
+    for each candidate it judged -- the one thing ``UvDomainIndex`` exists to
+    stop.  It is not called ``domain`` because ``inscribed_circle_radius``
+    already binds that name to the cropped mask.
     """
     if cache is None:
-        return inscribed_circle_radius(image, uv_mask, group, config)
+        return inscribed_circle_radius(image, uv_mask, group, config, domain_index)
     key = (config, group)
     if key not in cache:
-        cache[key] = inscribed_circle_radius(image, uv_mask, group, config)
+        cache[key] = inscribed_circle_radius(
+            image, uv_mask, group, config, domain_index
+        )
     return cache[key]
 
 
@@ -3966,6 +4546,10 @@ class DetectionState:
     # that per-island mask beside its response so later filters do not repeat
     # percentile/local-threshold and morphology work merely to inspect it.
     relief_edge_mask: np.ndarray | None = None
+    # The decimated high-passed atlas the repeating-material stage correlates
+    # against, kept so a resumed run does not rebuild it.  Read-only apart from
+    # its own match cache, and so safe to share by reference.
+    repeat_texture: RepeatTextureIndex | None = None
     # Shared by reference between successive stages in one run.  It is a
     # performance cache only: its keys include the immutable configuration and
     # it never changes a circle decision.
@@ -3986,6 +4570,7 @@ class DetectionState:
             relief_bridge_response=self.relief_bridge_response,
             island_bits=self.island_bits,
             relief_edge_mask=self.relief_edge_mask,
+            repeat_texture=self.repeat_texture,
             circle_radii=self.circle_radii,
         )
 
@@ -4175,6 +4760,63 @@ def _step_box_filter(
     )
 
 
+def _step_repeat_texture(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Drop boxes made of, or embedded in, repeating material.
+
+    Deliberately before any grouping.  A seam's worth of stitch dashes that
+    survives to the grouping stage merges into long chains that then read as
+    text lines, and by then nothing downstream can tell them from a legend.
+    """
+    if not config.enable_repeat_texture_filter or len(state.boxes) == 0:
+        return state, DetectionStage(
+            key="repeat_texture",
+            title="Repeating material",
+            kept=tuple(tuple(int(v) for v in box) for box in state.boxes),  # type: ignore[misc]
+            detail=(
+                "disabled"
+                if not config.enable_repeat_texture_filter
+                else "no boxes to test"
+            ),
+        )
+
+    boxes, rejected, index = filter_boxes_by_repeat_texture(
+        image, state.boxes, config, state.repeat_texture
+    )
+    return DetectionState(
+        boxes, [], domain=state.domain,
+        contrast_response=state.contrast_response,
+        contrast_threshold=state.contrast_threshold,
+        relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
+        relief_edge_mask=state.relief_edge_mask,
+        repeat_texture=index,
+    ), DetectionStage(
+        key="repeat_texture",
+        title="Repeating material",
+        kept=tuple(tuple(int(v) for v in box) for box in boxes),  # type: ignore[misc]
+        rejected=tuple(rejected),
+        detail=(
+            f"reject a box whose own {config.repeat_texture_tile_px} px patch "
+            f"recurs >= {config.repeat_texture_min_repeats} times, or whose "
+            f"surroundings recur >= {config.repeat_texture_context_repeats} times "
+            f"in >= {config.repeat_texture_context_directions} of four directions, "
+            f"at >= {config.repeat_texture_match_threshold:g} correlation within "
+            f"{config.repeat_texture_min_search_px}-"
+            f"{config.repeat_texture_max_search_px} px"
+            + (
+                f"; measured 1/{config.repeat_texture_decimation} scale"
+                if config.repeat_texture_decimation > 1
+                else ""
+            )
+        ),
+    )
+
+
 def _step_overlap_box_group(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
@@ -4358,9 +5000,10 @@ def _step_rotated_bounds(
     unadopted = 0
     edge_unadopted = 0
     edge_adopted = 0
+    domain = state.domain or build_uv_domain_index(uv_mask)
     for group in state.groups:
         if cached_inscribed_circle_radius(
-            image, uv_mask, group, config, state.circle_radii,
+            image, uv_mask, group, config, state.circle_radii, domain,
         ) is not None:
             kept.append(group)
             rotations.append(None)
@@ -4982,7 +5625,7 @@ def _region_shape_and_coverage(
 ) -> tuple[int | None, float]:
     """Infer a region's circle, then measure that circle or its rectangle."""
     radius = cached_inscribed_circle_radius(
-        image, uv_mask, group, config, circle_cache,
+        image, uv_mask, group, config, circle_cache, domain,
     )
     if radius is not None:
         x, y, w, h = group
@@ -5394,7 +6037,7 @@ def _step_overlap_group(
         elif cardinal_spread(indices, bounds) < 3:
             continue
         radius = cached_inscribed_circle_radius(
-            image, uv_mask, bounds, config, state.circle_radii,
+            image, uv_mask, bounds, config, state.circle_radii, domain,
         )
         if radius is None:
             continue
@@ -5457,9 +6100,10 @@ def _step_final_padding(
     adjusted = 0
     image_height, image_width = image.shape[:2]
 
+    domain = state.domain or build_uv_domain_index(uv_mask)
     for group in state.groups:
         radius = cached_inscribed_circle_radius(
-            image, uv_mask, group, config, state.circle_radii,
+            image, uv_mask, group, config, state.circle_radii, domain,
         )
         x, y, w, h = group
 
@@ -5667,6 +6311,7 @@ PIPELINE_STEPS = (
     _step_mser,
     _step_stroke_width,
     _step_box_filter,
+    _step_repeat_texture,
     _step_overlap_box_group,
     _step_grouped,
     _step_region_domain,
@@ -5695,6 +6340,7 @@ STEP_INDEX = {
             "boxes",
             "stroke_width",
             "box_filter",
+            "repeat_texture",
             "overlap_box_group",
             "grouped",
             "region_domain",
@@ -5788,6 +6434,19 @@ PARAMETER_STEP = {
     "box_feature_context_px": STEP_INDEX["box_filter"],
     "min_box_uv_coverage": STEP_INDEX["box_filter"],
     "box_min_feature_px": STEP_INDEX["box_filter"],
+    "enable_repeat_texture_filter": STEP_INDEX["repeat_texture"],
+    "repeat_texture_decimation": STEP_INDEX["repeat_texture"],
+    "repeat_texture_highpass_px": STEP_INDEX["repeat_texture"],
+    "repeat_texture_tile_px": STEP_INDEX["repeat_texture"],
+    "repeat_texture_search_scale": STEP_INDEX["repeat_texture"],
+    "repeat_texture_min_search_px": STEP_INDEX["repeat_texture"],
+    "repeat_texture_max_search_px": STEP_INDEX["repeat_texture"],
+    "repeat_texture_match_threshold": STEP_INDEX["repeat_texture"],
+    "repeat_texture_min_tile_contrast": STEP_INDEX["repeat_texture"],
+    "repeat_texture_min_repeats": STEP_INDEX["repeat_texture"],
+    "repeat_texture_context_repeats": STEP_INDEX["repeat_texture"],
+    "repeat_texture_context_directions": STEP_INDEX["repeat_texture"],
+    "repeat_texture_context_margin_px": STEP_INDEX["repeat_texture"],
     "group_axis_center_tolerance": STEP_INDEX["grouped"],
     "merge_distance_px": STEP_INDEX["grouped"],
     "min_group_union_region_px": STEP_INDEX["grouped"],
@@ -5906,6 +6565,7 @@ def run_detection(
     initial_relief_bridge_response: np.ndarray | None = None,
     initial_island_bits: np.ndarray | None = None,
     initial_relief_edge_mask: np.ndarray | None = None,
+    initial_repeat_texture: RepeatTextureIndex | None = None,
 ) -> DetectionRun:
     """Run the pipeline, resuming from the first step a config change affects.
 
@@ -5961,6 +6621,7 @@ def run_detection(
                     relief_bridge_response=initial_relief_bridge_response,
                     island_bits=initial_island_bits,
                     relief_edge_mask=initial_relief_edge_mask,
+                    repeat_texture=initial_repeat_texture,
                 )
                 start = 1
         else:
@@ -5973,6 +6634,7 @@ def run_detection(
                 relief_bridge_response=initial_relief_bridge_response,
                 island_bits=initial_island_bits,
                 relief_edge_mask=initial_relief_edge_mask,
+                repeat_texture=initial_repeat_texture,
             )
             start = 1
     else:
@@ -6000,8 +6662,17 @@ def run_detection(
                 relief_bridge_response=initial_relief_bridge_response,
                 island_bits=initial_island_bits,
                 relief_edge_mask=initial_relief_edge_mask,
+                repeat_texture=initial_repeat_texture,
             )
         )
+
+    if initial_repeat_texture is not None:
+        # A resumed run restores the state the previous one entered this step
+        # with, and that state carries the previous run's index.  Changing
+        # ``repeat_texture_decimation`` or ``repeat_texture_highpass_px``
+        # rebuilds the field, so the caller's index has to win or tuning either
+        # of those would silently keep measuring the old one.
+        state.repeat_texture = initial_repeat_texture
 
     for index in range(start, len(PIPELINE_STEPS)):
         entry_states.append(state.copy())
@@ -6013,6 +6684,8 @@ def run_detection(
             state.relief_edge_mask = entry_states[-1].relief_edge_mask
         if not state.circle_radii:
             state.circle_radii = entry_states[-1].circle_radii
+        if state.repeat_texture is None:
+            state.repeat_texture = entry_states[-1].repeat_texture
         if stage.key in GROUP_STAGE_KEYS and config.enable_circular_groups:
             # Shape is a property of the region's pixels, so it is derived per
             # stage rather than carried: a stage that moves a box reshapes it.
@@ -6021,6 +6694,7 @@ def run_detection(
                 circles=tuple(
                     cached_inscribed_circle_radius(
                         image, uv_mask, group, config, state.circle_radii,
+                        state.domain,
                     )
                     for group in stage.kept
                 ),
@@ -6066,6 +6740,7 @@ def detect_texture_regions(
         "image_size": f"{image.shape[1]}x{image.shape[0]}",
         "mser_boxes": len(by_key["mser"].kept),
         "boxes_rejected": len(by_key["box_filter"].rejected),
+        "repeat_texture_rejected": len(by_key["repeat_texture"].rejected),
         "candidate_groups": len(by_key["grouped"].kept),
         "pattern_groups_rejected": len(by_key["pattern_group"].rejected),
         "final_size_rejected": len(by_key["size"].rejected),
@@ -6351,6 +7026,7 @@ def main() -> None:
     )
     print(
         f"{summary['boxes_rejected']} boxes rejected, "
+        f"{summary['repeat_texture_rejected']} rejected as repeating material, "
         f"{summary['candidate_groups']} candidate groups, "
         f"{summary['pattern_groups_rejected']} rejected as repeating pattern, "
         f"{summary['final_size_rejected']} rejected by final size, "

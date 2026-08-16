@@ -98,6 +98,28 @@ class ForkedSwitchBaseTests(unittest.TestCase):
             interior["lc500_intemissive"], door["lc500_intemissive"]
         )
 
+    def test_every_forked_base_a_mesh_binds_also_names_a_material(self) -> None:
+        # The fork name is what the DAE binds, so minting it without writing
+        # the document leaves the mesh bound to nothing. Andronisk's door panel
+        # bound v60_andronisk_int_buttons_beamxp_tc_3, which no material
+        # defined, and its switches lit as bare blocks with no glyphs.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            materials = self._lc500_forks(tmp)
+            document = json.loads(
+                (tmp / "vehicles/lc500" / "beamxp_texture_correction.materials.json")
+                .read_text(encoding="utf-8")
+            )
+
+        bound = {
+            name
+            for part in ("lc500_interior", "lc500_door_L")
+            for name in materials.switch_bases_for_part(part).values()
+        }
+        self.assertTrue(bound)
+        for name in sorted(bound):
+            self.assertIn(name, document, f"{name} is bound but defines no material")
+
     def test_a_mesh_nothing_corrected_keeps_the_shipped_base(self) -> None:
         # lc500_steer carries the same material and was never corrected, so it
         # has to keep the original name for the stock entry to still find it.
@@ -211,6 +233,53 @@ class ForkedSwitchBaseTests(unittest.TestCase):
         self.assertIn(f'"on":"{door_on}"', updated)
         # Only this mesh's own base belongs on this part.
         self.assertNotIn(f'"{interior}"', updated)
+
+    def test_the_entry_rides_the_part_that_carries_the_mesh(self) -> None:
+        # A part is not named for its mesh. Andronisk's doorpanel_FL rides in
+        # door_FL, so looking the mesh name up as a part name matched nothing
+        # and the upsert wrote no entry at all -- the panel stayed bound to a
+        # forked base with no states behind it and its window switches lit as
+        # bare white blocks. Only the dash escaped, because a part there
+        # happens to share its mesh's name.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            vehicle_dir = tmp / "vehicles/lc500"
+            materials = self._lc500_forks(tmp)
+            jbeam = vehicle_dir / "conversion.jbeam"
+            jbeam.write_text(
+                """{
+  "lc500_doorshell_L_xp_rhd": {
+    "slotType":"lc500_doorshell_L",
+    "flexbodies":[
+      ["mesh", "[group]:"],
+      ["lc500_door_L_xp_rhd", ["lc500_doorbase_L"]],
+    ],
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {},
+                [dict(materials)],
+                build_pipeline._texture_correction_switch_base_aliases(tmp / "job"),
+                (
+                    '{"lc500":{"glowMap":{"lc500_intemissive":{"simpleFunction":'
+                    '{"lowbeam":0.49}, "off":"lc500_intemis_off", '
+                    '"on":"lc500_intemis_on"}}}}',
+                ),
+                None,
+                materials.switch_forks,
+                {"lc500_door_L_xp_rhd": "lc500_door_L"},
+            )
+            updated = jbeam.read_text(encoding="utf-8")
+            door = materials.switch_bases_for_part("lc500_door_L")["lc500_intemissive"]
+            door_on = materials.for_part("lc500_door_L")["lc500_intemis_on"]
+
+        self.assertIn(f'"{door}"', updated)
+        self.assertIn(f'"on":"{door_on}"', updated)
 
 
 class ForkedSkinTests(unittest.TestCase):

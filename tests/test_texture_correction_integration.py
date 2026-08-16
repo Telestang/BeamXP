@@ -367,6 +367,104 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             build_pipeline._mirrored_screen_page("<html><head></head></html>"),
         )
 
+    def test_unreadable_textures_are_announced_when_others_corrected(self) -> None:
+        # A mod may reference a texture it does not ship, so this stays
+        # non-fatal -- but it has to reach the caller, not just the log.
+        notice = build_pipeline.unreadable_texture_notice(
+            [{"texture": "vehicles/v/t/a.dds", "reason": "FileNotFoundError: a"}],
+            corrected=5,
+            label="v.dae",
+        )
+
+        self.assertIsNotNone(notice)
+        self.assertIn("could not read 1 texture(s)", notice)
+        self.assertIn("a.dds: FileNotFoundError: a", notice)
+
+    def test_reading_none_of_the_textures_raises(self) -> None:
+        # Andronisk's V60: 26 unreadable textures, zero corrected, and a build
+        # that reported success while every glyph stayed mirrored.
+        failures = [
+            {"texture": f"vehicles/v/t/{name}.dds", "reason": "FileNotFoundError"}
+            for name in "abcd"
+        ]
+
+        with self.assertRaises(RuntimeError) as caught:
+            build_pipeline.unreadable_texture_notice(
+                failures, corrected=0, label="v60_andronisk.dae"
+            )
+
+        message = str(caught.exception)
+        self.assertIn("read none of the 4 texture(s)", message)
+        self.assertIn("v60_andronisk.dae", message)
+        self.assertIn("and 1 more", message)
+
+    def test_no_failures_says_nothing(self) -> None:
+        self.assertIsNone(
+            build_pipeline.unreadable_texture_notice([], corrected=0, label="v.dae")
+        )
+
+    def test_a_corrected_texture_name_is_trimmed_only_when_it_will_not_fit(self) -> None:
+        material = "v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_int"
+        source = "v60_andronisk_int_stitch_amber_BC.color_rhd.dds"
+
+        # A short project keeps the name it has always written.
+        short = Path(r"C:\p\unpacked_output\vehicles\v")
+        self.assertEqual(
+            build_pipeline._corrected_texture_file_name(short, material, source),
+            f"{material}_{source}",
+        )
+
+        # The V60's, staged 153 characters deep, came to exactly 260.
+        deep = Path(
+            r"C:\Users\x\AppData\Local\BeamXP\handedness_conversion_projects"
+            r"\volvo_v60_andronisk_v5.1_01-08-26_v60_andronisk"
+            r"\unpacked_output\vehicles\v60_andronisk"
+        )
+        name = build_pipeline._corrected_texture_file_name(deep, material, source)
+        self.assertLess(len(str(deep / name)), 260)
+        self.assertTrue(name.endswith(".dds"))
+
+    def test_two_corrections_of_one_atlas_keep_distinct_trimmed_names(self) -> None:
+        deep = Path(
+            r"C:\Users\x\AppData\Local\BeamXP\handedness_conversion_projects"
+            r"\volvo_v60_andronisk_v5.1_01-08-26_v60_andronisk"
+            r"\unpacked_output\vehicles\v60_andronisk"
+        )
+        source = "v60_andronisk_int_stitch_amber_BC.color_rhd.dds"
+        first = build_pipeline._corrected_texture_file_name(
+            deep, "v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_int", source
+        )
+        second = build_pipeline._corrected_texture_file_name(
+            deep, "v60_andronisk_int_stitch_beamxp_tc.skin_interior.amber_ext", source
+        )
+
+        self.assertNotEqual(first, second)
+
+    def test_extraction_workspace_leaves_a_deep_mod_room_under_max_path(self) -> None:
+        # Andronisk's V60 nests its textures 113 characters deep. Under the
+        # project directory that came to 295 and Windows refused every one of
+        # its 26 extractions, so the conversion shipped uncorrected.
+        project = Path(
+            r"C:\Users\x\AppData\Local\BeamXP\handedness_conversion_projects"
+            r"\volvo_v60_andronisk_v5.1_01-08-26_v60_andronisk"
+        )
+        context = SimpleNamespace(project_dir=project)
+        root = build_pipeline.texture_correction_workspace_root(context)
+        archive_dir = root / build_pipeline._short_digest("some/mod/archive.zip")
+        member = (
+            "vehicles/v60_andronisk/texture/v60_andronisk_int_texture/wood"
+            "/v60_andronisk_int_texture_wood_white_BC.color.dds"
+        )
+
+        self.assertLess(len(str(archive_dir / member)), 260)
+        # Scratch, and deliberately not inside the project it belongs to.
+        self.assertNotIn(str(project), str(root))
+        # Two archives in one conversion still get separate directories.
+        self.assertNotEqual(
+            build_pipeline._short_digest("a.zip"),
+            build_pipeline._short_digest("b.zip"),
+        )
+
     def test_non_power_of_two_dds_falls_back_to_generated_png(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
@@ -1091,6 +1189,133 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertIsNone(appended)
         self.assertIsNotNone(material)
 
+    def test_a_prop_mesh_is_retargeted_on_its_baked_copy_not_split_into_rows(self) -> None:
+        """The Andronisk signal stalk: corrected, then wired to nothing.
+
+        A prop row names one mesh and the engine spawns exactly that one, so
+        the split pieces have no row to ride and the corrected material has to
+        land on the whole-mesh copy the row already names. That copy is baked
+        per row -- ``signalstalk_xp_rhd__<config>__<part>__<index>`` -- so it
+        answers to neither ``generated_mesh_name`` nor the pieces' names, and
+        the stalk shipped mirrored on its uncorrected shipped atlas.
+        """
+        baked = "signalstalk_xp_rhd__cross_250__dash__0000"
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            context = minimal_context(tmp)
+            output_root = tmp / "unpacked_output"
+            output_vehicle_dir = output_root / context.vehicle_path
+            output_vehicle_dir.mkdir(parents=True)
+            target_dae = output_vehicle_dir / "scintilla_handdrive.dae"
+            target_dae.write_text(
+                f"""<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="buttons_off-material" name="buttons_off"/></library_materials><library_geometries>
+<geometry id="geom_baked"><mesh><triangles material="buttons_off-material" count="0"/></mesh></geometry>
+</library_geometries><library_visual_scenes><visual_scene id="Scene">
+<node id="{baked}" name="{baked}"><matrix>1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1</matrix>
+<instance_geometry url="#geom_baked"><bind_material><technique_common>
+<instance_material symbol="buttons_off-material" target="#buttons_off-material"/>
+</technique_common></bind_material></instance_geometry></node>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            jbeam_dir = output_vehicle_dir / "jbeam"
+            jbeam_dir.mkdir()
+            jbeam_path = jbeam_dir / "handdrive_visual_conversion.jbeam"
+            jbeam_path.write_text(
+                '{"signalstalk_xp_rhd":{"props":[["func", "mesh", "idRef:", "idX:", "idY:"],'
+                f'["turnsignal", "{baked}", "f5l", "f5r", "dsh5"]]}}}}',
+                encoding="utf-8",
+            )
+            job = tmp / "texture_job"
+            job.mkdir()
+            source_dae = job / "signalstalk_rhd.dae"
+            source_dae.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="buttons_off-material" name="buttons_off"/></library_materials><library_geometries/>
+<library_visual_scenes><visual_scene id="Scene">
+<node id="signalstalk__beamxp_mirrored_carrier" name="signalstalk__beamxp_mirrored_carrier"/>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {
+                                "aliases": ["buttons_off", "buttons_off-material"],
+                                "maps": {},
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            detail_path = job / "texture.report.json"
+            detail_path.write_text(
+                json.dumps(
+                    {
+                        "dae_exports": [
+                            {
+                                "source_part": {"key": "signalstalk"},
+                                "generated_flexbody_rows": [
+                                    {"node_id": "signalstalk__beamxp_mirrored_carrier"}
+                                ],
+                                "dae_path": str(source_dae),
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = build_pipeline.integrate_texture_correction_artifacts(
+                context,
+                output_root,
+                output_vehicle_dir,
+                {
+                    "jobs": [
+                        {
+                            "dae": "vehicles/scintilla/scintilla.dae",
+                            "outputDirectory": str(job),
+                            "reportPath": str(detail_path),
+                        }
+                    ]
+                },
+                {core.HAND_RHD},
+                texture_correction_targets={"signalstalk": {"signalstalk"}},
+                prop_meshes={"signalstalk"},
+                flexbody_meshes=set(),
+                baked_mesh_copies={("signalstalk", core.HAND_RHD): [baked]},
+            )
+
+            jbeam = jbeam_path.read_text(encoding="utf-8")
+            root = ET.parse(target_dae).getroot()
+
+        patch_report = result["daePatches"][0]
+        self.assertEqual(patch_report["propTargetMeshes"], ["signalstalk"])
+        # No pieces appended and no row rewritten: a prop cannot carry a split.
+        self.assertEqual(patch_report["appendedNodes"], [])
+        self.assertEqual(result["rowReplacements"], {})
+        self.assertIn(baked, patch_report["retargetedNodes"])
+        self.assertIn(f'"turnsignal", "{baked}"', jbeam)
+        self.assertIsNone(
+            root.find(".//c:node[@id='signalstalk__beamxp_mirrored_carrier']", core.NS)
+        )
+        # The corrected material lands on the copy the row actually names.
+        binding = root.find(f".//c:node[@id='{baked}']//c:instance_material", core.NS)
+        triangle = root.find(".//c:geometry[@id='geom_baked']//c:triangles", core.NS)
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.get("symbol"), "buttons_off_beamxp_tc")
+        self.assertIsNotNone(triangle)
+        assert triangle is not None
+        self.assertEqual(triangle.get("material"), "buttons_off_beamxp_tc")
+
     def test_append_texture_correction_dae_bakes_transform_and_material(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
@@ -1350,10 +1575,70 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertIn("ardente_interior_beamxp_tc", materials)
         self.assertIn("ardente_interior_on_beamxp_tc", materials)
         self.assertNotIn("emissiveMap", materials["ardente_interior_beamxp_tc"]["Stages"][0])
+        # The lit state reads the corrected emissive image. Which material's
+        # name the copy carries is not part of the contract: one corrected
+        # image is copied in once and every material naming it shares that
+        # copy, so the prefix belongs to whichever minted it first.
         self.assertIn(
-            "ardente_interior_on_beamxp_tc_ardente_interior_g.color_rhd.dds",
+            "ardente_interior_g.color_rhd.dds",
             materials["ardente_interior_on_beamxp_tc"]["Stages"][0]["emissiveMap"],
         )
+
+    def test_one_corrected_image_is_copied_in_once(self) -> None:
+        # Every material naming a corrected image used to get its own copy of
+        # it. Andronisk's V60 shipped 504.7 MB of corrected DDS holding 219.3
+        # MB of distinct images: one fabric atlas copied once per skin, its
+        # normal copied again beside it, and a switch base's off and on states
+        # copied apart although they are one file.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            target = tmp / "vehicles/scintilla"
+            job.mkdir()
+            (job / "interior_b.color_rhd.dds").write_bytes(b"colour")
+            (job / "interior_nm.normal_rhd.dds").write_bytes(b"normal")
+
+            def entry(alias: str) -> dict:
+                return {
+                    "aliases": [alias],
+                    "maps": {
+                        "baseColorMap": "interior_b.color_rhd.dds",
+                        "normalMap": "interior_nm.normal_rhd.dds",
+                    },
+                }
+
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            entry("scintilla_interior"),
+                            entry("scintilla_interior.skin_interior.luxe"),
+                            entry("scintilla_interior.skin_interior.race"),
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            build_pipeline._prepare_texture_correction_materials(job, target, tmp)
+            copied = sorted(path.name for path in target.glob("*.dds"))
+            materials = json.loads(
+                (target / "beamxp_texture_correction.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        # Two distinct images in, two files out, however many materials name them.
+        self.assertEqual(len(copied), 2)
+        self.assertEqual(len(materials), 3)
+        colour = {
+            body["Stages"][0]["baseColorMap"] for body in materials.values()
+        }
+        normal = {body["Stages"][0]["normalMap"] for body in materials.values()}
+        self.assertEqual(len(colour), 1)
+        self.assertEqual(len(normal), 1)
+        self.assertNotEqual(colour, normal)
 
     def test_switch_base_alias_maps_to_corrected_off_state_material(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1874,6 +2159,89 @@ class SwapMeshCorrectionOptInTests(unittest.TestCase):
         )
         self.assertEqual(targets, {})
         self.assertEqual(forced, set())
+
+
+class WholeMeshMirrorCorrectionTests(unittest.TestCase):
+    """A Mirror prop ships a whole-mesh reflection, so nothing about it is rigid.
+
+    ``vehicleObj:addProp`` (lua/common/jbeam/sections/meshs.lua) spawns exactly
+    the mesh the row names, so a prop row cannot be swapped for the split a
+    flexbody row can carry. The Andronisk's signal stalk is the case: the sweep
+    called two of its triangles rigid, and their glyphs shipped unflipped under
+    geometry the exporter reflected anyway.
+    """
+
+    def test_a_mirror_prop_forces_its_whole_domain_mirrored(self) -> None:
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"signalstalk": "mirror", "dash": "mirror"},
+            {},
+            {"signalstalk"},
+            {"dash"},
+        )
+        self.assertEqual(forced, {"signalstalk"})
+
+    def test_a_mesh_bound_as_both_keeps_the_split(self) -> None:
+        # A flexbody row can carry the split, so the sweep's answer still ships.
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"handle": "mirror"},
+            {},
+            {"handle"},
+            {"handle"},
+        )
+        self.assertEqual(forced, set())
+
+    def test_a_prop_that_only_moves_is_not_forced(self) -> None:
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"stalk": "translate", "lever": "mirrorPosition", "knob": "skip"},
+            {},
+            {"stalk", "lever", "knob"},
+            set(),
+        )
+        self.assertEqual(forced, set())
+
+    def test_the_force_names_the_mesh_the_correction_is_made_on(self) -> None:
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"stalk_L": "mirror"},
+            {"stalk_L": "stalk_R"},
+            {"stalk_L"},
+            set(),
+        )
+        self.assertEqual(forced, {"stalk_R"})
+
+
+class BakedPropCopyTests(unittest.TestCase):
+    def test_copies_are_keyed_by_the_mesh_and_hand_they_were_minted_for(self) -> None:
+        specs = [
+            core.BakedMeshSpec(
+                configured_mesh="signalstalk",
+                source_mesh="signalstalk",
+                output_mesh="signalstalk_xp_rhd__cross_250__dash__0000",
+                target_hand=core.HAND_RHD,
+                mode="mirror",
+                placement_matrix=[],
+                bake_transform_into_dae=False,
+                is_prop=True,
+            ),
+            core.BakedMeshSpec(
+                configured_mesh="signalstalk",
+                source_mesh="signalstalk",
+                output_mesh="signalstalk_xp_rhd__police__dash__0001",
+                target_hand=core.HAND_RHD,
+                mode="mirror",
+                placement_matrix=[],
+                bake_transform_into_dae=False,
+                is_prop=True,
+            ),
+        ]
+        self.assertEqual(
+            build_pipeline.baked_mesh_copies_by_target(specs),
+            {
+                ("signalstalk", core.HAND_RHD): [
+                    "signalstalk_xp_rhd__cross_250__dash__0000",
+                    "signalstalk_xp_rhd__police__dash__0001",
+                ]
+            },
+        )
 
 
 class PartScopedCorrectedMaterialTests(unittest.TestCase):
