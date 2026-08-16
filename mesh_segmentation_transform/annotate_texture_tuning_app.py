@@ -66,6 +66,7 @@ from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     UvIslandSymmetryConfig,
     UvIslandSymmetryMatch,
     analyse_uv_island_symmetry,
+    build_repeat_texture_index,
     detect_foreground_boxes,
     detect_edge_boxes_from_response,
     edge_mask_from_response,
@@ -308,6 +309,15 @@ def session_settings_path() -> Path:
 
 SESSION_TEXT_KEYS = ("vehicle", "dae_member", "part_filter")
 
+# Parameter groups that belong to the texture rather than to a detection path.
+# Everything else is remembered per pipeline, because colour and relief are
+# different enough that one set cannot serve both.  UV island symmetry is not
+# like that: it is read off the UV mask alone, no detector touches it, and a
+# threshold that describes an island describes it whichever image is being
+# searched.  Keeping it per pipeline meant tuning it on one source and finding
+# the old value still in force after switching to another.
+SHARED_PARAMETER_PREFIXES = frozenset({"uv"})
+
 
 def load_session() -> dict[str, object]:
     """Recall the last vehicle, DAE, part filter and per-pipeline parameters.
@@ -343,6 +353,22 @@ def load_session() -> dict[str, object]:
             for pipeline, values in pipelines.items()
             if isinstance(pipeline, str) and isinstance(values, dict)
         }
+    stored = payload.get("shared")
+    shared = {
+        name: value
+        for name, value in (stored if isinstance(stored, dict) else {}).items()
+        if isinstance(name, str) and isinstance(value, (str, bool, int, float))
+    }
+    # Shared parameters used to be saved inside each pipeline's object.  Hoist
+    # whatever an older session left there rather than silently reverting the
+    # operator's threshold to its default; the first pipeline to carry one wins,
+    # which is arbitrary but only matters once, and only if they had diverged.
+    for values in (session.get("pipelines") or {}).values():
+        for name, value in values.items():
+            if name.split(":", 1)[0] in SHARED_PARAMETER_PREFIXES:
+                shared.setdefault(name, value)
+    if shared:
+        session["shared"] = shared
     return session
 
 
@@ -356,7 +382,17 @@ def save_session(session: dict[str, object]) -> None:
     }
     pipelines = session.get("pipelines")
     if isinstance(pipelines, dict) and pipelines:
-        payload["pipelines"] = pipelines
+        payload["pipelines"] = {
+            pipeline: {
+                name: value
+                for name, value in values.items()
+                if name.split(":", 1)[0] not in SHARED_PARAMETER_PREFIXES
+            }
+            for pipeline, values in pipelines.items()
+        }
+    shared = session.get("shared")
+    if isinstance(shared, dict) and shared:
+        payload["shared"] = shared
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
@@ -483,6 +519,25 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
             "box_feature_context_px",
             "box_feature_min_domain_px",
             "box_min_feature_px",
+        ),
+        None,
+    ),
+    (
+        "4. Repeating material",
+        (
+            "enable_repeat_texture_filter",
+            "repeat_texture_decimation",
+            "repeat_texture_highpass_px",
+            "repeat_texture_tile_px",
+            "repeat_texture_search_scale",
+            "repeat_texture_min_search_px",
+            "repeat_texture_max_search_px",
+            "repeat_texture_match_threshold",
+            "repeat_texture_min_tile_contrast",
+            "repeat_texture_min_repeats",
+            "repeat_texture_context_repeats",
+            "repeat_texture_context_directions",
+            "repeat_texture_context_margin_px",
         ),
         None,
     ),
@@ -952,8 +1007,26 @@ def run_detection_by_uv_island(
                 if config.box_source in {"contrast", "contrast_gpu"}:
                     contrast_by_island[island_index] = detection
 
+    # One atlas-wide recurrence index for every island.  Whether a texture
+    # repeats is a property of the material, not of the island consuming it,
+    # and an island crop is far too small to see a repeat at all: a stitched
+    # seam that scores 13 recurrences over the atlas scores 1 inside a 96 px
+    # crop.  Building it here also means the islands share one match cache.
+    repeat_texture = (
+        build_repeat_texture_index(image, config)
+        if config.enable_repeat_texture_filter
+        else None
+    )
+
     for island_index, (x0, y0, crop_mask) in enumerate(valid):
         crop = image[y0:y0 + crop_mask.shape[0], x0:x0 + crop_mask.shape[1]]
+        island_repeat_texture = (
+            repeat_texture.for_view(
+                (((0, 0, crop_mask.shape[1], crop_mask.shape[0]), x0, y0),)
+            )
+            if repeat_texture is not None
+            else None
+        )
         raw_boxes = raw_boxes_by_island[island_index]
         contrast = contrast_by_island[island_index]
         relief_edge_mask = edge_masks_by_island[island_index]
@@ -984,6 +1057,7 @@ def run_detection_by_uv_island(
                     ),
                     initial_relief_bridge_response=relief_bridge,
                     initial_relief_edge_mask=relief_edge_mask,
+                    initial_repeat_texture=island_repeat_texture,
                 )
                 pipeline_seconds += time.perf_counter() - pipeline_started
             run = empty_template
@@ -1000,6 +1074,7 @@ def run_detection_by_uv_island(
                 ),
                 initial_relief_bridge_response=relief_bridge,
                 initial_relief_edge_mask=relief_edge_mask,
+                initial_repeat_texture=island_repeat_texture,
             )
             pipeline_seconds += time.perf_counter() - pipeline_started
         per_island.append((x0, y0, run))
@@ -1616,6 +1691,7 @@ class TuningApp(tk.Tk):
         self.show_uv_symmetry = tk.BooleanVar(value=True)
 
         self._build_ui()
+        self._apply_shared_parameters()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_handle: str | None = self.after(60, self._poll_worker)
         self.after(0, self._restore_session)
@@ -2016,11 +2092,32 @@ class TuningApp(tk.Tk):
         return pipeline_for_source(source or self.active_source).detector_defaults()
 
     def _parameter_stores(self) -> tuple[tuple[str, dict[str, tk.Variable]], ...]:
+        """Every widget store, shared and per-pipeline alike."""
         return (
             ("mser", self.parameter_vars),
             ("uv", self.symmetry_parameter_vars),
             ("relief", self.relief_parameter_vars),
             ("rhd", self.rhd_parameter_vars),
+        )
+
+    def _pipeline_parameter_stores(
+        self,
+    ) -> tuple[tuple[str, dict[str, tk.Variable]], ...]:
+        """The stores each detection path remembers separately."""
+        return tuple(
+            (prefix, store)
+            for prefix, store in self._parameter_stores()
+            if prefix not in SHARED_PARAMETER_PREFIXES
+        )
+
+    def _shared_parameter_stores(
+        self,
+    ) -> tuple[tuple[str, dict[str, tk.Variable]], ...]:
+        """The stores that hold one value for every path at once."""
+        return tuple(
+            (prefix, store)
+            for prefix, store in self._parameter_stores()
+            if prefix in SHARED_PARAMETER_PREFIXES
         )
 
     def _capture_parameters(self) -> dict[str, object]:
@@ -2031,7 +2128,7 @@ class TuningApp(tk.Tk):
         """
         return {
             f"{prefix}:{name}": variable.get()
-            for prefix, store in self._parameter_stores()
+            for prefix, store in self._pipeline_parameter_stores()
             for name, variable in store.items()
         }
 
@@ -2044,7 +2141,7 @@ class TuningApp(tk.Tk):
         }
         return {
             f"{prefix}:{name}": getattr(defaults[prefix], name)
-            for prefix, store in self._parameter_stores()
+            for prefix, store in self._pipeline_parameter_stores()
             for name in store
         }
 
@@ -2061,18 +2158,45 @@ class TuningApp(tk.Tk):
         return values
 
     def _apply_parameters(self, values: dict[str, object]) -> None:
-        for prefix, store in self._parameter_stores():
+        self._apply_to_stores(self._pipeline_parameter_stores(), values)
+
+    def _apply_to_stores(
+        self,
+        stores: tuple[tuple[str, dict[str, tk.Variable]], ...],
+        values: dict[str, object],
+    ) -> None:
+        for prefix, store in stores:
             for name, variable in store.items():
                 value = values.get(f"{prefix}:{name}")
                 if value is None:
                     continue
                 variable.set(value if isinstance(value, bool) else str(value))
 
+    def _capture_shared_parameters(self) -> dict[str, object]:
+        return {
+            f"{prefix}:{name}": variable.get()
+            for prefix, store in self._shared_parameter_stores()
+            for name, variable in store.items()
+        }
+
+    def _apply_shared_parameters(self) -> None:
+        """Put the one remembered value into the shared widgets.
+
+        Called once at startup and never on a source switch: that is the whole
+        point of these being shared.
+        """
+        stored = self.session.get("shared")
+        self._apply_to_stores(
+            self._shared_parameter_stores(),
+            stored if isinstance(stored, dict) else {},
+        )
+
     def _remember_parameters(self) -> None:
         """Store visible values in the active detector class's JSON object."""
         pipeline = pipeline_for_source(self.active_source)
         self.mode_parameters[pipeline.pipeline_id] = self._capture_parameters()
         self.session["pipelines"] = self.mode_parameters
+        self.session["shared"] = self._capture_shared_parameters()
         self.session.pop("parameters", None)
         save_session(self.session)
 
@@ -2117,6 +2241,7 @@ class TuningApp(tk.Tk):
                 ("mser", "MSER boxes"),
                 ("stroke_width", "Stroke width"),
                 ("box_filter", "Box filtering"),
+                ("repeat_texture", "Repeating material"),
                 ("overlap_box_group", "Overlap grouping"),
                 ("grouped", "Initial grouping"),
                 ("region_domain", "Domain recovery"),

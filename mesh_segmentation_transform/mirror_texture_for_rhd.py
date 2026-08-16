@@ -79,6 +79,7 @@ from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     LocalContrastDetection,
     MserConfig,
     SHAPE_ROTATED,
+    build_repeat_texture_index,
     detect_local_contrast_gpu_batch,
     run_detection,
 )
@@ -154,6 +155,15 @@ class RhdTextureConfig:
     threshold_steps: int = 10
     min_region_faces: int = 6
     max_pseudo_aspect_ratio: float = 20.0
+    # A symmetric perimeter says nothing about what sits behind it: the collar
+    # where a wiper stalk meets the column shroud is a circle, and a circle is
+    # symmetric about every plane through its centre, so the stalk was accepted
+    # and rotated end for end into its mirrored position.  Candidates must also
+    # be shallow against their own perimeter plane, which keeps the fasciae we
+    # want (radio surrounds, switch packs, vent bezels, badges) and drops the
+    # protrusions we do not.  Measured fasciae sit around 0.1-0.2; a stalk is
+    # several times its collar diameter, so the exact cut is not delicate.
+    max_candidate_depth_ratio: float = 0.35
     symmetry_tolerance_metres: float = 0.001
     direct_symmetry_tolerance_metres: float = 0.0005
     sample_spacing_metres: float = 0.002
@@ -1690,6 +1700,7 @@ def sweep_part(
         config.threshold_steps,
         config.min_region_faces,
         config.max_pseudo_aspect_ratio,
+        config.max_candidate_depth_ratio,
         config.symmetry_tolerance_metres,
         config.direct_symmetry_tolerance_metres,
         config.sample_spacing_metres,
@@ -2702,13 +2713,26 @@ def exchangeable_share(
     stencil: np.ndarray,
     bounds: tuple[int, int, int, int],
     axis: str,
+    within: np.ndarray | None = None,
 ) -> float:
-    """Share of a rectangle whose texels can legally swap with their partner.
+    """Share of a region's writable texels that can legally swap with partners.
 
     A texel may only move if the position it swaps with is also inside the
     mirrored domain.  Where that fails the texel keeps its original content
     while its neighbours move, which does not leave the glyph backwards -- it
     breaks it.  Measuring the share first lets the caller decline.
+
+    ``within`` says which of the rectangle's texels are writable at all --
+    normally the material domain.  ``apply_masked_flip`` only ever writes
+    through the stencil, so a texel this mesh's material never paints cannot
+    tear and must not count against the region.  Dividing by the whole
+    rectangle instead cost the Andronisk door panel its gear-selector "2": the
+    detection box overhangs that glyph's UV island by 5%, and the overhang
+    alone scored it 0.94 against a 0.98 floor, while only 11 of the 2,397
+    texels actually painted there lacked a partner.  Declined on a mesh the
+    exporter mirrors regardless, the glyph shipped reading backwards.  A
+    region genuinely split between mirrored and rigid geometry still scores
+    low, because those texels are inside the domain and do tear.
     """
     x, y, w, h = bounds
     height, width = stencil.shape[:2]
@@ -2718,7 +2742,14 @@ def exchangeable_share(
         return 0.0
     mask = stencil[y0:y1, x0:x1]
     flip = np.fliplr if axis == "horizontal" else np.flipud
-    return float((mask & flip(mask)).mean())
+    exchangeable = mask & flip(mask)
+    if within is None:
+        return float(exchangeable.mean())
+    writable = within[y0:y1, x0:x1]
+    paintable = int(writable.sum())
+    if paintable <= 0:
+        return 0.0
+    return float((exchangeable & writable).sum()) / float(paintable)
 
 
 def _boundary_alpha(write_mask: np.ndarray, blend_px: float) -> np.ndarray | None:
@@ -3052,8 +3083,13 @@ def rotated_exchangeable_share(
     stencil: np.ndarray,
     corners: tuple[tuple[float, float], ...],
     rotated_axis: str,
+    within: np.ndarray | None = None,
 ) -> float:
-    """Share of a rotated rectangle whose reflected partner is also legal."""
+    """Share of a rotated rectangle whose reflected partner is also legal.
+
+    ``within`` narrows the rectangle to the texels that are writable at all,
+    for the reason ``exchangeable_share`` gives.
+    """
     axes = _rotated_rectangle_axes(corners)
     if axes is None:
         return 0.0
@@ -3077,6 +3113,8 @@ def rotated_exchangeable_share(
     inside = (np.abs(local_long) <= long_half + 0.5) & (
         np.abs(local_short) <= short_half + 0.5
     )
+    if within is not None:
+        inside = inside & within[y0:y1, x0:x1]
     if not bool(inside.any()):
         return 0.0
 
@@ -4498,6 +4536,33 @@ def _clamp_bounds_to_atlas(
     return x0, y0, x1 - x0, y1 - y0
 
 
+def _repeat_texture_for_view(
+    index,
+    view: DetectionView,
+):
+    """Address the atlas-wide recurrence index in one view's coordinates.
+
+    A view is a crop, a single island tile, or a collage of several, and the
+    tiles already carry the mapping back to the atlas.  Recurrence has to be
+    counted on the atlas: a stitched seam sliced into island crops shows one or
+    two dashes per crop and reads as unique in every one of them.
+    """
+    if index is None:
+        return None
+    return index.for_view(
+        tuple(
+            (
+                (dx0, dy0, dx1 - dx0, dy1 - dy0),
+                sx0 - dx0,
+                sy0 - dy0,
+            )
+            for sx0, sy0, _sx1, _sy1, dx0, dy0, dx1, dy1 in (
+                (*tile.source, *tile.dest) for tile in view.tiles
+            )
+        )
+    )
+
+
 def _map_bounds_from_detection_view(
     bounds: tuple[int, int, int, int],
     view: DetectionView,
@@ -4555,6 +4620,7 @@ def _detect_flip_regions_in_view(
     source: str,
     log=print,
     initial_contrast: LocalContrastDetection | None = None,
+    repeat_texture=None,
 ) -> RegionDetection:
     """Run detection and post-filters on one crop/collage/tile view."""
     started = time.perf_counter()
@@ -4576,6 +4642,7 @@ def _detect_flip_regions_in_view(
         ),
         initial_relief_bridge_response=view.relief_bridge_response,
         initial_island_bits=view.island_bits,
+        initial_repeat_texture=_repeat_texture_for_view(repeat_texture, view),
     )
     final = detection.stages[-1]
     detected = list(final.kept)
@@ -4731,9 +4798,17 @@ def detect_flip_regions(
     result = RegionDetection(source=source, detected=0)
     started = time.perf_counter()
     result.work_views = [_view_report(view) for view in views]
+    # One recurrence index for the whole atlas, shared by every view and by
+    # the match cache inside it.  Views are crops, and a crop cannot show that
+    # a texture repeats.
+    repeat_texture = (
+        build_repeat_texture_index(bgr, mser_config)
+        if mser_config.enable_repeat_texture_filter
+        else None
+    )
     for view in views:
         partial = _detect_flip_regions_in_view(
-            view, config, mser_config, source, log
+            view, config, mser_config, source, log, repeat_texture=repeat_texture,
         )
         result.detected += partial.detected
         result.regions.extend(partial.regions)
@@ -4769,6 +4844,14 @@ def detect_flip_regions_by_uv_island(
     started = time.perf_counter()
     result = RegionDetection(source=source, detected=0)
     consumers = _coalesce_overlapping_uv_consumers(island_masks)
+    # One recurrence index for the whole atlas, shared by every view and by
+    # the match cache inside it.  Views are crops, and a crop cannot show that
+    # a texture repeats.
+    repeat_texture = (
+        build_repeat_texture_index(bgr, mser_config)
+        if mser_config.enable_repeat_texture_filter
+        else None
+    )
 
     if mser_config.box_source == "contrast_gpu":
         indexed_views: list[tuple[int, DetectionView]] = []
@@ -4798,6 +4881,7 @@ def detect_flip_regions_by_uv_island(
                 f"{source}:uv-island-{index}",
                 log,
                 contrast,
+                repeat_texture=repeat_texture,
             )
             result.detected += partial.detected
             result.regions.extend(partial.regions)
@@ -4822,7 +4906,8 @@ def detect_flip_regions_by_uv_island(
             partial = RegionDetection(source=f"{source}:uv-island-{index}", detected=0)
             for view in views:
                 view_result = _detect_flip_regions_in_view(
-                    view, config, mser_config, partial.source, log
+                    view, config, mser_config, partial.source, log,
+                    repeat_texture=repeat_texture,
                 )
                 partial.detected += view_result.detected
                 partial.regions.extend(view_result.regions)
@@ -5994,11 +6079,11 @@ def build_rhd_texture(
         else:
             if rotation is not None and rotated_axis is not None:
                 exchangeable = rotated_exchangeable_share(
-                    mirror_mask, rotation, rotated_axis
+                    mirror_mask, rotation, rotated_axis, domain_mask
                 )
             else:
                 exchangeable = exchangeable_share(
-                    mirror_mask, (x, y, w, h), axis
+                    mirror_mask, (x, y, w, h), axis, domain_mask
                 )
             stencil = STENCIL_MIRROR
         if (
@@ -6006,14 +6091,16 @@ def build_rhd_texture(
             and exchangeable < config.min_region_exchangeable
         ):
             other = "vertical" if axis == "horizontal" else "horizontal"
-            alternative = exchangeable_share(mirror_mask, (x, y, w, h), other)
+            alternative = exchangeable_share(
+                mirror_mask, (x, y, w, h), other, domain_mask
+            )
             if rotation is not None and rotated_axis is not None:
                 domain_exchangeable = rotated_exchangeable_share(
-                    domain_mask, rotation, rotated_axis
+                    domain_mask, rotation, rotated_axis, domain_mask
                 )
             else:
                 domain_exchangeable = exchangeable_share(
-                    domain_mask, (x, y, w, h), axis
+                    domain_mask, (x, y, w, h), axis, domain_mask
                 )
             if domain_exchangeable >= config.min_region_exchangeable:
                 expanded += 1

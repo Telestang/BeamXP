@@ -1189,6 +1189,133 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertIsNone(appended)
         self.assertIsNotNone(material)
 
+    def test_a_prop_mesh_is_retargeted_on_its_baked_copy_not_split_into_rows(self) -> None:
+        """The Andronisk signal stalk: corrected, then wired to nothing.
+
+        A prop row names one mesh and the engine spawns exactly that one, so
+        the split pieces have no row to ride and the corrected material has to
+        land on the whole-mesh copy the row already names. That copy is baked
+        per row -- ``signalstalk_xp_rhd__<config>__<part>__<index>`` -- so it
+        answers to neither ``generated_mesh_name`` nor the pieces' names, and
+        the stalk shipped mirrored on its uncorrected shipped atlas.
+        """
+        baked = "signalstalk_xp_rhd__cross_250__dash__0000"
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            context = minimal_context(tmp)
+            output_root = tmp / "unpacked_output"
+            output_vehicle_dir = output_root / context.vehicle_path
+            output_vehicle_dir.mkdir(parents=True)
+            target_dae = output_vehicle_dir / "scintilla_handdrive.dae"
+            target_dae.write_text(
+                f"""<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="buttons_off-material" name="buttons_off"/></library_materials><library_geometries>
+<geometry id="geom_baked"><mesh><triangles material="buttons_off-material" count="0"/></mesh></geometry>
+</library_geometries><library_visual_scenes><visual_scene id="Scene">
+<node id="{baked}" name="{baked}"><matrix>1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1</matrix>
+<instance_geometry url="#geom_baked"><bind_material><technique_common>
+<instance_material symbol="buttons_off-material" target="#buttons_off-material"/>
+</technique_common></bind_material></instance_geometry></node>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            jbeam_dir = output_vehicle_dir / "jbeam"
+            jbeam_dir.mkdir()
+            jbeam_path = jbeam_dir / "handdrive_visual_conversion.jbeam"
+            jbeam_path.write_text(
+                '{"signalstalk_xp_rhd":{"props":[["func", "mesh", "idRef:", "idX:", "idY:"],'
+                f'["turnsignal", "{baked}", "f5l", "f5r", "dsh5"]]}}}}',
+                encoding="utf-8",
+            )
+            job = tmp / "texture_job"
+            job.mkdir()
+            source_dae = job / "signalstalk_rhd.dae"
+            source_dae.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="buttons_off-material" name="buttons_off"/></library_materials><library_geometries/>
+<library_visual_scenes><visual_scene id="Scene">
+<node id="signalstalk__beamxp_mirrored_carrier" name="signalstalk__beamxp_mirrored_carrier"/>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {
+                                "aliases": ["buttons_off", "buttons_off-material"],
+                                "maps": {},
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            detail_path = job / "texture.report.json"
+            detail_path.write_text(
+                json.dumps(
+                    {
+                        "dae_exports": [
+                            {
+                                "source_part": {"key": "signalstalk"},
+                                "generated_flexbody_rows": [
+                                    {"node_id": "signalstalk__beamxp_mirrored_carrier"}
+                                ],
+                                "dae_path": str(source_dae),
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = build_pipeline.integrate_texture_correction_artifacts(
+                context,
+                output_root,
+                output_vehicle_dir,
+                {
+                    "jobs": [
+                        {
+                            "dae": "vehicles/scintilla/scintilla.dae",
+                            "outputDirectory": str(job),
+                            "reportPath": str(detail_path),
+                        }
+                    ]
+                },
+                {core.HAND_RHD},
+                texture_correction_targets={"signalstalk": {"signalstalk"}},
+                prop_meshes={"signalstalk"},
+                flexbody_meshes=set(),
+                baked_mesh_copies={("signalstalk", core.HAND_RHD): [baked]},
+            )
+
+            jbeam = jbeam_path.read_text(encoding="utf-8")
+            root = ET.parse(target_dae).getroot()
+
+        patch_report = result["daePatches"][0]
+        self.assertEqual(patch_report["propTargetMeshes"], ["signalstalk"])
+        # No pieces appended and no row rewritten: a prop cannot carry a split.
+        self.assertEqual(patch_report["appendedNodes"], [])
+        self.assertEqual(result["rowReplacements"], {})
+        self.assertIn(baked, patch_report["retargetedNodes"])
+        self.assertIn(f'"turnsignal", "{baked}"', jbeam)
+        self.assertIsNone(
+            root.find(".//c:node[@id='signalstalk__beamxp_mirrored_carrier']", core.NS)
+        )
+        # The corrected material lands on the copy the row actually names.
+        binding = root.find(f".//c:node[@id='{baked}']//c:instance_material", core.NS)
+        triangle = root.find(".//c:geometry[@id='geom_baked']//c:triangles", core.NS)
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.get("symbol"), "buttons_off_beamxp_tc")
+        self.assertIsNotNone(triangle)
+        assert triangle is not None
+        self.assertEqual(triangle.get("material"), "buttons_off_beamxp_tc")
+
     def test_append_texture_correction_dae_bakes_transform_and_material(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
@@ -2032,6 +2159,89 @@ class SwapMeshCorrectionOptInTests(unittest.TestCase):
         )
         self.assertEqual(targets, {})
         self.assertEqual(forced, set())
+
+
+class WholeMeshMirrorCorrectionTests(unittest.TestCase):
+    """A Mirror prop ships a whole-mesh reflection, so nothing about it is rigid.
+
+    ``vehicleObj:addProp`` (lua/common/jbeam/sections/meshs.lua) spawns exactly
+    the mesh the row names, so a prop row cannot be swapped for the split a
+    flexbody row can carry. The Andronisk's signal stalk is the case: the sweep
+    called two of its triangles rigid, and their glyphs shipped unflipped under
+    geometry the exporter reflected anyway.
+    """
+
+    def test_a_mirror_prop_forces_its_whole_domain_mirrored(self) -> None:
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"signalstalk": "mirror", "dash": "mirror"},
+            {},
+            {"signalstalk"},
+            {"dash"},
+        )
+        self.assertEqual(forced, {"signalstalk"})
+
+    def test_a_mesh_bound_as_both_keeps_the_split(self) -> None:
+        # A flexbody row can carry the split, so the sweep's answer still ships.
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"handle": "mirror"},
+            {},
+            {"handle"},
+            {"handle"},
+        )
+        self.assertEqual(forced, set())
+
+    def test_a_prop_that_only_moves_is_not_forced(self) -> None:
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"stalk": "translate", "lever": "mirrorPosition", "knob": "skip"},
+            {},
+            {"stalk", "lever", "knob"},
+            set(),
+        )
+        self.assertEqual(forced, set())
+
+    def test_the_force_names_the_mesh_the_correction_is_made_on(self) -> None:
+        forced = core.whole_mesh_mirror_correction_ids(
+            {"stalk_L": "mirror"},
+            {"stalk_L": "stalk_R"},
+            {"stalk_L"},
+            set(),
+        )
+        self.assertEqual(forced, {"stalk_R"})
+
+
+class BakedPropCopyTests(unittest.TestCase):
+    def test_copies_are_keyed_by_the_mesh_and_hand_they_were_minted_for(self) -> None:
+        specs = [
+            core.BakedMeshSpec(
+                configured_mesh="signalstalk",
+                source_mesh="signalstalk",
+                output_mesh="signalstalk_xp_rhd__cross_250__dash__0000",
+                target_hand=core.HAND_RHD,
+                mode="mirror",
+                placement_matrix=[],
+                bake_transform_into_dae=False,
+                is_prop=True,
+            ),
+            core.BakedMeshSpec(
+                configured_mesh="signalstalk",
+                source_mesh="signalstalk",
+                output_mesh="signalstalk_xp_rhd__police__dash__0001",
+                target_hand=core.HAND_RHD,
+                mode="mirror",
+                placement_matrix=[],
+                bake_transform_into_dae=False,
+                is_prop=True,
+            ),
+        ]
+        self.assertEqual(
+            build_pipeline.baked_mesh_copies_by_target(specs),
+            {
+                ("signalstalk", core.HAND_RHD): [
+                    "signalstalk_xp_rhd__cross_250__dash__0000",
+                    "signalstalk_xp_rhd__police__dash__0001",
+                ]
+            },
+        )
 
 
 class PartScopedCorrectedMaterialTests(unittest.TestCase):

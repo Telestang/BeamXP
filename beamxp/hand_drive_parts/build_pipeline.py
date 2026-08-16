@@ -613,6 +613,7 @@ def export_texture_correction_artifacts(
     progress: Callable[[str], None] | None = None,
     shared_atlas_dependency_targets: dict[str, set[str]] | None = None,
     force_mirrored_dependency_ids: set[str] | None = None,
+    whole_mesh_mirror_ids: set[str] | None = None,
     texture_member_scope_by_source: dict[tuple[Path, str], set[str]] | None = None,
     bc7_quality: str | None = None,
 ) -> dict[str, object]:
@@ -686,6 +687,11 @@ def export_texture_correction_artifacts(
         by_source.setdefault((source_zip, obj.dae_path), []).append(mesh_id)
     dependency_targets = shared_atlas_dependency_targets or {}
     forced_dependency_ids = force_mirrored_dependency_ids or set()
+    # Whole-mesh mirrors force the sweep the same way a structural pair does,
+    # but unlike one they have no reason to be deferred into their own export:
+    # nothing about them can erase another mesh's mirrored domain, because a
+    # forced part contributes mirrored triangles and never rigid ones.
+    whole_mesh_mirror_ids = whole_mesh_mirror_ids or set()
     scoped_members_by_source = texture_member_scope_by_source or {}
     dependencies_by_source: dict[tuple[Path, str], list[str]] = {}
     for mesh_id in dependency_targets:
@@ -801,8 +807,12 @@ def export_texture_correction_artifacts(
                 dependency_targets.get(dependency_mesh, ())
             )
         wanted_meshes = sorted(set(wanted_meshes))
+        # ``texture_parts`` is what the correction actually scopes jobs to, so
+        # that is where a whole-mesh mirror has to be named to reach the sweep.
+        scoped_part_keys = {part.key for part in texture_parts}
         forced_part_keys = (
             set(wanted_meshes).intersection(forced_dependency_ids)
+            | (scoped_part_keys & whole_mesh_mirror_ids)
             | forced_texture_part_keys
         )
         matched_meshes = [mesh for mesh in wanted_meshes if mesh not in set(missing)]
@@ -945,6 +955,7 @@ def export_texture_correction_artifacts(
             deferred_forced_meshes,
             progress=progress,
             force_mirrored_dependency_ids=deferred_forced_meshes,
+            whole_mesh_mirror_ids=whole_mesh_mirror_ids,
             texture_member_scope_by_source=deferred_forced_scope,
             bc7_quality=bc7_quality,
         )
@@ -3787,6 +3798,23 @@ def _runtime_aliases_in_source_materials(context: VehicleContext) -> tuple[str, 
     return tuple(aliases)
 
 
+def baked_mesh_copies_by_target(
+    baked_shared_specs: Iterable[BakedMeshSpec],
+) -> dict[tuple[str, str], list[str]]:
+    """Per-row baked copies, keyed by the mesh and hand they were minted for.
+
+    ``baked_mesh_output_name`` appends the config, owning part and row index to
+    the generated name, so one configured mesh can hold several copies and none
+    of them answers to ``generated_mesh_name``.
+    """
+    copies: dict[tuple[str, str], list[str]] = {}
+    for spec in baked_shared_specs:
+        copies.setdefault((spec.configured_mesh, spec.target_hand), []).append(
+            spec.output_mesh
+        )
+    return copies
+
+
 def integrate_texture_correction_artifacts(
     context: VehicleContext,
     output_root: Path,
@@ -3796,6 +3824,9 @@ def integrate_texture_correction_artifacts(
     *,
     texture_correction_targets: dict[str, set[str]] | None = None,
     structural_sources: dict[str, str] | None = None,
+    prop_meshes: set[str] | None = None,
+    flexbody_meshes: set[str] | None = None,
+    baked_mesh_copies: dict[tuple[str, str], list[str]] | None = None,
 ) -> dict[str, object]:
     jobs = texture_correction_report.get("jobs", [])
     if not isinstance(jobs, list) or not jobs:
@@ -3811,6 +3842,9 @@ def integrate_texture_correction_artifacts(
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
     structural_sources = structural_sources or {}
+    prop_meshes = prop_meshes or set()
+    flexbody_meshes = flexbody_meshes or set()
+    baked_mesh_copies = baked_mesh_copies or {}
     for job in jobs:
         if not isinstance(job, dict):
             continue
@@ -3870,10 +3904,25 @@ def integrate_texture_correction_artifacts(
                 for target_mesh in target_meshes
                 if structural_sources.get(target_mesh) == source_mesh
             ]
+            # A prop row names one mesh and the engine spawns exactly that one
+            # (``vehicleObj:addProp``, lua/common/jbeam/sections/meshs.lua), so
+            # it cannot be repointed at a split the way a flexbody row can. Its
+            # row already names a whole-mesh copy -- usually a per-row baked
+            # one -- so the correction rides on that copy's materials instead,
+            # the same way a structural mirror's does. A mesh bound as both
+            # keeps the split, which is the binding that can carry one.
+            prop_target_meshes = [
+                target_mesh
+                for target_mesh in target_meshes
+                if target_mesh not in structural_target_meshes
+                and target_mesh in prop_meshes
+                and target_mesh not in flexbody_meshes
+            ]
             row_target_meshes = [
                 target_mesh
                 for target_mesh in target_meshes
                 if target_mesh not in structural_target_meshes
+                and target_mesh not in prop_target_meshes
             ]
             appended: list[str] = []
             if row_target_meshes:
@@ -3886,6 +3935,10 @@ def integrate_texture_correction_artifacts(
                         generated_mesh_name(target_mesh, hand)
                         for target_mesh in row_target_meshes
                         for hand in hands
+                        # Dropping a node a prop still binds would leave the
+                        # engine with nothing to spawn; that mesh keeps its
+                        # whole-mesh copy and is retargeted below instead.
+                        if target_mesh not in prop_meshes
                     },
                 )
                 if appended:
@@ -3913,25 +3966,34 @@ def integrate_texture_correction_artifacts(
                             if glass:
                                 mirror_row_targets[name] = glass
             retargeted: list[str] = []
-            if structural_target_meshes:
+            retarget_target_meshes = structural_target_meshes + prop_target_meshes
+            if retarget_target_meshes:
+                # A prop's row usually names a per-row baked copy rather than
+                # the shared ``_xp_rhd`` one -- a mirrored prop is baked
+                # unconditionally, because its node triad is left-handed and
+                # baseRotationGlobal cannot express a reflection -- so the
+                # copies have to be retargeted by the names they were minted
+                # with, not by the name they were minted from.
+                retarget_nodes = {
+                    name
+                    for target_mesh in retarget_target_meshes
+                    for hand in hands
+                    for name in (
+                        generated_mesh_name(target_mesh, hand),
+                        *baked_mesh_copies.get((target_mesh, hand), ()),
+                    )
+                }
                 retargeted = _retarget_texture_correction_generated_nodes(
                     target_dae,
                     source_dae,
-                    {
-                        generated_mesh_name(target_mesh, hand)
-                        for target_mesh in structural_target_meshes
-                        for hand in hands
-                    },
+                    retarget_nodes,
                     collada_alias_to_material,
                 )
                 # A mesh retargeted in place is bound to this mesh's own base
                 # just as a split one is, so its part needs the same glowMap
                 # entry. The LC500's doors come through here.
-                for target_mesh in structural_target_meshes:
-                    for hand in hands:
-                        generated_mesh_sources[generated_mesh_name(target_mesh, hand)] = (
-                            source_mesh
-                        )
+                for name in retarget_nodes:
+                    generated_mesh_sources[name] = source_mesh
             dae_patches.append(
                 {
                     "sourceMesh": source_mesh,
@@ -3939,6 +4001,7 @@ def integrate_texture_correction_artifacts(
                     "targetDae": str(target_dae),
                     "appendedNodes": appended,
                     "retargetedNodes": retargeted,
+                    "propTargetMeshes": prop_target_meshes,
                     "materialAliases": sorted(part_alias_to_material),
                     "colladaMaterialAliases": sorted(collada_alias_to_material),
                     "switchBaseAliases": sorted(switch_base_aliases),
@@ -4038,6 +4101,9 @@ def build_batch(
     texture_correction_source_ids: set[str] = set()
     shared_atlas_dependency_targets: dict[str, set[str]] = {}
     force_mirrored_dependency_ids: set[str] = set()
+    whole_mesh_mirror_ids: set[str] = set()
+    flexbody_meshes: set[str] = set()
+    prop_meshes: set[str] = set()
     if generated_variant_targets:
         object_modes = active_part_modes(conversion)
         # A vehicle whose every converted trim is fully covered by an authored
@@ -4084,6 +4150,9 @@ def build_batch(
                 force_mirrored_dependency_ids,
             ) = texture_correction_atlas_dependencies(
                 object_modes, structural_sources, texture_correction_ids
+            )
+            whole_mesh_mirror_ids = whole_mesh_mirror_correction_ids(
+                object_modes, structural_sources, prop_meshes, flexbody_meshes
             )
         node_mirror_map = build_node_mirror_map(context.node_positions)
         translated_prop_meshes = {
@@ -4194,6 +4263,7 @@ def build_batch(
             progress=emit_progress,
             shared_atlas_dependency_targets=shared_atlas_dependency_targets,
             force_mirrored_dependency_ids=force_mirrored_dependency_ids,
+            whole_mesh_mirror_ids=whole_mesh_mirror_ids,
             bc7_quality=texture_quality_setting(conversion),
         )
         auto_included = texture_correction_report.get("autoIncludedTargets", {})
@@ -4213,6 +4283,9 @@ def build_batch(
             set(generated_variant_targets.values()),
             texture_correction_targets=texture_correction_targets,
             structural_sources=structural_sources,
+            prop_meshes=prop_meshes,
+            flexbody_meshes=flexbody_meshes,
+            baked_mesh_copies=baked_mesh_copies_by_target(baked_shared_specs),
         )
         texture_correction_report["pruned"] = prune_unused_texture_correction_assets(
             output_root, output_vehicle_dir
@@ -4345,4 +4418,4 @@ def build_batch(
         texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'integrate_texture_correction_artifacts', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'baked_mesh_copies_by_target', 'integrate_texture_correction_artifacts', 'build_batch']

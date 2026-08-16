@@ -73,7 +73,7 @@ class RuntimeDisplayUvFlipTests(unittest.TestCase):
         self.assertEqual(colour.box_source, "contrast_gpu")
         self.assertTrue(colour.enable_feature_extension_filter)
         self.assertEqual(colour.feature_extension_context_px, 12)
-        self.assertEqual(colour.feature_extension_min_ratio, 0.25)
+        self.assertEqual(colour.feature_extension_min_ratio, 0.03)
         self.assertEqual(opacity.box_source, "opacity_mask")
         self.assertEqual(authoritative.box_source, "opacity_mask")
         self.assertFalse(opacity.enable_region_domain_filter)

@@ -10,6 +10,7 @@ import numpy as np
 from beamxp import hand_drive_core as core
 from beamxp import transform_helpers as th
 from mesh_segmentation_transform.annotate_texture_regions import (
+    STEP_INDEX,
     MserConfig,
     detect_foreground_boxes,
     detect_local_contrast,
@@ -402,7 +403,7 @@ class LocalContrastDetectorTests(unittest.TestCase):
             initial_boxes=boxes, initial_contrast_response=barrier,
             initial_contrast_threshold=5.0,
         )
-        self.assertEqual(len(blocked.stages[4].kept), 2)
+        self.assertEqual(len(blocked.stages[STEP_INDEX["grouped"]].kept), 2)
 
         clear = run_detection(
             image, np.ones((20, 30), dtype=bool), config,
@@ -410,7 +411,7 @@ class LocalContrastDetectorTests(unittest.TestCase):
             initial_contrast_response=np.zeros_like(barrier),
             initial_contrast_threshold=5.0,
         )
-        self.assertEqual(len(clear.stages[4].kept), 1)
+        self.assertEqual(len(clear.stages[STEP_INDEX["grouped"]].kept), 1)
 
     def test_bridge_uses_the_islands_selected_contrast_cut(self) -> None:
         """Mild backing variation must not split one multi-line label.
@@ -436,7 +437,7 @@ class LocalContrastDetectorTests(unittest.TestCase):
             initial_boxes=boxes, initial_contrast_response=backing,
             initial_contrast_threshold=20.0,
         )
-        self.assertEqual(len(grouped.stages[4].kept), 1)
+        self.assertEqual(len(grouped.stages[STEP_INDEX["grouped"]].kept), 1)
 
         divider = backing.copy()
         divider[6:10, 6:16] = 25.0
@@ -445,7 +446,7 @@ class LocalContrastDetectorTests(unittest.TestCase):
             initial_boxes=boxes, initial_contrast_response=divider,
             initial_contrast_threshold=20.0,
         )
-        self.assertEqual(len(split.stages[4].kept), 2)
+        self.assertEqual(len(split.stages[STEP_INDEX["grouped"]].kept), 2)
 
     def test_disabling_box_filter_keeps_boxes_below_its_minimum_size(self) -> None:
         image = np.zeros((12, 12, 3), dtype=np.uint8)
@@ -460,8 +461,8 @@ class LocalContrastDetectorTests(unittest.TestCase):
             image, np.ones((12, 12), dtype=bool), config, initial_boxes=tiny,
         )
 
-        self.assertEqual(run.stages[2].kept, ((4, 4, 1, 1),))
-        self.assertEqual(run.stages[2].rejected, ())
+        self.assertEqual(run.stages[STEP_INDEX["box_filter"]].kept, ((4, 4, 1, 1),))
+        self.assertEqual(run.stages[STEP_INDEX["box_filter"]].rejected, ())
 
     def test_local_contrast_collapses_nested_boxes_before_proximity_grouping(self) -> None:
         image = np.zeros((24, 24, 3), dtype=np.uint8)
@@ -476,9 +477,9 @@ class LocalContrastDetectorTests(unittest.TestCase):
             image, np.ones((24, 24), dtype=bool), config, initial_boxes=nested,
         )
 
-        self.assertEqual(len(run.stages[3].kept), 1)  # overlap grouping
-        self.assertEqual(len(run.stages[4].kept), 1)  # initial grouping
-        self.assertEqual(len(run.stages[6].kept), 1)  # Domain recovery is terminal
+        self.assertEqual(len(run.stages[STEP_INDEX["overlap_box_group"]].kept), 1)  # overlap grouping
+        self.assertEqual(len(run.stages[STEP_INDEX["grouped"]].kept), 1)  # initial grouping
+        self.assertEqual(len(run.stages[STEP_INDEX["overlap_group"]].kept), 1)  # Domain recovery is terminal
 
     def test_local_contrast_collapses_partial_overlap_before_proximity_grouping(self) -> None:
         image = np.zeros((24, 24, 3), dtype=np.uint8)
@@ -494,11 +495,11 @@ class LocalContrastDetectorTests(unittest.TestCase):
             initial_boxes=overlapping,
         )
 
-        self.assertEqual(len(run.stages[3].kept), 1)
+        self.assertEqual(len(run.stages[STEP_INDEX["overlap_box_group"]].kept), 1)
         # Initial grouping receives the one overlap-connected candidate and
         # does not need to reinterpret its geometry as proximity.
-        self.assertEqual(len(run.stages[4].kept), 1)
-        self.assertEqual(len(run.stages[6].kept), 1)
+        self.assertEqual(len(run.stages[STEP_INDEX["grouped"]].kept), 1)
+        self.assertEqual(len(run.stages[STEP_INDEX["overlap_group"]].kept), 1)
 
     def test_cached_relief_edge_refuses_colour_box_proximity_grouping(self) -> None:
         image = np.zeros((20, 30, 3), dtype=np.uint8)
@@ -517,14 +518,14 @@ class LocalContrastDetectorTests(unittest.TestCase):
             image, np.ones((20, 30), dtype=bool), config,
             initial_boxes=boxes, initial_relief_bridge_response=barrier,
         )
-        self.assertEqual(len(blocked.stages[4].kept), 2)
+        self.assertEqual(len(blocked.stages[STEP_INDEX["grouped"]].kept), 2)
 
         clear = run_detection(
             image, np.ones((20, 30), dtype=bool), config,
             initial_boxes=boxes,
             initial_relief_bridge_response=np.zeros_like(barrier),
         )
-        self.assertEqual(len(clear.stages[4].kept), 1)
+        self.assertEqual(len(clear.stages[STEP_INDEX["grouped"]].kept), 1)
 
     def test_relief_bridge_ignores_adjacent_glyph_perimeters(self) -> None:
         """Top/bottom glyph outlines inside a narrow gap are not a divider."""
@@ -545,7 +546,7 @@ class LocalContrastDetectorTests(unittest.TestCase):
             image, np.ones((20, 30), dtype=bool), config,
             initial_boxes=boxes, initial_relief_bridge_response=perimeters,
         )
-        self.assertEqual(len(grouped.stages[4].kept), 1)
+        self.assertEqual(len(grouped.stages[STEP_INDEX["grouped"]].kept), 1)
 
     def test_gpu_response_matches_cpu_when_compute_is_available(self) -> None:
         image = np.zeros((64, 80, 3), dtype=np.uint8)
