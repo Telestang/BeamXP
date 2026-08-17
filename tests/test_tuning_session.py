@@ -21,7 +21,9 @@ import numpy as np
 from mesh_segmentation_transform.annotate_texture_tuning_app import (
     BOX_SOURCE_FOR_SOURCE,
     CHOICE_PARAMETERS,
+    COLOUR_GLYPH_NAMESPACE,
     DETECTION_SOURCES,
+    RELIEF_GLYPH_NAMESPACE,
     HIDDEN_PARAMETERS,
     PARAMETER_SECTIONS,
     PIPELINES,
@@ -34,6 +36,7 @@ from mesh_segmentation_transform.annotate_texture_tuning_app import (
     SOURCE_RELIEF_GPU,
     SOURCE_RELIEF_CONTRAST,
     load_session,
+    namespaced_parameters,
     pipeline_for_source,
     run_detection_by_uv_island,
     save_session,
@@ -46,7 +49,6 @@ from mesh_segmentation_transform.annotate_texture_regions import (
     DetectionStage,
     MserConfig,
     PARAMETER_STEP,
-    SHAPE_ROTATED,
     run_detection,
 )
 from mesh_segmentation_transform.relief_from_normals import DEFAULT_RELIEF_CONFIG
@@ -243,6 +245,10 @@ class SourceDefaultTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG.contrast_merge_gap_px, 0)
         self.assertTrue(DEFAULT_CONFIG.enable_feature_extension_filter)
         self.assertEqual(DEFAULT_CONFIG.feature_extension_context_px, 12)
+        self.assertEqual(DEFAULT_CONFIG.feature_extension_reference_extent_px, 25)
+        self.assertEqual(DEFAULT_CONFIG.feature_extension_grace_px, 4)
+        self.assertEqual(DEFAULT_CONFIG.feature_extension_grace_max_fraction, 0.20)
+        self.assertEqual(DEFAULT_CONFIG.feature_extension_soft_fringe_ratio, 0.75)
         # Promoted 2026-08-16 from the colour+relief-edge session, along with
         # min_region_uv_coverage below.
         self.assertEqual(DEFAULT_CONFIG.feature_extension_min_ratio, 0.03)
@@ -253,14 +259,19 @@ class SourceDefaultTests(unittest.TestCase):
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.box_source, "edge")
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.edge_operator, "laplacian")
         self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_rotated_bounds_filter)
-        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.bounds_shape, SHAPE_ROTATED)
-        self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_edge_aligned_rotation)
-        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.rotation_edge_search_px, 50)
+        self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_symmetry_rotation)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_box_width_px, 8)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_box_height_px, 8)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.merge_distance_px, 21)
-        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.region_flatness_percentile, 95.0)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_region_relief, 5.0)
+        # Measured on the GPU edge response and shared with the CPU relief
+        # paths: one preset serves every relief front end, so these hold for
+        # "Relief (normal map)" and its GPU twin alike.
+        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.region_flatness_percentile, 60.0)
+        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_rotation_symmetry, 0.7)
+        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_rotated_elongation, 1.0)
+        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.ring_smoothness_width_px, 1)
+        self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.ring_smoothness_percentile, 20.0)
         self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_relief_glyph_filter)
         self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_relief_text_filter)
         self.assertFalse(DEFAULT_RELIEF_DETECTION_CONFIG.enable_feature_extension_filter)
@@ -306,6 +317,138 @@ class SourceDefaultTests(unittest.TestCase):
             config.min_blob_region_area_px,
             DEFAULT_RELIEF_DETECTION_CONFIG.min_blob_region_area_px,
         )
+
+    def test_the_colour_glyph_paths_read_one_shared_parameter_namespace(self) -> None:
+        """Local contrast CPU, GPU and relief-edge grouping are one tuning."""
+        from mesh_segmentation_transform.annotate_texture_tuning_app import TuningApp
+
+        app = object.__new__(TuningApp)
+        app.parameter_vars = {"contrast_kernel_px": object()}
+        app.symmetry_parameter_vars = {}
+        app.relief_parameter_vars = {}
+        app.rhd_parameter_vars = {}
+        app.mode_parameters = {COLOUR_GLYPH_NAMESPACE: {"mser:contrast_kernel_px": "9"}}
+
+        for source in (
+            SOURCE_COLOUR_CONTRAST, SOURCE_COLOUR_CONTRAST_GPU, SOURCE_COLOUR_RELIEF_CONTRAST,
+        ):
+            values = app._parameters_for_source(source)
+            self.assertEqual(values["mser:contrast_kernel_px"], "9", source)
+
+        # A path outside the namespace is unaffected, or the shared object would
+        # be a second set of global defaults rather than one path's tuning.
+        self.assertEqual(
+            app._parameters_for_source(SOURCE_COLOUR)["mser:contrast_kernel_px"],
+            DEFAULT_CONFIG.contrast_kernel_px,
+        )
+
+    def test_the_normal_map_paths_read_one_shared_parameter_namespace(self) -> None:
+        """CPU and GPU relief edge are one edge detector over one render."""
+        from mesh_segmentation_transform.annotate_texture_tuning_app import TuningApp
+
+        app = object.__new__(TuningApp)
+        app.parameter_vars = {"min_rotation_symmetry": object()}
+        app.symmetry_parameter_vars = {}
+        app.relief_parameter_vars = {}
+        app.rhd_parameter_vars = {}
+        app.mode_parameters = {RELIEF_GLYPH_NAMESPACE: {"mser:min_rotation_symmetry": "0.55"}}
+
+        for source in (SOURCE_RELIEF, SOURCE_RELIEF_GPU):
+            values = app._parameters_for_source(source)
+            self.assertEqual(values["mser:min_rotation_symmetry"], "0.55", source)
+
+        # The slope path renders the same relief but reaches the local-contrast
+        # front end, so its detector tuning stays its own.
+        self.assertEqual(
+            app._parameters_for_source(SOURCE_RELIEF_CONTRAST)["mser:min_rotation_symmetry"],
+            DEFAULT_RELIEF_DETECTION_CONFIG.min_rotation_symmetry,
+        )
+
+    def test_every_shared_path_saves_into_its_namespace(self) -> None:
+        shared = {
+            SOURCE_COLOUR_CONTRAST: COLOUR_GLYPH_NAMESPACE,
+            SOURCE_COLOUR_CONTRAST_GPU: COLOUR_GLYPH_NAMESPACE,
+            SOURCE_COLOUR_RELIEF_CONTRAST: COLOUR_GLYPH_NAMESPACE,
+            SOURCE_RELIEF: RELIEF_GLYPH_NAMESPACE,
+            SOURCE_RELIEF_GPU: RELIEF_GLYPH_NAMESPACE,
+        }
+        for source, namespace in shared.items():
+            self.assertEqual(
+                pipeline_for_source(source).parameter_namespace, namespace, source,
+            )
+        # Everything else keeps its own object under its own id.  The slope
+        # relief path subclasses the CPU edge one, so this also guards against
+        # it inheriting a namespace it should not be in.
+        for pipeline in PIPELINES:
+            if pipeline.label not in shared:
+                self.assertEqual(pipeline.parameter_namespace, pipeline.pipeline_id)
+
+
+class ParameterNamespaceLoadTests(unittest.TestCase):
+    """How saved objects collapse onto the namespace each path reads."""
+
+    def test_a_shared_namespace_keeps_its_own_saved_object(self) -> None:
+        grouped = namespaced_parameters(
+            {
+                "colour_local_contrast_gpu": {"mser:contrast_kernel_px": "5"},
+                COLOUR_GLYPH_NAMESPACE: {"mser:contrast_kernel_px": "7"},
+            }
+        )
+
+        self.assertEqual(grouped[COLOUR_GLYPH_NAMESPACE]["mser:contrast_kernel_px"], "7")
+
+    def test_a_stale_member_object_never_wins_whatever_the_key_order(self) -> None:
+        """A path not opened since the namespace was shared must not overwrite it."""
+        grouped = namespaced_parameters(
+            {
+                COLOUR_GLYPH_NAMESPACE: {"mser:contrast_kernel_px": "7"},
+                "colour_local_contrast_cpu": {"mser:contrast_kernel_px": "5"},
+                "colour_local_contrast_gpu": {"mser:contrast_kernel_px": "3"},
+            }
+        )
+
+        self.assertEqual(grouped[COLOUR_GLYPH_NAMESPACE]["mser:contrast_kernel_px"], "7")
+        self.assertNotIn("colour_local_contrast_cpu", grouped)
+        self.assertNotIn("colour_local_contrast_gpu", grouped)
+
+    def test_a_member_object_seeds_a_namespace_nothing_has_written(self) -> None:
+        grouped = namespaced_parameters(
+            {"colour_local_contrast_gpu": {"mser:contrast_kernel_px": "5"}}
+        )
+
+        self.assertEqual(grouped[COLOUR_GLYPH_NAMESPACE]["mser:contrast_kernel_px"], "5")
+
+    def test_unshared_paths_keep_their_own_objects(self) -> None:
+        grouped = namespaced_parameters(
+            {
+                "colour_foreground": {"mser:delta": "12"},
+                "colour_mser": {"mser:delta": "7"},
+                "relief_local_contrast_cpu": {"mser:delta": "9"},
+            }
+        )
+
+        self.assertEqual(grouped["colour_foreground"]["mser:delta"], "12")
+        self.assertEqual(grouped["colour_mser"]["mser:delta"], "7")
+        self.assertEqual(grouped["relief_local_contrast_cpu"]["mser:delta"], "9")
+
+    def test_the_cpu_edge_object_seeds_the_relief_namespace(self) -> None:
+        """The GPU path's object is the namespace; the CPU one only seeds it."""
+        self.assertEqual(
+            namespaced_parameters({"relief_edge": {"mser:delta": "7"}}),
+            {RELIEF_GLYPH_NAMESPACE: {"mser:delta": "7"}},
+        )
+        grouped = namespaced_parameters(
+            {
+                "relief_edge": {"mser:delta": "7"},
+                RELIEF_GLYPH_NAMESPACE: {"mser:delta": "12"},
+            }
+        )
+        self.assertEqual(grouped, {RELIEF_GLYPH_NAMESPACE: {"mser:delta": "12"}})
+
+    def test_unknown_and_malformed_keys_are_dropped(self) -> None:
+        self.assertEqual(namespaced_parameters({"gone_pipeline": {"mser:delta": "1"}}), {})
+        self.assertEqual(namespaced_parameters({"colour_foreground": "not a dict"}), {})
+        self.assertEqual(namespaced_parameters(None), {})
 
 
 class SharedParameterTests(unittest.TestCase):

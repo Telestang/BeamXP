@@ -174,6 +174,22 @@ SOURCE_RELIEF_GPU = "Relief (normal map - GPU)"
 SOURCE_RELIEF_CONTRAST = "Relief slope (local contrast - CPU)"
 
 
+# The three colour-glyph paths are one tuning problem, not three: they find the
+# same printed marks with the same local-contrast front end, and differ only in
+# where the response is computed and whether relief edges act as grouping
+# barriers.  Tuning them separately meant the same value had to be entered three
+# times and silently diverged when it was not.  The namespace is named for the
+# path production runs -- _production_layer_detection_config puts the colour
+# layer on contrast_gpu with relief-edge grouping -- so that path's saved object
+# is the one they all read, and the other two need no migration.
+COLOUR_GLYPH_NAMESPACE = "colour_relief_edge_grouping"
+# The two normal-map paths are the same case: one edge detector over one slope
+# render, computed on the CPU or on the GPU.  Named for the GPU path because
+# that is what production runs -- _detect_layer_regions gives the normal layer
+# box_source "edge_gpu" -- and because the relief preset was measured there.
+RELIEF_GLYPH_NAMESPACE = "relief_edge_gpu"
+
+
 class DetectionPipeline:
     """One isolated "Detect on" path and its persisted parameter namespace."""
 
@@ -184,11 +200,16 @@ class DetectionPipeline:
     renders_relief: bool = False
     uses_relief_edge_bridge: bool = False
     force_slope_relief: bool = False
+    # Which saved parameter object this path reads and writes.  Paths that are
+    # one tuning problem name a shared namespace here; left empty, a path keeps
+    # its own object under its own id.
+    parameter_namespace: str = ""
 
     def __init__(self, pipeline_id: str, label: str, box_source: str) -> None:
         self.pipeline_id = pipeline_id
         self.label = label
         self.box_source = box_source
+        self.parameter_namespace = self.parameter_namespace or pipeline_id
 
     def detector_defaults(self) -> MserConfig:
         return DEFAULT_RELIEF_DETECTION_CONFIG if self.renders_relief else DEFAULT_COLOUR_CONFIG
@@ -218,11 +239,15 @@ class ColourForegroundPipeline(DetectionPipeline):
 
 
 class ColourLocalContrastCpuPipeline(DetectionPipeline):
+    parameter_namespace = COLOUR_GLYPH_NAMESPACE
+
     def __init__(self) -> None:
         super().__init__("colour_local_contrast_cpu", SOURCE_COLOUR_CONTRAST, "contrast")
 
 
 class ColourLocalContrastGpuPipeline(DetectionPipeline):
+    parameter_namespace = COLOUR_GLYPH_NAMESPACE
+
     def __init__(self) -> None:
         super().__init__("colour_local_contrast_gpu", SOURCE_COLOUR_CONTRAST_GPU, "contrast_gpu")
 
@@ -230,6 +255,7 @@ class ColourLocalContrastGpuPipeline(DetectionPipeline):
 class ColourReliefEdgeGroupingPipeline(DetectionPipeline):
     requires_normal_map = True
     uses_relief_edge_bridge = True
+    parameter_namespace = COLOUR_GLYPH_NAMESPACE
 
     def __init__(self) -> None:
         super().__init__("colour_relief_edge_grouping", SOURCE_COLOUR_RELIEF_CONTRAST, "contrast_gpu")
@@ -255,12 +281,17 @@ class ColourMserComparisonPipeline(DetectionPipeline):
 class ReliefEdgePipeline(DetectionPipeline):
     requires_normal_map = True
     renders_relief = True
+    parameter_namespace = RELIEF_GLYPH_NAMESPACE
 
     def __init__(self) -> None:
         super().__init__("relief_edge", SOURCE_RELIEF, "edge")
 
 
 class ReliefEdgeGpuPipeline(ReliefEdgePipeline):
+    # Same detector on the same slope render as the CPU relief path, differing
+    # only in where the edge response is computed, so it shares that path's
+    # defaults and its tuning rather than carrying a second set that could
+    # drift from them.
     def __init__(self) -> None:
         DetectionPipeline.__init__(
             self, "relief_edge_gpu", SOURCE_RELIEF_GPU, "edge_gpu"
@@ -269,6 +300,10 @@ class ReliefEdgeGpuPipeline(ReliefEdgePipeline):
 
 class ReliefLocalContrastPipeline(ReliefEdgePipeline):
     force_slope_relief = True
+    # Cleared, not inherited: this path reaches the local-contrast front end
+    # rather than the edge one, so its detector parameters are its own even
+    # though it renders the same relief and reads the same preset defaults.
+    parameter_namespace = ""
 
     def __init__(self) -> None:
         DetectionPipeline.__init__(
@@ -370,6 +405,33 @@ def load_session() -> dict[str, object]:
     if shared:
         session["shared"] = shared
     return session
+
+
+def namespaced_parameters(stored: object) -> dict[str, dict[str, object]]:
+    """Group the saved parameter objects by the namespace each path reads.
+
+    Most paths own one object under their own id.  Where several share a
+    namespace, the object saved under the namespace itself is authoritative and
+    a member's own object only seeds a namespace nothing has written yet:
+    otherwise a block left behind by a path not opened since the namespace was
+    shared would overwrite the tuning every path in it is using.
+
+    Display labels are accepted as keys as well as pipeline ids, so a session
+    written before the ids existed is migrated rather than discarded.
+    """
+    grouped: dict[str, dict[str, object]] = {}
+    if not isinstance(stored, dict):
+        return grouped
+    for key, values in stored.items():
+        if not isinstance(values, dict):
+            continue
+        pipeline = PIPELINE_BY_ID.get(key) or PIPELINE_BY_LABEL.get(key)
+        if pipeline is None:
+            continue
+        namespace = pipeline.parameter_namespace
+        if key == namespace or namespace not in grouped:
+            grouped[namespace] = dict(values)
+    return grouped
 
 
 def save_session(session: dict[str, object]) -> None:
@@ -593,18 +655,19 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
     (
         "9. Rotated bounds",
         (
+            "min_rotation_angle_degrees",
+            "enable_symmetry_rotation",
+            "min_rotation_symmetry",
+            "max_rotation_symmetry_spread",
+            "rotation_symmetry_plateau",
+            "rotation_symmetry_step_degrees",
+            "rotation_symmetry_refinements",
+            "rotation_symmetry_grid_px",
+            "rotation_symmetry_hull_nodes",
             "enable_rotated_bounds_filter",
             "rotated_bounds_min_points",
             "min_rotated_fill",
             "max_rotated_aspect",
-            "bounds_shape",
-            "enable_edge_aligned_rotation",
-            "rotation_edge_min_gap_px",
-            "rotation_edge_search_px",
-            "rotation_edge_band_px",
-            "rotation_edge_min_points",
-            "max_rotation_edge_angle_degrees",
-            "max_opposite_rotation_edge_fraction",
             "min_feature_tightness",
             "min_rotated_elongation",
         ),
@@ -669,6 +732,10 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
         (
             "enable_feature_extension_filter",
             "feature_extension_context_px",
+            "feature_extension_reference_extent_px",
+            "feature_extension_grace_px",
+            "feature_extension_grace_max_fraction",
+            "feature_extension_soft_fringe_ratio",
             "feature_extension_min_ratio",
         ),
         None,
@@ -739,7 +806,6 @@ UV_SYMMETRY_OUTLINE_WIDTH = 2
 CHOICE_PARAMETERS: dict[str, tuple[str, ...]] = {
     "edge_operator": ("scharr", "sobel", "laplacian"),
     "swt_polarity": ("raised", "engraved", "both"),
-    "bounds_shape": ("hull", "rotated"),
 }
 
 RELIEF_PARAMETER_ORDER: tuple[str, ...] = (
@@ -766,6 +832,8 @@ RHD_PARAMETER_ORDER: tuple[str, ...] = (
     "enable_skewed_region_filter",
     "skewed_region_min_delta",
     "skewed_region_max_condition",
+    "skewed_region_tolerable_error_px",
+    "skewed_region_tolerable_error_ratio",
 )
 
 # ---------------------------------------------------------------------------
@@ -1649,18 +1717,9 @@ class TuningApp(tk.Tk):
         self.section_widgets: dict[str, list[tk.Widget]] = {}
         self.section_source: dict[str, str | tuple[str, ...] | None] = {}
         self.session = load_session()
-        # Each detector class owns one independent JSON object.  Migrate old
-        # display-label keys while loading; thereafter stable pipeline ids keep
-        # saved tuning separate even if a label is renamed.
-        stored = self.session.get("pipelines")
-        self.mode_parameters: dict[str, dict[str, object]] = {}
-        if isinstance(stored, dict):
-            for key, values in stored.items():
-                if not isinstance(values, dict):
-                    continue
-                pipeline = PIPELINE_BY_ID.get(key) or PIPELINE_BY_LABEL.get(key)
-                if pipeline is not None:
-                    self.mode_parameters[pipeline.pipeline_id] = dict(values)
+        self.mode_parameters: dict[str, dict[str, object]] = namespaced_parameters(
+            self.session.get("pipelines")
+        )
         self.active_source = SOURCE_COLOUR
         # What the cached session still has to catch up on, consumed as each
         # load completes: the archive scan cannot pick a DAE, and the DAE load
@@ -2151,7 +2210,7 @@ class TuningApp(tk.Tk):
         # The label fallback is only for an in-memory legacy session during
         # migration; all newly saved data uses the stable class id above.
         values.update(
-            self.mode_parameters.get(pipeline_for_source(source).pipeline_id)
+            self.mode_parameters.get(pipeline_for_source(source).parameter_namespace)
             or self.mode_parameters.get(source)
             or {}
         )
@@ -2192,21 +2251,24 @@ class TuningApp(tk.Tk):
         )
 
     def _remember_parameters(self) -> None:
-        """Store visible values in the active detector class's JSON object."""
+        """Store visible values in the active path's parameter namespace."""
         pipeline = pipeline_for_source(self.active_source)
-        self.mode_parameters[pipeline.pipeline_id] = self._capture_parameters()
+        self.mode_parameters[pipeline.parameter_namespace] = self._capture_parameters()
         self.session["pipelines"] = self.mode_parameters
         self.session["shared"] = self._capture_shared_parameters()
         self.session.pop("parameters", None)
         save_session(self.session)
 
     def _switch_parameter_set(self, incoming: str) -> None:
-        """Swap the whole panel over to the incoming source's own values.
+        """Swap the whole panel over to the incoming source's namespace.
 
         Colour and relief are different enough that one set cannot serve both:
         the magic-wand tolerance that suits print swallows a moulded stroke
         whole, and the domain coverage that suits relief throws print away.
         Sharing them means every switch silently detunes the other side.
+        Paths within one namespace are the opposite case and carry over
+        unchanged: the save below and the load that follows it name the same
+        object, so the panel keeps the values it already has.
         """
         if incoming == self.active_source:
             return

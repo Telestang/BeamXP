@@ -27,12 +27,13 @@ there.  The island's own outline only decides whether the whole island may be
 turned over on that axis, or whether its glyphs have to be done individually.
 Off-axis cases are resolved to the nearer axis and not otherwise corrected.
 
-Every archive-backed material map is detected and corrected independently:
-base colour, emissive, opacity, overlay, normal, roughness, metallic, AO and
-palette maps.  They share only geometry-derived UV domains and surface axes.
-This matters for powered materials whose off, on and on-intense images contain
-different artwork; an empty off screen cannot define what should move on its
-lit layer.  Repeated references to one physical file are still processed once.
+Every archive-backed material map is detected independently: base colour,
+emissive, opacity, overlay, normal, roughness, metallic, AO and palette maps.
+Within one material on one part/UV layout, the accepted regions are then shared
+across those maps before any is corrected.  A shallow printed mark can therefore
+inherit the box found in its embossed normal map, while powered materials still
+contribute their own otherwise-different artwork.  Repeated references to one
+physical file are still processed once.
 
 A tangent-space normal map is rendered as slope magnitude and cached as edge
 barriers for local-contrast glyph grouping.  When reflected it also negates
@@ -78,7 +79,6 @@ from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     DEFAULT_RELIEF_DETECTION_CONFIG,
     LocalContrastDetection,
     MserConfig,
-    SHAPE_ROTATED,
     build_repeat_texture_index,
     detect_local_contrast_gpu_batch,
     run_detection,
@@ -135,6 +135,11 @@ ProgressCallback = Callable[[dict[str, object]], None]
 # because it costs 3.4x ``basic`` for a texture nobody inspects at that level.
 BC7_QUALITY_TIERS = ("basic", "fast", "veryfast")
 DEFAULT_BC7_QUALITY = "basic"
+# The retained ``skewed_region_tolerable_error_px`` setting is interpreted at
+# this shorter-side span, then scaled with the detected mark.  Keeping the old
+# field avoids invalidating saved/build-time configs while removing its former
+# dependence on a texture layer's native resolution.
+SKEWED_REGION_ERROR_REFERENCE_SPAN_PX = 30.0
 
 # Deflate level for a PNG that ships, measured on scintilla's 4096-square
 # interior atlas: level 0 is 67.1 MB in 0.51s, level 1 14.6 MB in 0.57s,
@@ -200,6 +205,18 @@ class RhdTextureConfig:
     enable_skewed_region_filter: bool = True
     skewed_region_min_delta: float = 0.08
     skewed_region_max_condition: float = 50.0
+    # A non-axis-aligned UV frame makes the exact texture-space reflection a
+    # shear as well as a flip.  A coefficient below ``...min_delta`` is treated
+    # as numerical/small-angle tolerance only while its displacement relative
+    # to the mark is also safe.  Above that floor, bounded-error relaxation
+    # requires both limits below.  ``...error_px`` is retained as the allowance
+    # at ``SKEWED_REGION_ERROR_REFERENCE_SPAN_PX`` for config/session
+    # compatibility, then scaled with the shorter side; the explicit ratio is a
+    # second ceiling which stops a legacy large value excusing a tiny glyph.
+    # Ardente's 34x30 ON/OFF legend is about 7.5%; its nearby lock icon is much
+    # larger, and a strongly sheared 4px glyph can no longer hide below 3px.
+    skewed_region_tolerable_error_px: float = 3.0
+    skewed_region_tolerable_error_ratio: float = 0.10
     # Blend only the outside edge of in-place glyph writes, in pixels.  This is
     # deliberately tiny: it hides UV/mask joins without softening the mark body.
     region_boundary_blend_px: float = 1.5
@@ -608,9 +625,14 @@ def companion_maps_for_binding(
     material names its shared normal and roughness maps once per layer and only
     the first stage carries the base colour.
     """
+    from beamxp.core.beam_json import parse_beamng_json
+
     try:
         path = extract_archive_member(archive, binding.materials_member)
-        document = json.loads(path.read_text(encoding="utf-8-sig"))
+        document = parse_beamng_json(
+            path.read_text(encoding="utf-8-sig"),
+            label=binding.materials_member,
+        )
     except Exception:
         return ()
     material = document.get(binding.material_key) if isinstance(document, dict) else None
@@ -671,25 +693,36 @@ def material_symbols_for_binding(
         if material.get("id")
     }
     targets_by_symbol = _material_targets_by_symbol(root, namespace)
-    wanted = {
-        _normalise_material_alias(value)
-        for value in (binding.dae_material, binding.material_key)
-        if value
-    }
-
-    symbols: list[str] = []
+    dae_wanted = _normalise_material_alias(binding.dae_material)
+    material_wanted = _normalise_material_alias(binding.material_key)
+    exact_symbols: list[str] = []
+    fallback_symbols: list[str] = []
     for primitive in root.iter():
         if local_name(primitive.tag) not in PRIMITIVE_TAGS:
             continue
         symbol = (primitive.get("material") or "").strip()
-        if not symbol or symbol in symbols:
+        if not symbol:
             continue
         _material, aliases = _resolve_collada_material_for_symbol(
             symbol, material_by_id, targets_by_symbol
         )
-        if any(_normalise_material_alias(alias) in wanted for alias in aliases):
-            symbols.append(symbol)
-    return tuple(symbols)
+        normalised_aliases = {
+            _normalise_material_alias(alias) for alias in aliases if alias
+        }
+        if dae_wanted and dae_wanted in normalised_aliases:
+            if symbol not in exact_symbols:
+                exact_symbols.append(symbol)
+        elif material_wanted and material_wanted in normalised_aliases:
+            if symbol not in fallback_symbols:
+                fallback_symbols.append(symbol)
+
+    # A BeamNG glowMap/switch key can resolve to the same materials-JSON record
+    # as its static backing material.  In that case ``material_key`` is useful
+    # for archive lookup but is not permission to add every primitive using the
+    # backing material to this switch's UV domain.  Prefer the DAE-bound alias
+    # whenever it exists; retain the record-key match as compatibility fallback
+    # for exporters whose symbol only exposes the resolved material name.
+    return tuple(exact_symbols or fallback_symbols)
 
 
 def uv_triangles_by_source(
@@ -1035,6 +1068,14 @@ def _production_layer_detection_config(
         return replace(
             mser_config,
             box_source="opacity_mask",
+            # The mask front end has already joined neighbouring strokes with
+            # ``foreground_merge_gap_px``.  Re-running the ordinary 150 px
+            # text/relief proximity pass after that can join distinct controls
+            # which happen to occupy one connected UV chart.  The resulting
+            # broad reflection swaps their positions instead of only correcting
+            # their lettering.  Keep overlap collapse, but let the authored
+            # visibility components be the grouping authority.
+            merge_distance_px=0,
             # Detection is already clipped to one topological UV island.  A
             # second fitted-shape recovery rejects valid labels which fill a
             # small island, such as the Lexus mirror-control AUTO/L/R marks.
@@ -1937,11 +1978,15 @@ def skew_delta_for_region(
         tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...
     ] | None = None,
 ) -> float | None:
-    """Return how far the mesh-derived reflection differs from a flat flip.
+    """Return unsafe skew between the mesh reflection and a flat image flip.
 
     Skewed atlas regions can map upright onto the mesh, but skew and mirroring
-    do not commute.  When the local mesh reflection differs materially from the
-    flat texture-space flip, the region is treated as unsafe and left unchanged.
+    do not commute.  A coefficient difference alone is not a damage measure:
+    the same shear is harmless across a tiny label and destructive across a
+    large panel.  Even a small coefficient can accumulate visible displacement
+    across a long or slender region, so the coefficient floor never bypasses
+    the normalised check.  Above that floor, the bounded-error exception must
+    satisfy both the legacy reference-scaled allowance and the explicit ratio.
     """
     if frames is None and (not triangles or len(triangles) != len(surfaces)):
         return None
@@ -2001,7 +2046,35 @@ def skew_delta_for_region(
         else np.asarray(((1.0, 0.0), (0.0, -1.0)), dtype=np.float64)
     )
     delta = float(np.max(np.abs(texture_reflection - simple)))
-    if delta < config.skewed_region_min_delta:
+    difference = texture_reflection - simple
+    # Bounds are half-open continuous rectangles.  Using their full spans makes
+    # uniform layer scaling cancel exactly; texel-centre spans (w-1/h-1) change
+    # aspect ratio for small boxes and can cross the threshold at 2x.
+    half_x = max(float(w), 0.0) / 2.0
+    half_y = max(float(h), 0.0) / 2.0
+    worst_displacement = max(
+        float(np.linalg.norm(difference @ np.asarray((sx, sy))))
+        for sx in (-half_x, half_x)
+        for sy in (-half_y, half_y)
+    )
+    short_span = min(half_x * 2.0, half_y * 2.0)
+    legacy_ratio = max(float(config.skewed_region_tolerable_error_px), 0.0) / max(
+        SKEWED_REGION_ERROR_REFERENCE_SPAN_PX, 1.0
+    )
+    explicit_ratio = max(float(config.skewed_region_tolerable_error_ratio), 0.0)
+    relative_error = (
+        worst_displacement / short_span
+        if short_span > 0.0
+        else (0.0 if worst_displacement <= 0.0 else math.inf)
+    )
+    coefficient_below_floor = delta < max(
+        float(config.skewed_region_min_delta), 0.0
+    )
+    explicit_relative_safe = relative_error <= explicit_ratio
+    reference_scaled_safe = relative_error <= legacy_ratio
+    if explicit_relative_safe and (
+        coefficient_below_floor or reference_scaled_safe
+    ):
         return None
     return delta
 
@@ -3905,6 +3978,136 @@ class RegionDetection:
     seconds: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class SharedLayerRegionEvidence:
+    """Accepted regions from one physical map of a material/part UV job."""
+
+    size: tuple[int, int]
+    regions: tuple[tuple[int, int, int, int], ...]
+    rotations: tuple[tuple[tuple[float, float], ...] | None, ...]
+
+
+@dataclass(slots=True)
+class SharedLayerRegionLedger:
+    """Share accepted mark evidence across one material on one part/UV layout.
+
+    Detection remains layer-specific -- colour, scalar and normal maps keep
+    their own front ends.  The ledger runs only after those detectors and their
+    safety filters have accepted a region.  Every sibling layer then plans from
+    the union, so a mark visible only as normal relief or faint gloss is still
+    turned over in all maps that composite it.
+
+    A ledger belongs to exactly one correction-task group.  That scope is what
+    prevents a shared atlas used by another material or another mesh from
+    donating unrelated marks.  Pixel boxes are scaled through normalised atlas
+    coordinates because companion maps commonly ship at half resolution.
+    """
+
+    layers: dict[str, SharedLayerRegionEvidence] = field(default_factory=dict)
+
+    def record(
+        self,
+        member: str,
+        size: tuple[int, int],
+        regions: list[tuple[int, int, int, int]],
+        rotations: list[tuple[tuple[float, float], ...] | None],
+    ) -> None:
+        padded_rotations = list(rotations[: len(regions)])
+        padded_rotations.extend([None] * (len(regions) - len(padded_rotations)))
+        self.layers[member.lower()] = SharedLayerRegionEvidence(
+            size=size,
+            regions=tuple(regions),
+            rotations=tuple(padded_rotations),
+        )
+
+    def record_evidence(
+        self,
+        member: str,
+        evidence: SharedLayerRegionEvidence,
+    ) -> None:
+        """Record already-normalised evidence without a lossy size round trip."""
+        self.layers[member.lower()] = evidence
+
+    def combined(
+        self,
+        member: str,
+        size: tuple[int, int],
+        regions: list[tuple[int, int, int, int]],
+        rotations: list[tuple[tuple[float, float], ...] | None],
+    ) -> tuple[
+        list[tuple[int, int, int, int]],
+        list[tuple[tuple[float, float], ...] | None],
+        tuple[str, ...],
+        int,
+    ]:
+        """Return this layer's regions unioned with every sibling's evidence."""
+        own_rotations = list(rotations[: len(regions)])
+        own_rotations.extend([None] * (len(regions) - len(own_rotations)))
+        combined_regions = list(regions)
+        combined_rotations = own_rotations
+        contributors: list[str] = []
+        member_key = member.lower()
+
+        for source_member, evidence in self.layers.items():
+            if source_member == member_key or not evidence.regions:
+                continue
+            contributors.append(source_member)
+            combined_regions.extend(
+                _scale_detection_box(region, evidence.size, size)
+                for region in evidence.regions
+            )
+            combined_rotations.extend(
+                _scale_detection_rotation(rotation, evidence.size, size)
+                for rotation in evidence.rotations
+            )
+
+        before = set(regions)
+        combined_regions, combined_rotations, _removed = (
+            deduplicate_region_detections(combined_regions, combined_rotations)
+        )
+        added_or_widened = sum(region not in before for region in combined_regions)
+        return (
+            combined_regions,
+            combined_rotations,
+            tuple(contributors),
+            added_or_widened,
+        )
+
+
+def shared_layer_evidence_at_finest_resolution(
+    detections: list[tuple[tuple[int, int], RegionDetection]],
+    config: RhdTextureConfig,
+) -> SharedLayerRegionEvidence | None:
+    """Retain native detection precision for cross-layer region sharing.
+
+    An authoritative opacity mask can be 1024 px while a sibling placeholder
+    normal is only 32 px.  Scaling its boxes down for that normal and then back
+    up for the colour layer expands every boundary to a 32-pixel grid.  Those
+    coarse boxes overlap neighbouring controls and the later de-duplication
+    correctly-but-destructively unions them.  Combine at the finest source
+    resolution instead; each consumer then performs one scale from evidence to
+    its own map and no precision is invented or discarded in between.
+    """
+    if not detections:
+        return None
+    size = max(
+        (source_size for source_size, _detection in detections),
+        key=lambda value: (value[0] * value[1], value[0], value[1]),
+    )
+    regions: list[tuple[int, int, int, int]] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
+    for source_size, detection in detections:
+        scaled = _scale_detection_to_texture(detection, source_size, size)
+        regions, _added, rotations = merge_region_sets_with_rotations(
+            regions,
+            scaled.regions,
+            config,
+            rotations,
+            scaled.rotations,
+        )
+    return SharedLayerRegionEvidence(size, tuple(regions), tuple(rotations))
+
+
 FULL_MIRRORED_TEXTURE_MIN_COVERAGE = 0.95
 FULL_MIRRORED_TEXTURE_MAX_RIGID_COVERAGE = 0.001
 FULL_MIRRORED_TEXTURE_MAX_CONFLICT_COVERAGE = 0.001
@@ -4646,10 +4849,9 @@ def _detect_flip_regions_in_view(
     )
     final = detection.stages[-1]
     detected = list(final.kept)
-    use_rotated_regions = (
-        mser_config.enable_edge_aligned_rotation
-        or mser_config.bounds_shape == SHAPE_ROTATED
-    )
+    # Every outline this stage adopts is a rotated rectangle, so one is used
+    # wherever one was adopted.
+    use_rotated_regions = mser_config.enable_symmetry_rotation
     detected_rotations = [
         final.rotations[index]
         if use_rotated_regions
@@ -5172,9 +5374,11 @@ def build_rhd_texture(
     written_companions: set[str] | None = None,
     detection_session: ProductionDetectionSession[RegionDetection] | None = None,
     part_group_index: int = 0,
+    shared_layer_regions: SharedLayerRegionLedger | None = None,
+    detect_only: bool = False,
     log=print,
     progress: ProgressCallback | None = None,
-) -> RhdTextureResult:
+) -> RhdTextureResult | None:
     """Run the whole correction and write the PNG and DDS outputs.
 
     ``masks`` lets a caller supply a domain already rasterised for this UV
@@ -5191,8 +5395,12 @@ def build_rhd_texture(
     unscoped wiring a texture has always had.
 
     ``detection_session`` shares the one GPU warm-up and exact-input cache
-    across every physical material layer in an export.  No detection result is
-    transferred between different images.
+    across every physical material layer in an export.
+
+    ``shared_layer_regions`` is scoped by the caller to one material on one
+    part/UV layout.  A detect-only visit records this layer's accepted evidence;
+    the correction visit reuses the cached detection and adds the evidence from
+    its sibling maps, scaling boxes when their resolutions differ.
     """
     started = time.perf_counter()
     phase_timings: list[dict[str, object]] = []
@@ -5593,8 +5801,10 @@ def build_rhd_texture(
         log(f"  ! {note}")
 
     authoritative_detection_reports: list[dict[str, object]] = []
+    authoritative_shared_evidence: SharedLayerRegionEvidence | None = None
 
     def detect_primary_job() -> RegionDetection:
+        nonlocal authoritative_shared_evidence
         if full_domain_region is not None:
             log(
                 "  dedicated mirrored texture domain covers "
@@ -5618,6 +5828,9 @@ def build_rhd_texture(
             combined = RegionDetection(source="opacity_mask", detected=0)
             combined_regions: list[tuple[int, int, int, int]] = []
             combined_rotations: list[tuple[tuple[float, float], ...] | None] = []
+            native_detections: list[
+                tuple[tuple[int, int], RegionDetection]
+            ] = []
             for visibility_mask in authoritative_masks:
                 mask_name = PurePosixPath(visibility_mask.member).name
                 source_name = f"opacityMap:{mask_name}"
@@ -5659,6 +5872,7 @@ def build_rhd_texture(
                         "source_size": [mask_size[0], mask_size[1]],
                     }
                 )
+                native_detections.append((mask_size, detected_mask))
                 detected_mask = _scale_detection_to_texture(
                     detected_mask, mask_size, (width, height)
                 )
@@ -5675,6 +5889,11 @@ def build_rhd_texture(
                         detected_mask.rotations,
                     )
                 )
+            authoritative_shared_evidence = (
+                shared_layer_evidence_at_finest_resolution(
+                    native_detections, config
+                )
+            )
             combined.regions = combined_regions
             combined.rotations = combined_rotations
             combined.seconds = sum(
@@ -5979,6 +6198,49 @@ def build_rhd_texture(
             f"  collapsed {duplicate_regions_removed} overlapping/repeated "
             "atlas region(s) before flip planning"
         )
+
+    shared_layer_sources: tuple[str, ...] = ()
+    shared_layer_regions_added = 0
+    if shared_layer_regions is not None:
+        if authoritative_shared_evidence is not None:
+            shared_layer_regions.record_evidence(
+                texture_member, authoritative_shared_evidence
+            )
+        else:
+            shared_layer_regions.record(
+                texture_member,
+                (width, height),
+                mirrored_regions,
+                mirrored_rotations,
+            )
+        if detect_only:
+            emit_progress(
+                progress,
+                "end",
+                "texture_job",
+                f"Detected {texture_name} for shared material-layer evidence",
+                texture=texture_member,
+                seconds=round(time.perf_counter() - started, 6),
+                detect_only=True,
+            )
+            return None
+        (
+            mirrored_regions,
+            mirrored_rotations,
+            shared_layer_sources,
+            shared_layer_regions_added,
+        ) = shared_layer_regions.combined(
+            texture_member,
+            (width, height),
+            mirrored_regions,
+            mirrored_rotations,
+        )
+        if shared_layer_sources:
+            log(
+                f"  shared {len(mirrored_regions)} accepted region(s) across "
+                f"{len(shared_layer_sources) + 1} map(s) of this material/part; "
+                f"{shared_layer_regions_added} added or widened here"
+            )
 
     phase_started = time.perf_counter()
     emit_progress(
@@ -6477,10 +6739,18 @@ def build_rhd_texture(
         ),
         "skewed_region_min_delta": config.skewed_region_min_delta,
         "skewed_region_max_condition": config.skewed_region_max_condition,
+        "skewed_region_tolerable_error_px": (
+            config.skewed_region_tolerable_error_px
+        ),
+        "skewed_region_tolerable_error_ratio": (
+            config.skewed_region_tolerable_error_ratio
+        ),
         "regions_detected": detected_total,
         "mirrored_regions": len(mirrored_regions),
         "companion_regions_added": companion_regions_added,
         "state_group_regions_added": state_group_regions_added,
+        "shared_layer_regions_added": shared_layer_regions_added,
+        "shared_layer_region_sources": list(shared_layer_sources),
         "relief_regions_added": relief_added,
         "duplicate_regions_removed": duplicate_regions_removed,
         "outputs": {
@@ -7209,6 +7479,28 @@ class TextureCorrectionTaskOutcome:
     error: str | None
 
 
+def shared_layer_task_groups(
+    tasks: list[TextureCorrectionTask],
+) -> list[list[tuple[int, TextureCorrectionTask]]]:
+    """Group tasks that paint one material on the same part/UV layout.
+
+    The physical texture member is deliberately absent from the key: different
+    members are the layers which need to exchange evidence.  Material and exact
+    part scope remain in it so an atlas reused by another mesh or material can
+    never donate regions to this correction.
+    """
+    grouped: dict[
+        tuple[str, tuple[str, ...]], list[tuple[int, TextureCorrectionTask]]
+    ] = {}
+    for index, task in enumerate(tasks):
+        key = (
+            task.material,
+            tuple(sorted(str(part.key) for part in task.part_scope)),
+        )
+        grouped.setdefault(key, []).append((index, task))
+    return list(grouped.values())
+
+
 _TEXTURE_WORKER: dict[str, object] = {}
 
 
@@ -7243,6 +7535,7 @@ def _run_texture_correction_task(
     task: TextureCorrectionTask,
     output_directory: Path,
     context: Mapping[str, object],
+    shared_layer_regions: SharedLayerRegionLedger | None = None,
 ) -> TextureCorrectionTaskOutcome:
     """Run one correction, capturing its log instead of emitting it.
 
@@ -7265,13 +7558,88 @@ def _run_texture_correction_task(
             masks=task.masks,
             detection_session=context["session"],
             part_group_index=task.part_group_index,
+            shared_layer_regions=shared_layer_regions,
             log=lines.append,
         )
+        if result is None:
+            raise RuntimeError("texture correction stopped after detection")
         return TextureCorrectionTaskOutcome(result, lines, None)
     except Exception as exc:
         return TextureCorrectionTaskOutcome(
             None, lines, f"{type(exc).__name__}: {exc}"
         )
+
+
+def _record_texture_task_layer_evidence(
+    task: TextureCorrectionTask,
+    output_directory: Path,
+    context: Mapping[str, object],
+    shared_layer_regions: SharedLayerRegionLedger,
+) -> str | None:
+    """Run only this task's detector, retaining no duplicate pre-pass log."""
+    try:
+        build_rhd_texture(
+            context["archive"],
+            context["loaded"],
+            task.member,
+            output_directory,
+            context["config"],
+            context["mser_config"],
+            context["relief_mser_config"],
+            part_scope=list(task.part_scope),
+            material_scope=(task.material,),
+            masks=task.masks,
+            detection_session=context["session"],
+            part_group_index=task.part_group_index,
+            shared_layer_regions=shared_layer_regions,
+            detect_only=True,
+            log=lambda _line: None,
+        )
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _run_texture_correction_task_group(
+    tasks: tuple[TextureCorrectionTask, ...],
+    output_directory: Path,
+    context: Mapping[str, object],
+) -> list[TextureCorrectionTaskOutcome]:
+    """Detect every sibling layer first, then correct each from their union."""
+    if len(tasks) < 2:
+        return [
+            _run_texture_correction_task(tasks[0], output_directory, context)
+        ] if tasks else []
+
+    shared_layer_regions = SharedLayerRegionLedger()
+    prepass_errors = {
+        task.member: error
+        for task in tasks
+        if (
+            error := _record_texture_task_layer_evidence(
+                task, output_directory, context, shared_layer_regions
+            )
+        ) is not None
+    }
+
+    outcomes: list[TextureCorrectionTaskOutcome] = []
+    for task in tasks:
+        outcome = _run_texture_correction_task(
+            task,
+            output_directory,
+            context,
+            shared_layer_regions,
+        )
+        error = prepass_errors.get(task.member)
+        if error is not None:
+            outcome.log_lines.insert(
+                0,
+                f"  ! shared-evidence pre-pass failed for "
+                f"{PurePosixPath(task.member).name}: {error}; "
+                "this layer still ran on its own detector",
+            )
+        outcomes.append(outcome)
+    return outcomes
 
 
 def _run_texture_correction_task_in_worker(
@@ -7280,6 +7648,16 @@ def _run_texture_correction_task_in_worker(
 ) -> TextureCorrectionTaskOutcome:
     """Pool entry point: the context is whatever this process was initialised with."""
     return _run_texture_correction_task(task, output_directory, _TEXTURE_WORKER)
+
+
+def _run_texture_correction_task_group_in_worker(
+    tasks: tuple[TextureCorrectionTask, ...],
+    output_directory: Path,
+) -> list[TextureCorrectionTaskOutcome]:
+    """Pool entry point for a same-material/same-part layer group."""
+    return _run_texture_correction_task_group(
+        tasks, output_directory, _TEXTURE_WORKER
+    )
 
 
 TEXTURE_JOB_WORKER_DEFAULT = 4
@@ -7391,12 +7769,11 @@ def export_parts_preview(
 
     sweep_cache: dict[str, object] = {}
     mask_cache: dict[tuple, DomainMasks] = {}
-    # No companion set: ``build_rhd_texture`` keeps its companion container
-    # empty because every stage map is a first-class texture job now, so
-    # nothing replays a plan onto another image and nothing needs de-duping
-    # across corrections. Reviving companions means revisiting this pass --
-    # ``written_companions`` was the one piece of state a correction mutated
-    # for the next one to read, which a pool cannot share.
+    # Every stage map remains a first-class texture job.  Corrections which
+    # share one material and part/UV layout are submitted to the same worker as
+    # a group: the worker detects every layer first, then plans each from their
+    # resolution-scaled union.  The ledger is local to that group, so the pool
+    # never relies on mutable state from another process.
     detection_session: ProductionDetectionSession[RegionDetection] = (
         ProductionDetectionSession()
     )
@@ -7540,7 +7917,8 @@ def export_parts_preview(
 
     log = outer_log
     every_task = [task for _member, _held, tasks in planned for task in tasks]
-    workers = texture_correction_worker_count(config, len(every_task))
+    task_groups = shared_layer_task_groups(every_task)
+    workers = texture_correction_worker_count(config, len(task_groups))
     phase_started = time.perf_counter()
     emit_progress(
         progress,
@@ -7589,13 +7967,29 @@ def export_parts_preview(
             ),
         ) as pool:
             futures = {
-                index: pool.submit(
-                    _run_texture_correction_task_in_worker, task, output_directory
+                group_index: pool.submit(
+                    _run_texture_correction_task_group_in_worker,
+                    tuple(task for _index, task in group),
+                    output_directory,
                 )
-                for index, task in enumerate(every_task)
+                for group_index, group in enumerate(task_groups)
             }
-            for index, future in futures.items():
-                outcomes[index] = future.result()
+            for group_index, future in futures.items():
+                group = task_groups[group_index]
+                group_outcomes = future.result()
+                # Compatibility with single-task pool shims and callers from
+                # before layer groups were introduced.
+                if isinstance(group_outcomes, TextureCorrectionTaskOutcome):
+                    group_outcomes = [group_outcomes]
+                if len(group_outcomes) != len(group):
+                    group_outcomes = [
+                        TextureCorrectionTaskOutcome(
+                            None, [], "worker returned an incomplete layer group"
+                        )
+                        for _entry in group
+                    ]
+                for (task_index, _task), outcome in zip(group, group_outcomes):
+                    outcomes[task_index] = outcome
 
         # A worker fails for reasons the same work in this process may not
         # have: four of them hold four GL contexts on one card, and a texture
@@ -7609,22 +8003,33 @@ def export_parts_preview(
                 f"\n  ! {len(lost)} correction(s) failed on a worker; "
                 f"running them again on the serial path"
             )
-            for index in lost:
-                task = every_task[index]
-                log(f"    retrying {PurePosixPath(task.member).name}: "
-                    f"{outcomes[index].error}")
-                retried = _run_texture_correction_task(
-                    task, output_directory, context
+            lost_set = set(lost)
+            for group in task_groups:
+                if not any(index in lost_set for index, _task in group):
+                    continue
+                retried_group = _run_texture_correction_task_group(
+                    tuple(task for _index, task in group),
+                    output_directory,
+                    context,
                 )
-                if retried.error is None:
-                    log(f"    {PurePosixPath(task.member).name}: "
-                        f"recovered on the serial path")
-                outcomes[index] = retried
+                for (index, task), retried in zip(group, retried_group):
+                    if index not in lost_set:
+                        continue
+                    log(f"    retrying {PurePosixPath(task.member).name}: "
+                        f"{outcomes[index].error}")
+                    if retried.error is None:
+                        log(f"    {PurePosixPath(task.member).name}: "
+                            f"recovered on the serial path")
+                    outcomes[index] = retried
     else:
-        for index, task in enumerate(every_task):
-            outcomes[index] = _run_texture_correction_task(
-                task, output_directory, context
+        for group in task_groups:
+            group_outcomes = _run_texture_correction_task_group(
+                tuple(task for _index, task in group),
+                output_directory,
+                context,
             )
+            for (index, _task), outcome in zip(group, group_outcomes):
+                outcomes[index] = outcome
 
     consumed = 0
     for member, held, tasks in planned:

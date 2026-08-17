@@ -747,6 +747,68 @@ class ScopedTextureFlipTests(unittest.TestCase):
         """
         return ET.fromstring(xml)
 
+    def build_multi_target_geometry(self) -> ET.Element:
+        # Three islands share one TEXCOORD source.  The first target is split
+        # across two material primitives that reuse its corner entries, which
+        # proves shared consumers are reflected once rather than once per row.
+        xml = f"""
+        <geometry xmlns="{th.NS['c']}" id="atlas-mesh" name="atlas">
+          <mesh>
+            <source id="atlas-mesh-positions">
+              <float_array id="atlas-mesh-positions-array" count="36">
+                0 0 0  1 0 0  1 0 1  0 0 1
+                0 0 0  1 0 0  1 0 1  0 0 1
+                0 0 0  1 0 0  1 0 1  0 0 1
+              </float_array>
+              <technique_common>
+                <accessor source="#atlas-mesh-positions-array" count="12" stride="3">
+                  <param name="X" type="float"/>
+                  <param name="Y" type="float"/>
+                  <param name="Z" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <source id="atlas-mesh-map-0">
+              <float_array id="atlas-mesh-map-0-array" count="24">
+                0.1 0.2  0.9 0.2  0.9 0.8  0.1 0.8
+                1.1 0.2  1.9 0.2  1.9 0.8  1.1 0.8
+                2.1 0.2  2.9 0.2  2.9 0.8  2.1 0.8
+              </float_array>
+              <technique_common>
+                <accessor source="#atlas-mesh-map-0-array" count="12" stride="2">
+                  <param name="S" type="float"/>
+                  <param name="T" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <vertices id="atlas-mesh-vertices">
+              <input semantic="POSITION" source="#atlas-mesh-positions"/>
+            </vertices>
+            <triangles material="display_a-material" count="1">
+              <input semantic="VERTEX" source="#atlas-mesh-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#atlas-mesh-map-0" offset="1" set="0"/>
+              <p>0 0 1 1 2 2</p>
+            </triangles>
+            <triangles material="display_a_detail-material" count="1">
+              <input semantic="VERTEX" source="#atlas-mesh-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#atlas-mesh-map-0" offset="1" set="0"/>
+              <p>0 0 2 2 3 3</p>
+            </triangles>
+            <triangles material="display_b-material" count="2">
+              <input semantic="VERTEX" source="#atlas-mesh-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#atlas-mesh-map-0" offset="1" set="0"/>
+              <p>4 4 5 5 6 6  4 4 6 6 7 7</p>
+            </triangles>
+            <triangles material="protected_trim-material" count="2">
+              <input semantic="VERTEX" source="#atlas-mesh-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#atlas-mesh-map-0" offset="1" set="0"/>
+              <p>8 8 9 9 10 10  8 8 10 10 11 11</p>
+            </triangles>
+          </mesh>
+        </geometry>
+        """
+        return ET.fromstring(xml)
+
     def test_scoped_flip_reflects_only_nav_island(self) -> None:
         geometry = self.build_shared_geometry()
         out = th.mirrored_geometry(
@@ -770,6 +832,54 @@ class ScopedTextureFlipTests(unittest.TestCase):
         # The reflection stays within U[1,2); it must not land on the cluster.
         self.assertGreaterEqual(min(s[4:8]), 1.0)
         self.assertLessEqual(max(s[4:8]), 2.0)
+
+    def test_each_targeted_uv_component_uses_its_own_pivot(self) -> None:
+        geometry = self.build_multi_target_geometry()
+        out = th.mirrored_geometry(
+            geometry,
+            "new",
+            flip_texture=True,
+            flip_materials={"display_a", "display_a_detail", "display_b"},
+        )
+        s, t = uv_pairs(out)
+
+        # The two material consumers sharing tile A are one component, so its
+        # entries are reflected exactly once around 0.5.
+        self.assertEqual(s[0:4], [0.9, 0.1, 0.1, 0.9])
+        # Disconnected tile B gets its own 1.5 pivot; it cannot be translated
+        # into tile A by a combined source-wide min/max.
+        self.assertEqual(s[4:8], [1.9, 1.1, 1.1, 1.9])
+        # A third, non-targeted material sharing the source remains authored.
+        self.assertEqual(s[8:12], [2.1, 2.9, 2.9, 2.1])
+        self.assertEqual(t, [0.2, 0.2, 0.8, 0.8] * 3)
+
+    def test_target_component_touching_protected_entry_is_not_torn(self) -> None:
+        geometry = self.build_multi_target_geometry()
+        mesh = geometry.find("c:mesh", th.NS)
+        protected = next(
+            primitive
+            for primitive in mesh.findall("c:triangles", th.NS)
+            if primitive.get("material") == "protected_trim-material"
+        )
+        # The protected consumer reuses entry 2 at its material boundary.
+        protected.find("c:p", th.NS).text = (
+            "8 2 9 9 10 10  8 2 10 10 11 11"
+        )
+
+        out = th.mirrored_geometry(
+            geometry,
+            "new",
+            flip_texture=True,
+            flip_materials={"display_a", "display_a_detail", "display_b"},
+        )
+        s, _t = uv_pairs(out)
+
+        # All of tile A stays fixed, including target-only entries 0, 1 and 3;
+        # flipping just those while preserving shared entry 2 would distort it.
+        self.assertEqual(s[0:4], [0.1, 0.9, 0.9, 0.1])
+        # The independent targeted component is still safe to reflect.
+        self.assertEqual(s[4:8], [1.9, 1.1, 1.1, 1.9])
+        self.assertEqual(s[8:12], [2.1, 2.9, 2.9, 2.1])
 
 
 if __name__ == "__main__":

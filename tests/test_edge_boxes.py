@@ -26,6 +26,8 @@ from mesh_segmentation_transform.annotate_texture_regions import (
     detect_mser_boxes,
     edge_response,
     run_detection,
+    SHAPE_HULL,
+    SHAPE_ROTATED,
     STEP_INDEX,
 )
 
@@ -1208,6 +1210,27 @@ class MagicFeatureFilterTests(unittest.TestCase):
     def _image(self) -> np.ndarray:
         return np.full((128, 128, 3), 160, dtype=np.uint8)
 
+    def _soft_fringe_fixture(
+        self, scale: int = 1
+    ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        """A solid mark with a three-step antialiased edge outside its box."""
+        image = np.full((128 * scale, 128 * scale, 3), 160, dtype=np.uint8)
+        # Draw outer-to-inner so every reference-pixel ring scales exactly.
+        for low, high, value in (
+            (49, 79, 140),
+            (50, 78, 110),
+            (51, 77, 70),
+            (52, 76, 30),
+        ):
+            cv2.rectangle(
+                image,
+                (low * scale, low * scale),
+                ((high + 1) * scale - 1, (high + 1) * scale - 1),
+                (value, value, value),
+                -1,
+            )
+        return image, (52 * scale, 52 * scale, 25 * scale, 25 * scale)
+
     def test_a_filled_mark_reads_as_a_blob(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import blob_hull_fill
 
@@ -1282,6 +1305,192 @@ class MagicFeatureFilterTests(unittest.TestCase):
         self.assertIsNotNone(measure)
         self.assertEqual(measure.extension_area_px, 0)
         self.assertEqual(measure.extension_ratio, 0.0)
+
+    def test_feature_extension_accepts_a_soft_antialias_collar(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_extension_measure,
+        )
+
+        image, group = self._soft_fringe_fixture()
+        without_grace = feature_extension_measure(
+            image,
+            None,
+            group,
+            replace(DEFAULT_CONFIG, feature_extension_grace_px=0),
+        )
+        with_grace = feature_extension_measure(
+            image,
+            None,
+            group,
+            replace(DEFAULT_CONFIG, feature_extension_grace_px=4),
+        )
+
+        self.assertIsNotNone(without_grace)
+        self.assertIsNotNone(with_grace)
+        self.assertGreater(without_grace.extension_area_px, 0)
+        self.assertEqual(with_grace.extension_area_px, 0)
+        self.assertEqual(with_grace.extension_ratio, 0.0)
+        self.assertGreater(with_grace.soft_fringe_area_px, 0)
+        self.assertEqual(with_grace.expanded_bounds, (49, 49, 31, 31))
+
+    def test_feature_extension_rejects_a_hard_continuation_inside_the_grace(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_feature_extension,
+            feature_extension_measure,
+        )
+
+        ratios: list[float] = []
+        for scale in (1, 2):
+            image = np.full(
+                (128 * scale, 128 * scale, 3), 160, dtype=np.uint8
+            )
+            group = (52 * scale, 52 * scale, 25 * scale, 25 * scale)
+            # The same solid paint carries four reference pixels beyond the
+            # detector box.  It fits spatially inside the V60 allowance but is
+            # not antialiasing, at either native layer resolution.
+            cv2.rectangle(
+                image,
+                (52 * scale, 52 * scale),
+                (81 * scale - 1, 77 * scale - 1),
+                (30, 30, 30),
+                -1,
+            )
+
+            measure = feature_extension_measure(
+                image, None, group, DEFAULT_CONFIG
+            )
+            self.assertIsNotNone(measure)
+            self.assertEqual(measure.soft_fringe_area_px, 0)
+            self.assertGreater(
+                measure.extension_ratio,
+                DEFAULT_CONFIG.feature_extension_min_ratio,
+            )
+            ratios.append(measure.extension_ratio)
+            _state, stage = _step_feature_extension(
+                image,
+                None,
+                DEFAULT_CONFIG,
+                DetectionState(np.empty((0, 4), np.int32), [group]),
+            )
+            self.assertEqual(stage.rejected, (group,))
+        self.assertAlmostEqual(ratios[0], ratios[1])
+
+    def test_feature_extension_decision_is_invariant_at_double_resolution(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_extension_measure,
+        )
+
+        image_1x, group_1x = self._soft_fringe_fixture(1)
+        image_2x, group_2x = self._soft_fringe_fixture(2)
+        measure_1x = feature_extension_measure(
+            image_1x, None, group_1x, DEFAULT_CONFIG
+        )
+        measure_2x = feature_extension_measure(
+            image_2x, None, group_2x, DEFAULT_CONFIG
+        )
+
+        self.assertIsNotNone(measure_1x)
+        self.assertIsNotNone(measure_2x)
+        self.assertEqual(measure_1x.extension_ratio, 0.0)
+        self.assertEqual(measure_2x.extension_ratio, 0.0)
+        self.assertEqual(measure_2x.grace_px, measure_1x.grace_px * 2)
+        self.assertEqual(measure_2x.search_px, measure_1x.search_px * 2)
+        self.assertEqual(
+            measure_2x.expanded_bounds,
+            tuple(value * 2 for value in measure_1x.expanded_bounds),
+        )
+
+    def test_feature_extension_grace_is_fractionally_bounded_on_tiny_marks(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_extension_geometry,
+        )
+
+        tiny = feature_extension_geometry((0, 0, 4, 4), DEFAULT_CONFIG)
+        reference = feature_extension_geometry((0, 0, 25, 25), DEFAULT_CONFIG)
+
+        self.assertEqual(tiny.grace_px, 0)
+        self.assertEqual(reference.grace_px, 4)
+        self.assertLessEqual(
+            reference.grace_px / 25,
+            DEFAULT_CONFIG.feature_extension_grace_max_fraction,
+        )
+
+    def test_accepted_soft_fringe_expands_the_final_output_bounds(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_feature_extension,
+            _step_final_padding,
+        )
+
+        image, group = self._soft_fringe_fixture()
+        initial = DetectionState(np.empty((0, 4), np.int32), [group])
+        extended, extension_stage = _step_feature_extension(
+            image, None, DEFAULT_CONFIG, initial
+        )
+        final, _padding_stage = _step_final_padding(
+            image,
+            None,
+            replace(DEFAULT_CONFIG, enable_circular_groups=False),
+            extended,
+        )
+
+        self.assertEqual(extension_stage.kept, ((49, 49, 31, 31),))
+        self.assertEqual(extension_stage.adjusted, 1)
+        # Final padding is additional; every soft pixel from 49..79 is inside.
+        self.assertEqual(final.groups, [(47, 47, 35, 35)])
+
+    def test_accepted_soft_fringe_expands_a_rotated_output_stencil(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState,
+            _step_feature_extension,
+            _step_final_padding,
+        )
+        from mesh_segmentation_transform.mirror_texture_for_rhd import (
+            apply_masked_rotated_flip,
+        )
+
+        image, group = self._soft_fringe_fixture()
+        original = tuple(
+            (float(x), float(y))
+            for x, y in cv2.boxPoints(((64.0, 64.0), (25.0, 25.0), 17.0))
+        )
+        initial = DetectionState(
+            np.empty((0, 4), np.int32), [group], rotations=[original]
+        )
+
+        extended, _extension_stage = _step_feature_extension(
+            image, None, DEFAULT_CONFIG, initial
+        )
+        final, _padding_stage = _step_final_padding(
+            image,
+            None,
+            replace(DEFAULT_CONFIG, enable_circular_groups=False),
+            extended,
+        )
+
+        expanded = extended.rotations[0]
+        self.assertIsNotNone(expanded)
+        self.assertNotEqual(expanded, original)
+        self.assertEqual(final.rotations, [expanded])
+        expanded_polygon = np.asarray(expanded, dtype=np.float32)
+        for point in ((49, 49), (79, 49), (79, 79), (49, 79)):
+            self.assertGreaterEqual(
+                cv2.pointPolygonTest(expanded_polygon, point, True), -1e-4
+            )
+
+        # Exercise the production write shape, not just its reported outline.
+        rows, columns = np.indices(image.shape[:2])
+        source = np.zeros_like(image)
+        source[:, :, 0] = columns
+        source[:, :, 1] = rows
+        old_output = source.copy()
+        expanded_output = source.copy()
+        stencil = np.ones(image.shape[:2], dtype=bool)
+        apply_masked_rotated_flip(old_output, stencil, original, "long")
+        apply_masked_rotated_flip(expanded_output, stencil, expanded, "long")
+        self.assertTrue(np.array_equal(old_output[49, 49], source[49, 49]))
+        self.assertFalse(np.array_equal(expanded_output[49, 49], source[49, 49]))
 
     def test_blob_stage_rejects_only_blob_like_regions(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
@@ -1774,199 +1983,275 @@ class RotatedBoundsTests(unittest.TestCase):
         self.assertAlmostEqual(cx, 180.0, delta=6.0)
         self.assertAlmostEqual(cy, 190.0, delta=6.0)
 
-    def test_edge_aligned_rotation_uses_a_near_parallel_uv_edge(self) -> None:
+class SymmetryRotationTests(unittest.TestCase):
+    """The angle a mark is mirrored about is its own axis of symmetry.
+
+    Taking it from a nearby UV edge borrows a neighbour's direction; measuring
+    the mark's own reflective symmetry asks the question directly.  Measured on
+    the magic-wand feature and not on its convex hull -- over 15 ardente marks
+    the hull scored 0.83-0.99, a spread of 0.17 with everything bunched at the
+    top, because convexity forces high self-overlap whatever is inside it.
+    """
+
+    def _feature(self, draw, size: int = 128) -> np.ndarray:
+        mask = np.zeros((size, size), dtype=np.uint8)
+        draw(mask)
+        return mask > 0
+
+    def test_a_tilted_bar_reports_its_own_angle(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
-            edge_aligned_feature_outline,
-            feature_shape,
+            feature_symmetry_axis,
+        )
+        feature = self._feature(lambda m: cv2.fillConvexPoly(
+            m, cv2.boxPoints(((64.0, 64.0), (70.0, 16.0), 30.0)).astype(np.int32), 255
+        ))
+
+        axis = feature_symmetry_axis(feature, DEFAULT_CONFIG)
+
+        self.assertIsNotNone(axis)
+        self.assertAlmostEqual(axis.angle_degrees % 90.0, 30.0, delta=2.0)
+        self.assertGreater(axis.score, 0.9)
+
+    def test_a_disc_is_symmetric_about_everything_and_so_claims_nothing(self) -> None:
+        """A round mark peaks at an angle chosen by noise; spread catches it."""
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_symmetry_axis,
+        )
+        feature = self._feature(lambda m: cv2.circle(m, (64, 64), 40, 255, -1))
+
+        axis = feature_symmetry_axis(feature, DEFAULT_CONFIG)
+
+        self.assertIsNotNone(axis)
+        self.assertGreater(axis.score, 0.95)  # symmetric about every axis
+        self.assertGreater(axis.spread, DEFAULT_CONFIG.max_rotation_symmetry_spread)
+
+    def test_lettering_separates_by_whether_it_is_symmetric(self) -> None:
+        """The shape real marks actually take, rather than a solid blob."""
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_symmetry_axis,
         )
 
-        feature = np.zeros((256, 256), np.uint8)
-        cv2.line(feature, (70, 95), (150, 135), 255, 6)
-        mask = feature > 0
-        uv = np.zeros((256, 256), np.uint8)
-        cv2.fillPoly(
-            uv,
-            [np.asarray([(0, 76), (255, 204), (255, 255), (0, 255)], np.int32)],
+        def score(letter: str) -> float:
+            feature = self._feature(lambda m: cv2.putText(
+                m, letter, (30, 100), cv2.FONT_HERSHEY_SIMPLEX, 3.0, 255, 8
+            ))
+            axis = feature_symmetry_axis(feature, DEFAULT_CONFIG)
+            self.assertIsNotNone(axis, letter)
+            return axis.score
+
+        for letter in ("A", "T"):
+            self.assertGreater(score(letter), DEFAULT_CONFIG.min_rotation_symmetry, letter)
+        for letter in ("F", "L", "R"):
+            self.assertLess(score(letter), DEFAULT_CONFIG.min_rotation_symmetry, letter)
+
+    def test_a_solid_convex_blob_is_the_known_soft_spot(self) -> None:
+        """Recorded rather than fixed, because nothing here can fix it.
+
+        A convex shape overlaps its own reflection well however asymmetric it
+        is -- a scalene triangle measures about 0.78 -- so the score alone will
+        not reject one.  It does not need to: a solid convex blob is what
+        ``enable_blob_shape_filter`` exists to remove, and an angle on a shape
+        with no internal structure changes nothing when it is mirrored.
+        """
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_symmetry_axis,
+        )
+        feature = self._feature(lambda m: cv2.fillConvexPoly(
+            m, np.array([[64, 20], [100, 100], [50, 96]], dtype=np.int32), 255
+        ))
+
+        axis = feature_symmetry_axis(feature, DEFAULT_CONFIG)
+
+        self.assertIsNotNone(axis)
+        self.assertGreater(axis.score, 0.7)
+        self.assertLess(axis.score, 0.85)
+
+    def test_too_few_feature_pixels_conclude_nothing(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_symmetry_axis,
+        )
+        feature = np.zeros((32, 32), dtype=bool)
+        feature[4:6, 4:6] = True
+        self.assertIsNone(feature_symmetry_axis(feature, DEFAULT_CONFIG))
+
+
+    def test_the_numpy_hull_raster_matches_opencv(self) -> None:
+        """The fill is half-plane intersection, not cv2.fillConvexPoly."""
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            rasterise_convex_hull,
+        )
+        points = ((10, 12), (58, 10), (70, 44), (34, 60), (12, 40))
+
+        filled, origin = rasterise_convex_hull(points, 4096)  # 1 cell per pixel
+
+        reference = np.zeros(filled.shape, dtype=np.uint8)
+        cv2.fillConvexPoly(
+            reference,
+            (np.asarray(points, dtype=np.int32) - np.asarray(origin, dtype=np.int32)),
             255,
         )
-        config = replace(
-            DEFAULT_CONFIG,
-            enable_edge_aligned_rotation=True,
-            rotation_edge_search_px=18,
-            rotation_edge_band_px=5,
-            max_rotation_edge_angle_degrees=10.0,
+        overlap = (filled & (reference > 0)).sum()
+        union = (filled | (reference > 0)).sum()
+        self.assertGreater(overlap / union, 0.95)
+
+    def test_a_degenerate_hull_rasterises_to_nothing(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            rasterise_convex_hull,
         )
-        box = (65, 88, 95, 55)
-        shape = feature_shape(mask, box, config)
-        self.assertIsNotNone(shape)
-        alignment = edge_aligned_feature_outline(mask, uv > 0, box, shape, config)
-        self.assertIsNotNone(alignment)
-        self.assertLess(alignment.distance_px, config.rotation_edge_search_px)
-        self.assertLess(
-            alignment.angle_delta_degrees,
-            config.max_rotation_edge_angle_degrees,
+        self.assertIsNone(rasterise_convex_hull(((1, 1), (2, 2)), 64))
+        self.assertIsNone(rasterise_convex_hull(((1, 1), (1, 1), (1, 1)), 64))
+
+    def test_the_outline_keeps_the_mark_the_way_round_it_was(self) -> None:
+        """Extent is re-measured in the axis frame, never carried from the fit.
+
+        A fitted rectangle's size is expressed along *its* axes, so pasting a
+        different angle onto it leaves the two dimensions on the wrong sides;
+        and the symmetry angle turns the mirror line off vertical while
+        OpenCV's rectangle angle turns its width side off horizontal, which is
+        another 90 degrees apart.  Together they drew a portrait box around a
+        landscape mark.
+        """
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            feature_symmetry_axis, symmetry_aligned_outline,
         )
 
-        corners = alignment.outline
-        side_angle = np.degrees(
-            np.arctan2(
-                corners[1][1] - corners[0][1],
-                corners[1][0] - corners[0][0],
+        for angle in (0.0, 20.0, 70.0, 155.0):
+            mask = np.zeros((200, 200), dtype=np.uint8)
+            cv2.fillConvexPoly(
+                mask,
+                cv2.boxPoints(((100.0, 100.0), (90.0, 24.0), angle)).astype(np.int32),
+                255,
             )
-        ) % 180.0
-        self.assertAlmostEqual(side_angle, alignment.edge_angle_degrees, delta=0.01)
+            feature = mask > 0
+            axis = feature_symmetry_axis(feature, DEFAULT_CONFIG)
+            self.assertIsNotNone(axis, angle)
 
-    def test_edge_aligned_rotation_uses_uv_edge_when_glyph_angle_disagrees(self) -> None:
+            outline = symmetry_aligned_outline(feature, (0, 0), axis)
+
+            self.assertIsNotNone(outline, angle)
+            points = np.asarray(outline)
+            sides = [
+                float(np.hypot(*(points[(i + 1) % 4] - points[i]))) for i in range(4)
+            ]
+            longest, shortest = max(sides), min(sides)
+            # The bar is 90 x 24; the outline must come back that way round.
+            self.assertAlmostEqual(longest, 90.0, delta=4.0, msg=str(angle))
+            self.assertAlmostEqual(shortest, 24.0, delta=4.0, msg=str(angle))
+
+    def test_a_squarish_mark_is_not_gated_by_edge_fit_elongation(self) -> None:
+        """The case the symmetry path was adopted for.
+
+        ``min_rotated_elongation`` exists because the *edge fit* cannot claim a
+        direction for a squarish mark.  Symmetry can -- it carries its own
+        degeneracy guard -- so it must be asked before that gate, or it never
+        sees the marks it was brought in to handle.  The ardente's tilted
+        footwell-vent icon is aspect 1.76 against a gate of 2.5, and reads a
+        sharp axis 7.6 degrees off the atlas.
+        """
         from mesh_segmentation_transform.annotate_texture_regions import (
-            edge_aligned_feature_outline,
-            feature_shape,
+            DetectionState, _step_rotated_bounds,
         )
 
-        feature = np.zeros((160, 160), np.uint8)
-        cv2.line(feature, (80, 85), (80, 120), 255, 6)
-        mask = feature > 0
-        uv = np.zeros((160, 160), np.uint8)
-        cv2.fillPoly(
-            uv,
-            [np.asarray([(0, 20), (159, 100), (159, 159), (0, 159)], np.int32)],
-            255,
-        )
+        image = np.full((256, 256), 130, dtype=np.uint8)
+        # A squarish but plainly one-way mark: a wide bar over a narrow one,
+        # the whole thing turned well off axis.
+        for size, offset in (((90.0, 18.0), -22.0), ((40.0, 16.0), 14.0)):
+            cv2.fillConvexPoly(
+                image,
+                cv2.boxPoints(((128.0, 128.0 + offset), size, 8.0)).astype(np.int32),
+                30,
+            )
+        image = np.repeat(image[:, :, None], 3, axis=2)
+        group = (70, 80, 116, 96)
         config = replace(
-            DEFAULT_CONFIG,
-            enable_edge_aligned_rotation=True,
-            rotation_edge_search_px=30,
-            rotation_edge_band_px=5,
-            max_rotation_edge_angle_degrees=10.0,
+            MARKS_CONFIG,
+            enable_symmetry_rotation=True,
+            min_rotation_angle_degrees=0.5,
+            # Pinned rather than inherited: what is under test is that symmetry
+            # is asked before the elongation gate, not where the bar happens to
+            # sit today.
+            min_rotation_symmetry=0.70,
+            # A squarish region with quiet corners inscribes a circle, and that
+            # branch answers before any outline question is asked.  Not what is
+            # under test here.
+            enable_circular_groups=False,
         )
-        box = (72, 79, 18, 48)
-        shape = feature_shape(mask, box, config)
-        self.assertIsNotNone(shape)
-        alignment = edge_aligned_feature_outline(
-            mask, uv > 0, box, shape, config
-        )
-        self.assertIsNotNone(alignment)
-        assert alignment is not None
-        self.assertGreater(
-            alignment.angle_delta_degrees,
-            config.max_rotation_edge_angle_degrees,
-        )
-        self.assertAlmostEqual(alignment.edge_angle_degrees, 26.7, delta=2.0)
+        state = DetectionState(np.empty((0, 4), np.int32), [group])
 
-    def test_closest_uv_tangent_does_not_inherit_a_glyph_tilt(self) -> None:
+        _state, stage = _step_rotated_bounds(image, None, config, state)
+
+        self.assertEqual(len(stage.kept), 1)
+        self.assertIsNotNone(
+            stage.rotations[0],
+            f"squarish mark got no outline: {stage.detail}",
+        )
+
+
+class NegligibleRotationTests(unittest.TestCase):
+    """A rotation of a fraction of a degree is quantisation, not tilt.
+
+    Measured over the 147 marks the shipped plans flipped, 55% sit within a
+    quarter of a degree of an atlas axis; adopting such an angle resamples the
+    region when it is mirrored, softening every edge in it to move it nowhere.
+    """
+
+    def test_distance_is_measured_to_the_nearest_axis(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
-            edge_aligned_feature_outline,
-            feature_shape,
+            rotation_off_axis_degrees,
         )
+        for angle, expected in (
+            (0.0, 0.0), (0.3, 0.3), (89.7, 0.3), (90.0, 0.0),
+            (179.6, 0.4), (45.0, 45.0), (-0.4, 0.4), (135.0, 45.0),
+        ):
+            self.assertAlmostEqual(
+                rotation_off_axis_degrees(angle), expected, places=6, msg=str(angle)
+            )
 
-        feature = np.zeros((128, 192), np.uint8)
-        cv2.line(feature, (24, 62), (168, 54), 255, 5)
-        mask = feature > 0
-        uv = np.zeros((128, 192), np.uint8)
-        cv2.rectangle(uv, (0, 38), (191, 127), 255, -1)
-        config = replace(
-            DEFAULT_CONFIG,
-            enable_edge_aligned_rotation=True,
-            rotation_edge_search_px=30,
-            rotation_edge_band_px=5,
-            max_rotation_edge_angle_degrees=10.0,
-        )
-        box = (18, 48, 156, 22)
-        shape = feature_shape(mask, box, config)
-        self.assertIsNotNone(shape)
-        alignment = edge_aligned_feature_outline(
-            mask, uv > 0, box, shape, config
-        )
-
-        self.assertIsNotNone(alignment)
-        assert alignment is not None
-        self.assertGreater(alignment.angle_delta_degrees, 2.0)
-        self.assertAlmostEqual(alignment.edge_angle_degrees, 0.0, delta=0.25)
-
-    def test_edge_aligned_rotation_rejects_a_distant_edge(self) -> None:
+    def test_a_sub_degree_turn_is_declined(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
-            edge_aligned_feature_outline,
-            feature_shape,
+            _rotation_is_negligible,
         )
+        config = replace(DEFAULT_CONFIG, min_rotation_angle_degrees=0.5)
+        self.assertTrue(_rotation_is_negligible(0.2, config))
+        self.assertTrue(_rotation_is_negligible(89.9, config))
+        self.assertFalse(_rotation_is_negligible(0.6, config))
+        self.assertFalse(_rotation_is_negligible(20.0, config))
 
-        feature = np.zeros((128, 128), np.uint8)
-        cv2.line(feature, (20, 55), (100, 95), 255, 6)
-        mask = feature > 0
-        uv = np.zeros((128, 128), np.uint8)
-        cv2.fillPoly(
-            uv,
-            [np.asarray([(0, 20), (127, 84), (127, 127), (0, 127)], np.int32)],
-            255,
-        )
-        config = replace(
-            DEFAULT_CONFIG,
-            enable_edge_aligned_rotation=True,
-            rotation_edge_search_px=4,
-            rotation_edge_band_px=3,
-            max_rotation_edge_angle_degrees=10.0,
-        )
-        box = (15, 48, 95, 55)
-        shape = feature_shape(mask, box, config)
-        self.assertIsNotNone(shape)
-        self.assertIsNone(
-            edge_aligned_feature_outline(mask, uv > 0, box, shape, config)
-        )
-
-    def test_edge_aligned_rotation_rejects_a_touching_edge(self) -> None:
+    def test_a_zero_floor_disables_the_gate(self) -> None:
         from mesh_segmentation_transform.annotate_texture_regions import (
-            edge_aligned_feature_outline,
-            feature_shape,
+            _rotation_is_negligible,
         )
+        config = replace(DEFAULT_CONFIG, min_rotation_angle_degrees=0.0)
+        self.assertFalse(_rotation_is_negligible(0.0, config))
 
-        feature = np.zeros((128, 128), np.uint8)
-        cv2.line(feature, (20, 46), (100, 86), 255, 6)
-        mask = feature > 0
-        uv = np.zeros((128, 128), np.uint8)
-        cv2.fillPoly(
-            uv,
-            [np.asarray([(0, 36), (127, 100), (127, 127), (0, 127)], np.int32)],
-            255,
-        )
-        config = replace(
-            DEFAULT_CONFIG,
-            enable_edge_aligned_rotation=True,
-            rotation_edge_min_gap_px=2.0,
-            rotation_edge_search_px=18,
-            rotation_edge_band_px=5,
-            max_rotation_edge_angle_degrees=10.0,
-        )
-        box = (15, 39, 95, 55)
-        shape = feature_shape(mask, box, config)
-        self.assertIsNotNone(shape)
-        self.assertIsNone(
-            edge_aligned_feature_outline(mask, uv > 0, box, shape, config)
-        )
+    def test_an_axis_aligned_bar_keeps_its_box(self) -> None:
+        """The end-to-end case the gate exists for."""
+        image = np.full((512, 512), 128, dtype=np.uint8)
+        cv2.rectangle(image, (330, 220), (496, 246), 200, -1)
+        image = np.repeat(image[:, :, None], 3, axis=2)
+        config = replace(MARKS_CONFIG, min_rotation_angle_degrees=0.5)
 
-    def test_edge_aligned_rotation_rejects_a_two_sided_uv_strip(self) -> None:
-        from mesh_segmentation_transform.annotate_texture_regions import (
-            edge_aligned_feature_outline,
-            feature_shape,
-        )
+        run = run_detection(image, None, config)
 
-        feature = np.zeros((160, 160), np.uint8)
-        cv2.rectangle(feature, (72, 25), (88, 135), 255, -1)
-        mask = feature > 0
-        uv = np.zeros((160, 160), np.uint8)
-        cv2.rectangle(uv, (52, 0), (108, 159), 255, -1)
-        config = replace(
-            DEFAULT_CONFIG,
-            enable_edge_aligned_rotation=True,
-            rotation_edge_min_gap_px=2.0,
-            rotation_edge_search_px=24,
-            rotation_edge_band_px=5,
-            rotation_edge_min_points=8,
-            max_opposite_rotation_edge_fraction=0.5,
+        stage = run.stages[STEP_INDEX["rotated_bounds"]]
+        self.assertGreater(len(stage.kept), 0)
+        self.assertEqual([r for r in stage.rotations if r], [])
+        self.assertIn("straightened back to their box", stage.detail)
+
+    def test_the_same_bar_tilted_does_earn_an_outline(self) -> None:
+        image = np.full((512, 512), 128, dtype=np.uint8)
+        cv2.fillConvexPoly(
+            image,
+            cv2.boxPoints(((413.0, 233.0), (166.0, 26.0), 20.0)).astype(np.int32),
+            200,
         )
-        box = (68, 20, 25, 120)
-        shape = feature_shape(mask, box, config)
-        self.assertIsNotNone(shape)
-        self.assertIsNone(
-            edge_aligned_feature_outline(mask, uv > 0, box, shape, config)
-        )
+        image = np.repeat(image[:, :, None], 3, axis=2)
+        config = replace(MARKS_CONFIG, min_rotation_angle_degrees=0.5)
+
+        run = run_detection(image, None, config)
+
+        stage = run.stages[STEP_INDEX["rotated_bounds"]]
+        self.assertTrue([r for r in stage.rotations if r])
 
 
 def separated_marks(size: int = 512) -> np.ndarray:
@@ -1983,9 +2268,16 @@ def separated_marks(size: int = 512) -> np.ndarray:
     cv2.rectangle(image, (60, 240), (150, 330), 200, -1)    # square
     cv2.rectangle(image, (300, 300), (320, 320), 200, -1)   # small square
     cv2.line(image, (60, 420), (300, 430), 200, 10)         # long thin bar
-    # Elongated, solidly filled and axis-aligned: the one mark here that earns
-    # a rotated outline, so the adoption rules have something to accept.
-    cv2.rectangle(image, (330, 220), (496, 246), 200, -1)
+    # Elongated, solidly filled and genuinely tilted: the one mark here that
+    # earns a rotated outline, so the adoption rules have something to accept.
+    # It has to be off-axis to earn one -- an axis-aligned bar fits a rectangle
+    # turned by 0 degrees, which `min_rotation_angle_degrees` declines because
+    # a rotation of nothing only costs a resample.
+    cv2.fillConvexPoly(
+        image,
+        cv2.boxPoints(((413.0, 233.0), (166.0, 26.0), 20.0)).astype(np.int32),
+        200,
+    )
     return np.repeat(image[:, :, None], 3, axis=2)
 
 
@@ -2075,17 +2367,39 @@ class FeatureShapeTests(unittest.TestCase):
         return feature_shape(mask, box, replace(DEFAULT_CONFIG, **overrides))
 
     def test_the_hull_hugs_tighter_than_the_rectangle(self) -> None:
-        # The substantive reason to prefer it.  Measured on the ardente the
-        # hull is about four fifths of the rectangle's area; a cross is a
-        # sharper case of the same thing.
-        image = np.zeros((256, 256), np.uint8)
-        cv2.line(image, (60, 128), (200, 128), 255, 12)
-        cv2.line(image, (128, 60), (128, 200), 255, 12)
-        shape = self._shape(image > 0, (55, 55, 150, 150))
+        """Both descriptions are still available; the stage asks for one.
+
+        Nothing configurable chooses between them any more -- the rotated
+        rectangle is named at the call site -- but the shape can still describe
+        itself either way, and the hull is what the symmetry axis is read off.
+        """
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        cv2.fillConvexPoly(
+            mask, np.array([[20, 20], [44, 24], [40, 44], [22, 38]], np.int32), 255
+        )
+        shape = self._shape(mask > 0, (16, 16, 34, 34))
+
         self.assertIsNotNone(shape)
         self.assertLess(shape.hull_area, shape.rectangle_area)
-        self.assertGreater(shape.tightness("hull"), shape.tightness("rotated"))
+        self.assertGreater(shape.tightness(SHAPE_HULL), shape.tightness(SHAPE_ROTATED))
 
+    def test_the_shape_still_outlines_either_way(self) -> None:
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        cv2.fillConvexPoly(
+            mask, np.array([[20, 20], [44, 24], [40, 44], [22, 38]], np.int32), 255
+        )
+        box = (16, 16, 34, 34)
+
+        self.assertEqual(len(self._shape(mask > 0, box).outline(SHAPE_ROTATED)), 4)
+        self.assertGreater(len(self._shape(mask > 0, box).outline(SHAPE_HULL)), 4)
+
+    def test_the_rectangle_is_what_the_shape_reports_by_default(self) -> None:
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        cv2.rectangle(mask, (20, 20), (44, 44), 255, -1)
+        shape = self._shape(mask > 0, (16, 16, 34, 34))
+
+        self.assertEqual(shape.tightness(), shape.tightness(SHAPE_ROTATED))
+        self.assertEqual(shape.outline(), shape.outline(SHAPE_ROTATED))
     def test_the_rectangle_from_the_hull_matches_the_one_from_every_point(self) -> None:
         # Which is what makes taking both nearly free: rotating calipers over
         # a handful of hull points, not over thousands of texels.
@@ -2104,7 +2418,7 @@ class FeatureShapeTests(unittest.TestCase):
         image = np.zeros((128, 128), np.uint8)
         cv2.rectangle(image, (40, 40), (90, 90), 255, -1)
         shape = self._shape(image > 0, (38, 38, 55, 55))
-        self.assertGreater(shape.tightness("hull"), 0.9)
+        self.assertGreater(shape.tightness(), 0.9)
 
     def test_scattered_speckle_wraps_mostly_nothing(self) -> None:
         # The case the bar exists for: a boundary can be fitted, but it
@@ -2116,35 +2430,29 @@ class FeatureShapeTests(unittest.TestCase):
             image[y, x] = 255
         shape = self._shape(image > 0, (10, 10, 110, 110))
         self.assertIsNotNone(shape)
-        self.assertLess(shape.tightness("hull"), DEFAULT_CONFIG.min_feature_tightness)
+        self.assertLess(shape.tightness(), DEFAULT_CONFIG.min_feature_tightness)
 
     def test_tightness_over_one_is_normal(self) -> None:
-        # The hull is a polygon through pixel centres while the feature is
-        # counted in whole pixels, so a small solid mark can exceed 1.
+        # The rectangle is a polygon through pixel centres while the feature
+        # is counted in whole pixels, so a small solid mark can exceed 1.
         image = np.zeros((64, 64), np.uint8)
         cv2.rectangle(image, (28, 28), (34, 34), 255, -1)
         shape = self._shape(image > 0, (26, 26, 11, 11))
-        self.assertGreater(shape.tightness("hull"), 1.0)
-
-    def test_the_shape_choice_changes_the_outline(self) -> None:
-        image = np.zeros((256, 256), np.uint8)
-        cv2.line(image, (60, 128), (200, 128), 255, 12)
-        cv2.line(image, (128, 60), (128, 200), 255, 12)
-        mask = image > 0
-        box = (55, 55, 150, 150)
-        self.assertEqual(len(self._shape(mask, box).outline("rotated")), 4)
-        self.assertGreater(len(self._shape(mask, box).outline("hull")), 4)
+        self.assertGreater(shape.tightness(), 1.0)
 
     def test_the_region_is_kept_whichever_shape_is_adopted(self) -> None:
         # Declining the outline must not remove the region: how well a shape
         # describes a mark is not evidence about whether it is one.
+        #
+        # Tightness is the lever under test, and it gates the edge and plain
+        # paths only -- symmetry is asked ahead of it, deliberately, and would
+        # answer for both configurations here.
+        base = replace(MARKS_CONFIG, enable_symmetry_rotation=False)
         loose = run_detection(
-            separated_marks(), None,
-            replace(MARKS_CONFIG, min_feature_tightness=0.0),
+            separated_marks(), None, replace(base, min_feature_tightness=0.0),
         )
         strict = run_detection(
-            separated_marks(), None,
-            replace(MARKS_CONFIG, min_feature_tightness=1.5),
+            separated_marks(), None, replace(base, min_feature_tightness=1.5),
         )
         a = next(s for s in loose.stages if s.key == "rotated_bounds")
         b = next(s for s in strict.stages if s.key == "rotated_bounds")

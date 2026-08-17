@@ -708,6 +708,9 @@ def scan_vehicle_archive(
     vehicle archives. ``path`` is indexed first and wins duplicate virtual
     paths; dependency archives fill in anything the source zip does not ship.
     """
+    _ensure_repo_root_on_sys_path()
+    from beamxp.core.beam_json import parse_beamng_json
+
     ordered_paths: list[Path] = []
     seen_paths: set[str] = set()
 
@@ -741,6 +744,13 @@ def scan_vehicle_archive(
     material_switch_targets: dict[str, list[str]] = {}
     material_switch_states: dict[str, list[ArchiveMaterialSwitchState]] = {}
     material_switch_triggers: dict[str, list[str]] = {}
+    # The source ZIP is mounted before its dependencies and therefore owns a
+    # glowMap alias it defines.  Handles such as ``auto_D`` are intentionally
+    # generic and recur across stock vehicles; unioning their states across
+    # every mounted archive sends one mod's mesh through unrelated atlases.
+    # Definitions within the same archive may still be spread over parts and
+    # are merged as before.
+    material_switch_owner_archive: dict[str, int] = {}
     runtime_material_aliases: list[str] = []
     errors: list[str] = []
 
@@ -773,7 +783,14 @@ def scan_vehicle_archive(
                     continue
                 try:
                     raw = archive.read(member).decode("utf-8-sig")
-                    document = json.loads(raw)
+                    # BeamNG material files are SJSON, not strict JSON.  Use
+                    # the engine-compatible parser so valid comments and
+                    # trailing/missing commas do not make an entire material
+                    # file disappear from the archive index.
+                    document = parse_beamng_json(
+                        raw,
+                        label=f"{archive_path.name}:{member}",
+                    )
                 except Exception as exc:
                     errors.append(f"{archive_path.name}:{member}: {type(exc).__name__}: {exc}")
                     continue
@@ -823,6 +840,11 @@ def scan_vehicle_archive(
                     base_key = _normalise_material_alias(base)
                     if not base_key:
                         continue
+                    owner = material_switch_owner_archive.setdefault(
+                        base_key, archive_index
+                    )
+                    if owner != archive_index:
+                        continue
                     values = material_switch_targets.setdefault(base_key, [])
                     for target in targets:
                         target_key = _normalise_material_alias(target)
@@ -831,6 +853,11 @@ def scan_vehicle_archive(
                 for base, states in _jbeam_glowmap_switch_states(raw).items():
                     base_key = _normalise_material_alias(base)
                     if not base_key:
+                        continue
+                    owner = material_switch_owner_archive.setdefault(
+                        base_key, archive_index
+                    )
+                    if owner != archive_index:
                         continue
                     values = material_switch_states.setdefault(base_key, [])
                     for state in states:
@@ -846,6 +873,11 @@ def scan_vehicle_archive(
                 for base, triggers in _jbeam_glowmap_switch_triggers(raw).items():
                     base_key = _normalise_material_alias(base)
                     if not base_key:
+                        continue
+                    owner = material_switch_owner_archive.setdefault(
+                        base_key, archive_index
+                    )
+                    if owner != archive_index:
                         continue
                     values = material_switch_triggers.setdefault(base_key, [])
                     for trigger in triggers:
@@ -4826,20 +4858,15 @@ def export_transformed_part_dae(
                 reverse_winding=False,
                 source_value_cache=source_value_cache,
             )
-            uv_flip = _flip_material_texcoord_islands(
-                geometry,
-                namespace,
-                runtime_display_uv_flip_materials or set(),
-            )
-            if uv_flip["matched_materials"]:
-                uv_flip.update(
-                    {
-                        "geometry_id": geometry_id,
-                        "role": "rigid_symmetric",
-                        "candidate_id": candidate_id,
-                    }
-                )
-                runtime_display_uv_flips.append(uv_flip)
+            # No UV flip here.  The flip exists to undo a reflection the
+            # carrier applies to a live display's texture coordinates, and a
+            # rigid candidate is never reflected: `_candidate_rigid_transform`
+            # composes G L into a determinant +1 placement precisely so a
+            # text-bearing island reaches the other side without mirroring.
+            # Flipping it anyway mirrors a screen that was already the right
+            # way round -- the Ardente's satnav sits on its own centreline, so
+            # its rigid transform is the identity, and it shipped backwards
+            # while the gauge cluster on the carrier beside it read correctly.
             generated_geometries.append(geometry)
             generated_geometry_ids.append(geometry_id)
             instance_geometry_ids.append(geometry_id)

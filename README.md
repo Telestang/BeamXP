@@ -2,7 +2,7 @@
 
 **BeamXP (BeamNG Vehicle eXPort Services)** converts BeamNG.drive vehicles between left-hand drive and right-hand drive, with automatic correction of meshes, textures, controls, cameras, mirrors, lighting, configuration parts, and licence plates.
 
-**[Download BeamXP 0.3.2-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.2-alpha-windows.zip)** — extract it anywhere and run the exe.
+**[Download BeamXP 0.3.3-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.3-alpha-windows.zip)** — extract it anywhere and run the exe.
 
 > BeamXP was previously named **BeamHDC (BeamNG Hand Drive Converter)**.
 
@@ -28,7 +28,7 @@ The old **39 trims in 4 minutes 30 seconds** figure is no longer used as a bench
 
 ## Quick Start
 
-1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.2-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
+1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.3-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
 2. Open the app settings and configure:
    - your BeamNG vehicle-content folder;
    - your BeamNG mods folder.
@@ -52,6 +52,31 @@ Enjoying driving from the other side? Star the repo to help other people find it
 ## What's New in 0.3.x
 
 The 0.3 line is a major conversion-quality and workflow overhaul. It introduced automatic mesh and texture correction, then spent the releases since making that pipeline correct and affordable — much of it found while converting the Lexus LC500 and Civetta Scintilla.
+
+### Better glyph detection, and glyphs land where they belong
+
+0.3.3-alpha is a texture-correction release on two fronts: **finding the glyphs**
+— the text, symbols and markings that must not end up mirrored — and **mapping a
+correction back onto the mesh that actually uses the texture**, so the corrected
+detail appears in the right place on the converted vehicle rather than shifted,
+scaled, or applied to a neighbouring trim piece.
+
+Interiors that previously came out with mirrored labels, or with corrected
+patches sitting slightly off their intended features, come out noticeably
+cleaner. Across the test vehicles this is an across-the-board improvement over
+0.3.2-alpha.
+
+**It is not issue-free.** Two known gaps are being carried into the next
+release rather than held back:
+
+- **Digital gauge clusters are not corrected.** Screen-style instrument panels
+  are still missed by detection, so their readouts and legends can remain
+  mirrored on a converted vehicle.
+- **Glyph and text angle detection needs further work.** Markings that sit at an
+  angle — raked dial faces, slanted lettering, text following a curved surface —
+  are less reliably recognised and corrected than upright ones.
+
+Both are planned for the next release.
 
 ### Repeating material is no longer mistaken for lettering
 
@@ -858,6 +883,8 @@ If you encounter a vehicle that does not convert correctly, please report it. Re
 - Automatic headlight handedness conversion depends on the source vehicle using BeamNG's vanilla headlight-pattern implementation.
 - Rear custom plates do not currently reproduce the same emboss treatment as the front plate.
 - Automatic texture correction is computationally more expensive than the old whole-mesh mirroring path.
+- Digital/screen-style gauge clusters are not currently picked up by texture correction and may stay mirrored. A fix is planned for the next release.
+- Glyphs and text set at an angle are detected less reliably than upright markings, so some angled lettering may be left uncorrected. Improvement is planned for the next release.
 
 The previous RHD driver-camera lean bug is **not** a current BeamXP limitation: BeamNG fixed it officially in version 0.39.3.
 

@@ -44,6 +44,80 @@ def _screen_quad_dae(u_low: float, u_high: float) -> str:
     """
 
 
+def _combined_screen_dae(
+    first_material: str,
+    second_material: str,
+) -> str:
+    """A generated-mesh fixture with two independently scoped UV islands."""
+    return f"""<?xml version="1.0"?>
+    <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
+      <asset><unit meter="1"/></asset>
+      <library_geometries>
+        <geometry id="combined_screen" name="combined_screen">
+          <mesh>
+            <source id="combined_screen-positions">
+              <float_array id="combined_screen-positions-array" count="24">
+                -1 0 0  0 0 0  0 0 1  -1 0 1
+                 0 0 0  1 0 0  1 0 1   0 0 1
+              </float_array>
+              <technique_common>
+                <accessor source="#combined_screen-positions-array" count="8" stride="3">
+                  <param name="X" type="float"/><param name="Y" type="float"/>
+                  <param name="Z" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <source id="combined_screen-map">
+              <float_array id="combined_screen-map-array" count="16">
+                0.1 0.2  0.9 0.2  0.9 0.8  0.1 0.8
+                1.1 0.2  1.9 0.2  1.9 0.8  1.1 0.8
+              </float_array>
+              <technique_common>
+                <accessor source="#combined_screen-map-array" count="8" stride="2">
+                  <param name="S" type="float"/><param name="T" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <vertices id="combined_screen-vertices">
+              <input semantic="POSITION" source="#combined_screen-positions"/>
+            </vertices>
+            <triangles material="{first_material}-material" count="2">
+              <input semantic="VERTEX" source="#combined_screen-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#combined_screen-map" offset="1" set="0"/>
+              <p>0 0 1 1 2 2  0 0 2 2 3 3</p>
+            </triangles>
+            <triangles material="{second_material}-material" count="2">
+              <input semantic="VERTEX" source="#combined_screen-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#combined_screen-map" offset="1" set="0"/>
+              <p>4 4 5 5 6 6  4 4 6 6 7 7</p>
+            </triangles>
+          </mesh>
+        </geometry>
+      </library_geometries>
+      <library_visual_scenes>
+        <visual_scene id="Scene">
+          <node id="lc500_interior" name="lc500_interior">
+            <matrix>1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</matrix>
+            <instance_geometry url="#combined_screen"/>
+          </node>
+        </visual_scene>
+      </library_visual_scenes>
+      <scene><instance_visual_scene url="#Scene"/></scene>
+    </COLLADA>
+    """
+
+
+def _combined_screen_s_values(path: Path) -> list[float]:
+    root = ET.parse(path).getroot()
+    source = root.find(
+        ".//c:source[@id='combined_screen-map']/c:float_array",
+        core.NS,
+    )
+    if source is None or source.text is None:
+        raise AssertionError("generated DAE lost the combined screen UV source")
+    return [float(value) for value in source.text.split()][0::2]
+
+
 def minimal_context(tmp: Path) -> VehicleContext:
     source_zip = tmp / "vehicle.zip"
     source_zip.write_bytes(b"placeholder")
@@ -137,7 +211,9 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 )
             output = tmp / "out" / "vehicles" / "lc500"
             output.mkdir(parents=True)
-            target_mesh = core.generated_mesh_name("lc500_interior", core.HAND_RHD)
+            target_mesh = core.generated_mesh_name("lc500_screen", core.HAND_RHD)
+            split_screen_mesh = "lc500_screen__beamxp_mirrored_carrier"
+            other_mesh = core.generated_mesh_name("lc500_body", core.HAND_RHD)
             generated_jbeam = output / "handdrive_visual_conversion.jbeam"
             generated_jbeam.write_text(
                 '{"lc500":{"slotType":"main","flexbodies":[["mesh","[group]:"],["'
@@ -145,11 +221,11 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 + '",["lc500_body"]]]},'
                 '"lc500_body_xp_rhd":{"slotType":"lc500_body",'
                 '"flexbodies":[["mesh","[group]:"],["'
-                + target_mesh
+                + other_mesh
                 + '",["lc500_body"]]]},'
                 '"lc500_interior_xp_rhd":{"slotType":"lc500_interior",'
                 '"flexbodies":[["mesh","[group]:"],["'
-                + target_mesh
+                + split_screen_mesh
                 + '",["lc500_body"]]],'
                 # Texture correction runs first and has already claimed the
                 # "off" state; isolating the live state must not undo that.
@@ -166,7 +242,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 variants={},
                 objects={},
                 preview_by_id={
-                    "lc500_interior": {"materials": ["lc500_centralscreen"]}
+                    "lc500_screen": {"materials": ["lc500_centralscreen"]}
                 },
                 jbeam_texts={"vehicles/lc500/lc500.jbeam": source_jbeam},
                 node_positions={},
@@ -179,8 +255,9 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             report = build_pipeline.isolate_converted_runtime_screens(
                 context,
                 output,
-                {"lc500_interior"},
+                {"lc500_screen"},
                 {core.HAND_RHD},
+                generated_mesh_replacements={target_mesh: [split_screen_mesh]},
             )
             patched = generated_jbeam.read_text(encoding="utf-8")
             materials = json.loads(
@@ -197,6 +274,523 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertEqual(materials[target_alias]["Stages"][0]["colorMap"], "@" + target_alias)
         self.assertIn('"off":"lc500_screens_off_beamxp_tc"', patched)
         self.assertNotIn('"on_intense":"lc500_GPS"', patched)
+        # Mesh and part identities are independent, and texture correction may
+        # have replaced the generated mesh with a split carrier before runtime
+        # isolation runs.  The containing generated interior part still owns
+        # the navigator controller/glow rebind.
+        self.assertIn(split_screen_mesh, patched)
+        self.assertEqual(patched.count(target_mesh), 1)  # untouched donor row only
+
+    def test_direct_navigator_binding_survives_stale_child_and_clones_dim_state(self) -> None:
+        """A child glowMap cannot hand a private screen back to the donor tag."""
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            source = tmp / "vivace.zip"
+            source_jbeam = r'''
+            {
+              "ardente_dash": {
+                "slotType":"ardente_dash",
+                "controller":[["fileName"], ["beamNavigator", {
+                  "screenMaterialName":"@ardente_gps_screen",
+                  "htmlFilePath":"local://local/vehicles/vivace/ardente/nav.html",
+                  "name":"ardente_navi"
+                }]],
+                "glowMap":{
+                  "ardente_gps_screen":{"simpleFunction":{"ignitionLevel":0.1},
+                    "off":"screen_off", "on":"ardente_gps_screen",
+                    "on_intense":"ardente_gps_screen_dim"}
+                }
+              },
+              "ardente_screen_branding": {
+                "slotType":"ardente_screen_branding",
+                "glowMap":{
+                  "ardente_gps_screen":{"simpleFunction":{"ignitionLevel":0.1},
+                    "off":"screen_off", "on":"ardente_gps_screen",
+                    "on_intense":"ardente_gps_screen_dim"}
+                }
+              }
+            }
+            '''
+            source_materials = {
+                "ardente_gps_screen": {
+                    "name": "ardente_gps_screen",
+                    "mapTo": "ardente_gps_screen",
+                    "class": "Material",
+                    "Stages": [{"emissiveMap": "@ardente_gps_screen"}],
+                },
+                "ardente_gps_screen_dim": {
+                    "name": "ardente_gps_screen_dim",
+                    "mapTo": "ardente_gps_screen_dim",
+                    "class": "Material",
+                    "Stages": [{"emissiveMap": "@ardente_gps_screen"}],
+                },
+                "screen_off": {
+                    "name": "screen_off",
+                    "mapTo": "screen_off",
+                    "class": "Material",
+                    "Stages": [{"baseColorMap": "screen_off.dds"}],
+                },
+            }
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("vehicles/vivace/ardente/interior.jbeam", source_jbeam)
+                archive.writestr(
+                    "vehicles/vivace/ardente/screens.materials.json",
+                    json.dumps(source_materials),
+                )
+
+            output = tmp / "out" / "vehicles" / "vivace"
+            output.mkdir(parents=True)
+            source_mesh = "ardente_screens"
+            generated_mesh = core.generated_mesh_name(source_mesh, core.HAND_RHD)
+            split_mesh = "ardente_screens__beamxp_mirrored_carrier"
+            generated_jbeam = output / "handdrive_visual_conversion.jbeam"
+            generated_jbeam.write_text(
+                f'''{{
+                  "ardente_dash_xp_rhd": {{
+                    "slotType":"ardente_dash",
+                    "flexbodies":[["mesh","[group]:"],
+                      ["{split_mesh}",["ardente_dash"]]],
+                    "controller":[["fileName"],["beamNavigator",{{
+                      "screenMaterialName":"@ardente_gps_screen",
+                      "htmlFilePath":"local://local/vehicles/vivace/ardente/nav.html",
+                      "name":"ardente_navi"}}]],
+                    "glowMap":{{"ardente_gps_screen":{{
+                      "simpleFunction":{{"ignitionLevel":0.1}},
+                      "off":"screen_off", "on":"ardente_gps_screen",
+                      "on_intense":"ardente_gps_screen_dim"}}}}
+                  }},
+                  "ardente_screen_branding": {{
+                    "slotType":"ardente_screen_branding",
+                    "glowMap":{{"ardente_gps_screen":{{
+                      "off":"screen_off", "on":"ardente_gps_screen",
+                      "on_intense":"ardente_gps_screen_dim"}}}}
+                  }}
+                }}''',
+                encoding="utf-8",
+            )
+            generated_dae = output / "ardente_handdrive.dae"
+            generated_dae.write_text(
+                f'''<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
+                  <library_effects><effect id="ardente-screen-effect"/></library_effects>
+                  <library_materials>
+                    <material id="ardente_gps_screen-material" name="ardente_gps_screen">
+                      <instance_effect url="#ardente-screen-effect"/>
+                    </material>
+                  </library_materials>
+                  <library_geometries><geometry id="shared-screen"><mesh>
+                    <triangles material="ardente_gps_screen-material" count="0"/>
+                  </mesh></geometry></library_geometries>
+                  <library_visual_scenes><visual_scene id="Scene">
+                    <node id="{split_mesh}" name="{split_mesh}">
+                      <instance_geometry url="#shared-screen"><bind_material>
+                        <technique_common><instance_material
+                          symbol="ardente_gps_screen-material"
+                          target="#ardente_gps_screen-material"/>
+                        </technique_common></bind_material>
+                      </instance_geometry>
+                    </node>
+                    <node id="stock_screen" name="stock_screen">
+                      <instance_geometry url="#shared-screen"><bind_material>
+                        <technique_common><instance_material
+                          symbol="ardente_gps_screen-material"
+                          target="#ardente_gps_screen-material"/>
+                        </technique_common></bind_material>
+                      </instance_geometry>
+                    </node>
+                  </visual_scene></library_visual_scenes>
+                </COLLADA>''',
+                encoding="utf-8",
+            )
+            context = VehicleContext(
+                source_zip=source,
+                vehicle_id="vivace",
+                vehicle_path="vehicles/vivace",
+                dae_paths=[],
+                variants={},
+                objects={},
+                preview_by_id={source_mesh: {"materials": ["ardente_gps_screen"]}},
+                jbeam_texts={"vehicles/vivace/ardente/interior.jbeam": source_jbeam},
+                node_positions={},
+                project_dir=tmp,
+                part_body_index={
+                    "ardente_dash": (source_jbeam, "vehicles/vivace/ardente/interior.jbeam")
+                },
+            )
+
+            report = build_pipeline.isolate_converted_runtime_screens(
+                context,
+                output,
+                {source_mesh},
+                {core.HAND_RHD},
+                generated_mesh_replacements={generated_mesh: [split_mesh]},
+            )
+            patched = generated_jbeam.read_text(encoding="utf-8")
+            materials = json.loads(
+                (output / "beamxp_runtime_screens.materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            suffix = build_pipeline.mod_id_for_context(context).lower()
+            target_alias = f"ardente_gps_screen_beamxp_{suffix}"
+            target_dim = f"ardente_gps_screen_dim_beamxp_{suffix}"
+            symbols = build_pipeline._node_material_symbols(
+                generated_dae, {split_mesh, "stock_screen"}
+            )
+
+        self.assertTrue(report["enabled"])
+        self.assertEqual(symbols[split_mesh], {target_alias})
+        # The shared geometry was copied before retargeting; the stock consumer
+        # remains on its authored material.
+        self.assertEqual(symbols["stock_screen"], {"ardente_gps_screen"})
+        self.assertEqual(
+            materials[target_alias]["Stages"][0]["emissiveMap"], "@" + target_alias
+        )
+        self.assertEqual(
+            materials[target_dim]["Stages"][0]["emissiveMap"], "@" + target_alias
+        )
+        self.assertIn('"' + target_alias + '":{', patched)
+        self.assertIn('"on":"' + target_alias + '"', patched)
+        self.assertIn('"on_intense":"' + target_dim + '"', patched)
+        self.assertEqual(len(report["colladaRetargets"]), 1)
+        # The ungenerated branding part deliberately remains stale.  It can no
+        # longer affect the converted mesh because that mesh binds target_alias.
+        branding = build_pipeline.transform_helpers.extract_keyed_object(
+            patched, "ardente_screen_branding"
+        )
+        self.assertIsNotNone(branding)
+        self.assertIn('"on_intense":"ardente_gps_screen_dim"', branding)
+
+    def test_switched_navigator_rebinds_reachable_texture_correction_fork(self) -> None:
+        """A split screen's private glow handle must own the live state too."""
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            source = tmp / "vehicle.zip"
+            source_jbeam = r'''
+            {
+              "car_interior": {
+                "slotType":"car_interior",
+                "controller":[["fileName"], ["beamNavigator", {
+                  "screenMaterialName":"@car_nav_screen",
+                  "htmlFilePath":"local://local/vehicles/car/nav.html",
+                  "name":"car_nav"
+                }]],
+                "glowMap":{
+                  "car_nav_screen":{"simpleFunction":{"ignitionLevel":0.5},
+                    "off":"car_black", "on":"car_idle_screen",
+                    "on_intense":"car_nav_screen"}
+                }
+              }
+            }
+            '''
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("vehicles/car/interior.jbeam", source_jbeam)
+                archive.writestr(
+                    "vehicles/car/screens.materials.json",
+                    json.dumps(
+                        {
+                            "car_nav_screen": {
+                                "name": "car_nav_screen",
+                                "mapTo": "car_nav_screen",
+                                "Stages": [{"colorMap": "@car_nav_screen"}],
+                            }
+                        }
+                    ),
+                )
+
+            output = tmp / "out" / "vehicles" / "car"
+            output.mkdir(parents=True)
+            source_mesh = "car_screen"
+            generated_mesh = core.generated_mesh_name(source_mesh, core.HAND_RHD)
+            split_mesh = "car_screen__beamxp_mirrored_carrier"
+            fork_material = "car_nav_screen_beamxp_tc"
+            generated_jbeam = output / "handdrive_visual_conversion.jbeam"
+            generated_jbeam.write_text(
+                f'''{{
+                  "car_body_xp_rhd": {{
+                    "slotType":"car_body",
+                    "flexbodies":[["mesh","[group]:"],
+                      ["car_body_xp_rhd",["car_body"]]],
+                    "glowMap":{{"{fork_material}":{{
+                      "simpleFunction":{{"ignitionLevel":0.5}},
+                      "off":"car_body_black_beamxp_tc",
+                      "on":"car_body_idle_beamxp_tc",
+                      "on_intense":"{fork_material}"}}}}
+                  }},
+                  "car_interior_xp_rhd": {{
+                    "slotType":"car_interior",
+                    "flexbodies":[["mesh","[group]:"],
+                      ["{split_mesh}",["car_body"]]],
+                    "controller":[["fileName"],["beamNavigator",{{
+                      "screenMaterialName":"@car_nav_screen",
+                      "htmlFilePath":"local://local/vehicles/car/nav.html",
+                      "name":"car_nav"}}]],
+                    "glowMap":{{"{fork_material}":{{
+                      "simpleFunction":{{"ignitionLevel":0.5}},
+                      "off":"car_black",
+                      "on":"car_idle_screen_beamxp_tc",
+                      "on_intense":"{fork_material}"}}}}
+                  }},
+                  "car_door_xp_rhd": {{
+                    "slotType":"car_door",
+                    "flexbodies":[["mesh","[group]:"],
+                      ["car_door_xp_rhd",["car_body"]]],
+                    "glowMap":{{"{fork_material}":{{
+                      "simpleFunction":{{"ignitionLevel":0.5}},
+                      "off":"car_door_black_beamxp_tc",
+                      "on":"car_door_idle_beamxp_tc",
+                      "on_intense":"{fork_material}"}}}}
+                  }}
+                }}''',
+                encoding="utf-8",
+            )
+            generated_dae = output / "car_handdrive.dae"
+            generated_dae.write_text(
+                f'''<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
+                  <library_geometries>
+                    <geometry id="screen-geometry"><mesh>
+                      <triangles material="{fork_material}-material" count="0"/>
+                    </mesh></geometry>
+                  </library_geometries>
+                  <library_visual_scenes><visual_scene id="Scene">
+                    <node id="{split_mesh}" name="{split_mesh}">
+                      <instance_geometry url="#screen-geometry"/>
+                    </node>
+                  </visual_scene></library_visual_scenes>
+                </COLLADA>''',
+                encoding="utf-8",
+            )
+            context = VehicleContext(
+                source_zip=source,
+                vehicle_id="car",
+                vehicle_path="vehicles/car",
+                dae_paths=[],
+                variants={},
+                objects={},
+                preview_by_id={source_mesh: {"materials": ["car_nav_screen"]}},
+                jbeam_texts={"vehicles/car/interior.jbeam": source_jbeam},
+                node_positions={},
+                project_dir=tmp,
+                part_body_index={
+                    "car_interior": (source_jbeam, "vehicles/car/interior.jbeam")
+                },
+            )
+
+            report = build_pipeline.isolate_converted_runtime_screens(
+                context,
+                output,
+                {source_mesh},
+                {core.HAND_RHD},
+                generated_mesh_replacements={generated_mesh: [split_mesh]},
+                generated_switch_forks=[
+                    {
+                        "alias": "car_nav_screen",
+                        "material": fork_material,
+                        "partKeys": [source_mesh],
+                        "states": {
+                            "car_idle_screen": "car_idle_screen_beamxp_tc"
+                        },
+                    }
+                ],
+            )
+            patched = generated_jbeam.read_text(encoding="utf-8")
+            part_bodies = {
+                part_id: build_pipeline.transform_helpers.extract_keyed_object(
+                    patched, part_id
+                )
+                for part_id in (
+                    "car_body_xp_rhd",
+                    "car_interior_xp_rhd",
+                    "car_door_xp_rhd",
+                )
+            }
+            glow_entries_by_part = {}
+            for part_id, part_body in part_bodies.items():
+                self.assertIsNotNone(part_body)
+                glow = build_pipeline.transform_helpers.extract_keyed_object(
+                    part_body, "glowMap"
+                )
+                self.assertIsNotNone(glow)
+                glow_entries_by_part[part_id] = {
+                    key: value
+                    for key, _start, _end, value in (
+                        build_pipeline._top_level_jbeam_object_entries(glow)
+                    )
+                }
+            bound_symbols = build_pipeline._node_material_symbols(
+                generated_dae, {split_mesh}
+            )[split_mesh]
+
+        target_alias = report["materials"][0]
+        self.assertEqual(bound_symbols, {fork_material})
+        expected_static_states = {
+            "car_body_xp_rhd": (
+                "car_body_black_beamxp_tc",
+                "car_body_idle_beamxp_tc",
+            ),
+            "car_interior_xp_rhd": ("car_black", "car_idle_screen_beamxp_tc"),
+            "car_door_xp_rhd": (
+                "car_door_black_beamxp_tc",
+                "car_door_idle_beamxp_tc",
+            ),
+        }
+        for part_id, (off_material, on_material) in expected_static_states.items():
+            glow_entries = glow_entries_by_part[part_id]
+            self.assertEqual(set(glow_entries), {fork_material})
+            reachable = glow_entries[fork_material]
+            self.assertIn('"off":"' + off_material + '"', reachable)
+            self.assertIn('"on":"' + on_material + '"', reachable)
+            self.assertIn('"on_intense":"' + target_alias + '"', reachable)
+
+        # JBeam merges every selected part's glowMap into one table, so every
+        # duplicate fork row must agree.  Controller ownership is narrower:
+        # only the part carrying the converted screen mesh gets the navigator.
+        self.assertIn('"screenMaterialName":"@' + target_alias + '"', patched)
+        self.assertEqual(patched.count('"screenMaterialName":"@' + target_alias + '"'), 1)
+        self.assertNotIn('"screenMaterialName":"@car_nav_screen"', patched)
+        self.assertEqual(patched.count('["beamNavigator"'), 1)
+        self.assertNotIn('"controller"', part_bodies["car_body_xp_rhd"])
+        self.assertNotIn('"controller"', part_bodies["car_door_xp_rhd"])
+
+    def test_runtime_screen_patch_adds_missing_parent_glowmap(self) -> None:
+        target_mesh = "car_screen_xp_rhd"
+        updated, changed = build_pipeline._patch_runtime_screen_parts(
+            '{"car_interior_xp_rhd":{"slotType":"car_interior",'
+            '"flexbodies":[["mesh","[group]:"],'
+            f'["{target_mesh}",["car_body"]]]}}',
+            [
+                {
+                    "sourceAlias": "car_nav_screen",
+                    "targetAlias": "car_nav_screen_beamxp_conversion",
+                    "controllerRow": (
+                        '["beamNavigator", {'
+                        '"screenMaterialName":"@car_nav_screen_beamxp_conversion"}]'
+                    ),
+                    "glowEntries": {
+                        "car_nav_screen": (
+                            '{"off":"car_black",'
+                            '"on":"car_nav_screen_beamxp_conversion"}'
+                        )
+                    },
+                    "targetMeshes": [target_mesh],
+                    "switchForks": [],
+                }
+            ],
+        )
+
+        self.assertEqual(changed, 1)
+        self.assertIn('"glowMap":{', updated)
+        self.assertIn('"car_nav_screen":{', updated)
+        self.assertIn('"on":"car_nav_screen_beamxp_conversion"', updated)
+
+    def test_each_navigator_is_rebound_only_on_its_own_screen_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            source = tmp / "two_navs.zip"
+            source_jbeam = r'''
+            {
+              "nav_a": {
+                "slotType":"nav_a",
+                "controller":[["fileName"], ["beamNavigator", {
+                  "screenMaterialName":"@canvas_a", "name":"nav_a"
+                }]],
+                "glowMap":{"screen_a":{"off":"black", "on":"canvas_a"}}
+              },
+              "nav_b": {
+                "slotType":"nav_b",
+                "controller":[["fileName"], ["beamNavigator", {
+                  "screenMaterialName":"@canvas_b", "name":"nav_b"
+                }]],
+                "glowMap":{"screen_b":{"off":"black", "on":"canvas_b"}}
+              }
+            }
+            '''
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("vehicles/two/navs.jbeam", source_jbeam)
+                archive.writestr(
+                    "vehicles/two/main.materials.json",
+                    json.dumps(
+                        {
+                            alias: {
+                                "name": alias,
+                                "mapTo": alias,
+                                "Stages": [{"colorMap": "@" + alias}],
+                            }
+                            for alias in ("canvas_a", "canvas_b")
+                        }
+                    ),
+                )
+
+            output = tmp / "out" / "vehicles" / "two"
+            output.mkdir(parents=True)
+            mesh_a = core.generated_mesh_name("screen_mesh_a", core.HAND_RHD)
+            mesh_b = core.generated_mesh_name("screen_mesh_b", core.HAND_RHD)
+            generated_jbeam = output / "handdrive_visual_conversion.jbeam"
+            generated_jbeam.write_text(
+                '{"interior_a_xp_rhd":{"slotType":"interior_a",'
+                '"flexbodies":[["mesh","[group]:"],'
+                f'["{mesh_a}",["body"]]],'
+                '"glowMap":{"screen_a":'
+                '{"off":"black_beamxp_tc", "on":"canvas_a"}}},'
+                '"interior_b_xp_rhd":{"slotType":"interior_b",'
+                '"flexbodies":[["mesh","[group]:"],'
+                f'["{mesh_b}",["body"]]],'
+                '"glowMap":{"screen_b":'
+                '{"off":"black_beamxp_tc", "on":"canvas_b"}}}}',
+                encoding="utf-8",
+            )
+            context = VehicleContext(
+                source_zip=source,
+                vehicle_id="two",
+                vehicle_path="vehicles/two",
+                dae_paths=[],
+                variants={},
+                objects={},
+                preview_by_id={
+                    "screen_mesh_a": {"materials": ["screen_a"]},
+                    "screen_mesh_b": {"materials": ["screen_b"]},
+                },
+                jbeam_texts={"vehicles/two/navs.jbeam": source_jbeam},
+                node_positions={},
+                project_dir=tmp,
+                part_body_index={
+                    "nav_a": (
+                        r'''"nav_a":{"slotType":"nav_a",
+                        "controller":[["fileName"],["beamNavigator",{
+                        "screenMaterialName":"@canvas_a","name":"nav_a"}]],
+                        "glowMap":{"screen_a":{"off":"black","on":"canvas_a"}}}''',
+                        "vehicles/two/navs.jbeam",
+                    ),
+                    "nav_b": (
+                        r'''"nav_b":{"slotType":"nav_b",
+                        "controller":[["fileName"],["beamNavigator",{
+                        "screenMaterialName":"@canvas_b","name":"nav_b"}]],
+                        "glowMap":{"screen_b":{"off":"black","on":"canvas_b"}}}''',
+                        "vehicles/two/navs.jbeam",
+                    ),
+                },
+            )
+
+            build_pipeline.isolate_converted_runtime_screens(
+                context,
+                output,
+                {"screen_mesh_a", "screen_mesh_b"},
+                {core.HAND_RHD},
+            )
+            patched = generated_jbeam.read_text(encoding="utf-8")
+            suffix = build_pipeline.mod_id_for_context(context).lower()
+
+        alias_a = f"canvas_a_beamxp_{suffix}"
+        alias_b = f"canvas_b_beamxp_{suffix}"
+        split = patched.index('"interior_b_xp_rhd"')
+        part_a, part_b = patched[:split], patched[split:]
+        self.assertIn(alias_a, part_a)
+        self.assertNotIn(alias_b, part_a)
+        self.assertIn(alias_b, part_b)
+        self.assertNotIn(alias_a, part_b)
+        self.assertEqual(patched.count('"screenMaterialName":"@' + alias_a + '"'), 1)
+        self.assertEqual(patched.count('"screenMaterialName":"@' + alias_b + '"'), 1)
 
     def test_lua_owned_runtime_tag_gets_a_conversion_copy_of_its_controller(self) -> None:
         # The LC500's cluster tag lives in the mod's own controller Lua, not in
@@ -228,6 +822,13 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             with zipfile.ZipFile(source, "w") as archive:
                 archive.writestr("vehicles/lc500/lc500_interior.jbeam", source_jbeam)
                 archive.writestr(
+                    "vehicles/lc500/lc500.dae",
+                    _combined_screen_dae(
+                        "lc500_screen_off",
+                        "lc500_trim",
+                    ),
+                )
+                archive.writestr(
                     "vehicles/lc500/lua/controller/LEX_LC500_21.lua", controller_lua
                 )
                 archive.writestr(
@@ -238,6 +839,22 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                     "vehicles/lc500/main.materials.json",
                     json.dumps(
                         {
+                            # This is the DAE-bound glow base.  Giving it an
+                            # emissive screen stage puts this exact alias in
+                            # display_texture_flip_scope, so the generated DAE
+                            # below really does flip the cluster island.
+                            "lc500_screen_off": {
+                                "name": "lc500_screen_off",
+                                "mapTo": "lc500_screen_off",
+                                "class": "Material",
+                                "Stages": [
+                                    {
+                                        "emissiveMap": (
+                                            "/vehicles/lc500/cluster_boot.png"
+                                        )
+                                    }
+                                ],
+                            },
                             "lc500_screen_off_on": {
                                 "name": "lc500_screen_off_on",
                                 "mapTo": "lc500_screen_off_on",
@@ -245,7 +862,15 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                                 "Stages": [
                                     {"emissiveMap": "@LEX_LC500_21_fh6_gauge"}
                                 ],
-                            }
+                            },
+                            "lc500_trim": {
+                                "name": "lc500_trim",
+                                "mapTo": "lc500_trim",
+                                "class": "Material",
+                                "Stages": [
+                                    {"baseColorMap": "/vehicles/lc500/trim.png"}
+                                ],
+                            },
                         }
                     ),
                 )
@@ -268,8 +893,25 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 vehicle_path="vehicles/lc500",
                 dae_paths=["vehicles/lc500/lc500.dae"],
                 variants={},
-                objects={},
-                preview_by_id={},
+                objects={
+                    "lc500_interior": DaeObject(
+                        id="lc500_interior",
+                        name="lc500_interior",
+                        dae_path="vehicles/lc500/lc500.dae",
+                        x=0.0,
+                        y=0.0,
+                        z=0.0,
+                        geometry_ids=("combined_screen",),
+                    )
+                },
+                preview_by_id={
+                    "lc500_interior": {
+                        "materials": [
+                            "lc500_screen_off",
+                            "lc500_trim",
+                        ]
+                    }
+                },
                 jbeam_texts={"vehicles/lc500/lc500_interior.jbeam": source_jbeam},
                 node_positions={},
                 project_dir=tmp,
@@ -281,11 +923,32 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 },
             )
 
+            generated_daes = build_pipeline.generate_daes(
+                context,
+                tmp / "out",
+                output,
+                {"lc500_interior": core.MODE_MIRROR},
+                {},
+                {core.HAND_RHD},
+                {},
+                set(),
+                set(),
+                set(),
+                [],
+                {"lc500_interior"},
+            )
+            self.assertEqual(len(generated_daes), 1)
+            generated_s = _combined_screen_s_values(generated_daes[0])
+            scoped_aliases = build_pipeline.display_texture_flip_scope(context)[
+                "lc500_interior"
+            ]
+
             report = build_pipeline.isolate_converted_runtime_screens(
                 context,
                 output,
                 {"lc500_interior"},
                 {core.HAND_RHD},
+                reflected_geometry=True,
             )
             patched = generated_jbeam.read_text(encoding="utf-8")
             materials = json.loads(
@@ -297,12 +960,15 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             copied = output / "lua" / "controller" / f"LEX_LC500_21_beamxp_{suffix}.lua"
             copied_text = copied.read_text(encoding="utf-8")
             page = output / "html" / f"lc500_beamxp_{suffix}.html"
-            page_text = page.read_text(encoding="utf-8")
+            page_written = page.exists()
 
         target_alias = f"lex_lc500_21_fh6_gauge_beamxp_{suffix}"
         target_material = f"lc500_screen_off_on_beamxp_{suffix}"
 
         self.assertTrue(report["enabled"])
+        self.assertIn("lc500_screen_off", scoped_aliases)
+        for got, expected in zip(generated_s[:4], (0.9, 0.1, 0.1, 0.9)):
+            self.assertAlmostEqual(got, expected)
         # The conversion loads its own controller, and only that row moved.
         self.assertIn(f'["LEX_LC500_21_beamxp_{suffix}"]', patched)
         self.assertNotIn('["LEX_LC500_21"]', patched)
@@ -318,19 +984,131 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertIn(f'"on":"{target_material}"', patched)
         self.assertIn('"off":"lc500_screen_off_off_beamxp_tc"', patched)
         self.assertEqual(patched.count('"lc500_screen_off"'), 1)
-        # The live screen is corrected at its source: the page the webview
-        # renders is reflected, so the reflected quad reads the right way round.
-        self.assertIn(
-            f'"local://local/vehicles/lc500/html/lc500_beamxp_{suffix}.html"',
-            copied_text,
-        )
-        self.assertNotIn('"local://local/vehicles/lc500/html/lc500.html"', copied_text)
-        self.assertIn("transform:scaleX(-1)", page_text)
-        self.assertIn("<title>gauge</title>", page_text)
-        self.assertLess(page_text.index("beamxp-mirror"), page_text.index("</head>"))
-        # The quad reads u 0.2..0.8, so the page turns about the middle of that
-        # window (50%), not about a window it never shows.
-        self.assertIn("transform-origin:50.0000% 50%", page_text)
+        # The selected screen mesh already has material-scoped UV orientation
+        # repair.  Mirrored carriers receive that one flip while rigid pieces
+        # keep their authored UVs, so reflecting the HTML would reverse the
+        # LC500 gauge a second time.
+        self.assertIn('"local://local/vehicles/lc500/html/lc500.html"', copied_text)
+        self.assertNotIn(f"lc500_beamxp_{suffix}.html", copied_text)
+        self.assertNotIn("transform:scaleX(-1)", copied_text)
+        self.assertFalse(page_written)
+        self.assertEqual(report["screenPages"], [])
+
+    def test_co_located_unscoped_display_does_not_suppress_html_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            source = tmp / "two_screens.zip"
+            source_jbeam = r'''
+            {
+              "cluster": {
+                "slotType":"cluster",
+                "controller":[["fileName"], ["customCluster"]],
+                "glowMap":{
+                  "cluster_base":{"off":"cluster_off", "on":"cluster_on"}
+                }
+              }
+            }
+            '''
+            controller_lua = (
+                'local tag = "@cluster_canvas"\n'
+                'local page = "local://local/vehicles/two/html/cluster.html"\n'
+                "htmlTexture.create(tag, page, 800, 400, 30)\n"
+            )
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("vehicles/two/cluster.jbeam", source_jbeam)
+                archive.writestr(
+                    "vehicles/two/lua/controller/customCluster.lua",
+                    controller_lua,
+                )
+                archive.writestr(
+                    "vehicles/two/html/cluster.html",
+                    "<html><head></head><body>cluster</body></html>",
+                )
+                archive.writestr(
+                    "vehicles/two/main.materials.json",
+                    json.dumps(
+                        {
+                            "cluster_on": {
+                                "name": "cluster_on",
+                                "mapTo": "cluster_on",
+                                "Stages": [{"emissiveMap": "@cluster_canvas"}],
+                            },
+                            "unrelated_nav_screen": {
+                                "name": "unrelated_nav_screen",
+                                "mapTo": "unrelated_nav_screen",
+                                "Stages": [
+                                    {
+                                        "emissiveMap": (
+                                            "/vehicles/two/unrelated.png"
+                                        )
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                )
+
+            output = tmp / "out" / "vehicles" / "two"
+            output.mkdir(parents=True)
+            generated_jbeam = output / "handdrive_visual_conversion.jbeam"
+            generated_jbeam.write_text(
+                '{"cluster_xp_rhd":{"slotType":"cluster",'
+                '"controller":[["fileName"], ["customCluster"]],'
+                '"glowMap":{"cluster_base":'
+                '{"off":"cluster_off_beamxp_tc", "on":"cluster_on"}}}}',
+                encoding="utf-8",
+            )
+            context = VehicleContext(
+                source_zip=source,
+                vehicle_id="two",
+                vehicle_path="vehicles/two",
+                dae_paths=[],
+                variants={},
+                objects={},
+                preview_by_id={
+                    "combined_display": {
+                        "materials": ["unrelated_nav_screen", "cluster_base"]
+                    }
+                },
+                jbeam_texts={"vehicles/two/cluster.jbeam": source_jbeam},
+                node_positions={},
+                project_dir=tmp,
+                part_body_index={
+                    "cluster": (source_jbeam, "vehicles/two/cluster.jbeam")
+                },
+            )
+
+            # Both materials occupy one generated source mesh, but the DAE
+            # exporter receives only the display scope below as flip_materials.
+            # Co-location must not claim the cluster controller's UV island.
+            scoped_aliases = build_pipeline.display_texture_flip_scope(context)[
+                "combined_display"
+            ]
+
+            report = build_pipeline.isolate_converted_runtime_screens(
+                context,
+                output,
+                {"combined_display"},
+                {core.HAND_RHD},
+                reflected_geometry=True,
+            )
+            suffix = build_pipeline.mod_id_for_context(context).lower()
+            copied_controller = (
+                output
+                / "lua"
+                / "controller"
+                / f"customCluster_beamxp_{suffix}.lua"
+            ).read_text(encoding="utf-8")
+            copied_page = (
+                output / "html" / f"cluster_beamxp_{suffix}.html"
+            ).read_text(encoding="utf-8")
+
+        self.assertTrue(report["enabled"])
+        self.assertEqual(scoped_aliases, frozenset({"unrelated_nav_screen"}))
+        self.assertIn(f"cluster_beamxp_{suffix}.html", copied_controller)
+        self.assertIn("body{transform:scaleX(-1)", copied_page)
+        self.assertNotIn("html{transform:scaleX(-1)", copied_page)
+        self.assertEqual(len(report["screenPages"]), 1)
 
     def test_an_off_centre_screen_window_turns_about_its_own_middle(self) -> None:
         # A quad reading u 0.27..0.79 of its page: reflecting about the page
@@ -359,7 +1137,10 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
 
         self.assertAlmostEqual(centre, 0.52993, places=5)
         page = build_pipeline._mirrored_screen_page("<html><head></head></html>", centre)
-        self.assertIn("transform-origin:52.9930% 50%", page)
+        self.assertIn(
+            "body{transform:scaleX(-1);transform-origin:52.9930% 50%", page
+        )
+        self.assertNotIn("html{transform:scaleX(-1)", page)
 
     def test_a_screen_symbol_with_no_uvs_falls_back_to_the_page_centre(self) -> None:
         self.assertIn(

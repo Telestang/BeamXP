@@ -264,13 +264,99 @@ def _primitive_texcoord_ref(primitive: ET.Element) -> tuple[str, int, int] | Non
 
 
 def _primitive_texcoord_indices(primitive: ET.Element, stride: int, offset: int) -> set[int]:
-    indices: set[int] = set()
-    for p in primitive.findall("c:p", NS):
+    return {
+        index
+        for face in _primitive_texcoord_faces(primitive, stride, offset)
+        for index in face
+    }
+
+
+def _primitive_texcoord_faces(
+    primitive: ET.Element,
+    stride: int,
+    offset: int,
+) -> list[tuple[int, ...]]:
+    """Return the primitive's individual TEXCOORD-connected faces.
+
+    A COLLADA ``triangles`` element commonly contains many disconnected UV
+    islands for one material.  Treating its whole ``p`` stream as one consumer
+    would merge those islands again, so retain the face boundaries encoded by
+    each primitive type.  Fans and strips are connected by definition and can
+    remain one component per ``p`` stream.
+    """
+
+    def p_indices(p: ET.Element) -> tuple[int, ...]:
         if not p.text:
-            continue
+            return ()
         values = p.text.split()
-        indices.update(int(values[i]) for i in range(offset, len(values), stride))
-    return indices
+        return tuple(int(values[i]) for i in range(offset, len(values), stride))
+
+    tag = primitive.tag.rsplit("}", 1)[-1]
+    streams = [p_indices(p) for p in primitive.findall(".//c:p", NS)]
+    streams = [stream for stream in streams if stream]
+    if tag == "triangles":
+        return [
+            stream[start : start + 3]
+            for stream in streams
+            for start in range(0, len(stream), 3)
+            if stream[start : start + 3]
+        ]
+    if tag == "polylist":
+        vcount = primitive.find("c:vcount", NS)
+        if vcount is None or not vcount.text:
+            return streams
+        stream = tuple(index for values in streams for index in values)
+        faces: list[tuple[int, ...]] = []
+        cursor = 0
+        for count in (int(value) for value in vcount.text.split()):
+            face = stream[cursor : cursor + count]
+            cursor += count
+            if face:
+                faces.append(face)
+        if cursor < len(stream):
+            # Preserve the old conservative behaviour for malformed exporters:
+            # no referenced coordinate should silently fall out of the scope.
+            faces.append(stream[cursor:])
+        return faces
+    return streams
+
+
+def _connected_texcoord_components(
+    faces: list[tuple[int, ...]],
+) -> list[set[int]]:
+    """Partition faces by shared TEXCOORD entries.
+
+    Index identity is deliberate here.  Equal-valued coordinates can be
+    stacked, mirrored, or separated by an authored seam; only reuse of the
+    same source entry proves that two consumers are one UV island.
+    """
+    parent: dict[int, int] = {}
+
+    def find(index: int) -> int:
+        parent.setdefault(index, index)
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for face in faces:
+        if not face:
+            continue
+        first = face[0]
+        find(first)
+        for index in face[1:]:
+            union(first, index)
+
+    components: dict[int, set[int]] = {}
+    for index in parent:
+        components.setdefault(find(index), set()).add(index)
+    return sorted(components.values(), key=min)
 
 
 _PRIMITIVE_TAGS = ("triangles", "polylist", "polygons", "trifans", "tristrips")
@@ -279,14 +365,21 @@ _PRIMITIVE_TAGS = ("triangles", "polylist", "polygons", "trifans", "tristrips")
 def flip_texcoord_islands(mesh: ET.Element, flip_materials: set[str]) -> None:
     """Flip S only for the UV islands owned by ``flip_materials``.
 
-    Primitives are bucketed by whether their material is targeted; an index
-    used by any non-targeted primitive is protected and left alone, so a shared
-    texcoord source is only reflected where the two islands are disjoint (they
-    are, in practice -- each material occupies its own UV region)."""
+    Connectivity is evaluated within each TEXCOORD source, but every
+    disconnected targeted island gets its own reflection pivot.  This matters
+    for atlases where two screen materials use separate tiles in the same
+    source: one combined min/max would move each screen onto the other's tile.
+
+    A targeted component that shares any TEXCOORD entry with a non-targeted
+    primitive is left untouched as a whole.  Partially flipping such an island
+    would tear the protected material at its shared vertex.  Conversely,
+    targeted primitives sharing entries form one component and are flipped
+    exactly once.
+    """
     sources_by_id = {
         source.get("id"): source for source in mesh.findall("c:source", NS)
     }
-    targeted: dict[str, set[int]] = {}
+    targeted_faces: dict[str, list[tuple[int, ...]]] = {}
     protected: dict[str, set[int]] = {}
     for tag in _PRIMITIVE_TAGS:
         for primitive in mesh.findall(f"c:{tag}", NS):
@@ -294,19 +387,23 @@ def flip_texcoord_islands(mesh: ET.Element, flip_materials: set[str]) -> None:
             if ref is None:
                 continue
             source_id, stride, offset = ref
-            indices = _primitive_texcoord_indices(primitive, stride, offset)
+            faces = _primitive_texcoord_faces(primitive, stride, offset)
+            indices = {index for face in faces for index in face}
             if not indices:
                 continue
             symbol = _primitive_material_symbol(primitive)
-            bucket = targeted if (symbol is not None and symbol in flip_materials) else protected
-            bucket.setdefault(source_id, set()).update(indices)
-    for source_id, indices in targeted.items():
+            if symbol is not None and symbol in flip_materials:
+                targeted_faces.setdefault(source_id, []).extend(faces)
+            else:
+                protected.setdefault(source_id, set()).update(indices)
+    for source_id, faces in targeted_faces.items():
         source = sources_by_id.get(source_id)
         if source is None:
             continue
-        flippable = indices - protected.get(source_id, set())
-        if flippable:
-            flip_texcoord_s_for_indices(source, flippable)
+        protected_indices = protected.get(source_id, set())
+        for component in _connected_texcoord_components(faces):
+            if component.isdisjoint(protected_indices):
+                flip_texcoord_s_for_indices(source, component)
 
 
 def mirrored_geometry(
