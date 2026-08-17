@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,13 +74,66 @@ class RuntimeDisplayUvFlipTests(unittest.TestCase):
         self.assertEqual(colour.box_source, "contrast_gpu")
         self.assertTrue(colour.enable_feature_extension_filter)
         self.assertEqual(colour.feature_extension_context_px, 12)
+        self.assertEqual(colour.feature_extension_reference_extent_px, 25)
+        self.assertEqual(colour.feature_extension_grace_px, 4)
+        self.assertEqual(colour.feature_extension_grace_max_fraction, 0.20)
+        self.assertEqual(colour.feature_extension_soft_fringe_ratio, 0.75)
         self.assertEqual(colour.feature_extension_min_ratio, 0.03)
         self.assertEqual(opacity.box_source, "opacity_mask")
         self.assertEqual(authoritative.box_source, "opacity_mask")
+        self.assertEqual(opacity.merge_distance_px, 0)
+        self.assertEqual(authoritative.merge_distance_px, 0)
+        self.assertGreater(colour.merge_distance_px, 0)
         self.assertFalse(opacity.enable_region_domain_filter)
         self.assertFalse(authoritative.enable_region_domain_filter)
         self.assertFalse(opacity.enable_feature_extension_filter)
         self.assertFalse(authoritative.enable_feature_extension_filter)
+
+    def test_opacity_grouping_keeps_distant_controls_separate(self) -> None:
+        image = np.zeros((120, 32, 3), dtype=np.uint8)
+        # Each pair is close enough to be one authored label, while the two
+        # controls merely share a UV chart and must retain separate centres.
+        image[8:16, 4:8] = 255
+        image[8:16, 12:16] = 255
+        image[88:96, 4:8] = 255
+        image[88:96, 12:16] = 255
+        detector = rhd._production_layer_detection_config(
+            rhd.DEFAULT_CONFIG,
+            True,
+            ("baseColorMap",),
+            authoritative_opacity_mask=True,
+        )
+
+        detection = rhd.run_detection(
+            image, np.ones(image.shape[:2], dtype=bool), detector
+        )
+        grouped = next(stage for stage in detection.stages if stage.key == "grouped")
+
+        self.assertEqual(len(grouped.kept), 2)
+
+    def test_exact_dae_switch_symbol_does_not_absorb_its_backing_material(self) -> None:
+        loaded, _sweep = _screens_fixture()
+        binding = SimpleNamespace(
+            dae_material="ardente_gps_screen",
+            material_key="ardente_gauges_screen",
+        )
+
+        self.assertEqual(
+            rhd.material_symbols_for_binding(loaded, binding),
+            ("ardente_gps_screen-material",),
+        )
+
+    def test_material_record_name_remains_a_symbol_fallback(self) -> None:
+        loaded, _sweep = _screens_fixture()
+        binding = SimpleNamespace(
+            dae_material="switch_alias_not_exported",
+            material_key="ardente_gauges_screen",
+        )
+
+        self.assertEqual(
+            rhd.material_symbols_for_binding(loaded, binding),
+            ("ardente_gauges_screen-material",),
+        )
 
     def test_runtime_display_uv_flip_is_material_scoped(self) -> None:
         namespace = "http://www.collada.org/2005/11/COLLADASchema"
@@ -126,6 +180,195 @@ class RuntimeDisplayUvFlipTests(unittest.TestCase):
         self.assertEqual(result["matched_materials"], ["lc500_centralscreen"])
         self.assertEqual(result["modified_texcoords"], 2)
 
+    def test_rigid_symmetric_display_keeps_its_texcoords(self) -> None:
+        """A screen reaching the far side rigidly was never mirrored to undo.
+
+        The Ardente carries its gauge cluster and its satnav on one mesh.  The
+        cluster is residual and rides the reflected carrier, so its UVs need
+        turning back; the satnav is self-symmetric about the car's centreline
+        and its rigid transform is the identity, so flipping it shipped the
+        only screen in the cabin that was already the right way round
+        backwards.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "screens_rhd.dae"
+            loaded, sweep = _screens_fixture()
+            info = sym_mesh.export_transformed_part_dae(
+                loaded,
+                sweep,
+                output,
+                runtime_display_uv_flip_materials={
+                    "ardente_gauges_screen",
+                    "ardente_gps_screen",
+                },
+            )
+
+            uvs = _texcoords_by_material(output)
+
+        # Subsetting reindexes each geometry's own source, so compare the U
+        # values a material carries rather than the order they land in.
+        # The carrier's cluster is reflected, so its U is turned back about the
+        # island's own extent: 0.0/1.0 exchange and 0.25 becomes 0.75.
+        self.assertEqual(
+            sorted(uvs["ardente_gauges_screen-material"]), [0.0, 0.75, 1.0]
+        )
+        # The rigid satnav keeps the U it was authored with -- 0.25, not 0.75.
+        self.assertEqual(
+            sorted(uvs["ardente_gps_screen-material"]), [0.0, 0.25, 1.0]
+        )
+
+        flips = info["runtime_display_uv_flip"]
+        self.assertEqual(
+            [entry["role"] for entry in flips["geometries"]],
+            ["mirrored_carrier"],
+        )
+        self.assertEqual(
+            flips["geometries"][0]["matched_materials"],
+            ["ardente_gauges_screen"],
+        )
+
+
+def _screens_fixture() -> tuple[object, object]:
+    """One mesh, two display materials: one residual, one rigid candidate."""
+    namespace = "http://www.collada.org/2005/11/COLLADASchema"
+    root = ET.fromstring(
+        f"""<COLLADA xmlns="{namespace}" version="1.4.1">
+          <library_geometries>
+            <geometry id="screens-mesh" name="screens">
+              <mesh>
+                <source id="screens-pos">
+                  <float_array id="screens-pos-array" count="18">
+                    -1 0 0  -1 1 0  -0.5 0 0
+                     0.5 0 1   -0.5 0 1   0 1 1
+                  </float_array>
+                  <technique_common>
+                    <accessor source="#screens-pos-array" count="6" stride="3">
+                      <param name="X" type="float"/>
+                      <param name="Y" type="float"/>
+                      <param name="Z" type="float"/>
+                    </accessor>
+                  </technique_common>
+                </source>
+                <source id="screens-uv">
+                  <float_array id="screens-uv-array" count="12">
+                    0 0  1 0  0.25 1
+                    0 0  1 0  0.25 1
+                  </float_array>
+                  <technique_common>
+                    <accessor source="#screens-uv-array" count="6" stride="2">
+                      <param name="S" type="float"/>
+                      <param name="T" type="float"/>
+                    </accessor>
+                  </technique_common>
+                </source>
+                <vertices id="screens-verts">
+                  <input semantic="POSITION" source="#screens-pos"/>
+                </vertices>
+                <triangles material="ardente_gauges_screen-material" count="1">
+                  <input semantic="VERTEX" source="#screens-verts" offset="0"/>
+                  <input semantic="TEXCOORD" source="#screens-uv" offset="1"/>
+                  <p>0 0 1 1 2 2</p>
+                </triangles>
+                <triangles material="ardente_gps_screen-material" count="1">
+                  <input semantic="VERTEX" source="#screens-verts" offset="0"/>
+                  <input semantic="TEXCOORD" source="#screens-uv" offset="1"/>
+                  <p>3 3 4 4 5 5</p>
+                </triangles>
+              </mesh>
+            </geometry>
+          </library_geometries>
+          <library_visual_scenes>
+            <visual_scene id="scene">
+              <node id="ardente_screens" name="ardente_screens" type="NODE">
+                <instance_geometry url="#screens-mesh"/>
+              </node>
+            </visual_scene>
+          </library_visual_scenes>
+          <scene><instance_visual_scene url="#scene"/></scene>
+        </COLLADA>"""
+    )
+    loaded = sym_mesh.LoadedDae(
+        path=Path("screens.dae"),
+        tree=ET.ElementTree(root),
+        namespace=namespace,
+        unit_scale=1.0,
+        parts=[],
+        geometries={"screens-mesh": root.find(f"{{{namespace}}}library_geometries/"
+                                              f"{{{namespace}}}geometry")},
+    )
+    selected = DaePart(
+        key="ardente_screens",
+        label="ardente_screens",
+        node_id="ardente_screens",
+        node_name="ardente_screens",
+        matrix=np.eye(4),
+        instances=(GeometryInstance("screens-mesh"),),
+    )
+    # The satnav triangle (face 1) is the accepted candidate; it straddles the
+    # centreline symmetrically, so G L is the identity and nothing moves.
+    measurement = SimpleNamespace(
+        centroid=(0.0, 0.0, 1.0),
+        plane_normal=(1.0, 0.0, 0.0),
+        initial_plane_normal=(1.0, 0.0, 0.0),
+        rms_error=0.0,
+        initial_rms_error=0.0,
+        mirror_plane_y_tilt_degrees=0.0,
+        rigid_y_rotation_correction_degrees=0.0,
+        tilt_search_applied=False,
+    )
+    sweep = SimpleNamespace(
+        part=selected,
+        topology=SimpleNamespace(
+            triangles=np.asarray(((0, 1, 2), (3, 4, 5))),
+            source_faces=(
+                SourceFaceRef(0, "screens-mesh", 0, 0),
+                SourceFaceRef(0, "screens-mesh", 1, 0),
+            ),
+        ),
+        candidates=[
+            SimpleNamespace(
+                candidate_id=1,
+                faces=(1,),
+                measurement=measurement,
+                accepted_angle=120.0,
+            )
+        ],
+    )
+    return loaded, sweep
+
+
+def _texcoords_by_material(dae_path: Path) -> dict[str, list[float]]:
+    """The U of every texcoord an exported geometry's material actually uses."""
+    root = ET.parse(dae_path).getroot()
+    namespace = root.tag[1:].split("}")[0]
+    found: dict[str, list[float]] = {}
+    for geometry in root.iter(f"{{{namespace}}}geometry"):
+        mesh = geometry.find(f"{{{namespace}}}mesh")
+        if mesh is None:
+            continue
+        sources = {
+            source.get("id"): [
+                float(value)
+                for value in source.find(f"{{{namespace}}}float_array").text.split()
+            ]
+            for source in mesh.findall(f"{{{namespace}}}source")
+        }
+        for primitive in mesh.findall(f"{{{namespace}}}triangles"):
+            inputs = primitive.findall(f"{{{namespace}}}input")
+            stride = max(int(item.get("offset", "0")) for item in inputs) + 1
+            texcoord = next(
+                item
+                for item in inputs
+                if (item.get("semantic") or "").upper() == "TEXCOORD"
+            )
+            offset = int(texcoord.get("offset", "0"))
+            values = sources[(texcoord.get("source") or "")[1:]]
+            indices = [
+                int(value)
+                for value in primitive.find(f"{{{namespace}}}p").text.split()
+            ][offset::stride]
+            found[primitive.get("material")] = [values[index * 2] for index in indices]
+    return found
 
 
 class SurfaceFlipAxisTests(unittest.TestCase):
@@ -272,6 +515,142 @@ class SurfaceFlipAxisTests(unittest.TestCase):
 
         self.assertIsNone(delta)
 
+    def test_skew_delta_allows_the_ardente_shear_at_each_resolution(self) -> None:
+        """A modest coefficient causes only bounded relative deformation.
+
+        This is the shape of the Ardente door-card ON/OFF mapping: the exact
+        vertical reflection adds a small horizontal shear, but omitting it
+        moves the edge of the detected legend by about 7.5% of its short side,
+        which is much safer than leaving the writing backwards.
+        """
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (-7.5, -100.0, 0.0),
+                ]
+            ),
+        )
+        config = replace(
+            rhd.DEFAULT_RHD_CONFIG,
+            skewed_region_min_delta=0.08,
+            skewed_region_tolerable_error_px=3.0,
+            skewed_region_tolerable_error_ratio=0.10,
+        )
+
+        for scale in (1, 2, 4):
+            with self.subTest(scale=scale):
+                delta = rhd.skew_delta_for_region(
+                    uv,
+                    xyz,
+                    (20 * scale, 20 * scale, 34 * scale, 30 * scale),
+                    "vertical",
+                    100 * scale,
+                    100 * scale,
+                    config,
+                )
+                self.assertIsNone(delta)
+
+    def test_skew_delta_rejects_high_relative_error_on_a_small_region(self) -> None:
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        config = replace(
+            rhd.DEFAULT_RHD_CONFIG,
+            skewed_region_min_delta=0.01,
+            skewed_region_tolerable_error_px=3.0,
+            skewed_region_tolerable_error_ratio=0.10,
+        )
+
+        for shear, expected_delta in ((0.4, 0.8), (1.0, 2.0)):
+            xyz = (
+                np.asarray(
+                    [
+                        (0.0, 0.0, 0.0),
+                        (100.0, 0.0, 0.0),
+                        (-100.0 * shear, -100.0, 0.0),
+                    ]
+                ),
+            )
+            for size in (4, 8):
+                with self.subTest(shear=shear, size=size):
+                    delta = rhd.skew_delta_for_region(
+                        uv,
+                        xyz,
+                        (20, 20, size, size),
+                        "vertical",
+                        100,
+                        100,
+                        config,
+                    )
+                    self.assertIsNotNone(delta)
+                    self.assertAlmostEqual(delta, expected_delta)
+
+    def test_skew_delta_decision_is_exactly_scale_invariant_near_the_limit(self) -> None:
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (-4.5, -100.0, 0.0),
+                ]
+            ),
+        )
+        config = replace(
+            rhd.DEFAULT_RHD_CONFIG,
+            skewed_region_min_delta=0.08,
+            skewed_region_tolerable_error_px=3.0,
+            skewed_region_tolerable_error_ratio=0.10,
+        )
+
+        decisions = [
+            rhd.skew_delta_for_region(
+                uv,
+                xyz,
+                (20 * scale, 20 * scale, 4 * scale, 8 * scale),
+                "vertical",
+                100 * scale,
+                100 * scale,
+                config,
+            )
+            for scale in (1, 2, 4)
+        ]
+
+        self.assertEqual(decisions, [None, None, None])
+
+    def test_skew_delta_floor_does_not_hide_long_region_displacement(self) -> None:
+        """A small coefficient can still move a slender label many pixels."""
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (-3.0, -100.0, 0.0),
+                ]
+            ),
+        )
+        config = replace(
+            rhd.DEFAULT_RHD_CONFIG,
+            skewed_region_min_delta=0.08,
+            skewed_region_tolerable_error_px=3.0,
+            skewed_region_tolerable_error_ratio=0.10,
+        )
+
+        delta = rhd.skew_delta_for_region(
+            uv,
+            xyz,
+            (20, 20, 4, 1000),
+            "vertical",
+            2000,
+            2000,
+            config,
+        )
+
+        self.assertIsNotNone(delta)
+        self.assertAlmostEqual(delta, 0.06)
+
 
 class CroppedDetectionTests(unittest.TestCase):
     def test_cropped_detection_reports_full_atlas_coordinates(self) -> None:
@@ -296,7 +675,7 @@ class CroppedDetectionTests(unittest.TestCase):
                 mirror,
                 domain,
                 config,
-                replace(rhd.DEFAULT_CONFIG, enable_edge_aligned_rotation=True),
+                replace(rhd.DEFAULT_CONFIG, enable_symmetry_rotation=True),
                 log=lambda *_a: None,
             )
 
@@ -333,7 +712,7 @@ class CroppedDetectionTests(unittest.TestCase):
                 mirror,
                 domain,
                 config,
-                replace(rhd.DEFAULT_CONFIG, enable_edge_aligned_rotation=True),
+                replace(rhd.DEFAULT_CONFIG, enable_symmetry_rotation=True),
                 log=lambda *_a: None,
             )
 
@@ -382,7 +761,7 @@ class CroppedDetectionTests(unittest.TestCase):
                 mirror,
                 domain,
                 config,
-                replace(rhd.DEFAULT_CONFIG, enable_edge_aligned_rotation=True),
+                replace(rhd.DEFAULT_CONFIG, enable_symmetry_rotation=True),
                 log=lambda *_a: None,
             )
 
@@ -432,7 +811,7 @@ class CroppedDetectionTests(unittest.TestCase):
                 mirror,
                 domain,
                 config,
-                replace(rhd.DEFAULT_CONFIG, enable_edge_aligned_rotation=True),
+                replace(rhd.DEFAULT_CONFIG, enable_symmetry_rotation=True),
                 log=lambda *_a: None,
             )
 
@@ -673,6 +1052,58 @@ class CroppedDetectionTests(unittest.TestCase):
 
 
 class MultiPartPreviewTests(unittest.TestCase):
+    def test_sjson_material_keeps_normal_and_scalar_companions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_zip = root / "vehicle.zip"
+            materials_member = "vehicles/car/screens.materials.json"
+            base_member = "vehicles/car/screen_b.color.dds"
+            normal_member = "vehicles/car/screen_n.normal.dds"
+            roughness_member = "vehicles/car/screen_r.data.dds"
+            with zipfile.ZipFile(source_zip, "w") as archive:
+                archive.writestr("vehicles/car/car.dae", "<COLLADA/>")
+                archive.writestr(
+                    materials_member,
+                    """{
+                      // BeamNG accepts comments and commas as whitespace.
+                      "car_screen": {
+                        "name": "car_screen",
+                        "mapTo": "car_screen",
+                        "Stages": [{
+                          "baseColorMap":
+                            "/vehicles/car/screen_b.color.png",
+                          /* These maps share the same authored UV layout. */
+                          "normalMap":
+                            "/vehicles/car/screen_n.normal.png",
+                          "roughnessMap":
+                            "/vehicles/car/screen_r.data.png",
+                        },],
+                      },
+                    }""",
+                )
+                archive.writestr(base_member, b"base")
+                archive.writestr(normal_member, b"normal")
+                archive.writestr(roughness_member, b"roughness")
+
+            vehicle = rhd.scan_vehicle_archive(source_zip, root / "workspace")
+            binding = ArchiveTextureBinding(
+                dae_material="car_screen",
+                material_key="car_screen",
+                materials_member=materials_member,
+                texture_reference="/vehicles/car/screen_b.color.png",
+                texture_member=base_member,
+            )
+
+            companions = rhd.companion_maps_for_binding(vehicle, binding)
+
+        self.assertEqual(
+            companions,
+            (
+                rhd.CompanionMap(normal_member, "normalMap", "normal"),
+                rhd.CompanionMap(roughness_member, "roughnessMap", "scalar"),
+            ),
+        )
+
     def test_manifest_reassembles_independently_corrected_material_layers(self) -> None:
         source = {
             "key": "lc500_screen_on",
@@ -2753,6 +3184,299 @@ class SplitTextureManifestTests(unittest.TestCase):
             [entry["maps"]["baseColorMap"] for entry in materials],
             ["screen_rhd.png", "screen_2_rhd.png"],
         )
+
+
+class SharedLayerRegionTests(unittest.TestCase):
+    """One material/part must use one accepted region set across its maps."""
+
+    def test_task_groups_do_not_cross_a_material_or_part_boundary(self) -> None:
+        dash = part("dashboard")
+        door = part("door")
+        mask = np.ones((2, 2), dtype=bool)
+
+        def task(member: str, material: str, scope: DaePart):
+            return rhd.TextureCorrectionTask(
+                member=member,
+                material=material,
+                part_scope=(scope,),
+                masks=rhd.DomainMasks(
+                    mirror=mask,
+                    rigid=np.zeros_like(mask),
+                    conflict_coverage=0.0,
+                    mirrored_triangles=1,
+                    rigid_triangles=0,
+                    parts_analysed=1,
+                ),
+                part_group_index=0,
+            )
+
+        groups = rhd.shared_layer_task_groups(
+            [
+                task("interior_b.dds", "interior", dash),
+                task("interior_nm.dds", "interior", dash),
+                task("trim_r.dds", "trim", dash),
+                task("interior_ao.dds", "interior", door),
+            ]
+        )
+
+        self.assertEqual(
+            [[entry.member for _index, entry in group] for group in groups],
+            [
+                ["interior_b.dds", "interior_nm.dds"],
+                ["trim_r.dds"],
+                ["interior_ao.dds"],
+            ],
+        )
+
+    def test_a_layer_with_no_detection_inherits_its_siblings_region(self) -> None:
+        ledger = rhd.SharedLayerRegionLedger()
+        ledger.record(
+            "vehicles/ardente/interior_nm.normal.dds",
+            (8, 8),
+            [(1, 2, 5, 3)],
+            [None],
+        )
+        ledger.record(
+            "vehicles/ardente/interior_b.color.dds",
+            (8, 8),
+            [],
+            [],
+        )
+
+        regions, rotations, sources, added = ledger.combined(
+            "vehicles/ardente/interior_b.color.dds",
+            (8, 8),
+            [],
+            [],
+        )
+
+        self.assertEqual(regions, [(1, 2, 5, 3)])
+        self.assertEqual(rotations, [None])
+        self.assertEqual(
+            sources, ("vehicles/ardente/interior_nm.normal.dds",)
+        )
+        self.assertEqual(added, 1)
+
+    def test_sibling_boxes_and_rotations_scale_to_this_layers_resolution(self) -> None:
+        ledger = rhd.SharedLayerRegionLedger()
+        ledger.record(
+            "vehicles/ardente/interior_nm.normal.dds",
+            (4, 2),
+            [(1, 0, 2, 1)],
+            [((1.0, 0.0), (3.0, 0.0), (3.0, 1.0), (1.0, 1.0))],
+        )
+
+        regions, rotations, _sources, _added = ledger.combined(
+            "vehicles/ardente/interior_r.data.dds",
+            (8, 4),
+            [],
+            [],
+        )
+
+        self.assertEqual(regions, [(2, 0, 4, 2)])
+        self.assertEqual(
+            rotations,
+            [((2.0, 0.0), (6.0, 0.0), (6.0, 2.0), (2.0, 2.0))],
+        )
+
+    def test_authoritative_evidence_keeps_mask_native_precision(self) -> None:
+        native_region = (23, 192, 65, 128)
+        detection = rhd.RegionDetection(
+            source="opacityMap:labels.png",
+            detected=1,
+            regions=[native_region],
+            rotations=[None],
+        )
+        evidence = rhd.shared_layer_evidence_at_finest_resolution(
+            [((1024, 1024), detection)], rhd.DEFAULT_RHD_CONFIG
+        )
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence.size, (1024, 1024))
+
+        # The old 1024 -> 32 -> 1024 route visibly broadens this interval.
+        coarse = rhd._scale_detection_box(native_region, (1024, 1024), (32, 32))
+        broadened = rhd._scale_detection_box(coarse, (32, 32), (1024, 1024))
+        self.assertNotEqual(broadened, native_region)
+
+        ledger = rhd.SharedLayerRegionLedger()
+        ledger.record_evidence("vehicles/car/null_n.dds", evidence)
+        regions, _rotations, _sources, _added = ledger.combined(
+            "vehicles/car/labels.color.dds", (1024, 1024), [], []
+        )
+        self.assertEqual(regions, [native_region])
+
+    def test_build_records_authoritative_regions_before_target_downscaling(self) -> None:
+        dash = part("dashboard")
+        target_member = "vehicles/car/null_n.dds"
+        mask_member = "vehicles/car/labels_o.data.dds"
+        binding = rhd.MaterialTextureLayerBinding(
+            dae_material="labels",
+            material_key="labels",
+            materials_member="vehicles/car/main.materials.json",
+            texture_reference=f"/{target_member}",
+            texture_member=target_member,
+            stage_key="normalMap",
+            kind="normal",
+        )
+        mirror = np.zeros((32, 32), dtype=bool)
+        mirror[:, :16] = True
+        masks = rhd.DomainMasks(
+            mirror=mirror,
+            rigid=np.zeros_like(mirror),
+            conflict_coverage=0.0,
+            mirrored_triangles=1,
+            rigid_triangles=0,
+            parts_analysed=1,
+        )
+        native_region = (23, 192, 65, 128)
+        ledger = rhd.SharedLayerRegionLedger()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            target = workspace / "null_n.dds"
+            opacity = workspace / "labels_o.data.dds"
+            Image.new("RGBA", (32, 32), (128, 128, 255, 255)).save(
+                target, format="PNG"
+            )
+            Image.new("RGBA", (1024, 1024), (0, 0, 0, 255)).save(
+                opacity, format="PNG"
+            )
+
+            def extracted(_archive, member):
+                return opacity if member == mask_member else target
+
+            with (
+                patch.object(
+                    rhd,
+                    "scoped_parts_using_material",
+                    return_value=[(dash, binding)],
+                ),
+                patch.object(
+                    rhd,
+                    "material_symbols_for_binding",
+                    return_value=("labels-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", side_effect=extracted),
+                patch.object(
+                    rhd,
+                    "authoritative_visibility_masks_for_layer_bindings",
+                    return_value=(
+                        rhd.CompanionMap(mask_member, "opacityMap", "scalar"),
+                    ),
+                ),
+                patch.object(
+                    rhd,
+                    "detect_flip_regions_by_uv_island",
+                    return_value=rhd.RegionDetection(
+                        source="opacityMap:labels_o.data.dds",
+                        detected=1,
+                        regions=[native_region],
+                        rotations=[None],
+                    ),
+                ),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    target_member,
+                    workspace,
+                    config=replace(
+                        rhd.DEFAULT_RHD_CONFIG,
+                        detect_on_normal_map=False,
+                    ),
+                    part_scope=[dash],
+                    material_scope=("labels",),
+                    masks=masks,
+                    shared_layer_regions=ledger,
+                    detect_only=True,
+                    log=lambda *_a: None,
+                )
+
+        self.assertIsNone(result)
+        evidence = ledger.layers[target_member.lower()]
+        self.assertEqual(evidence.size, (1024, 1024))
+        self.assertEqual(evidence.regions, (native_region,))
+
+    def test_build_plans_from_scaled_sibling_evidence_when_own_detector_is_empty(
+        self,
+    ) -> None:
+        dash = part("ardente_dashboard")
+        target_member = "vehicles/ardente/interior_b.color.dds"
+        binding = ArchiveTextureBinding(
+            dae_material="ardente_interior",
+            material_key="ardente_interior",
+            materials_member="vehicles/ardente/main.materials.json",
+            texture_reference=f"/{target_member}",
+            texture_member=target_member,
+        )
+        ledger = rhd.SharedLayerRegionLedger()
+        ledger.record(
+            "vehicles/ardente/interior_nm.normal.dds",
+            (4, 4),
+            [(1, 1, 2, 2)],
+            [None],
+        )
+        mirror = np.zeros((8, 8), dtype=bool)
+        mirror[:, :4] = True
+        masks = rhd.DomainMasks(
+            mirror=mirror,
+            rigid=np.zeros_like(mirror),
+            conflict_coverage=0.0,
+            mirrored_triangles=1,
+            rigid_triangles=0,
+            parts_analysed=1,
+        )
+        planned_regions: list[tuple[int, int, int, int]] = []
+
+        def plan(_mirror, regions, _config, _axis_map, _components=None):
+            planned_regions.extend(regions)
+            return [], np.zeros_like(mirror)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = workspace / "interior_b.color.dds"
+            Image.new("RGBA", (8, 8), (0, 0, 0, 255)).save(
+                source, format="PNG"
+            )
+            with (
+                patch.object(
+                    rhd,
+                    "scoped_parts_using_material",
+                    return_value=[(dash, binding)],
+                ),
+                patch.object(
+                    rhd,
+                    "material_symbols_for_binding",
+                    return_value=("ardente_interior-material",),
+                ),
+                patch.object(rhd, "extract_archive_member", return_value=source),
+                patch.object(
+                    rhd,
+                    "detect_flip_regions",
+                    return_value=rhd.RegionDetection(source="colour", detected=0),
+                ),
+                patch.object(rhd, "plan_island_flips", side_effect=plan),
+            ):
+                result = rhd.build_rhd_texture(
+                    SimpleNamespace(materials=[]),
+                    SimpleNamespace(),
+                    target_member,
+                    workspace,
+                    config=replace(
+                        rhd.DEFAULT_RHD_CONFIG,
+                        detect_on_normal_map=False,
+                        enable_skewed_region_filter=False,
+                    ),
+                    part_scope=[dash],
+                    material_scope=("ardente_interior",),
+                    masks=masks,
+                    shared_layer_regions=ledger,
+                    log=lambda *_a: None,
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(planned_regions, [(2, 2, 4, 4)])
+        self.assertEqual(result.report["shared_layer_regions_added"], 1)
 
 
 class ParallelTextureCorrectionTests(unittest.TestCase):

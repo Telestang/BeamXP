@@ -1847,6 +1847,13 @@ def _prepare_texture_correction_materials(
         tuple[str, tuple[str, ...]],
         tuple[dict[str, object] | None, dict[str, str], dict[str, str]],
     ] = {}
+    # A glowMap state is scoped by its base as well as its mesh.  Several bases
+    # can deliberately reuse one state material on one mesh while sampling
+    # different UV islands from it (the EV3's P/R/N/D glyphs do exactly that).
+    # ``by_part[part][state]`` cannot distinguish those corrections, so retain
+    # the base dimension until each SwitchBaseFork is assembled.
+    switch_shared_states: dict[str, dict[str, str]] = {}
+    switch_states_by_part: dict[str, dict[str, dict[str, str]]] = {}
     # Copied content -> the one path every material naming it shares. Spans
     # states and skins, because that is where the copies repeat.
     shared_textures: dict[tuple[str, str], str] = {}
@@ -1863,6 +1870,29 @@ def _prepare_texture_correction_materials(
                     by_part.setdefault(part_key, {}).setdefault(normalised, material_name)
             else:
                 shared.setdefault(normalised, material_name)
+        switch_bases = {
+            _normalise_material_alias(base_alias)
+            for base_alias in (entry.get("switchBaseAliases", []) or [])
+            if isinstance(base_alias, str) and base_alias.strip()
+        }
+        for base_alias in switch_bases:
+            if part_keys:
+                for part_key in part_keys:
+                    routed_states = (
+                        switch_states_by_part.setdefault(base_alias, {}).setdefault(
+                            part_key, {}
+                        )
+                    )
+                    for alias in variant_aliases:
+                        routed_states.setdefault(
+                            _normalise_material_alias(alias), material_name
+                        )
+            else:
+                routed_states = switch_shared_states.setdefault(base_alias, {})
+                for alias in variant_aliases:
+                    routed_states.setdefault(
+                        _normalise_material_alias(alias), material_name
+                    )
         base_forks.setdefault(
             _split_material_skin_suffix(_normalise_material_alias(variant_aliases[0]))[0],
             [],
@@ -1889,25 +1919,24 @@ def _prepare_texture_correction_materials(
                 by_stage,
             )
 
-        for base_alias in entry.get("switchBaseAliases", []) or []:
-            if not isinstance(base_alias, str) or not base_alias.strip():
-                continue
+        for base_alias in switch_bases:
             switch_sources.setdefault(
-                (_normalise_material_alias(base_alias), part_keys),
+                (base_alias, part_keys),
                 (_entry_source_material_for_alias(entry, base_alias), by_source, by_stage),
             )
 
     switch_forks: list[SwitchBaseFork] = []
     for base_alias, part_keys in sorted(switch_sources):
         fork_name = _texture_correction_material_name(base_alias, used_names)
-        # The states are whatever this mesh's corrections came to overall, not
-        # merely the entries that named this base: one glowMap entry can switch
-        # to several materials, and only some of them are corrected per mesh.
-        # Reading them the way the DAE binding does keeps entry and mesh
-        # agreeing about which copy of a texture this mesh got.
-        states = dict(shared)
+        # The states are the corrections exported for this base on this mesh.
+        # One glowMap entry can switch to several materials, while several
+        # entries on that mesh can reuse those material names over different UV
+        # islands.  Keeping both axes makes each entry choose its own copy.
+        states = dict(switch_shared_states.get(base_alias, {}))
         for part_key in part_keys:
-            states.update(by_part.get(part_key, {}))
+            states.update(
+                switch_states_by_part.get(base_alias, {}).get(part_key, {})
+            )
         switch_forks.append(SwitchBaseFork(base_alias, fork_name, part_keys, states))
         base_forks.setdefault(base_alias, []).append((part_keys, fork_name))
 
@@ -2259,6 +2288,120 @@ def _node_material_symbols(dae_path: Path, node_ids: set[str]) -> dict[str, set[
             symbols |= geometry_materials.get((instance.get("url") or "").lstrip("#"), set())
         found[node_id] = symbols
     return found
+
+
+def _retarget_runtime_screen_nodes(
+    dae_path: Path,
+    node_ids: set[str],
+    alias_to_material: dict[str, str],
+) -> list[str]:
+    """Give selected screen nodes private COLLADA material bindings.
+
+    A glowMap is assembled from every selected JBeam part.  A child part may
+    therefore restore the donor's glow entry after the generated screen owner
+    was patched.  Retargeting the converted node's trigger material makes that
+    donor entry irrelevant, while the conversion can carry a private trigger
+    with the same state machine.
+
+    Geometry can be instanced by more than one node.  In that case mutate a
+    private geometry copy for the selected nodes instead of changing an
+    unconverted consumer as a side effect.
+    """
+    if not node_ids or not alias_to_material:
+        return []
+    try:
+        tree = ET.parse(dae_path)
+    except (OSError, ET.ParseError):
+        return []
+    root = tree.getroot()
+    renames = {
+        _normalise_material_alias(source): str(target)
+        for source, target in alias_to_material.items()
+        if _normalise_material_alias(source) and str(target).strip()
+    }
+    if not renames:
+        return []
+
+    source_root = copy.deepcopy(root)
+    geometry_library = root.find(".//c:library_geometries", NS)
+    if geometry_library is None:
+        return []
+    geometries = {
+        geometry.get("id"): geometry
+        for geometry in geometry_library.findall("c:geometry", NS)
+        if geometry.get("id")
+    }
+    parent = _collada_parent_map(root)
+
+    def owning_node(instance: ET.Element) -> ET.Element | None:
+        current = parent.get(instance)
+        while current is not None and current.tag != _collada_q("node"):
+            current = parent.get(current)
+        return current
+
+    instances_by_geometry: dict[str, list[tuple[ET.Element, str]]] = {}
+    for instance in root.findall(".//c:instance_geometry", NS):
+        geometry_id = (instance.get("url") or "").lstrip("#")
+        owner = owning_node(instance)
+        if not geometry_id or owner is None:
+            continue
+        owner_id = owner.get("id") or owner.get("name") or ""
+        instances_by_geometry.setdefault(geometry_id, []).append((instance, owner_id))
+
+    selected_instances: dict[str, list[ET.Element]] = {}
+    for geometry_id, instances in instances_by_geometry.items():
+        selected = [instance for instance, owner_id in instances if owner_id in node_ids]
+        if selected:
+            selected_instances[geometry_id] = selected
+
+    used_geometry_ids = set(geometries)
+    retargeted_nodes: set[str] = set()
+    changed = False
+    for geometry_id, instances in selected_instances.items():
+        source_geometry = geometries.get(geometry_id)
+        if source_geometry is None:
+            continue
+        painted_aliases = {
+            _normalise_material_alias(material)
+            for primitive in source_geometry.iter()
+            if (material := primitive.get("material"))
+        }
+        relevant = painted_aliases.intersection(renames)
+        if not relevant:
+            continue
+
+        all_instances = instances_by_geometry.get(geometry_id, [])
+        shared_with_unselected = any(owner_id not in node_ids for _, owner_id in all_instances)
+        geometry = source_geometry
+        if shared_with_unselected:
+            base_id = f"{geometry_id}__beamxp_runtime"
+            clone_id = base_id
+            counter = 2
+            while clone_id in used_geometry_ids:
+                clone_id = f"{base_id}_{counter}"
+                counter += 1
+            geometry = copy.deepcopy(source_geometry)
+            geometry.set("id", clone_id)
+            if geometry.get("name"):
+                geometry.set("name", f"{geometry.get('name')} BeamXP runtime")
+            geometry_library.append(geometry)
+            used_geometry_ids.add(clone_id)
+            for instance in instances:
+                instance.set("url", f"#{clone_id}")
+
+        _retarget_collada_materials(geometry, renames)
+        for instance in instances:
+            _retarget_collada_materials(instance, renames)
+            owner = owning_node(instance)
+            if owner is not None:
+                retargeted_nodes.add(owner.get("id") or owner.get("name") or "")
+        changed = True
+
+    if not changed:
+        return []
+    _ensure_retargeted_collada_materials(root, source_root, renames)
+    write_xml_tree(tree, dae_path)
+    return sorted(node_id for node_id in retargeted_nodes if node_id)
 
 
 def _mirror_row_split_target(
@@ -3112,17 +3255,18 @@ _LOCAL_PAGE_RE = re.compile(r'"local://local/([^"]+\.html)"', re.IGNORECASE)
 def _mirror_page_style(origin: float) -> str:
     """Reflect the rendered page about ``origin`` of its own width.
 
-    Reflecting the page is the only correction a live screen can take: there is
-    no image to rewrite, and no UV island to reflect either, because a
-    texture-corrected mesh is rebuilt by the symmetry sweep and never sees the
-    flip scope.  The axis has to be the middle of the window the quad actually
-    samples, not the middle of the page -- the LC500's cluster reads
-    u 0.275..0.785, so reflecting about the page instead slides the dial 12% of
-    the quad's width to the left and tucks part of it behind the binnacle.
+    Reflecting the page is the fallback for a live screen whose final UV island
+    was rebuilt by the texture-correction sweep.  Apply the transform to the
+    rendered body, not the root ``html`` element: BeamNG's webview texture
+    capture does not include a root-element compositor transform even though a
+    desktop Chromium screenshot does.  The axis has to be the middle of the
+    window the quad actually samples, not the middle of the page -- the
+    LC500's cluster reads u 0.275..0.785, so reflecting about the page centre
+    slides the dial 12% of the quad's width behind the binnacle.
     """
     return (
         '<style id="beamxp-mirror">'
-        f"html{{transform:scaleX(-1);transform-origin:{origin * 100:.4f}% 50%;}}"
+        f"body{{transform:scaleX(-1);transform-origin:{origin * 100:.4f}% 50%;}}"
         "</style>"
     )
 
@@ -3478,6 +3622,85 @@ def _append_controller_row(part_body: str, row: str, runtime_alias: str) -> str:
     return prefix + addition + part_body[close:]
 
 
+def _replace_or_append_beam_navigator_row(
+    part_body: str,
+    row: str,
+    source_alias: str,
+    target_alias: str,
+) -> str:
+    """Move one generated part's navigator from its donor tag to our tag.
+
+    BeamNG keys loaded controllers by their configured ``name`` and initializes
+    every distinct row (``lua/vehicle/controller.lua``).  Appending a renamed
+    navigator beside the donor therefore leaves two live HTML textures updating
+    forever.  The conversion-specific part needs the same navigator settings,
+    but under one conversion-owned runtime identity, so replace that exact row.
+    """
+    controller = transform_helpers.extract_named_array(part_body, "controller")
+    if not controller:
+        return _append_controller_row(part_body, row, target_alias)
+
+    masked = transform_helpers.mask_comments_preserve_offsets(controller)
+    matching_rows: list[tuple[int, int, str]] = []
+    for match in _BEAM_NAVIGATOR_ROW_RE.finditer(masked):
+        bracket = masked.find("[", match.start(), match.end())
+        try:
+            end = transform_helpers.find_matching(masked, bracket, "[", "]")
+        except ValueError:
+            continue
+        existing_row = controller[bracket:end]
+        material_match = re.search(
+            _JBEAM_STRING_FIELD_RE.format(field="screenMaterialName"),
+            existing_row,
+        )
+        if material_match is None:
+            continue
+        try:
+            material = json.loads(material_match.group(0).split(":", 1)[1])
+        except Exception:
+            continue
+        material_alias = _runtime_alias(material)
+        if material_alias in {source_alias, target_alias}:
+            matching_rows.append((bracket, end, material_alias))
+
+    if not matching_rows:
+        return _append_controller_row(part_body, row, target_alias)
+
+    # Retain exactly one controller on repeated runs too.  Prefer an existing
+    # target row when repairing an output made by an older BeamXP version;
+    # otherwise the donor row is the position replaced in a clean build.
+    anchor = next(
+        (item for item in matching_rows if item[2] == target_alias),
+        matching_rows[0],
+    )
+    updated_controller = controller
+    for start, end, _material_alias in reversed(matching_rows):
+        if start == anchor[0]:
+            updated_controller = (
+                updated_controller[:start] + row + updated_controller[end:]
+            )
+            continue
+        current_masked = transform_helpers.mask_comments_preserve_offsets(
+            updated_controller
+        )
+        right = end
+        while right < len(current_masked) and current_masked[right].isspace():
+            right += 1
+        if right < len(current_masked) and current_masked[right] == ",":
+            updated_controller = (
+                updated_controller[:start] + updated_controller[right + 1 :]
+            )
+            continue
+        left = start - 1
+        while left >= 0 and current_masked[left].isspace():
+            left -= 1
+        if left >= 0 and current_masked[left] == ",":
+            updated_controller = updated_controller[:left] + updated_controller[end:]
+        else:
+            updated_controller = updated_controller[:start] + updated_controller[end:]
+    return part_body.replace(controller, updated_controller, 1)
+
+
 def _upsert_part_glow_entries(part_body: str, entries: dict[str, str]) -> str:
     if not entries:
         return part_body
@@ -3496,9 +3719,20 @@ def _upsert_part_glow_entries(part_body: str, entries: dict[str, str]) -> str:
 
 def _patch_runtime_screen_parts(
     text: str,
-    target_meshes: set[str],
     specs: list[dict[str, object]],
 ) -> tuple[str, int]:
+    """Rebind screen owners and synchronize their generated glowMap forks.
+
+    A flexbody's mesh name and its owning JBeam part id are independent.  In
+    particular, a dedicated screen mesh commonly lives in a generated interior
+    part, and texture correction can replace that mesh with one or more split
+    nodes.  The mesh row is therefore the ownership evidence; requiring the
+    part id to equal the mesh silently leaves the donor's runtime tag in place.
+
+    Glow maps have broader scope: all selected parts merge into one table, so a
+    duplicate private fork row on any generated part must name the same live
+    target even though only the screen's owning part receives the controller.
+    """
     key_pattern = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:[\s,]*\{')
     masked = transform_helpers.mask_comments_preserve_offsets(text)
     out: list[str] = []
@@ -3517,32 +3751,177 @@ def _patch_runtime_screen_parts(
         if (
             '"slotType"' not in part_body
             or _GENERATED_HAND_PART_RE.search(part_id) is None
-            or part_id not in target_meshes
-            or not any(
-            encode_beamng_json(mesh) in part_body for mesh in target_meshes
-            )
         ):
             continue
         updated = part_body
         for spec in specs:
-            updated = _append_controller_row(
+            target_meshes = {
+                str(mesh)
+                for mesh in spec.get("targetMeshes", ())
+                if str(mesh).strip()
+            }
+            owns_target_mesh = any(
+                encode_beamng_json(mesh) in part_body for mesh in target_meshes
+            )
+            source_alias = _runtime_alias(spec["sourceAlias"])
+            target_alias = _runtime_alias(spec["targetAlias"])
+            source_glow_entries = {
+                _runtime_alias(key): str(value)
+                for key, value in dict(spec["glowEntries"]).items()
+                if _runtime_alias(key)
+            }
+            part_glow = transform_helpers.extract_keyed_object(updated, "glowMap")
+            current_glow_entries = {
+                _runtime_alias(key): (key, value)
+                for key, _start, _end, value in (
+                    _top_level_jbeam_object_entries(part_glow or "{}")
+                )
+                if _runtime_alias(key)
+            }
+            fork_updates: dict[str, str] = {}
+            forked_source_entries: set[str] = set()
+            for raw_fork in spec.get("switchForks", ()):
+                if not isinstance(raw_fork, Mapping):
+                    continue
+                fork_alias = _runtime_alias(raw_fork.get("alias"))
+                fork_material = _runtime_alias(raw_fork.get("material"))
+                if not fork_alias or not fork_material:
+                    continue
+                current = current_glow_entries.get(fork_material)
+                bound_by_dae = bool(raw_fork.get("boundByDae"))
+                # A JBeam's installed parts merge into one vehicle.glowMap.
+                # Every generated duplicate of a live, DAE-bound fork must
+                # therefore agree, or part merge order can restore a stale
+                # self-reference.  Only the mesh owner may synthesize a row;
+                # other generated parts are consistency updates, not owners.
+                if not owns_target_mesh and not bound_by_dae:
+                    continue
+                if current is None and not (owns_target_mesh and bound_by_dae):
+                    continue
+                value = (
+                    current[1]
+                    if current is not None
+                    else source_glow_entries.get(fork_alias)
+                )
+                if value is None:
+                    continue
+                raw_states = raw_fork.get("states")
+                states = (
+                    {
+                        _runtime_alias(source): str(material)
+                        for source, material in raw_states.items()
+                        if _runtime_alias(source) and str(material).strip()
+                    }
+                    if isinstance(raw_states, Mapping)
+                    else {}
+                )
+                # Start from the already-corrected fork row when it exists.
+                # If integration supplied no row, reconstruct exactly that row
+                # from the donor and the fork's state map.  In both cases the
+                # static off/on materials stay corrected before the one live
+                # state is moved to the conversion-owned webview.
+                value = _replace_glow_material_states(
+                    value,
+                    fork_alias,
+                    fork_material,
+                    states,
+                )
+                live_renames = {source_alias: target_alias}
+                corrected_live = states.get(source_alias)
+                if corrected_live:
+                    live_renames[_runtime_alias(corrected_live)] = target_alias
+                if source_alias == fork_alias:
+                    # Texture correction replaces a state equal to its base
+                    # with the private fork name.  The EV3 authors its live
+                    # navigator state exactly that way.
+                    live_renames[fork_material] = target_alias
+                for source, target in live_renames.items():
+                    value = _replace_runtime_alias_in_glow_entry(
+                        value, source, target
+                    )
+                if not any(
+                    _runtime_alias(match.group("material")) == target_alias
+                    for match in _GLOW_MATERIAL_STATE_RE.finditer(value)
+                ):
+                    continue
+                fork_updates[
+                    current[0] if current is not None else str(raw_fork.get("material"))
+                ] = value
+                forked_source_entries.add(fork_alias)
+            if fork_updates:
+                updated = _upsert_part_glow_entries(updated, fork_updates)
+            if not owns_target_mesh:
+                continue
+
+            # A selected child slot can contribute the same donor glowMap key
+            # after this generated parent is merged.  The converted DAE binds
+            # a private trigger in that case, so preserve this part's already
+            # corrected static states under the private key as well.  A stale
+            # child row then continues to control only the donor material.
+            trigger_renames = {
+                _runtime_alias(source): str(target)
+                for source, target in dict(spec.get("triggerRenames", {})).items()
+                if _runtime_alias(source) and str(target).strip()
+            }
+            material_renames = {
+                _runtime_alias(source): str(target)
+                for source, target in dict(spec.get("materialRenames", {})).items()
+                if _runtime_alias(source) and str(target).strip()
+            }
+            if trigger_renames:
+                current_glow = transform_helpers.extract_keyed_object(updated, "glowMap")
+                current_entries = {
+                    _runtime_alias(key): value
+                    for key, _start, _end, value in (
+                        _top_level_jbeam_object_entries(current_glow or "{}")
+                    )
+                    if _runtime_alias(key)
+                }
+                fallback_entries = {
+                    _runtime_alias(key): str(value)
+                    for key, value in dict(spec.get("directGlowEntries", {})).items()
+                    if _runtime_alias(key)
+                }
+                private_entries: dict[str, str] = {}
+                for source_trigger, target_trigger in trigger_renames.items():
+                    value = current_entries.get(source_trigger)
+                    if value is None:
+                        value = fallback_entries.get(_runtime_alias(target_trigger))
+                    if value is None:
+                        continue
+                    value = _replace_glow_material_states(
+                        value,
+                        source_trigger,
+                        target_trigger,
+                        material_renames,
+                    )
+                    private_entries[target_trigger] = value
+                if private_entries:
+                    updated = _upsert_part_glow_entries(updated, private_entries)
+
+            updated = _replace_or_append_beam_navigator_row(
                 updated,
                 str(spec["controllerRow"]),
-                str(spec["targetAlias"]),
+                source_alias,
+                target_alias,
             )
             # In place first: this runs after texture correction has rewritten
             # the other states of the same trigger, and replacing the row with
             # the donor's would hand those states back to the donor.
             updated, rebound = _rebind_part_glow_materials(
                 updated,
-                {str(spec["sourceAlias"]): str(spec["targetAlias"])},
+                material_renames
+                or {str(spec["sourceAlias"]): str(spec["targetAlias"])},
             )
+            satisfied_entries = {
+                _runtime_alias(trigger) for trigger in rebound
+            } | forked_source_entries | set(trigger_renames)
             updated = _upsert_part_glow_entries(
                 updated,
                 {
                     key: value
                     for key, value in dict(spec["glowEntries"]).items()
-                    if key not in rebound
+                    if _runtime_alias(key) not in satisfied_entries
                 },
             )
         if updated == part_body:
@@ -3563,6 +3942,8 @@ def isolate_converted_runtime_screens(
     source_meshes: Iterable[str],
     target_hands: Iterable[str],
     reflected_geometry: bool = True,
+    generated_mesh_replacements: Mapping[str, Iterable[str]] | None = None,
+    generated_switch_forks: Iterable[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Give switched HTML screens a conversion-owned webview/material key.
 
@@ -3571,28 +3952,177 @@ def isolate_converted_runtime_screens(
     so it must not recreate the stock vehicle's live texture under that key.
     """
     nav_scope = nav_screen_mesh_scope(context)
-    selected_sources = set(source_meshes).intersection(nav_scope)
-    target_meshes = {
-        generated_mesh_name(source_mesh, hand)
-        for source_mesh in selected_sources
-        for hand in set(target_hands)
-    }
+    uv_flipped_sources = set(source_meshes)
+    selected_sources = uv_flipped_sources.intersection(nav_scope)
+    hands = set(target_hands)
+    replacements = generated_mesh_replacements or {}
+    switch_forks = tuple(
+        fork for fork in generated_switch_forks if isinstance(fork, Mapping)
+    )
+
+    def generated_targets_for(source_ids: Iterable[str]) -> set[str]:
+        """Generated/split mesh names carrying exactly ``source_ids``."""
+        targets = {
+            generated_mesh_name(source_mesh, hand)
+            for source_mesh in source_ids
+            for hand in hands
+        }
+        # Runtime isolation runs after texture-correction integration.  A
+        # selected generated screen may therefore no longer appear literally
+        # in JBeam: its flexbody row can name the sweep's carrier/rigid pieces.
+        pending = list(targets)
+        while pending:
+            mesh = pending.pop()
+            values = replacements.get(mesh, ())
+            if isinstance(values, str):
+                values = (values,)
+            for replacement in values:
+                replacement = str(replacement).strip()
+                if not replacement or replacement in targets:
+                    continue
+                targets.add(replacement)
+                pending.append(replacement)
+        return targets
 
     controllers = _source_beam_navigator_objects(context)
     suffix = mod_id_for_context(context).lower()
     material_definitions: dict[str, object] = {}
     specs: list[dict[str, object]] = []
+    planned_collada_retargets: list[tuple[Path, set[str], dict[str, str]]] = []
     for source_alias, controller_object in controllers.items():
-        source_entries = _source_glow_entries_for_runtime_alias(context, source_alias)
-        # Direct-bound navigator materials do not need a glowMap override and
-        # require COLLADA material retargeting, which is a separate path.
-        if not source_entries:
-            continue
-        target_alias = f"{source_alias}_beamxp_{suffix}"
-        material = _clone_runtime_material_definition(
-            context, source_alias, target_alias
+        runtime_material_keys = _source_materials_referencing_runtime_alias(
+            context, source_alias
         )
-        if material is None:
+        # A glow state usually names a material, not the @webview sampled by
+        # that material.  Follow every material drawing from the navigator tag
+        # so a row whose only live state is a sibling (for example a dim screen)
+        # is still discovered and isolated.
+        source_entries: dict[str, str] = {}
+        for material_key in (source_alias, *runtime_material_keys):
+            for key, value in _source_glow_entries_for_runtime_alias(
+                context, material_key
+            ).items():
+                source_entries.setdefault(key, value)
+        navigator_materials = {
+            _runtime_alias(alias)
+            for alias in (source_alias, *runtime_material_keys, *source_entries)
+            if _runtime_alias(alias)
+        }
+        owned_sources = {
+            source_mesh
+            for source_mesh in selected_sources
+            if navigator_materials.intersection(
+                _runtime_alias(alias)
+                for alias in nav_scope.get(source_mesh, ())
+            )
+        }
+        target_meshes = generated_targets_for(owned_sources)
+        if not target_meshes:
+            continue
+        owned_nav_materials = {
+            _runtime_alias(alias)
+            for source_mesh in owned_sources
+            for alias in nav_scope.get(source_mesh, ())
+            if _runtime_alias(alias)
+        }
+        source_entries = {
+            key: value
+            for key, value in source_entries.items()
+            if _runtime_alias(key) in owned_nav_materials
+        }
+        bound_materials_by_dae: dict[Path, set[str]] = {}
+        bound_materials: set[str] = set()
+        for dae_path in output_vehicle_dir.rglob("*.dae"):
+            dae_materials: set[str] = set()
+            for materials in _node_material_symbols(dae_path, target_meshes).values():
+                dae_materials.update(materials)
+            if dae_materials:
+                bound_materials_by_dae[dae_path] = dae_materials
+                bound_materials.update(dae_materials)
+        source_glow_aliases = {
+            _runtime_alias(alias) for alias in source_entries if _runtime_alias(alias)
+        }
+        relevant_forks: list[dict[str, object]] = []
+        for fork in switch_forks:
+            fork_alias = _runtime_alias(fork.get("alias"))
+            fork_material = _runtime_alias(fork.get("material"))
+            if fork_alias not in source_glow_aliases or not fork_material:
+                continue
+            raw_part_keys = fork.get("partKeys") or ()
+            if isinstance(raw_part_keys, str):
+                raw_part_keys = (raw_part_keys,)
+            elif not isinstance(raw_part_keys, Iterable):
+                raw_part_keys = ()
+            part_keys = {
+                str(key).strip() for key in raw_part_keys if str(key).strip()
+            }
+            if part_keys and part_keys.isdisjoint(owned_sources):
+                continue
+            bound_by_dae = fork_material in bound_materials
+            if bound_materials and not bound_by_dae:
+                continue
+            raw_states = fork.get("states")
+            relevant_forks.append(
+                {
+                    "alias": fork_alias,
+                    "material": str(fork.get("material")),
+                    "states": dict(raw_states) if isinstance(raw_states, Mapping) else {},
+                    "boundByDae": bound_by_dae,
+                }
+            )
+        target_alias = f"{source_alias}_beamxp_{suffix}"
+
+        # A navigator tag is not necessarily used by only one material.  The
+        # Ardente, for example, has bright and dim screen materials that both
+        # sample the same @ardente_gps_screen webview.  Moving the controller
+        # but cloning only the bright material leaves the dim state sampling a
+        # render target nobody creates.
+        material_renames: dict[str, str] = {}
+        for material_key in runtime_material_keys:
+            target_material = (
+                target_alias
+                if material_key == source_alias
+                else f"{material_key}_beamxp_{suffix}"
+            )
+            cloned = _clone_runtime_material_definition(
+                context,
+                material_key,
+                target_material,
+                {source_alias: target_alias},
+            )
+            if cloned is None:
+                continue
+            material_definitions[target_material] = cloned
+            material_renames[material_key] = target_material
+        if not material_renames:
+            continue
+
+        # A source child slot can merge a stale glowMap row after the generated
+        # parent.  For trigger materials painted by the converted screen mesh,
+        # isolate the COLLADA binding and give the generated part a private
+        # trigger key.  The child may still restore its donor key, but that key
+        # no longer addresses the converted geometry.
+        direct_sources = set(source_glow_aliases)
+        if source_alias in bound_materials:
+            direct_sources.add(source_alias)
+        trigger_renames: dict[str, str] = {}
+        for trigger_alias in sorted(direct_sources.intersection(bound_materials)):
+            target_trigger = material_renames.get(trigger_alias)
+            if target_trigger is None:
+                target_trigger = f"{trigger_alias}_beamxp_{suffix}"
+                cloned = _clone_runtime_material_definition(
+                    context,
+                    trigger_alias,
+                    target_trigger,
+                    {source_alias: target_alias},
+                )
+                if cloned is None:
+                    continue
+                material_definitions[target_trigger] = cloned
+                material_renames[trigger_alias] = target_trigger
+            trigger_renames[trigger_alias] = target_trigger
+
+        if not source_entries and not trigger_renames:
             continue
         controller = _replace_jbeam_string_field(
             controller_object, "screenMaterialName", "@" + target_alias
@@ -3600,28 +4130,65 @@ def isolate_converted_runtime_screens(
         controller = _replace_jbeam_string_field(
             controller, "name", "beamxp_" + target_alias
         )
-        glow_entries = {
-            key: _replace_runtime_alias_in_glow_entry(
-                value, source_alias, target_alias
-            )
-            for key, value in source_entries.items()
-        }
-        material_definitions[target_alias] = material
+        glow_entries: dict[str, str] = {}
+        direct_glow_entries: dict[str, str] = {}
+        for key, value in source_entries.items():
+            rewritten = value
+            for source_material, target_material in material_renames.items():
+                rewritten = _replace_runtime_alias_in_glow_entry(
+                    rewritten, source_material, target_material
+                )
+            glow_entries[key] = rewritten
+            target_trigger = trigger_renames.get(_runtime_alias(key))
+            if target_trigger:
+                direct_glow_entries[target_trigger] = rewritten
+
+        for dae_path, dae_materials in bound_materials_by_dae.items():
+            dae_renames = {
+                source: target
+                for source, target in trigger_renames.items()
+                if source in dae_materials
+            }
+            if dae_renames:
+                planned_collada_retargets.append(
+                    (dae_path, set(target_meshes), dae_renames)
+                )
         specs.append(
             {
                 "sourceAlias": source_alias,
                 "targetAlias": target_alias,
                 "controllerRow": '["beamNavigator", ' + controller + "]",
                 "glowEntries": glow_entries,
+                "targetMeshes": sorted(target_meshes),
+                "switchForks": relevant_forks,
+                "materialRenames": material_renames,
+                "triggerRenames": trigger_renames,
+                "directGlowEntries": direct_glow_entries,
             }
         )
 
     # Isolating the tag is needed whatever the conversion does to the geometry.
-    # Reflecting the page is only right once the cabin is actually reflected --
-    # a translate-mode conversion leaves the screen reading as authored.
+    # Page orientation, however, belongs to each controller's own screen.  The
+    # geometry exporter reflects only the aliases in this exact per-mesh scope
+    # (``generation.generate_daes`` passes it as ``flip_materials``).  Use the
+    # same set here: another display material merely sharing the mesh is not
+    # evidence that this controller's own UV island moved.  A scoped mirrored
+    # island gets one UV flip and must not also reflect its HTML; an unscoped
+    # controller keeps the HTML fallback.
+    display_scope = display_texture_flip_scope(context)
+    uv_owned_materials = {
+        _runtime_alias(alias)
+        for source_mesh in uv_flipped_sources.intersection(display_scope)
+        for alias in display_scope.get(source_mesh, ())
+        if _runtime_alias(alias)
+    }
     controller_specs, controller_materials, controller_lua, controller_pages = (
         _controller_owned_screen_specs(
-            context, controllers, suffix, reflect_pages=reflected_geometry
+            context,
+            controllers,
+            suffix,
+            reflect_pages=reflected_geometry,
+            uv_owned_materials=uv_owned_materials,
         )
     )
     material_definitions.update(controller_materials)
@@ -3630,9 +4197,9 @@ def isolate_converted_runtime_screens(
     for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
         original = path.read_text(encoding="utf-8")
         updated = original
-        if specs and target_meshes:
+        if specs:
             updated, _changed = _patch_runtime_screen_parts(
-                updated, target_meshes, specs
+                updated, specs
             )
         if controller_specs:
             updated, _changed = _patch_controller_owned_screen_parts(
@@ -3643,7 +4210,25 @@ def isolate_converted_runtime_screens(
         path.write_text(updated, encoding="utf-8")
         patched_files.append(str(path))
     if not patched_files:
-        return {"enabled": False, "materials": [], "jbeamFiles": []}
+        return {
+            "enabled": False,
+            "materials": [],
+            "jbeamFiles": [],
+            "colladaRetargets": [],
+        }
+
+    collada_retargets: list[dict[str, object]] = []
+    for dae_path, node_ids, renames in planned_collada_retargets:
+        nodes = _retarget_runtime_screen_nodes(dae_path, node_ids, renames)
+        if not nodes:
+            continue
+        collada_retargets.append(
+            {
+                "daeFile": str(dae_path),
+                "nodes": nodes,
+                "materials": dict(sorted(renames.items())),
+            }
+        )
 
     written_lua: list[str] = []
     for file_name, text in controller_lua.items():
@@ -3668,6 +4253,7 @@ def isolate_converted_runtime_screens(
         "enabled": True,
         "materials": sorted(material_definitions),
         "jbeamFiles": patched_files,
+        "colladaRetargets": collada_retargets,
         "controllerFiles": sorted(written_lua),
         "screenPages": sorted(written_pages),
     }
@@ -3678,6 +4264,7 @@ def _controller_owned_screen_specs(
     navigator_controllers: dict[str, str],
     suffix: str,
     reflect_pages: bool = False,
+    uv_owned_materials: Iterable[str] = (),
 ) -> tuple[list[dict[str, object]], dict[str, object], dict[str, str], dict[str, str]]:
     """Plan the isolation of runtime tags a mod's own controller hard-codes.
 
@@ -3700,6 +4287,9 @@ def _controller_owned_screen_specs(
     materials: dict[str, object] = {}
     lua_files: dict[str, str] = {}
     page_files: dict[str, str] = {}
+    geometry_owned = {
+        _runtime_alias(alias) for alias in uv_owned_materials if _runtime_alias(alias)
+    }
     for source_alias, source_controller in sorted(owners.items()):
         entry = lua_sources.get(source_controller)
         if entry is None:
@@ -3736,7 +4326,12 @@ def _controller_owned_screen_specs(
                 )
 
         controller_text = _retag_controller_lua(entry[1], source_alias, target_alias)
-        if reflect_pages:
+        controller_materials = {
+            _runtime_alias(alias)
+            for alias in (source_alias, *renames, *glow_entries)
+            if _runtime_alias(alias)
+        }
+        if reflect_pages and controller_materials.isdisjoint(geometry_owned):
             # The glow trigger keys are the symbols the DAE binds, which is what
             # tells us how much of the page this screen actually shows.
             origin = _sampled_u_centre(context, set(glow_entries))
@@ -4216,6 +4811,7 @@ def build_batch(
         "enabled": False,
         "materials": [],
         "jbeamFiles": [],
+        "colladaRetargets": [],
     }
     if variant_targets:
         emit_progress("Writing generated JBeam and config files...")
@@ -4300,6 +4896,17 @@ def build_batch(
         # After correction, not before: correction rebuilds a switched trigger's
         # row from the donor's jbeam, so a runtime rebind applied first is
         # handed straight back to the donor's material.
+        integration = texture_correction_report.get("integration")
+        generated_mesh_replacements = (
+            integration.get("rowReplacements", {})
+            if isinstance(integration, dict)
+            else {}
+        )
+        generated_switch_forks = (
+            integration.get("switchBaseForks", [])
+            if isinstance(integration, dict)
+            else []
+        )
         runtime_screen_patch = isolate_converted_runtime_screens(
             context,
             output_vehicle_dir,
@@ -4308,6 +4915,16 @@ def build_batch(
             reflected_geometry=any(
                 mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
                 for mode in object_modes.values()
+            ),
+            generated_mesh_replacements=(
+                generated_mesh_replacements
+                if isinstance(generated_mesh_replacements, Mapping)
+                else {}
+            ),
+            generated_switch_forks=(
+                generated_switch_forks
+                if isinstance(generated_switch_forks, list)
+                else []
             ),
         )
     texture_correction_report["runtimeScreens"] = runtime_screen_patch

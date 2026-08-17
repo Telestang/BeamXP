@@ -182,6 +182,77 @@ class ForkedSwitchBaseTests(unittest.TestCase):
         self.assertIn(f'"on":"{door_on}"', door_entry)
         self.assertNotEqual(interior_on, door_on)
 
+    def test_switch_bases_sharing_states_keep_their_own_uv_corrections(self) -> None:
+        """A state alias is not a sufficient key when one mesh reuses it.
+
+        The EV3's P/R/N/D glyph quads are four glowMap bases on one shifter.
+        Every base switches to the same off/on material pair, but each quad
+        occupies a different UV island.  The texture exporter consequently
+        writes four corrections of each state.  Collapsing them through the
+        part-wide ``state alias -> material`` map routes all four bases to the
+        first island's correction and leaves the other glyphs behind.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            job = tmp / "job"
+            job.mkdir()
+            entries: list[dict] = []
+            for base in ("auto_P", "auto_R", "auto_N", "auto_D"):
+                for state in ("interior_text", "interior_text_on"):
+                    texture = f"{base.lower()}_{state}.dds"
+                    (job / texture).write_bytes(b"dds")
+                    entries.append(
+                        {
+                            "aliases": [base, state],
+                            "switchBaseAliases": [base],
+                            "partKeys": ["shifter"],
+                            "maps": {"baseColorMap": texture},
+                            "outputMaps": [
+                                {
+                                    "stageKey": "baseColorMap",
+                                    "member": "vehicles/test/interior_text.dds",
+                                    "dds": texture,
+                                }
+                            ],
+                            "sourceMaterials": [
+                                {
+                                    "key": state,
+                                    "aliases": [state],
+                                    "material": {
+                                        "name": state,
+                                        "mapTo": state,
+                                        "Stages": [
+                                            {
+                                                "baseColorMap": (
+                                                    "/vehicles/test/interior_text.dds"
+                                                )
+                                            }
+                                        ],
+                                    },
+                                }
+                            ],
+                        }
+                    )
+            (job / "rhd_materials.json").write_text(
+                json.dumps({"materials": entries}) + "\n", encoding="utf-8"
+            )
+
+            materials = build_pipeline._prepare_texture_correction_materials(
+                job, tmp / "vehicles/test", tmp
+            )
+            material_documents = json.loads(
+                (tmp / "vehicles/test/beamxp_texture_correction.materials.json")
+                .read_text(encoding="utf-8")
+            )
+
+        forks = {fork.alias: fork for fork in materials.switch_forks}
+        self.assertEqual(set(forks), {"auto_p", "auto_r", "auto_n", "auto_d"})
+        for state in ("interior_text", "interior_text_on"):
+            routed = [forks[base].states[state] for base in sorted(forks)]
+            self.assertEqual(len(set(routed)), 4, (state, routed))
+            self.assertTrue(set(routed).issubset(material_documents))
+
 
     def test_a_retargeted_part_gets_its_entry_like_a_split_one(self) -> None:
         # The LC500's doors are mirrored structurally, so they are retargeted

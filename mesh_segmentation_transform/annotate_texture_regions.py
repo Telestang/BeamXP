@@ -44,6 +44,8 @@ from PIL import Image as _PILImage
 # ---------------------------------------------------------------------------
 
 
+
+
 SHAPE_HULL = "hull"
 SHAPE_ROTATED = "rotated"
 BOUNDS_SHAPES = (SHAPE_HULL, SHAPE_ROTATED)
@@ -221,17 +223,6 @@ class MserConfig:
     # mark"; the rectangle is kept because it is the thing an angle and a true
     # aspect ratio come from, and because a hull of thirty points is a busier
     # outline to read at a glance.
-    bounds_shape:                  str = SHAPE_HULL  # default: "hull"
-    # Optional UV-edge direction for adopting a rotated outline.  The closest
-    # contiguous UV contour is authoritative: glyph pixels determine only the
-    # outline extent and its distance from that contour, never its angle.
-    enable_edge_aligned_rotation: bool = False  # default: False
-    rotation_edge_min_gap_px:     float = 2.0  # default: 2.0 (touching the edge is not proximity)
-    rotation_edge_search_px:      int = 24  # default: 24 (max distance to UV edge)
-    rotation_edge_band_px:        int = 6  # default: 6 (edge samples near closest approach)
-    rotation_edge_min_points:     int = 8  # default: 8 (else no edge angle is fitted)
-    max_rotation_edge_angle_degrees: float = 12.0  # default: 12.0 (max local UV-tangent instability)
-    max_opposite_rotation_edge_fraction: float = 0.5  # default: 0.5 (reject UV-bounded strips)
     # How much of the enclosing shape has to be feature before the outline is
     # worth adopting.  An absolute bar, not a comparison against the
     # axis-aligned box: comparing two shapes around one feature, the ratio of
@@ -250,6 +241,92 @@ class MserConfig:
     # reads 9.1 and AIRBAG 5.3 about axes that are unmistakably real.  Below
     # this the region keeps its axis-aligned box, which claims nothing.
     min_rotated_elongation:      float = 2.5  # default: 2.5
+
+    # A rotation smaller than this is declined and the axis-aligned box kept,
+    # whichever way the angle was arrived at.  Measured over the 147 marks the
+    # shipped plans under segmentation_outputs flipped, 55% sit within a
+    # quarter of a degree of an atlas axis and a further 4% inside half a
+    # degree, then the distribution thins out -- only 12 more regions between
+    # half a degree and one.  So marks are overwhelmingly drawn on axis, and a
+    # sub-degree angle is quantisation rather than tilt.
+    #
+    # Declining costs nothing and avoids something: mirroring about a rotated
+    # box resamples the region, so a fraction-of-a-pixel rotation softens every
+    # edge in it to move it nowhere.  On a false positive that is pure damage.
+    min_rotation_angle_degrees:  float = 0.5  # default: 0.5 (0 disables)
+
+    # Take the angle from the mark's own reflective symmetry rather than from a
+    # nearby UV edge.  The axis a mark should be mirrored about is its own axis
+    # of symmetry, so measure that instead of borrowing a neighbour's.
+    #
+    # Measured on the magic-wand feature, not on its convex hull.  The hull
+    # cannot carry this test: over 15 ardente marks it scored 0.83-0.99, a
+    # spread of 0.17 with everything bunched at the top, and it calls a scalene
+    # triangle 0.97 -- convexity forces high self-overlap and discards exactly
+    # the internal structure that makes a mark symmetric.  The same measure on
+    # the feature mask spreads 0.19-0.96.
+    #
+    # On by default.  It answers the question the edge fit could only approach
+    # sideways -- the axis a mark is mirrored about is its own axis of
+    # symmetry, not a neighbouring UV edge's direction -- and on the ardente it
+    # separates the marks that want an angle from the ones that do not:
+    # the vent symbol adopts at 7.6 degrees off axis, the AIRBAG block is
+    # recognised as symmetric and left square because it already is, and both
+    # horn pictograms are declined.
+    enable_symmetry_rotation:    bool = True  # default: True
+    # Reflection intersection-over-union at the best axis, the same statistic
+    # ``analyse_uv_island_symmetry`` uses for UV islands.  Lettering separates
+    # cleanly on it -- A scores 0.99 and T 1.00 against F 0.31, L 0.32 and
+    # R 0.53 -- which is the shape real marks take.  A solid *convex* blob is
+    # the known soft spot: it overlaps its own reflection well however
+    # asymmetric it is, and a scalene triangle measures 0.78.  That is left
+    # alone because it needs no fixing here: a convex blob with no internal
+    # structure is what the blob-shape filter removes, and mirroring one about
+    # any axis changes nothing.
+    # Measured over the 103 symmetry probes the harness's own per-island
+    # pipeline makes on the ardente dashboard.  The marks that should carry an
+    # angle score 0.930 (the R badge), 0.950 (the AIRBAG legend) and 0.966 (the
+    # vent symbol); both horn pictograms, which should not, score 0.888.  0.91
+    # sits in the middle of that gap.
+    #
+    # For scale, it admits 57 of the 103 -- of which 41 are then straightened
+    # by ``min_rotation_angle_degrees`` for being square already, so 16 regions
+    # actually turn.  The population runs 0.575 to 1.000 with a median of
+    # 0.927, so this is a bar near the middle, not out on a tail.
+    min_rotation_symmetry:       float = 0.91  # default: 0.91
+    # A round mark is symmetric about every axis, so a high score alone does
+    # not mean the angle means anything.  This is the share of the sweep coming
+    # within ``rotation_symmetry_plateau`` of the best score; real marks measure
+    # 0.00-0.07, a disc measures 1.0.
+    max_rotation_symmetry_spread: float = 0.25  # default: 0.25
+    rotation_symmetry_plateau:   float = 0.02  # default: 0.02
+    # Sweep resolution.  The refinement halves the coarse step this many times,
+    # so it has to reach well below ``min_rotation_angle_degrees`` or the gate
+    # is deciding on noise: 6 degrees halved 6 times is 0.094.
+    rotation_symmetry_step_degrees: float = 6.0  # default: 6.0
+    rotation_symmetry_refinements: int = 6  # default: 6
+    # The square the shape is resampled into before it is reflected.
+    #
+    # Measured on the regions the harness's own per-island pipeline produces
+    # for the ardente dashboard -- 103 symmetry probes over 805 UV islands --
+    # the grid barely matters: the separation between the marks that want an
+    # angle and the ones that do not is +0.042 at 64, +0.043 at 96 and +0.044
+    # at 128, and only 48 is clearly worse at +0.023.  64 is kept because it is
+    # the cheapest of the three and scores the AIRBAG legend highest (0.950,
+    # against 0.933 at 96).
+    #
+    # An earlier reading of 96 came from measuring a 700x147 block that
+    # contained the legend rather than the legend's own 101x17 region; a large
+    # region is downsampled into the grid and does benefit from more of it,
+    # which is not the common case.
+    rotation_symmetry_grid_px:   int = 64  # default: 64
+    # Vertices the hull is reduced to before it is reflected.  A hull straight
+    # off the feature carries as many points as the silhouette happens to have
+    # -- 6 for the AIRBAG legend, 13 for the vent symbol, 38 for the R badge --
+    # so shapes are not compared on equal terms.  Fixing the count does that,
+    # and a low count is deliberately forgiving: fewer vertices sit closer to
+    # regular, so more shapes read as symmetric.  0 leaves the hull alone.
+    rotation_symmetry_hull_nodes: int = 6  # default: 6
 
     # Text lines.  The only filter here that asks what a mark *is* rather than
     # whether it is one.  A horn or seat pictogram passes every other test --
@@ -374,7 +451,20 @@ class MserConfig:
     # If the same magic-wand feature continues outside the detected bounds, the
     # box is probably a slice of a larger motif/material run rather than a mark.
     enable_feature_extension_filter:   bool = False  # default: False
-    feature_extension_context_px:      int = 12  # default: 12
+    # Reference-scale distances for a candidate whose shorter side is
+    # ``feature_extension_reference_extent_px``.  Scaling them with the mark,
+    # rather than leaving them as native-atlas pixels, gives a half-resolution
+    # material layer the same decision as its full-resolution sibling.
+    feature_extension_context_px:      int = 12  # default: 12 beyond the grace
+    feature_extension_reference_extent_px: int = 25  # default: 25
+    # Local-contrast boxes end at the thresholded core of an anti-aliased
+    # mark, not necessarily at the last connected edge texel.  On the V60 the
+    # otherwise complete P/R/N/D and door-card 2 boxes carry a roughly four-pixel
+    # fringe at this reference size.  Only a lower-contrast fringe is forgiven;
+    # a hard continuation remains evidence of a seam or larger motif.
+    feature_extension_grace_px:        int = 4  # default: 4 at reference size
+    feature_extension_grace_max_fraction: float = 0.20  # default: 20% of short side
+    feature_extension_soft_fringe_ratio: float = 0.75  # default: collar/core contrast
     feature_extension_min_ratio:       float = 0.25  # default: 0.25 (outside / inside)
 
     # Post-detection filtering.  MSER's own max_area already caps a region far
@@ -558,6 +648,15 @@ DEFAULT_COLOUR_CONFIG = replace(
     feature_extension_min_ratio=0.03,
     min_region_uv_coverage=0.98,
 )
+# One preset for every relief front end.  Its rotation, flatness and ring
+# values were measured on the GPU edge response and promoted 2026-08-16 from
+# the tuning harness's saved "Relief (normal map - GPU)" session; the CPU relief
+# paths now take them too.  It is the same detector on the same slope render,
+# differing only in where the edge response is computed, so a second preset
+# could only describe the same marks twice and drift.  Production reads this
+# constant for the normal layer, running it with box_source="edge_gpu" (see
+# _detect_layer_regions in mirror_texture_for_rhd.py), so these values are what
+# a production run detects moulded marks with.
 DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     DEFAULT_COLOUR_CONFIG,
     box_source="edge",
@@ -566,25 +665,45 @@ DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     swt_polarity="both",
     enable_rotated_bounds_filter=True,
     min_rotated_fill=0.01,
-    bounds_shape=SHAPE_ROTATED,
-    enable_edge_aligned_rotation=True,
-    rotation_edge_search_px=50,
     min_feature_tightness=0.01,
+    # Symmetry-driven rotation: a coarser sweep with more refinement passes on
+    # a finer grid, accepting a lower symmetry score.  Moulded marks rarely
+    # reach 0.91 on a slope render, and an unrotated box on a rotated glyph is
+    # the failure this search exists to avoid.
+    min_rotation_symmetry=0.7,
+    rotation_symmetry_step_degrees=12.0,
+    rotation_symmetry_refinements=10,
+    rotation_symmetry_grid_px=96,
+    rotation_symmetry_hull_nodes=8,
+    min_rotated_elongation=1.0,
     enable_region_flatness_filter=True,
-    region_flatness_percentile=95.0,
+    # Relief renders sit at a lower percentile than colour: the flatness gate
+    # is measuring slope, not ink.
+    region_flatness_percentile=60.0,
     min_region_relief=5.0,
     enable_relief_glyph_filter=True,
     enable_relief_text_filter=True,
     enable_feature_extension_filter=False,
     enable_ring_smoothness_filter=True,
     ring_smoothness_margin_px=4,
-    ring_smoothness_percentile=30.0,
+    ring_smoothness_width_px=1,
+    ring_smoothness_percentile=20.0,
     min_box_width_px=8,
     min_box_height_px=8,
     box_feature_min_domain_px=8,
     box_min_feature_px=15,
     merge_distance_px=21,
     final_max_aspect=20.0,
+    # The relief path keeps the detection it had before 2026-08-16's work on
+    # colour false positives.  Both of these came to it only by inheriting a
+    # field default, never by being measured on a normal map: the recurrence
+    # filter was characterised on colour atlases -- stitching, woven carbon,
+    # perforated leather -- and the blob floor was lowered on the strength of
+    # colour dashes filling their hull at a flat colour, which is not a
+    # statement a relief render makes.  Turn them on here once there is
+    # evidence from a normal map.
+    enable_repeat_texture_filter=False,
+    min_blob_region_area_px=512,
     # Pinned rather than inherited: the colour preset above was retuned in
     # 2026-08-16's promotion and the relief path was not, so without these two
     # it would follow the colour path by accident.
@@ -1717,7 +1836,7 @@ class FeatureShape:
     rectangle: tuple[tuple[float, float], tuple[float, float], float]
     rectangle_area: float
 
-    def tightness(self, shape: str) -> float:
+    def tightness(self, shape: str = SHAPE_ROTATED) -> float:
         """Share of the enclosing shape that is actually feature.
 
         This is the measure that says how closely a boundary hugs what it
@@ -1734,7 +1853,7 @@ class FeatureShape:
         area = self.hull_area if shape == SHAPE_HULL else self.rectangle_area
         return self.area_px / max(area, 1e-6)
 
-    def outline(self, shape: str) -> tuple[tuple[float, float], ...]:
+    def outline(self, shape: str = SHAPE_ROTATED) -> tuple[tuple[float, float], ...]:
         if shape == SHAPE_HULL:
             return self.hull
         return tuple(
@@ -1750,6 +1869,7 @@ class RegionMagicFeature:
     inner: tuple[int, int, int, int]
     feature: np.ndarray
     tolerance: int
+    background: tuple[int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1768,6 +1888,12 @@ class FeatureExtensionMeasure:
 
     feature_area_px: int
     extension_area_px: int
+    expanded_bounds: tuple[int, int, int, int] | None = None
+    grace_px: int = 0
+    search_px: int = 0
+    soft_fringe_area_px: int = 0
+    hard_extension_area_px: int = 0
+    soft_fringe_hull: tuple[tuple[float, float], ...] = ()
 
     @property
     def extension_ratio(self) -> float:
@@ -1775,16 +1901,114 @@ class FeatureExtensionMeasure:
 
 
 @dataclass(frozen=True, slots=True)
-class EdgeAlignment:
-    """A feature rectangle whose side is parallel to a nearby UV edge."""
+class FeatureExtensionGeometry:
+    """Candidate-scaled distances used by the continuation filter."""
 
-    outline: tuple[tuple[float, float], ...]
-    edge_angle_degrees: float
-    feature_angle_degrees: float
-    angle_delta_degrees: float
-    edge_stability_degrees: float
-    distance_px: float
-    edge_points: int
+    grace_px: int
+    search_px: int
+    ring_margin_px: int
+    ring_width_px: int
+
+
+def _scaled_reference_pixels(value: int, scale: float, minimum: int = 0) -> int:
+    """Scale a positive reference distance without inventing one from zero."""
+    if int(value) <= 0:
+        return 0
+    return max(int(round(float(value) * max(float(scale), 0.0))), minimum)
+
+
+def feature_extension_geometry(
+    group: tuple[int, int, int, int],
+    config: MserConfig,
+) -> FeatureExtensionGeometry:
+    """Scale extension-filter geometry from the candidate's shorter side.
+
+    A text atlas and its scalar/normal companions commonly differ by two or four
+    in resolution.  Their candidate rectangles scale with the atlas, so the
+    shorter side is the local resolution signal that survives cropped and
+    collaged detection.  The fractional cap deliberately wins on tiny marks:
+    an old four-pixel absolute grace must not swallow a four-pixel glyph.
+    """
+    _x, _y, width, height = group
+    extent = max(min(int(width), int(height)), 0)
+    reference = max(float(config.feature_extension_reference_extent_px), 1.0)
+    scale = float(extent) / reference
+    requested_grace = _scaled_reference_pixels(
+        config.feature_extension_grace_px, scale
+    )
+    grace_cap = max(
+        int(math.floor(extent * max(config.feature_extension_grace_max_fraction, 0.0))),
+        0,
+    )
+    grace = min(requested_grace, grace_cap)
+    search = _scaled_reference_pixels(
+        config.feature_extension_context_px, scale, 1
+    )
+    # Background samples begin beyond both the accepted fringe and the ordinary
+    # offset margin.  Scaling the band as well keeps its statistical support
+    # comparable when the same material ships at another resolution.
+    ring_margin = grace + _scaled_reference_pixels(
+        config.region_feature_ring_margin_px, scale, 1
+    )
+    ring_width = _scaled_reference_pixels(
+        config.region_feature_ring_width_px, scale, 1
+    )
+    return FeatureExtensionGeometry(grace, search, ring_margin, ring_width)
+
+
+def expand_rotated_outline_to_points(
+    outline: tuple[tuple[float, float], ...],
+    points: tuple[tuple[float, float], ...],
+) -> tuple[tuple[float, float], ...] | None:
+    """Grow a rotated rectangle around points without moving its mirror axis.
+
+    A carried outline is the stencil used by the production flip planner.  When
+    the continuation check accepts antialiased texels beyond the detector box,
+    growing only that axis-aligned box would leave those texels outside a
+    rotated stencil.  Projecting the fringe onto the outline's own axes keeps
+    its orientation and centre (and therefore its reflection line) unchanged,
+    while symmetrically extending each half-size far enough to include it.
+    """
+    if not points:
+        return outline
+    if len(outline) != 4:
+        return None
+    rectangle = np.asarray(outline, dtype=np.float64)
+    extra = np.asarray(points, dtype=np.float64)
+    if (
+        rectangle.shape != (4, 2)
+        or extra.ndim != 2
+        or extra.shape[1] != 2
+        or not bool(np.isfinite(rectangle).all())
+        or not bool(np.isfinite(extra).all())
+    ):
+        return None
+
+    edges = np.roll(rectangle, -1, axis=0) - rectangle
+    lengths = np.linalg.norm(edges, axis=1)
+    first = int(np.argmax(lengths))
+    second = (first + 1) % 4
+    if float(lengths[first]) <= 1e-6 or float(lengths[second]) <= 1e-6:
+        return None
+    first_axis = edges[first] / lengths[first]
+    second_axis = edges[second] / lengths[second]
+    # Carried outlines come from minAreaRect/symmetry fits and are rectangles.
+    # Drop malformed input to the expanded axis-aligned box rather than retain
+    # a stale rotated stencil that excludes the accepted fringe.
+    if abs(float(first_axis @ second_axis)) > 1e-3:
+        return None
+
+    centre = rectangle.mean(axis=0)
+    offsets = np.concatenate((rectangle, extra), axis=0) - centre
+    first_half = float(np.max(np.abs(offsets @ first_axis)))
+    second_half = float(np.max(np.abs(offsets @ second_axis)))
+    expanded = (
+        centre - first_axis * first_half - second_axis * second_half,
+        centre + first_axis * first_half - second_axis * second_half,
+        centre + first_axis * first_half + second_axis * second_half,
+        centre - first_axis * first_half + second_axis * second_half,
+    )
+    return tuple((float(point[0]), float(point[1])) for point in expanded)
 
 
 def feature_shape(
@@ -1833,269 +2057,235 @@ def feature_shape(
     )
 
 
-def _normalised_axis_angle_degrees(angle: float) -> float:
-    """Map a line direction to [0, 180), because opposite edges are parallel."""
-    return float(angle % 180.0)
+@dataclass(frozen=True, slots=True)
+class SymmetryAxis:
+    """A feature's own axis of reflective symmetry."""
+
+    angle_degrees: float
+    score: float  # reflection intersection-over-union at that axis
+    spread: float  # share of the sweep within `plateau` of the best score
 
 
-def _parallel_angle_delta_degrees(first: float, second: float) -> float:
-    """Smallest angle between two unoriented line directions."""
-    delta = abs(
-        _normalised_axis_angle_degrees(first)
-        - _normalised_axis_angle_degrees(second)
-    )
-    return float(min(delta, 180.0 - delta))
+def rotation_off_axis_degrees(angle_degrees: float) -> float:
+    """Return how far an angle sits from the nearest atlas axis.
 
-
-def _rectangle_long_axis_angle_degrees(
-    rectangle: tuple[tuple[float, float], tuple[float, float], float],
-) -> float:
-    """Return the direction of a min-area rectangle's long side."""
-    _centre, (rw, rh), angle = rectangle
-    if rh > rw:
-        angle += 90.0
-    return _normalised_axis_angle_degrees(angle)
-
-
-def _feature_points(
-    mask: np.ndarray,
-    bounds: tuple[int, int, int, int],
-    config: MserConfig,
-) -> np.ndarray | None:
-    """Feature texel centres inside one clamped region, in absolute pixels."""
-    x, y, w, h = bounds
-    height, width = mask.shape[:2]
-    x0, y0 = max(x, 0), max(y, 0)
-    x1, y1 = min(x + w, width), min(y + h, height)
-    if x1 <= x0 or y1 <= y0:
-        return None
-    points = cv2.findNonZero(mask[y0:y1, x0:x1].astype(np.uint8))
-    if points is None or len(points) < max(config.rotated_bounds_min_points, 3):
-        return None
-    absolute = points.reshape(-1, 2).astype(np.float32)
-    absolute[:, 0] += x0
-    absolute[:, 1] += y0
-    return absolute
-
-
-def _oriented_rectangle_outline(
-    points: np.ndarray,
-    angle_degrees: float,
-) -> tuple[tuple[float, float], ...]:
-    """Axis-aligned bounds in a rotated basis, returned as image-space corners."""
-    radians = math.radians(angle_degrees)
-    along = np.asarray((math.cos(radians), math.sin(radians)), dtype=np.float32)
-    across = np.asarray((-math.sin(radians), math.cos(radians)), dtype=np.float32)
-    projected_along = points @ along
-    projected_across = points @ across
-    min_along, max_along = float(projected_along.min()), float(projected_along.max())
-    min_across, max_across = float(projected_across.min()), float(projected_across.max())
-    corners = (
-        along * min_along + across * min_across,
-        along * max_along + across * min_across,
-        along * max_along + across * max_across,
-        along * min_along + across * max_across,
-    )
-    return tuple((float(point[0]), float(point[1])) for point in corners)
-
-
-def edge_aligned_feature_outline(
-    mask: np.ndarray,
-    uv_mask: np.ndarray | None,
-    bounds: tuple[int, int, int, int],
-    shape: FeatureShape,
-    config: MserConfig,
-    uv_boundary: np.ndarray | None = None,
-    uv_contours: tuple[np.ndarray, ...] | None = None,
-) -> EdgeAlignment | None:
-    """Return a rotated feature outline whose side follows a nearby UV edge.
-
-    Proximity is measured from the feature pixels, not from the box centre.  A
-    long word beside a trim edge can be many pixels from that edge at its
-    centre while one long side is still genuinely close.  The UV-edge angle is
-    fitted from a short contiguous arc around the single closest contour point.
-    The glyph does not contribute an angle, so curved lettering and asymmetric
-    logos cannot tilt a rectangle away from the surface direction.
+    Rotations are equivalent modulo 90 degrees for a rectangle, so the answer
+    is never more than 45.
     """
-    if uv_mask is None:
-        return None
-    feature_points = _feature_points(mask, bounds, config)
-    if feature_points is None:
-        return None
+    remainder = float(angle_degrees) % 90.0
+    return min(remainder, 90.0 - remainder)
 
-    search = max(int(config.rotation_edge_search_px), 0)
-    band = max(int(config.rotation_edge_band_px), 0)
-    x, y, w, h = expanded_box(bounds, search)
-    clamped = clamp_group((x, y, w, h), uv_mask.shape)
-    if clamped is None:
-        return None
-    sx, sy, sw, sh = clamped
 
-    if uv_boundary is None:
-        domain = uv_mask.astype(np.uint8)
-        uv_boundary = cv2.morphologyEx(
-            domain,
-            cv2.MORPH_GRADIENT,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        ).astype(bool)
-    boundary = uv_boundary
-    boundary_crop = boundary[sy : sy + sh, sx : sx + sw]
-    if not bool(boundary_crop.any()):
-        return None
+def feature_symmetry_axis(
+    feature: np.ndarray,
+    config: MserConfig,
+) -> SymmetryAxis | None:
+    """Find the axis a feature most nearly reflects onto itself about.
 
-    feature_crop = np.zeros((sh, sw), dtype=bool)
-    local_x = np.rint(feature_points[:, 0] - sx).astype(np.int32)
-    local_y = np.rint(feature_points[:, 1] - sy).astype(np.int32)
-    inside = (local_x >= 0) & (local_x < sw) & (local_y >= 0) & (local_y < sh)
-    if not bool(inside.any()):
-        return None
-    feature_crop[local_y[inside], local_x[inside]] = True
+    The feature is resampled into a square grid centred on its centroid, so a
+    left-right flip of that grid is an exact reflection about the axis under
+    test, and the score is intersection-over-union between the two -- the same
+    statistic ``analyse_uv_island_symmetry`` applies to UV islands.
 
-    distance_to_feature = cv2.distanceTransform(
-        (~feature_crop).astype(np.uint8), cv2.DIST_L2, 3
+    ``spread`` is what keeps a disc honest.  A round mark reflects onto itself
+    about every axis and so scores 1.0 at an angle chosen by noise; measuring
+    how much of the sweep is within a hair of the best separates that from a
+    mark with one real axis, which peaks sharply.
+    """
+    rows, columns = np.nonzero(feature)
+    if rows.size < 12:
+        return None
+    centre_x = float(columns.mean())
+    centre_y = float(rows.mean())
+    radius = float(
+        np.sqrt(((columns - centre_x) ** 2 + (rows - centre_y) ** 2).max())
     )
-    if uv_contours is None:
-        found, _hierarchy = cv2.findContours(
-            uv_mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE,
+    if radius < 1.0:
+        return None
+
+    grid = max(int(config.rotation_symmetry_grid_px), 8)
+    axis = (np.arange(grid, dtype=np.float64) + 0.5) / grid * 2.0 - 1.0
+    grid_x, grid_y = np.meshgrid(axis, axis)
+    height, width = feature.shape[:2]
+
+    def score_at(degrees: float) -> float:
+        radians = np.radians(degrees)
+        cos, sin = np.cos(radians), np.sin(radians)
+        # Inverse-map each cell of the upright grid back into the feature.
+        source_x = (grid_x * cos - grid_y * sin) * radius + centre_x
+        source_y = (grid_x * sin + grid_y * cos) * radius + centre_y
+        column = np.rint(source_x).astype(np.int32)
+        row = np.rint(source_y).astype(np.int32)
+        inside = (
+            (column >= 0) & (column < width) & (row >= 0) & (row < height)
         )
-        uv_contours = tuple(found)
+        sampled = np.zeros((grid, grid), dtype=bool)
+        sampled[inside] = feature[row[inside], column[inside]]
+        mirrored = sampled[:, ::-1]
+        union = int((sampled | mirrored).sum())
+        if union == 0:
+            return 0.0
+        return float((sampled & mirrored).sum()) / union
 
-    nearest: tuple[float, np.ndarray, int] | None = None
-    for contour in uv_contours:
-        points = contour.reshape(-1, 2)
-        if len(points) < 2:
-            continue
-        inside_search = (
-            (points[:, 0] >= sx)
-            & (points[:, 0] < sx + sw)
-            & (points[:, 1] >= sy)
-            & (points[:, 1] < sy + sh)
-        )
-        indices = np.flatnonzero(inside_search)
-        if not len(indices):
-            continue
-        local = points[indices] - np.asarray((sx, sy), dtype=np.int32)
-        distances = distance_to_feature[local[:, 1], local[:, 0]]
-        local_index = int(np.argmin(distances))
-        candidate = (float(distances[local_index]), points, int(indices[local_index]))
-        if nearest is None or candidate[0] < nearest[0]:
-            nearest = candidate
-    if nearest is None:
+    step = max(float(config.rotation_symmetry_step_degrees), 0.1)
+    coarse = np.arange(0.0, 180.0, step)
+    scores = [score_at(float(angle)) for angle in coarse]
+    best_index = int(np.argmax(scores))
+    best_angle = float(coarse[best_index])
+    best = float(scores[best_index])
+
+    span = step
+    for _ in range(max(int(config.rotation_symmetry_refinements), 0)):
+        span /= 2.0
+        for candidate in (best_angle - span, best_angle + span):
+            value = score_at(candidate)
+            if value > best:
+                best_angle, best = candidate, value
+
+    plateau = max(float(config.rotation_symmetry_plateau), 0.0)
+    near = sum(1 for value in scores if value >= best - plateau)
+    return SymmetryAxis(
+        angle_degrees=best_angle % 180.0,
+        score=best,
+        spread=near / max(len(scores), 1),
+    )
+
+
+def rasterise_convex_hull(
+    points: Sequence[tuple[int, int]],
+    grid: int,
+) -> tuple[np.ndarray, tuple[int, int]] | None:
+    """Fill a convex polygon into a boolean raster and say where it starts.
+
+    numpy rather than ``cv2.fillConvexPoly``: a convex polygon is the
+    intersection of its edges' half-planes, which is a couple of array
+    operations, and OpenCV is on its way out of this module.
+    """
+    if len(points) < 3:
         return None
-    closest, contour_points, closest_index = nearest
-    minimum_gap = max(float(config.rotation_edge_min_gap_px), 0.0)
-    if closest < minimum_gap:
+    polygon = np.asarray(points, dtype=np.float64)
+    low = np.floor(polygon.min(axis=0)).astype(int)
+    high = np.ceil(polygon.max(axis=0)).astype(int)
+    span = high - low + 1
+    if span.min() < 2:
         return None
-    if closest > search:
+    scale = max(float(span.max()) / max(int(grid), 8), 1.0)
+    height = max(int(round(span[1] / scale)), 2)
+    width = max(int(round(span[0] / scale)), 2)
+    xs = low[0] + (np.arange(width, dtype=np.float64) + 0.5) * scale
+    ys = low[1] + (np.arange(height, dtype=np.float64) + 0.5) * scale
+    grid_x = xs[None, :]
+    grid_y = ys[:, None]
+
+    shifted = np.roll(polygon, -1, axis=0)
+    twice_area = float(
+        (polygon[:, 0] * shifted[:, 1] - shifted[:, 0] * polygon[:, 1]).sum()
+    )
+    sign = 1.0 if twice_area >= 0.0 else -1.0
+    inside = np.ones((height, width), dtype=bool)
+    for (x0, y0), (x1, y1) in zip(polygon, shifted):
+        cross = (x1 - x0) * (grid_y - y0) - (y1 - y0) * (grid_x - x0)
+        inside &= (cross * sign) >= -1e-9
+    if not inside.any():
         return None
+    return inside, (int(low[0]), int(low[1]))
 
-    minimum = max(int(config.rotation_edge_min_points), 2)
-    half_arc = max(minimum // 2, band * 2, 2)
 
-    def contour_arc(half_width: int) -> np.ndarray:
-        if len(contour_points) <= half_width * 2 + 1:
-            return contour_points.astype(np.float32)
-        offsets = np.arange(-half_width, half_width + 1, dtype=np.int32)
-        return contour_points[(closest_index + offsets) % len(contour_points)].astype(
-            np.float32
-        )
+def simplify_convex_hull(
+    points: Sequence[tuple[int, int]],
+    nodes: int,
+) -> tuple[tuple[int, int], ...]:
+    """Reduce a convex polygon to at most ``nodes`` vertices.
 
-    tangent_points = contour_arc(half_arc)
-    if len(tangent_points) < minimum:
+    Drops whichever vertex costs the least area, repeatedly.  For a convex
+    polygon that cost is just the triangle its two neighbours close over, so
+    the shape is kept as near itself as a polygon of that many sides can be.
+
+    numpy rather than ``cv2.approxPolyDP``: that takes a distance tolerance
+    rather than a vertex count, so hitting an exact count means bisecting on
+    epsilon, and OpenCV is on its way out of this module either way.
+    """
+    polygon = [tuple(int(value) for value in point) for point in points]
+    if nodes < 3 or len(polygon) <= nodes:
+        return tuple(polygon)  # type: ignore[return-value]
+    while len(polygon) > nodes:
+        best_index, best_cost = 0, None
+        for index in range(len(polygon)):
+            (ax, ay) = polygon[index - 1]
+            (bx, by) = polygon[index]
+            (cx, cy) = polygon[(index + 1) % len(polygon)]
+            cost = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
+            if best_cost is None or cost < best_cost:
+                best_index, best_cost = index, cost
+        polygon.pop(best_index)
+    return tuple(polygon)  # type: ignore[return-value]
+
+
+def hull_symmetry_axis(
+    hull: RegionFeatureHull,
+    config: MserConfig,
+) -> SymmetryAxis | None:
+    """Return the symmetry axis of a feature's convex hull.
+
+    Same sweep as ``feature_symmetry_axis``, applied to the filled silhouette.
+    Its *score* is not usable as evidence -- a convex shape overlaps its own
+    reflection whatever is inside it -- but its angle is steady, which is what
+    it is offered for.
+    """
+    rasterised = rasterise_convex_hull(
+        simplify_convex_hull(hull.points, int(config.rotation_symmetry_hull_nodes)),
+        max(int(config.rotation_symmetry_grid_px), 8),
+    )
+    if rasterised is None:
         return None
-    vx, vy, _px, _py = cv2.fitLine(
-        tangent_points, cv2.DIST_L2, 0, 0.01, 0.01
-    ).reshape(4)
-    edge_angle = _normalised_axis_angle_degrees(
-        math.degrees(math.atan2(float(vy), float(vx)))
-    )
+    filled, _origin = rasterised
+    return feature_symmetry_axis(filled, config)
 
-    wider_points = contour_arc(half_arc * 2)
-    wide_vx, wide_vy, _wide_px, _wide_py = cv2.fitLine(
-        wider_points, cv2.DIST_L2, 0, 0.01, 0.01
-    ).reshape(4)
-    wider_angle = _normalised_axis_angle_degrees(
-        math.degrees(math.atan2(float(wide_vy), float(wide_vx)))
-    )
-    edge_stability = _parallel_angle_delta_degrees(edge_angle, wider_angle)
-    if edge_stability > float(config.max_rotation_edge_angle_degrees):
+
+def symmetry_aligned_outline(
+    feature: np.ndarray,
+    origin: tuple[int, int],
+    axis: SymmetryAxis,
+) -> tuple[tuple[float, float], ...] | None:
+    """Return the feature's own bounding box, squared to its symmetry axis.
+
+    The extent has to be re-measured in the axis's own frame rather than
+    borrowed from the fitted rectangle.  That rectangle's size is expressed
+    along *its* axes, so substituting a different angle leaves the two
+    dimensions attached to the wrong sides -- and since the symmetry angle is
+    the mirror line's direction while OpenCV's rectangle angle is its width
+    side's, the two conventions are a further 90 degrees apart.  Carrying the
+    old size through both mistakes drew a portrait box around a landscape mark.
+
+    ``angle_degrees`` turns the mirror line off vertical, so the line points
+    along ``(-sin, cos)`` and the box's width lies across it, at
+    ``angle_degrees`` from horizontal.
+    """
+    rows, columns = np.nonzero(feature)
+    if rows.size < 3:
         return None
-
-    # Keep the broader nearby-boundary set only for the two-sided-strip guard;
-    # it no longer participates in the angle fit.
-    nearby_edge = boundary_crop & (distance_to_feature <= closest + band)
-    support_points = cv2.findNonZero(nearby_edge.astype(np.uint8))
-    if support_points is None or len(support_points) < minimum:
-        return None
-    feature_angle = _rectangle_long_axis_angle_degrees(shape.rectangle)
-    delta = _parallel_angle_delta_degrees(edge_angle, feature_angle)
-
-    radians = math.radians(edge_angle)
-    along = np.asarray((math.cos(radians), math.sin(radians)), dtype=np.float32)
-    across = np.asarray((-math.sin(radians), math.cos(radians)), dtype=np.float32)
-    feature_along = feature_points @ along
-    feature_across = feature_points @ across
-    min_along, max_along = float(feature_along.min()), float(feature_along.max())
-    min_across, max_across = float(feature_across.min()), float(feature_across.max())
-
-    edge_absolute = support_points.reshape(-1, 2).astype(np.float32)
-    edge_absolute[:, 0] += sx
-    edge_absolute[:, 1] += sy
-    edge_along = edge_absolute @ along
-    edge_across = edge_absolute @ across
-    overlaps_side = (
-        (edge_along >= min_along - band)
-        & (edge_along <= max_along + band)
+    radians = np.radians(float(axis.angle_degrees))
+    cos, sin = np.cos(radians), np.sin(radians)
+    x = columns.astype(np.float64) + float(origin[0])
+    y = rows.astype(np.float64) + float(origin[1])
+    # Across the mirror line, then along it.
+    across = x * cos + y * sin
+    along = -x * sin + y * cos
+    low_across, high_across = float(across.min()), float(across.max())
+    low_along, high_along = float(along.min()), float(along.max())
+    mid_across = (low_across + high_across) / 2.0
+    mid_along = (low_along + high_along) / 2.0
+    centre = (
+        mid_across * cos - mid_along * sin,
+        mid_across * sin + mid_along * cos,
     )
-    min_side_distances = np.abs(edge_across - min_across)
-    max_side_distances = np.abs(edge_across - max_across)
-    eligible_edge = overlaps_side & (
-        np.minimum(min_side_distances, max_side_distances) >= minimum_gap
-    ) & (
-        np.minimum(min_side_distances, max_side_distances) <= search
+    size = (
+        max(high_across - low_across, 1.0),
+        max(high_along - low_along, 1.0),
     )
-    min_side_candidates = (
-        eligible_edge
-        & (min_side_distances <= max_side_distances)
-    )
-    max_side_candidates = (
-        eligible_edge
-        & (max_side_distances < min_side_distances)
-    )
-    min_support = int(min_side_candidates.sum())
-    max_support = int(max_side_candidates.sum())
-    primary_support = max(min_support, max_support)
-    opposite_support = min(min_support, max_support)
-    if primary_support < minimum:
-        return None
-    opposite_fraction = opposite_support / max(float(primary_support), 1.0)
-    if opposite_fraction > float(config.max_opposite_rotation_edge_fraction):
-        return None
-    side_candidates = (
-        min_side_candidates if min_support >= max_support else max_side_candidates
-    )
-    side_distances = (
-        min_side_distances if min_support >= max_support else max_side_distances
-    )
-
-    outline = (
-        (along * min_along + across * min_across),
-        (along * max_along + across * min_across),
-        (along * max_along + across * max_across),
-        (along * min_along + across * max_across),
-    )
-
-    return EdgeAlignment(
-        outline=tuple(
-            (float(point[0]), float(point[1]))
-            for point in outline
-        ),
-        edge_angle_degrees=edge_angle,
-        feature_angle_degrees=feature_angle,
-        angle_delta_degrees=delta,
-        edge_stability_degrees=edge_stability,
-        distance_px=float(side_distances[side_candidates].min()),
-        edge_points=int(side_candidates.sum()),
+    return tuple(
+        (float(px), float(py))
+        for px, py in cv2.boxPoints((centre, size, float(axis.angle_degrees)))
     )
 
 
@@ -2687,10 +2877,19 @@ def _region_background_ring(
     image_shape: tuple[int, ...],
     group: tuple[int, int, int, int],
     config: MserConfig,
+    *,
+    margin_px: int | None = None,
+    width_px: int | None = None,
 ) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
     x, y, w, h = group
-    margin = max(int(config.region_feature_ring_margin_px), 0)
-    band = max(int(config.region_feature_ring_width_px), 1)
+    margin = max(
+        int(config.region_feature_ring_margin_px if margin_px is None else margin_px),
+        0,
+    )
+    band = max(
+        int(config.region_feature_ring_width_px if width_px is None else width_px),
+        1,
+    )
     outer = margin + band
     clamped = clamp_group(context_box(group, outer), image_shape)
     if clamped is None:
@@ -2711,9 +2910,17 @@ def region_magic_feature(
     config: MserConfig,
     *,
     context_px: int = 0,
+    ring_margin_px: int | None = None,
+    ring_width_px: int | None = None,
 ) -> RegionMagicFeature | None:
     """Extract non-background pixels using a background ring around a region."""
-    ring_result = _region_background_ring(image.shape, group, config)
+    ring_result = _region_background_ring(
+        image.shape,
+        group,
+        config,
+        margin_px=ring_margin_px,
+        width_px=ring_width_px,
+    )
     if ring_result is None:
         return None
     ring_bounds, ring = ring_result
@@ -2764,6 +2971,7 @@ def region_magic_feature(
         inner=_local_inner_rect(feature_bounds, group),
         feature=feature,
         tolerance=tolerance,
+        background=tuple(int(value) for value in background),
     )
 
 
@@ -2840,38 +3048,124 @@ def feature_extension_measure(
     group: tuple[int, int, int, int],
     config: MserConfig,
 ) -> FeatureExtensionMeasure | None:
-    """Return connected feature area inside and outside the detected region."""
+    """Return connected core/fringe area and hard continuation outside it.
+
+    The grace collar is not a blanket spatial exemption.  A connected component
+    is accepted as antialiasing only when its collar is materially softer than
+    the same component inside the detector's box.  Hard paint, stitching and
+    trim edges therefore remain continuation evidence even when they stop inside
+    the collar.  Accepted soft pixels expand ``expanded_bounds`` so the later
+    correction actually moves the fringe it used as evidence.
+    """
+    geometry = feature_extension_geometry(group, config)
     extracted = region_magic_feature(
         image,
         uv_mask,
         group,
         config,
-        context_px=config.feature_extension_context_px,
+        context_px=geometry.grace_px + geometry.search_px,
+        ring_margin_px=geometry.ring_margin_px,
+        ring_width_px=geometry.ring_width_px,
     )
     if extracted is None:
         return None
     x, y, w, h = extracted.inner
     if w <= 0 or h <= 0:
         return None
-    inside = np.zeros(extracted.feature.shape, dtype=bool)
-    inside[y : y + h, x : x + w] = True
-    feature_area_px = int((extracted.feature & inside).sum())
-    if feature_area_px < max(config.region_feature_min_px, 1):
+    seed = np.zeros(extracted.feature.shape, dtype=bool)
+    seed[y : y + h, x : x + w] = True
+    seed_area_px = int((extracted.feature & seed).sum())
+    if seed_area_px < max(config.region_feature_min_px, 1):
         return None
 
     count, labels = cv2.connectedComponents(
         extracted.feature.astype(np.uint8), connectivity=8
     )
     if count <= 1:
-        return FeatureExtensionMeasure(feature_area_px, 0)
-    inner_labels = labels[inside & extracted.feature]
+        return FeatureExtensionMeasure(
+            seed_area_px,
+            0,
+            group,
+            geometry.grace_px,
+            geometry.search_px,
+        )
+    inner_labels = labels[seed & extracted.feature]
     inner_labels = inner_labels[inner_labels > 0]
     if inner_labels.size == 0:
         return None
-    connected = np.isin(labels, np.unique(inner_labels))
+    component_labels = np.unique(inner_labels)
+    connected = np.isin(labels, component_labels) & extracted.feature
+    grace_domain = np.zeros(extracted.feature.shape, dtype=bool)
+    grace_domain[
+        max(y - geometry.grace_px, 0) : min(
+            y + h + geometry.grace_px, grace_domain.shape[0]
+        ),
+        max(x - geometry.grace_px, 0) : min(
+            x + w + geometry.grace_px, grace_domain.shape[1]
+        ),
+    ] = True
+
+    crop_x, crop_y, crop_w, crop_h = extracted.bounds
+    crop = image[crop_y : crop_y + crop_h, crop_x : crop_x + crop_w]
+    background = np.asarray(extracted.background, dtype=np.int16)
+    strength = np.abs(crop.astype(np.int16) - background).max(axis=2)
+    soft_fringe = np.zeros(extracted.feature.shape, dtype=bool)
+    hard_collar = np.zeros(extracted.feature.shape, dtype=bool)
+    soft_limit = max(float(config.feature_extension_soft_fringe_ratio), 0.0)
+    collar_domain = grace_domain & ~seed
+    for label in component_labels:
+        component = labels == int(label)
+        core = component & extracted.feature & seed
+        collar = component & extracted.feature & collar_domain
+        if not bool(collar.any()):
+            continue
+        core_strength = strength[core]
+        if core_strength.size == 0:
+            hard_collar |= collar
+            continue
+        # A high core percentile represents the solid stroke; a lower collar
+        # percentile tolerates a few fully covered edge texels while still
+        # separating a uniformly painted continuation (ratio ~= 1).
+        core_level = float(np.percentile(core_strength, 90.0))
+        collar_level = float(np.percentile(strength[collar], 75.0))
+        if collar_level <= core_level * soft_limit:
+            soft_fringe |= collar
+        else:
+            hard_collar |= collar
+
+    core_feature = connected & seed
+    outside_grace = connected & ~grace_domain
+    feature_area_px = int(core_feature.sum() + soft_fringe.sum())
+    hard_extension = hard_collar | outside_grace
+    extension_area_px = int(hard_extension.sum())
+
+    expanded_bounds = group
+    soft_fringe_hull: tuple[tuple[float, float], ...] = ()
+    if bool(soft_fringe.any()):
+        rows, columns = np.nonzero(soft_fringe)
+        group_x, group_y, group_w, group_h = group
+        x0 = min(group_x, crop_x + int(columns.min()))
+        y0 = min(group_y, crop_y + int(rows.min()))
+        x1 = max(group_x + group_w, crop_x + int(columns.max()) + 1)
+        y1 = max(group_y + group_h, crop_y + int(rows.max()) + 1)
+        expanded_bounds = (x0, y0, x1 - x0, y1 - y0)
+        fringe_points = cv2.findNonZero(soft_fringe.astype(np.uint8))
+        if fringe_points is not None:
+            fringe_hull = cv2.convexHull(fringe_points).reshape(-1, 2)
+            soft_fringe_hull = tuple(
+                (float(px + crop_x), float(py + crop_y))
+                for px, py in fringe_hull
+            )
+
     return FeatureExtensionMeasure(
         feature_area_px,
-        int((connected & extracted.feature & ~inside).sum()),
+        extension_area_px,
+        expanded_bounds,
+        geometry.grace_px,
+        geometry.search_px,
+        int(soft_fringe.sum()),
+        extension_area_px,
+        soft_fringe_hull,
     )
 
 
@@ -4949,6 +5243,20 @@ def _rotations_for_subset(
     return aligned
 
 
+def _rotation_is_negligible(angle_degrees: float, config: MserConfig) -> bool:
+    """Say whether an angle is too small to be worth turning the box for.
+
+    A rotation of a fraction of a degree cannot be distinguished from the
+    quantisation of a mark drawn on axis, and adopting one is not free: the
+    region is resampled when it is mirrored, so every edge in it is softened to
+    move it nowhere.
+    """
+    floor = float(config.min_rotation_angle_degrees)
+    if floor <= 0.0:
+        return False
+    return rotation_off_axis_degrees(angle_degrees) < floor
+
+
 def _step_rotated_bounds(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
@@ -4980,26 +5288,15 @@ def _step_rotated_bounds(
     if mask is None:  # keeps static typing honest; the branches always fill it.
         grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         mask, _response = edge_mask(grey, uv_mask, config)
-    uv_boundary = None
-    uv_contours: tuple[np.ndarray, ...] | None = None
-    if config.enable_edge_aligned_rotation and uv_mask is not None:
-        uv_boundary = cv2.morphologyEx(
-            uv_mask.astype(np.uint8),
-            cv2.MORPH_GRADIENT,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        ).astype(bool)
-        found_contours, _hierarchy = cv2.findContours(
-            uv_mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE,
-        )
-        uv_contours = tuple(found_contours)
-
     kept: list[tuple[int, int, int, int]] = []
     rejected: list[tuple[int, int, int, int]] = []
     rotations: list[tuple[tuple[float, float], ...] | None] = []
     unfitted = 0
     unadopted = 0
-    edge_unadopted = 0
-    edge_adopted = 0
+    symmetry_adopted = 0
+    symmetry_unadopted = 0
+    straightened = 0
+    symmetry_scores: list[float] = []
     domain = state.domain or build_uv_domain_index(uv_mask)
     for group in state.groups:
         if cached_inscribed_circle_radius(
@@ -5020,36 +5317,72 @@ def _step_rotated_bounds(
             rejected.append(group)
             continue
         kept.append(group)
+        if config.enable_symmetry_rotation:
+            # Deliberately ahead of the elongation and tightness gates below.
+            # Those exist because the *edge fit* cannot claim a direction for a
+            # squarish mark -- "the fit settles wherever the noise puts it" --
+            # and symmetry does not have that weakness: it carries its own
+            # degeneracy guard in ``spread``, which asks the question directly
+            # by seeing whether the axis is sharp or the shape reflects onto
+            # itself everywhere.  Held behind ``min_rotated_elongation`` it
+            # missed exactly what it was adopted for: the ardente's tilted
+            # footwell-vent icon is aspect 1.76, so it never reached this
+            # branch, while its symmetry reads 0.87 at 7.6 degrees off axis
+            # with a spread of 0.00 -- an unmistakable axis on a squarish mark.
+            #
+            # The mark's own axis, in preference to a neighbour's edge.  Read
+            # off the convex hull, which describes the *block's* orientation:
+            # measured on the ardente, AIRBAG's hull scores 0.97 and the vent
+            # symbol's 0.96 against 0.89 for both horn pictograms, while the
+            # feature mask inverts that ordering because a row of different
+            # letters is internally asymmetric however square its block is.
+            # The extent still comes from the feature.
+            extracted = region_magic_feature(image, uv_mask, group, config)
+            hull = region_feature_hull(image, uv_mask, group, config)
+            axis = hull_symmetry_axis(hull, config) if hull is not None else None
+            if axis is not None:
+                symmetry_scores.append(axis.score)
+            if (
+                axis is None
+                or extracted is None
+                or axis.score < config.min_rotation_symmetry
+                or axis.spread > config.max_rotation_symmetry_spread
+            ):
+                symmetry_unadopted += 1
+                rotations.append(None)
+                continue
+            if _rotation_is_negligible(axis.angle_degrees, config):
+                straightened += 1
+                rotations.append(None)
+                continue
+            outline = symmetry_aligned_outline(
+                extracted.feature, extracted.bounds[:2], axis
+            )
+            if outline is None:
+                symmetry_unadopted += 1
+                rotations.append(None)
+                continue
+            symmetry_adopted += 1
+            rotations.append(outline)
+            continue
         # Whether to adopt the outline is a separate question from whether to
         # keep the region: a shape wrapping mostly empty space describes the
         # feature badly, but that is not evidence the region holds no mark.
         if (
-            shape.tightness(config.bounds_shape) < config.min_feature_tightness
+            shape.tightness(SHAPE_ROTATED) < config.min_feature_tightness
             or aspect < config.min_rotated_elongation
         ):
             unadopted += 1
             rotations.append(None)
             continue
-        if config.enable_edge_aligned_rotation:
-            alignment = edge_aligned_feature_outline(
-                mask, uv_mask, group, shape, config, uv_boundary, uv_contours
-            )
-            if alignment is None:
-                edge_unadopted += 1
-                rotations.append(None)
-                continue
-            edge_adopted += 1
-            rotations.append(alignment.outline)
+        if _rotation_is_negligible(shape.rectangle[2], config):
+            straightened += 1
+            rotations.append(None)
             continue
         # Points from OpenCV rather than re-derived, so what is drawn is the
         # shape that was measured, to the pixel.
-        rotations.append(shape.outline(config.bounds_shape))
+        rotations.append(shape.outline(SHAPE_ROTATED))
 
-    adopted_shape = (
-        "edge-aligned rectangle"
-        if config.enable_edge_aligned_rotation
-        else f"{config.bounds_shape} outline"
-    )
     return DetectionState(
         state.boxes, kept, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
@@ -5064,18 +5397,35 @@ def _step_rotated_bounds(
         detail=(
             f"keep fill >= {config.min_rotated_fill:g} of the axis-aligned box "
             f"and true aspect <= {config.max_rotated_aspect:g}; adopt the "
-            f"{adopted_shape} only where it is >= "
+            f"rotated outline only where it is >= "
             f"{config.min_feature_tightness:.0%} feature and elongated "
             f">= {config.min_rotated_elongation:g}"
             + (
-                f"; edge-aligned rotation adopted {edge_adopted} and declined "
-                f"{edge_unadopted} closer than {config.rotation_edge_min_gap_px:g} px, "
-                f"outside {config.rotation_edge_search_px} px, or "
-                f"with a local UV tangent changing by more than "
-                f"{config.max_rotation_edge_angle_degrees:g} degrees across fit scales; "
-                f"opposite side support must be <= "
-                f"{config.max_opposite_rotation_edge_fraction:.0%}"
-                if config.enable_edge_aligned_rotation
+                f"; symmetry adopted {symmetry_adopted} and declined "
+                f"{symmetry_unadopted} below {config.min_rotation_symmetry:g} "
+                f"reflection overlap or above "
+                f"{config.max_rotation_symmetry_spread:g} sweep spread"
+                if config.enable_symmetry_rotation
+                else ""
+            )
+            + (
+                "; hull symmetry over the regions probed: "
+                + "/".join(
+                    f"{value:.3f}"
+                    for value in (
+                        min(symmetry_scores),
+                        sorted(symmetry_scores)[len(symmetry_scores) // 2],
+                        max(symmetry_scores),
+                    )
+                )
+                + " min/median/max"
+                if symmetry_scores
+                else ""
+            )
+            + (
+                f"; {straightened} straightened back to their box, turned by "
+                f"less than {config.min_rotation_angle_degrees:g} degrees"
+                if straightened
                 else ""
             )
             + (f"; {unfitted} had too few feature pixels to fit" if unfitted else "")
@@ -5484,6 +5834,9 @@ def _step_feature_extension(
     rejected: list[tuple[int, int, int, int]] = []
     rotations: list[tuple[tuple[float, float], ...] | None] = []
     unjudged = 0
+    expanded = 0
+    grace_values: list[int] = []
+    search_values: list[int] = []
     threshold = max(float(config.feature_extension_min_ratio), 0.0)
     for index, group in enumerate(state.groups):
         outline = state.rotations[index] if index < len(state.rotations) else None
@@ -5495,8 +5848,26 @@ def _step_feature_extension(
         elif measure.extension_ratio >= threshold:
             rejected.append(group)
         else:
-            kept.append(group)
-            rotations.append(outline)
+            accepted = measure.expanded_bounds or group
+            accepted_outline = (
+                expand_rotated_outline_to_points(
+                    outline, measure.soft_fringe_hull
+                )
+                if outline is not None and measure.soft_fringe_hull
+                else outline
+            )
+            kept.append(accepted)
+            rotations.append(accepted_outline)
+            expanded += int(accepted != group)
+        if measure is not None:
+            grace_values.append(measure.grace_px)
+            search_values.append(measure.search_px)
+
+    def distance_range(values: list[int]) -> str:
+        if not values:
+            return "n/a"
+        low, high = min(values), max(values)
+        return str(low) if low == high else f"{low}-{high}"
 
     return DetectionState(
         state.boxes, kept, rotations=rotations,
@@ -5511,9 +5882,14 @@ def _step_feature_extension(
         rotations=tuple(rotations),
         detail=(
             "reject connected feature continuation where outside/inside "
-            f">= {threshold:.0%}, searched {config.feature_extension_context_px} px past it"
+            f">= {threshold:.0%}; candidate-scaled grace {distance_range(grace_values)} px "
+            f"and search {distance_range(search_values)} px beyond it; "
+            f"soft fringe <= {max(config.feature_extension_soft_fringe_ratio, 0.0):.0%} "
+            "of its component core"
+            + (f"; expanded {expanded} accepted bound{'s' if expanded != 1 else ''}" if expanded else "")
             + (f"; {unjudged} had too little feature/ring domain to judge" if unjudged else "")
         ),
+        adjusted=expanded,
     )
 
 
@@ -6469,14 +6845,15 @@ PARAMETER_STEP = {
     "max_rotated_aspect": STEP_INDEX["rotated_bounds"],
     "min_feature_tightness": STEP_INDEX["rotated_bounds"],
     "min_rotated_elongation": STEP_INDEX["rotated_bounds"],
-    "bounds_shape": STEP_INDEX["rotated_bounds"],
-    "enable_edge_aligned_rotation": STEP_INDEX["rotated_bounds"],
-    "rotation_edge_min_gap_px": STEP_INDEX["rotated_bounds"],
-    "rotation_edge_search_px": STEP_INDEX["rotated_bounds"],
-    "rotation_edge_band_px": STEP_INDEX["rotated_bounds"],
-    "rotation_edge_min_points": STEP_INDEX["rotated_bounds"],
-    "max_rotation_edge_angle_degrees": STEP_INDEX["rotated_bounds"],
-    "max_opposite_rotation_edge_fraction": STEP_INDEX["rotated_bounds"],
+    "min_rotation_angle_degrees": STEP_INDEX["rotated_bounds"],
+    "enable_symmetry_rotation": STEP_INDEX["rotated_bounds"],
+    "min_rotation_symmetry": STEP_INDEX["rotated_bounds"],
+    "max_rotation_symmetry_spread": STEP_INDEX["rotated_bounds"],
+    "rotation_symmetry_plateau": STEP_INDEX["rotated_bounds"],
+    "rotation_symmetry_step_degrees": STEP_INDEX["rotated_bounds"],
+    "rotation_symmetry_refinements": STEP_INDEX["rotated_bounds"],
+    "rotation_symmetry_grid_px": STEP_INDEX["rotated_bounds"],
+    "rotation_symmetry_hull_nodes": STEP_INDEX["rotated_bounds"],
     "enable_region_flatness_filter": STEP_INDEX["region_flatness"],
     "region_flatness_percentile": STEP_INDEX["region_flatness"],
     "region_flatness_min_domain_px": STEP_INDEX["region_flatness"],
@@ -6509,6 +6886,10 @@ PARAMETER_STEP = {
     "min_blob_internal_colour_variation": STEP_INDEX["blob_shape"],
     "enable_feature_extension_filter": STEP_INDEX["feature_extension"],
     "feature_extension_context_px": STEP_INDEX["feature_extension"],
+    "feature_extension_reference_extent_px": STEP_INDEX["feature_extension"],
+    "feature_extension_grace_px": STEP_INDEX["feature_extension"],
+    "feature_extension_grace_max_fraction": STEP_INDEX["feature_extension"],
+    "feature_extension_soft_fringe_ratio": STEP_INDEX["feature_extension"],
     "feature_extension_min_ratio": STEP_INDEX["feature_extension"],
     "enable_text_line_filter": STEP_INDEX["text_line"],
     "text_min_component_px": STEP_INDEX["text_line"],

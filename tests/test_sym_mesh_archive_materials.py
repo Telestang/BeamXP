@@ -49,6 +49,116 @@ class SymMeshArchiveMaterialTests(unittest.TestCase):
         )
         self.assertEqual(scanned.materials, ())
 
+    def test_beamng_sjson_materials_are_indexed(self) -> None:
+        """Material discovery accepts the same comments/commas as BeamNG."""
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_path = root / "runtime_sjson.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("vehicles/car/car.dae", "<COLLADA/>")
+                archive.writestr(
+                    "vehicles/car/screens.materials.json",
+                    """{
+                      // BeamNavigator paints this texture at runtime.
+                      "car_nav_screen": {
+                        "name": "car_nav_screen",
+                        "mapTo": "car_nav_screen",
+                        "Stages": [
+                          { "colorMap": "@car_nav_screen", },
+                        ],
+                      },
+                      /* Static siblings in the same file must survive too. */
+                      "car_screen_frame": {
+                        "name": "car_screen_frame",
+                        "mapTo": "car_screen_frame",
+                        "Stages": [
+                          {
+                            "baseColorMap":
+                              "/vehicles/car/car_screen_frame_b.color.png",
+                          },
+                        ],
+                      },
+                    }""",
+                )
+
+            scanned = scan_vehicle_archive(archive_path, root / "scan")
+
+        self.assertIn("car_nav_screen", scanned.runtime_material_aliases)
+        self.assertEqual(
+            [material.key for material in scanned.materials],
+            ["car_screen_frame"],
+        )
+        self.assertEqual(scanned.material_errors, ())
+
+    def test_source_glowmap_alias_wins_dependency_name_collision(self) -> None:
+        """Generic glow handles in stock archives must not pollute a mod.
+
+        Material names live in BeamNG's mounted namespace, but a source mod
+        overrides dependencies.  Common glow handles such as ``auto_D`` occur
+        in many vehicles; unioning every dependency's states makes one shifter
+        a candidate for unrelated gauge atlases and loses its own UV-scoped
+        state correction among them.
+        """
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_zip = root / "source.zip"
+            dependency_zip = root / "dependency.zip"
+            with zipfile.ZipFile(source_zip, "w") as archive:
+                archive.writestr("vehicles/mod/mod.dae", "<COLLADA/>")
+                archive.writestr(
+                    "vehicles/mod/mod.jbeam",
+                    """{
+                      "mod": {
+                        "glowMap": {
+                          "auto_D": {
+                            "simpleFunction": "mod_gear",
+                            "off": "mod_text",
+                            "on": "mod_text_on"
+                          }
+                        }
+                      }
+                    }""",
+                )
+            with zipfile.ZipFile(dependency_zip, "w") as archive:
+                archive.writestr(
+                    "vehicles/common/common.jbeam",
+                    """{
+                      "common": {
+                        "glowMap": {
+                          "auto_D": {
+                            "simpleFunction": "common_gear",
+                            "off": "common_gauges",
+                            "on": "common_gauges_on"
+                          }
+                        }
+                      }
+                    }""",
+                )
+
+            scanned = scan_vehicle_archive(
+                source_zip,
+                root / "scan",
+                asset_archives=(dependency_zip,),
+            )
+
+        self.assertEqual(
+            scanned.material_switch_targets["auto_d"],
+            ("mod_text", "mod_text_on"),
+        )
+        self.assertEqual(
+            [
+                (state.state, state.material)
+                for state in scanned.material_switch_states["auto_d"]
+            ],
+            [("off", "mod_text"), ("on", "mod_text_on")],
+        )
+        self.assertEqual(
+            scanned.material_switch_triggers["auto_d"],
+            ("mod_gear",),
+        )
+
     def test_materials_and_textures_resolve_from_dependency_archives(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
