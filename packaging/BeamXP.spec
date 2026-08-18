@@ -39,16 +39,12 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="BeamXP",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    # UPX packs the exe with the same compression scheme malware droppers
-    # commonly use to hide payloads; heuristic AV engines key on that pattern
-    # (see the Windows Defender note in README.md's Status section).
     upx=False,
     console=False,
     disable_windowed_traceback=False,
@@ -57,4 +53,13 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ROOT / "assets" / "BeamXP_icon.ico"),
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="BeamXP",
 )

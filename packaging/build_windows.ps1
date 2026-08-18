@@ -1,14 +1,15 @@
 param(
-    [string]$Version = "0.3.3-alpha"
+    [string]$Version = "0.3.4-alpha"
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $AppName = "BeamXP"
-$DistExe = Join-Path $Root "dist\$AppName.exe"
-$StageDir = Join-Path $Root "dist\BeamXP"
-$StageExe = Join-Path $StageDir "$AppName.exe"
+$PyInstallerDir = Join-Path $Root "dist\$AppName"
+$DistExe = Join-Path $PyInstallerDir "$AppName.exe"
+
+$StageDir = Join-Path $Root "build\release-stage\$AppName"
 $ReleaseDir = Join-Path $Root "release"
 $ReleaseZip = Join-Path $ReleaseDir "BeamXP-$Version-windows.zip"
 
@@ -25,16 +26,14 @@ if (!(Test-Path $DistExe)) {
 }
 
 if (Test-Path $StageDir) {
-    $ResolvedRoot = (Resolve-Path $Root).Path
-    $ResolvedStage = (Resolve-Path $StageDir).Path
-    if (!$ResolvedStage.StartsWith($ResolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to remove staging directory outside repository root: $ResolvedStage"
-    }
-    Remove-Item -LiteralPath $ResolvedStage -Recurse -Force
+    Remove-Item -LiteralPath $StageDir -Recurse -Force
 }
-New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
 
-Copy-Item -LiteralPath $DistExe -Destination $StageExe -Force
+$StageParent = Split-Path -Parent $StageDir
+New-Item -ItemType Directory -Path $StageParent -Force | Out-Null
+
+Copy-Item -LiteralPath $PyInstallerDir -Destination $StageDir -Recurse -Force
+
 Copy-Item -LiteralPath ".\README.md" -Destination $StageDir -Force
 Copy-Item -LiteralPath ".\LICENSE" -Destination $StageDir -Force
 

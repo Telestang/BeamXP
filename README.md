@@ -2,7 +2,7 @@
 
 **BeamXP (BeamNG Vehicle eXPort Services)** converts BeamNG.drive vehicles between left-hand drive and right-hand drive, with automatic correction of meshes, textures, controls, cameras, mirrors, lighting, configuration parts, and licence plates.
 
-**[Download BeamXP 0.3.3-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.3-alpha-windows.zip)** — extract it anywhere and run the exe.
+**[Download BeamXP 0.3.4-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.4-alpha-windows.zip)** — extract it anywhere and run the exe. Keep `BeamXP.exe` in the extracted folder beside its `_internal` directory.
 
 > BeamXP was previously named **BeamHDC (BeamNG Hand Drive Converter)**.
 
@@ -28,7 +28,7 @@ The old **39 trims in 4 minutes 30 seconds** figure is no longer used as a bench
 
 ## Quick Start
 
-1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.3-alpha-windows.zip)**, extract it, and run the exe (or run from source — see Requirements).
+1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.4-alpha-windows.zip)**, extract it, and run the exe from the extracted folder (or run from source — see Requirements).
 2. Open the app settings and configure:
    - your BeamNG vehicle-content folder;
    - your BeamNG mods folder.
@@ -52,6 +52,22 @@ Enjoying driving from the other side? Star the repo to help other people find it
 ## What's New in 0.3.x
 
 The 0.3 line is a major conversion-quality and workflow overhaul. It introduced automatic mesh and texture correction, then spent the releases since making that pipeline correct and affordable — much of it found while converting the Lexus LC500 and Civetta Scintilla.
+
+### The Windows build is now a folder, not a single exe
+
+0.3.4-alpha changes packaging only — there are no conversion changes over
+0.3.3-alpha. PyInstaller now produces a **one-folder** build: a small
+`BeamXP.exe` beside an `_internal` directory holding Python and the libraries,
+where previous releases packed everything into one self-extracting exe.
+
+This is an experiment against antivirus false positives. A one-file build
+unpacks itself to a temp directory and runs from there on every launch, which is
+the behaviour heuristic engines key on; a one-folder build simply loads the
+files sitting next to it. Whether it actually reduces detections is what this
+release is meant to find out — please report what your scanner does with it.
+
+Extract the whole folder and run `BeamXP.exe` from inside it. Moving the exe out
+on its own will not work.
 
 ### Better glyph detection, and glyphs land where they belong
 
@@ -824,6 +840,10 @@ Download the Windows release, extract it anywhere, and run:
 BeamXP.exe
 ```
 
+As of 0.3.4-alpha this is a one-folder build: `BeamXP.exe` sits beside an
+`_internal` directory it loads at startup. Keep the extracted folder intact
+— a shortcut to the exe is fine, a copy of the exe on its own is not.
+
 No Python installation is required.
 
 Blender is optional and external.
@@ -901,6 +921,11 @@ BeamXP performs several operations that can look suspicious to automated heurist
 - creates new mod archives;
 - writes files intended to be loaded by another application;
 - is distributed as a small unsigned PyInstaller application.
+
+As of 0.3.4-alpha the Windows build ships as a **one-folder** PyInstaller
+application rather than a single self-extracting exe, specifically to see
+whether it draws fewer heuristic detections. UPX packing was already dropped for
+the same reason.
 
 BeamXP is source-available under the MIT licence. You can inspect the code or build the executable yourself instead of using the packaged Windows build.
 
