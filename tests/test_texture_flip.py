@@ -853,6 +853,71 @@ class ScopedTextureFlipTests(unittest.TestCase):
         self.assertEqual(s[8:12], [2.1, 2.9, 2.9, 2.1])
         self.assertEqual(t, [0.2, 0.2, 0.8, 0.8] * 3)
 
+    def build_per_corner_screen_geometry(self) -> ET.Element:
+        # The ETK nav screen: two quads side by side in one contiguous UV
+        # rectangle, with a private texcoord entry per corner.  No two
+        # triangles share an index, so index identity alone sees four islands.
+        xml = f"""
+        <geometry xmlns="{th.NS['c']}" id="screen-mesh" name="screen">
+          <mesh>
+            <source id="screen-mesh-positions">
+              <float_array id="screen-mesh-positions-array" count="12">
+                0 0 0  1 0 0  1 0 1  0 0 1
+              </float_array>
+              <technique_common>
+                <accessor source="#screen-mesh-positions-array" count="4" stride="3">
+                  <param name="X" type="float"/>
+                  <param name="Y" type="float"/>
+                  <param name="Z" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <source id="screen-mesh-map-0">
+              <float_array id="screen-mesh-map-0-array" count="24">
+                0.0 0.0  0.6 0.0  0.6 1.0
+                0.0 0.0  0.6 1.0  0.0 1.0
+                0.6 0.0  1.0 0.0  1.0 1.0
+                0.6 0.0  1.0 1.0  0.6 1.0
+              </float_array>
+              <technique_common>
+                <accessor source="#screen-mesh-map-0-array" count="12" stride="2">
+                  <param name="S" type="float"/>
+                  <param name="T" type="float"/>
+                </accessor>
+              </technique_common>
+            </source>
+            <vertices id="screen-mesh-vertices">
+              <input semantic="POSITION" source="#screen-mesh-positions"/>
+            </vertices>
+            <triangles material="display_screen-material" count="4">
+              <input semantic="VERTEX" source="#screen-mesh-vertices" offset="0"/>
+              <input semantic="TEXCOORD" source="#screen-mesh-map-0" offset="1" set="0"/>
+              <p>0 0 1 1 2 2  0 3 2 4 3 5  1 6 0 7 3 8  1 9 3 10 2 11</p>
+            </triangles>
+          </mesh>
+        </geometry>
+        """
+        return ET.fromstring(xml)
+
+    def test_per_corner_texcoords_flip_as_one_screen(self) -> None:
+        geometry = self.build_per_corner_screen_geometry()
+        out = th.mirrored_geometry(
+            geometry, "new", flip_texture=True, flip_materials={"display_screen"}
+        )
+        s, t = uv_pairs(out)
+
+        # One reflection about the screen's own 0..1 span, not one per quad:
+        # the narrow right-hand panel has to end up on the left.
+        for got, expected in zip(
+            s,
+            [1.0, 0.4, 0.4, 1.0, 0.4, 1.0, 0.4, 0.0, 0.0, 0.4, 0.0, 0.4],
+        ):
+            self.assertAlmostEqual(got, expected)
+        self.assertEqual(
+            t,
+            [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        )
+
     def test_target_component_touching_protected_entry_is_not_torn(self) -> None:
         geometry = self.build_multi_target_geometry()
         mesh = geometry.find("c:mesh", th.NS)

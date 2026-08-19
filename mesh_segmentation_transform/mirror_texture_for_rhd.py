@@ -193,11 +193,6 @@ class RhdTextureConfig:
     # the chosen stencil.  If the mirrored domain alone would tear the glyph,
     # pass 3 tries the full material domain before leaving the region unchanged.
     min_region_exchangeable: float = 0.98
-    # A rotated rectangle whose chosen local axis is effectively image
-    # horizontal/vertical should use the exact axis-aligned flip.  The rotated
-    # sampler is for genuinely angled text; using it for a 0.8 degree AIRBAG
-    # box loses detail for no useful geometric gain.
-    rotated_axis_snap_degrees: float = 2.0
     # Some atlas marks are skewed in texture space but become upright only when
     # mapped onto the mesh.  Skewing and mirroring do not commute, and the flat
     # texture often lacks enough detail to repair honestly, so materially
@@ -217,6 +212,32 @@ class RhdTextureConfig:
     # larger, and a strongly sheared 4px glyph can no longer hide below 3px.
     skewed_region_tolerable_error_px: float = 3.0
     skewed_region_tolerable_error_ratio: float = 0.10
+    # A residual that is nearly a rotation is not the same defect as one that
+    # deforms.  Split it: the symmetric half is shear strain, which smears a
+    # glyph, and the antisymmetric half only turns it.  Under this strain the
+    # flat flip leaves the mark turned by twice the residual angle and
+    # otherwise intact, so the displacement is judged against the looser ratio
+    # below.  This is a lesser evil, not a free pass -- the Ardente door
+    # card's "L MIRROR R" is 73x18 at 2.6% strain and 1.9 px of lean, and was
+    # refused by the 10% ratio and shipped reading backwards, which is far
+    # worse than the three degrees the flat flip leaves behind.  The proper
+    # answer is to apply the oblique reflection rather than approximate it
+    # with a flat flip; until that exists this keeps the mark legible.  The
+    # stalk legends it must keep refusing run 5.9% to 45% strain.
+    skewed_region_tolerable_shear: float = 0.04
+    # How far a near-rigid residual may still swing a mark out of place,
+    # against its narrow side.  A rotation is only harmless while it stays
+    # small against the mark: a 4 px wide, 1000 px long sliver rotated by the
+    # same three degrees leaves its ends seven widths adrift of the stitching
+    # it belongs to, and that join is visible.
+    skewed_region_rotation_error_ratio: float = 0.25
+    # ...and only where the box is a mark at all.  Turning a mark is harmless
+    # because a mark is one object; turning an 8 px slice of a 300 px seam
+    # reverses that slice's lean while the run above and below keeps its own,
+    # and the notch shows -- Scintilla's interior seam is two such slices.
+    # Measured against the atlas's shorter side so a half-resolution companion
+    # map reaches the same verdict as the colour layer it composites with.
+    skewed_region_rotation_min_short_side: float = 12.0 / 4096.0
     # Blend only the outside edge of in-place glyph writes, in pixels.  This is
     # deliberately tiny: it hides UV/mask joins without softening the mark body.
     region_boundary_blend_px: float = 1.5
@@ -251,6 +272,28 @@ class RhdTextureConfig:
     background_tolerance_floor: float = 14.0
     escape_margin_fraction: float = 0.6  # how far past the region to follow
     escape_min_margin_px: int = 24
+
+    # Repeat rejection.  An in-place flip is meant to reverse one mark inside
+    # its own bounds.  Over a repeating moulding -- the ETK door card's grid of
+    # switch pads -- reversal and a plain slide are the same operation, so the
+    # flip carries the pads and the icons printed on them off their buttons
+    # instead of turning anything over.  Correlating the flipped crop against
+    # the original separates the two cleanly: the pad grid matched at 1.00 one
+    # step along and 0.36 in place, while the marks around it peaked at 0.96
+    # in place and never above 0.88 anywhere else.
+    enable_repeat_filter: bool = True
+    # How well the flipped crop must match the original somewhere other than
+    # where it started before the flip counts as a slide.
+    max_region_repeat_match: float = 0.95
+    # ...and by how much that must beat matching in place, so a mark that is
+    # its own reflection is not mistaken for a lattice.
+    min_region_repeat_margin: float = 0.20
+    # Shifts below this are register error, not a lattice step.
+    min_region_repeat_shift_px: int = 3
+    min_region_repeat_shift_fraction: float = 0.05
+    # Correlating a whole-atlas rectangle costs more than it can decide; a
+    # region that large is island-flip work, not a glyph.
+    max_region_repeat_area_px: int = 4_000_000
 
     # Blob rejection.  A bare vent slot nearly fills its own convex hull and
     # is uniform inside; lettering is full of concavity.  Two guards keep it
@@ -2076,6 +2119,24 @@ def skew_delta_for_region(
         coefficient_below_floor or reference_scaled_safe
     ):
         return None
+    # Second reading, for a residual that barely deforms the mark.  Its
+    # symmetric half is the shear strain; the antisymmetric half is a
+    # rotation, which leaves a glyph legible and correctly handed.  Where the
+    # strain is negligible the mark is only turned, and the displacement is
+    # held to the looser rotation allowance rather than the deformation one.
+    strain = 0.5 * (difference + difference.T)
+    shear = float(np.max(np.abs(np.linalg.eigvalsh(strain))))
+    rotation_ratio = max(float(config.skewed_region_rotation_error_ratio), 0.0)
+    atlas_span = float(min(max(width, 1), max(height, 1)))
+    mark_enough = short_span >= atlas_span * max(
+        float(config.skewed_region_rotation_min_short_side), 0.0
+    )
+    if (
+        mark_enough
+        and shear <= max(float(config.skewed_region_tolerable_shear), 0.0)
+        and relative_error <= rotation_ratio
+    ):
+        return None
     return delta
 
 
@@ -2682,6 +2743,92 @@ def blob_interior_contrast(
     blob = labels == largest
     base = np.median(crop[blob], axis=0)
     return float(np.percentile(np.abs(crop - base).max(axis=2)[blob], 99))
+
+
+def region_repeat_shift(
+    image: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    axis: str,
+    config: RhdTextureConfig,
+) -> tuple[float, int, float] | None:
+    """Return (match, shift, in-place match) when this flip only slides content.
+
+    ``flipud``/``fliplr`` inside a rectangle is a reflection of whatever the
+    rectangle holds.  Over one mark that reverses it in place, which is the
+    correction.  Over a run of identical mouldings it is indistinguishable
+    from a translation by one step, and applying it drags the run along the
+    axis: the ETK door card's switch icons left their buttons that way, and
+    the pad relief they sit in went with them.
+
+    Correlating the flipped crop against the original says which happened.  A
+    mark matches best where it started, or nowhere.  A lattice fragment
+    matches almost perfectly one step away and poorly in place, and that gap
+    is the signature.  ``None`` means nothing was concluded -- too small to
+    measure, flat, or too large to be worth correlating.
+    """
+    x, y, w, h = bounds
+    height, width = image.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    if (x1 - x0) * (y1 - y0) > max(int(config.max_region_repeat_area_px), 0):
+        return None
+    crop = image[y0:y1, x0:x1]
+    if crop.ndim == 3:
+        crop = crop.mean(axis=2)
+    crop = np.ascontiguousarray(crop, dtype=np.float32)
+    span = crop.shape[0] if axis == "vertical" else crop.shape[1]
+    min_shift = max(
+        int(config.min_region_repeat_shift_px),
+        int(round(span * max(float(config.min_region_repeat_shift_fraction), 0.0))),
+        1,
+    )
+    # Keep at least a third of the region in the template, so the match that
+    # wins is over a real overlap rather than a sliver.
+    max_shift = span // 3
+    if max_shift < min_shift:
+        return None
+    flipped = np.flipud(crop) if axis == "vertical" else np.fliplr(crop)
+    template = (
+        flipped[max_shift : span - max_shift, :]
+        if axis == "vertical"
+        else flipped[:, max_shift : span - max_shift]
+    )
+    if template.size == 0 or float(template.std()) <= 1e-6 or float(crop.std()) <= 1e-6:
+        return None
+    centred = template - template.mean()
+    template_energy = float(np.sqrt((centred * centred).sum()))
+    if template_energy <= 1e-6:
+        return None
+    reach = span - 2 * max_shift
+    scores = np.empty(2 * max_shift + 1, dtype=np.float64)
+    for index in range(scores.size):
+        window = (
+            crop[index : index + reach, :]
+            if axis == "vertical"
+            else crop[:, index : index + reach]
+        )
+        offset = window - window.mean()
+        energy = float(np.sqrt((offset * offset).sum())) * template_energy
+        scores[index] = (
+            float((offset * centred).sum()) / energy if energy > 1e-12 else 0.0
+        )
+    if not bool(np.isfinite(scores).all()):
+        return None
+    in_place = float(scores[max_shift])
+    shifts = np.arange(-max_shift, max_shift + 1)
+    candidates = np.abs(shifts) >= min_shift
+    if not bool(candidates.any()):
+        return None
+    best_index = int(np.argmax(np.where(candidates, scores, -np.inf)))
+    best = float(scores[best_index])
+    shift = int(shifts[best_index])
+    if best < float(config.max_region_repeat_match):
+        return None
+    if best - in_place < float(config.min_region_repeat_margin):
+        return None
+    return best, shift, in_place
 
 
 def _reflection_similarity(component: np.ndarray, reflected: np.ndarray) -> float:
@@ -6199,6 +6346,40 @@ def build_rhd_texture(
             "atlas region(s) before flip planning"
         )
 
+    # Drop the boxes whose flip would only slide a repeating moulding, before
+    # they are offered to the material's other maps.  Judging it here rather
+    # than at planning time is what keeps every map of one material planning
+    # from the same list: the ledger is filled by a detect-only pass over all
+    # of them, so a box refused on the relief that carried it is refused
+    # everywhere, and the print and the relief cannot fall out of register.
+    repeated: list[tuple[int, int, int, int, str, float, int]] = []
+    if config.enable_repeat_filter and not authoritative_mask_regions:
+        repeat_image = (
+            direct_normal_edge_data.relief_bgr
+            if direct_normal_edge_data is not None
+            else rgba_detection_bgr(rgba)
+        )
+        kept_regions: list[tuple[int, int, int, int]] = []
+        kept_rotations: list[tuple[tuple[float, float], ...] | None] = []
+        for bounds, rotation in zip(mirrored_regions, mirrored_rotations):
+            axis, _share = (
+                region_flip_axis(masks.axis_map, mirror_mask, bounds)
+                if masks.axis_map is not None
+                else ("horizontal", 1.0)
+            )
+            verdict = region_repeat_shift(repeat_image, bounds, axis, config)
+            if verdict is None:
+                kept_regions.append(bounds)
+                kept_rotations.append(rotation)
+                continue
+            match, shift, in_place = verdict
+            repeated.append((*bounds, axis, match, shift))
+            log(f"    - ({bounds[0]},{bounds[1]}) {bounds[2]}x{bounds[3]}: the "
+                f"{axis} flip matches {match:.2f} at {shift:+d} px against "
+                f"{in_place:.2f} in place; a repeat it would slide, left alone")
+        mirrored_regions = kept_regions
+        mirrored_rotations = kept_rotations
+
     shared_layer_sources: tuple[str, ...] = ()
     shared_layer_regions_added = 0
     if shared_layer_regions is not None:
@@ -6293,19 +6474,17 @@ def build_rhd_texture(
             marginal += 1
             log(f"    ~ ({x},{y}) {w}x{h}: axis only {share:.0%} {axis}; "
                 "the surface turns a corner under this glyph")
+        # Every detected rotation is applied, however small.  A near-axis
+        # rectangle used to be snapped to the flat flip on the grounds that
+        # resampling cost detail for no geometric gain, but the gain is twice
+        # the detected angle: reflecting about the image axis instead of a
+        # mirror line sitting at 0.8 degrees to it leaves the mark turned by
+        # 1.6, and a baseline that far off is visible on text.
         rotated_axis = (
             rotated_axis_for_surface_axis(rotation, axis)
             if rotation is not None
             else None
         )
-        if rotation is not None and rotated_axis is not None:
-            alignment = rotated_axis_alignment_degrees(rotation, axis, rotated_axis)
-            if (
-                alignment is not None
-                and alignment <= config.rotated_axis_snap_degrees
-            ):
-                rotation = None
-                rotated_axis = None
         if config.enable_skewed_region_filter and not authoritative_mask_regions:
             if cached_skew_frames is None:
                 cached_skew_frames = domain_skew_frames(masks, (width, height))
@@ -6834,6 +7013,11 @@ def build_rhd_texture(
         "blob_regions": [
             {"x": x, "y": y, "w": w, "h": h, "solidity": round(v, 3)}
             for x, y, w, h, v in blobs
+        ],
+        "repeated_regions": [
+            {"x": x, "y": y, "w": w, "h": h, "axis": axis,
+             "match": round(match, 4), "shift": shift}
+            for x, y, w, h, axis, match, shift in repeated
         ],
         "uncontained_regions": [
             {"x": x, "y": y, "w": w, "h": h, "escape": round(e, 4)}

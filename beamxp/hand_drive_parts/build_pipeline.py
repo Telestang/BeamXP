@@ -2404,6 +2404,29 @@ def _retarget_runtime_screen_nodes(
     return sorted(node_id for node_id in retargeted_nodes if node_id)
 
 
+def _rigid_only_material_aliases(
+    piece_materials: dict[str, set[str]],
+) -> set[str]:
+    """Materials this split carries only on pieces it did not mirror.
+
+    A perimeter-symmetric candidate is moved to the other side by a rotation or
+    a translation, never a reflection, so its texture still reads the right way
+    round and a corrected one would read backwards on it.  The LC500's gauge
+    cluster is such a piece: its screen material is a glowMap switch, and
+    pointing that switch's off state at the corrected atlas -- correct for the
+    mirrored quad behind it, which binds the same state material directly --
+    handed the cluster a pre-reversed image it had no reversal to cancel.
+    """
+    mirrored: set[str] = set()
+    rigid: set[str] = set()
+    for piece, symbols in piece_materials.items():
+        if "__beamxp_rigid_" in piece:
+            rigid |= symbols
+        else:
+            mirrored |= symbols
+    return rigid - mirrored
+
+
 def _mirror_row_split_target(
     pieces: Iterable[str],
     piece_materials: dict[str, set[str]],
@@ -2634,15 +2657,21 @@ def _retarget_unmapped_glowmap_state_entries(
     alias_to_material: dict[str, str],
     switch_base_aliases: set[str],
     forked_bases: set[str] | None = None,
+    rigid_only_aliases: set[str] | None = None,
 ) -> tuple[str, int]:
     if not alias_to_material:
         return glow_text, 0
     forked_bases = forked_bases or set()
+    rigid_only_aliases = rigid_only_aliases or set()
     out: list[str] = []
     cursor = 0
     changed = 0
     for key, _start, end, value_text in entries:
         key_alias = _normalise_jbeam_material_alias(key)
+        if key_alias in rigid_only_aliases:
+            # This switch's meshes were rotated or translated into place, not
+            # reflected, so the stock states are the ones that read correctly.
+            continue
         if key_alias in forked_bases:
             # This base now has an entry per mesh, so the original is left
             # speaking for the meshes nothing corrected -- with the stock
@@ -2674,11 +2703,13 @@ def _append_texture_correction_glowmap_entries(
     material_alias_sets: Iterable[dict[str, str]],
     switch_base_aliases: set[str] | None = None,
     switch_forks: Iterable[SwitchBaseFork] = (),
+    rigid_only_aliases: set[str] | None = None,
 ) -> tuple[str, int]:
     entries = _top_level_jbeam_object_entries(glow_text)
     if not entries:
         return glow_text, 0
     switch_base_aliases = switch_base_aliases or set()
+    rigid_only_aliases = rigid_only_aliases or set()
     switch_forks = list(switch_forks)
     forked_bases = {fork.alias for fork in switch_forks}
     combined_alias_to_material: dict[str, str] = {}
@@ -2693,6 +2724,7 @@ def _append_texture_correction_glowmap_entries(
         combined_alias_to_material,
         switch_base_aliases,
         forked_bases,
+        rigid_only_aliases,
     )
     existing_keys = {_normalise_jbeam_material_alias(key) for key, *_ in entries}
     additions: list[str] = []
@@ -2701,6 +2733,8 @@ def _append_texture_correction_glowmap_entries(
             continue
         for key, _start, _end, value_text in entries:
             if _normalise_jbeam_material_alias(key) in switch_base_aliases:
+                continue
+            if _normalise_jbeam_material_alias(key) in rigid_only_aliases:
                 continue
             corrected_base = alias_to_material.get(_normalise_jbeam_material_alias(key))
             if not corrected_base:
@@ -2818,6 +2852,7 @@ def _corrected_source_glowmap_entries(
     material_alias_sets: Iterable[dict[str, str]],
     switch_base_aliases: set[str],
     forked_bases: set[str] | None = None,
+    rigid_only_aliases: set[str] | None = None,
 ) -> dict[str, str]:
     combined: dict[str, str] = {}
     for alias_to_material in material_alias_sets:
@@ -2826,12 +2861,16 @@ def _corrected_source_glowmap_entries(
     if not combined:
         return {}
     forked_bases = forked_bases or set()
+    rigid_only_aliases = rigid_only_aliases or set()
 
     corrected: dict[str, str] = {}
 
     def collect(glow_text: str) -> tuple[str, int]:
         for key, _start, _end, value_text in _top_level_jbeam_object_entries(glow_text):
             key_alias = _normalise_jbeam_material_alias(key)
+            if key_alias in rigid_only_aliases:
+                # Its meshes were never reflected; the stock states are right.
+                continue
             if key_alias in forked_bases:
                 # Carried per mesh instead; under the shared key this would be
                 # one mesh's states answering for every mesh.
@@ -2974,6 +3013,7 @@ def _patch_texture_correction_jbeams(
     mirror_row_targets: dict[str, str] | None = None,
     switch_forks: Iterable[SwitchBaseFork] = (),
     generated_mesh_sources: dict[str, str] | None = None,
+    rigid_only_aliases: Iterable[str] | None = None,
 ) -> dict[str, object]:
     patched_files: list[str] = []
     replaced_rows = 0
@@ -2983,6 +3023,7 @@ def _patch_texture_correction_jbeams(
     switch_base_aliases = set(switch_base_aliases)
     switch_forks = list(switch_forks)
     generated_mesh_sources = generated_mesh_sources or {}
+    rigid_only_aliases = set(rigid_only_aliases or ())
     source_jbeam_texts = tuple(source_jbeam_texts)
     forked_bases = {fork.alias for fork in switch_forks}
     corrected_source_glow_entries = _corrected_source_glowmap_entries(
@@ -2990,6 +3031,7 @@ def _patch_texture_correction_jbeams(
         material_alias_sets,
         switch_base_aliases,
         forked_bases,
+        rigid_only_aliases,
     )
     fork_source_glow_entries = _switch_fork_source_glowmap_entries(
         source_jbeam_texts,
@@ -3044,6 +3086,7 @@ def _patch_texture_correction_jbeams(
                     material_alias_sets,
                     switch_base_aliases,
                     switch_forks,
+                    rigid_only_aliases,
                 ),
             )
         if corrected_source_glow_entries or fork_source_glow_entries:
@@ -4433,6 +4476,7 @@ def integrate_texture_correction_artifacts(
     glow_material_alias_sets: list[dict[str, str]] = []
     glow_switch_base_aliases: set[str] = set()
     glow_switch_forks: list[SwitchBaseFork] = []
+    glow_rigid_only_aliases: set[str] = set()
     generated_mesh_sources: dict[str, str] = {}
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
@@ -4541,6 +4585,9 @@ def integrate_texture_correction_artifacts(
                     # retargeted material names, which is what has to be
                     # compared against the ones the correction minted.
                     piece_materials = _node_material_symbols(target_dae, set(appended))
+                    glow_rigid_only_aliases |= _rigid_only_material_aliases(
+                        piece_materials
+                    )
                     glass = _mirror_row_split_target(
                         appended,
                         piece_materials,
@@ -4603,6 +4650,15 @@ def integrate_texture_correction_artifacts(
                 }
             )
 
+    # A switch whose meshes all landed in rigid pieces must keep its stock
+    # states; nothing reflected them, so a corrected texture would read
+    # backwards.  Never let one job's rigid piece speak for another job's
+    # mirrored one, though: a material corrected anywhere is corrected.
+    glow_rigid_only_aliases -= {
+        _normalise_jbeam_material_alias(alias)
+        for alias_set in glow_material_alias_sets
+        for alias in alias_set
+    }
     jbeam_patch = _patch_texture_correction_jbeams(
         output_vehicle_dir,
         row_replacements,
@@ -4612,6 +4668,7 @@ def integrate_texture_correction_artifacts(
         mirror_row_targets,
         glow_switch_forks,
         generated_mesh_sources,
+        glow_rigid_only_aliases,
     )
     return {
         "enabled": True,
@@ -4619,6 +4676,7 @@ def integrate_texture_correction_artifacts(
         "jbeamPatch": jbeam_patch,
         "rowReplacements": row_replacements,
         "mirrorRowTargets": mirror_row_targets,
+        "rigidOnlyMaterials": sorted(glow_rigid_only_aliases),
         "switchBaseForks": [
             {
                 "alias": fork.alias,

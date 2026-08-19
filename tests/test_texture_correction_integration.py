@@ -1705,6 +1705,64 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertIn('"off":"lc500_screen_off_off_beamxp_tc"', updated)
         self.assertIn('"on":"lc500_screen_off_on_beamxp_tc"', updated)
 
+    def test_jbeam_patch_leaves_a_rigid_only_switch_on_its_stock_states(self) -> None:
+        """The LC500 gauge cluster: a switch on a piece nothing reflected.
+
+        The cluster's 38 faces are a perimeter-symmetric candidate, so the
+        split translates them rather than mirroring them, while the backing
+        quad behind them binds the same off-state material directly and is
+        mirrored.  Correcting that shared atlas is right for the quad; pointing
+        the cluster's switch at it hands an unreflected mesh a pre-reversed
+        image, which is how the cluster shipped reading backwards.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw)
+            jbeam = vehicle_dir / "lc500.jbeam"
+            jbeam.write_text(
+                """{
+  "lc500": {
+    "glowMap":{
+      "lc500_screen_off":{"simpleFunction":"running", "off":"lc500_screen_off_off", "on":"lc500_screen_off_on"}
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {},
+                [
+                    {
+                        "lc500_screen_off_off": "lc500_screen_off_off_beamxp_tc",
+                    }
+                ],
+                rigid_only_aliases={"lc500_screen_off"},
+            )
+            updated = jbeam.read_text(encoding="utf-8")
+
+        self.assertIn('"off":"lc500_screen_off_off"', updated)
+        self.assertNotIn("lc500_screen_off_off_beamxp_tc", updated)
+
+    def test_rigid_only_aliases_exclude_materials_a_carrier_still_paints(self) -> None:
+        pieces = {
+            "lc500_interior__beamxp_mirrored_carrier": {
+                "lc500_leather1",
+                "lc500_screen_off_off_beamxp_tc",
+            },
+            "lc500_interior__beamxp_rigid_001": {
+                "lc500_chrome",
+                "lc500_screen_off",
+            },
+            "lc500_interior__beamxp_rigid_002": {"lc500_leather1"},
+        }
+
+        self.assertEqual(
+            build_pipeline._rigid_only_material_aliases(pieces),
+            {"lc500_chrome", "lc500_screen_off"},
+        )
+
     def test_jbeam_patch_imports_source_glowmap_into_generated_part(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             vehicle_dir = Path(raw)

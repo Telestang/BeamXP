@@ -553,6 +553,77 @@ class SurfaceFlipAxisTests(unittest.TestCase):
                 )
                 self.assertIsNone(delta)
 
+    def test_skew_delta_allows_a_near_rigid_lean_across_a_long_label(self) -> None:
+        """The Andronisk door card's "L MIRROR R", 73x18 on a 4096 atlas.
+
+        The exact reflection adds a 0.052 shear: 1.9 px of lean over the
+        word's length, which the short side reads as 10.5% and refuses.  Split
+        into its parts the residual is 2.6% strain and a 1.5 degree turn, so
+        the word comes out legible and correctly handed rather than backwards.
+        """
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (-2.58, -100.0, 0.0),
+                ]
+            ),
+        )
+
+        delta = rhd.skew_delta_for_region(
+            uv, xyz, (20, 20, 18, 73), "vertical", 4096, 4096,
+            rhd.DEFAULT_RHD_CONFIG,
+        )
+
+        self.assertIsNone(delta)
+
+    def test_skew_delta_refuses_the_same_lean_across_a_seam_sliver(self) -> None:
+        """Scintilla's interior seam: the residual is smaller still, but an
+        8 px slice of a 300 px run is not a mark whose rotation is harmless --
+        reversing the slice's lean notches it against the run it belongs to.
+        The floor is read against the atlas so a half-resolution companion map
+        reaches the same verdict as the colour layer it composites with."""
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (-2.58, -100.0, 0.0),
+                ]
+            ),
+        )
+
+        for atlas, width, height in ((4096, 8, 40), (2048, 4, 20)):
+            with self.subTest(atlas=atlas):
+                delta = rhd.skew_delta_for_region(
+                    uv, xyz, (10, 10, width, height), "vertical", atlas, atlas,
+                    rhd.DEFAULT_RHD_CONFIG,
+                )
+                self.assertIsNotNone(delta)
+
+    def test_skew_delta_still_refuses_a_deforming_lean_on_the_same_label(self) -> None:
+        """Twice the shear is 5.9% strain: the stalk legends stay refused."""
+        uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
+        xyz = (
+            np.asarray(
+                [
+                    (0.0, 0.0, 0.0),
+                    (100.0, 0.0, 0.0),
+                    (-5.9, -100.0, 0.0),
+                ]
+            ),
+        )
+
+        delta = rhd.skew_delta_for_region(
+            uv, xyz, (20, 20, 18, 73), "vertical", 4096, 4096,
+            rhd.DEFAULT_RHD_CONFIG,
+        )
+
+        self.assertIsNotNone(delta)
+
     def test_skew_delta_rejects_high_relative_error_on_a_small_region(self) -> None:
         uv = (np.asarray([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),)
         config = replace(
@@ -650,6 +721,87 @@ class SurfaceFlipAxisTests(unittest.TestCase):
 
         self.assertIsNotNone(delta)
         self.assertAlmostEqual(delta, 0.06)
+
+
+class RepeatingRegionTests(unittest.TestCase):
+    """A flip that only slides a repeating moulding must be declined.
+
+    The ETK door card is the case: its switch pads repeat every 40 px down the
+    armrest and the relief detector boxed a 73 px slice of them, so the
+    vertical flip carried the pads -- and the window icons printed on them --
+    19 px off their buttons instead of reversing anything.
+    """
+
+    @staticmethod
+    def lattice(height: int, width: int, period: int) -> np.ndarray:
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        for row in range(0, height, period):
+            image[row : row + period // 2, :, :] = 220
+        return image
+
+    @staticmethod
+    def mark(height: int, width: int) -> np.ndarray:
+        """A wedge: handed on both axes and self-similar under no shift."""
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        for row in range(height):
+            image[row, : 4 + (row * (width - 8)) // height, :] = 230
+        return image
+
+    def test_repeating_pads_are_declined_on_the_axis_that_slides_them(self) -> None:
+        image = self.lattice(240, 172, 40)
+
+        verdict = rhd.region_repeat_shift(
+            image, (0, 60, 172, 73), "vertical", rhd.DEFAULT_RHD_CONFIG
+        )
+
+        self.assertIsNotNone(verdict)
+        match, shift, in_place = verdict
+        self.assertGreaterEqual(match, rhd.DEFAULT_RHD_CONFIG.max_region_repeat_match)
+        self.assertNotEqual(shift, 0)
+        self.assertGreater(match - in_place, rhd.DEFAULT_RHD_CONFIG.min_region_repeat_margin)
+
+    def test_a_handed_mark_is_kept(self) -> None:
+        image = np.zeros((240, 172, 3), dtype=np.uint8)
+        image[60:133, 0:80] = self.mark(73, 80)
+
+        self.assertIsNone(
+            rhd.region_repeat_shift(
+                image, (0, 60, 80, 73), "vertical", rhd.DEFAULT_RHD_CONFIG
+            )
+        )
+        self.assertIsNone(
+            rhd.region_repeat_shift(
+                image, (0, 60, 80, 73), "horizontal", rhd.DEFAULT_RHD_CONFIG
+            )
+        )
+
+    def test_a_mark_that_is_its_own_reflection_is_kept(self) -> None:
+        image = np.zeros((240, 172, 3), dtype=np.uint8)
+        image[80:120, 40:120] = 200
+        image[95:105, 60:100] = 40
+
+        self.assertIsNone(
+            rhd.region_repeat_shift(
+                image, (30, 70, 100, 60), "vertical", rhd.DEFAULT_RHD_CONFIG
+            )
+        )
+
+    def test_a_flat_region_concludes_nothing(self) -> None:
+        image = np.full((240, 172, 3), 128, dtype=np.uint8)
+
+        self.assertIsNone(
+            rhd.region_repeat_shift(
+                image, (0, 60, 172, 73), "vertical", rhd.DEFAULT_RHD_CONFIG
+            )
+        )
+
+    def test_the_filter_can_be_switched_off(self) -> None:
+        image = self.lattice(240, 172, 40)
+        config = replace(rhd.DEFAULT_RHD_CONFIG, max_region_repeat_match=1.01)
+
+        self.assertIsNone(
+            rhd.region_repeat_shift(image, (0, 60, 172, 73), "vertical", config)
+        )
 
 
 class CroppedDetectionTests(unittest.TestCase):

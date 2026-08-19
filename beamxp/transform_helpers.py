@@ -321,6 +321,109 @@ def _primitive_texcoord_faces(
     return streams
 
 
+def _source_texcoord_values(
+    source: ET.Element,
+) -> tuple[list[float], int, int, int, int]:
+    """Return (values, stride, offset, s_slot, t_slot) for a TEXCOORD source."""
+    float_array = source.find("c:float_array", NS)
+    accessor = source.find(".//c:accessor", NS)
+    if float_array is None or accessor is None or not float_array.text:
+        return [], 0, 0, 0, 0
+    values = [float(v) for v in float_array.text.split()]
+    stride = int(accessor.get("stride", "2"))
+    offset = int(accessor.get("offset", "0"))
+    if stride < 1:
+        return [], 0, 0, 0, 0
+    params = [p.get("name", "").upper() for p in accessor.findall("c:param", NS)]
+    s_slot = params.index("S") if "S" in params else 0
+    if "T" in params:
+        t_slot = params.index("T")
+    else:
+        t_slot = 1 if stride >= 2 and s_slot != 1 else s_slot
+    return values, stride, offset, s_slot, t_slot
+
+
+def _component_uv_bounds(
+    component: set[int],
+    values: list[float],
+    stride: int,
+    offset: int,
+    s_slot: int,
+    t_slot: int,
+) -> tuple[float, float, float, float] | None:
+    """(min_s, min_t, max_s, max_t) for one component's texcoord entries."""
+    s_values: list[float] = []
+    t_values: list[float] = []
+    for index in component:
+        base = offset + index * stride
+        if base + max(s_slot, t_slot) >= len(values) or base < 0:
+            continue
+        s_values.append(values[base + s_slot])
+        t_values.append(values[base + t_slot])
+    if not s_values:
+        return None
+    return min(s_values), min(t_values), max(s_values), max(t_values)
+
+
+def _merge_touching_uv_components(
+    components: list[set[int]],
+    source: ET.Element,
+) -> list[set[int]]:
+    """Rejoin components whose UV footprints touch or overlap.
+
+    Index identity proves two consumers are one island, but it does not
+    disprove it: an exporter that writes a private texcoord entry per corner
+    leaves every triangle of one screen its own component.  Reflecting each of
+    those about its own S range flips the quads in place instead of turning the
+    screen over, which is how the ETK nav screen's button column ended up in
+    the middle of the map.  Overlapping footprints are the same island however
+    the indices were written, while two screens on separate atlas tiles stay
+    apart -- the case the per-island pivot exists for.
+    """
+    if len(components) < 2:
+        return components
+    values, stride, offset, s_slot, t_slot = _source_texcoord_values(source)
+    if not values:
+        return components
+    boxes: list[tuple[float, float, float, float] | None] = [
+        _component_uv_bounds(component, values, stride, offset, s_slot, t_slot)
+        for component in components
+    ]
+    parent = list(range(len(components)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    # Coordinates shared along a seam are written identically by the exporter,
+    # so a closed-interval test rejoins them without reaching across a gutter.
+    tolerance = 1e-6
+    for left in range(len(components)):
+        first = boxes[left]
+        if first is None:
+            continue
+        for right in range(left + 1, len(components)):
+            second = boxes[right]
+            if second is None:
+                continue
+            if (
+                first[0] - tolerance <= second[2]
+                and second[0] - tolerance <= first[2]
+                and first[1] - tolerance <= second[3]
+                and second[1] - tolerance <= first[3]
+            ):
+                left_root, right_root = find(left), find(right)
+                if left_root != right_root:
+                    parent[right_root] = left_root
+
+    merged: dict[int, set[int]] = {}
+    for index, component in enumerate(components):
+        merged.setdefault(find(index), set()).update(component)
+    return sorted(merged.values(), key=min)
+
+
 def _connected_texcoord_components(
     faces: list[tuple[int, ...]],
 ) -> list[set[int]]:
@@ -328,7 +431,10 @@ def _connected_texcoord_components(
 
     Index identity is deliberate here.  Equal-valued coordinates can be
     stacked, mirrored, or separated by an authored seam; only reuse of the
-    same source entry proves that two consumers are one UV island.
+    same source entry proves that two consumers are one UV island.  Callers
+    that need the island rather than the consumer pass the result through
+    ``_merge_touching_uv_components``, which rejoins the pieces an exporter
+    split by writing a private texcoord entry per corner.
     """
     parent: dict[int, int] = {}
 
@@ -401,7 +507,10 @@ def flip_texcoord_islands(mesh: ET.Element, flip_materials: set[str]) -> None:
         if source is None:
             continue
         protected_indices = protected.get(source_id, set())
-        for component in _connected_texcoord_components(faces):
+        components = _merge_touching_uv_components(
+            _connected_texcoord_components(faces), source
+        )
+        for component in components:
             if component.isdisjoint(protected_indices):
                 flip_texcoord_s_for_indices(source, component)
 

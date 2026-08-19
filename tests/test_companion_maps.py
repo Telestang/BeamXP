@@ -288,7 +288,10 @@ class NormalChannelNegationTests(unittest.TestCase):
         self.assertLess(int(image[10, 10, 0]), 128)
         self.assertLess(int(image[10, 10, 1]), 128)
 
-    def test_near_axis_rotated_rectangle_can_be_snapped(self) -> None:
+    def test_a_near_axis_rotated_rectangle_keeps_its_rotation(self) -> None:
+        """A mirror line a fraction of a degree off the image axis still gets
+        the rotated sampler.  Flipping about the axis instead would leave the
+        mark turned by twice that angle, which reads on a text baseline."""
         corners = ((0.0, 0.0), (100.0, 1.0), (100.0, 11.0), (0.0, 10.0))
         rotated_axis = rotated_axis_for_surface_axis(corners, "horizontal")
         self.assertEqual(rotated_axis, "long")
@@ -296,7 +299,7 @@ class NormalChannelNegationTests(unittest.TestCase):
             corners, "horizontal", rotated_axis
         )
         self.assertIsNotNone(alignment)
-        self.assertLess(alignment, DEFAULT_RHD_CONFIG.rotated_axis_snap_degrees)
+        self.assertLess(alignment, 1.0)
 
 
 class ExchangeableShareTests(unittest.TestCase):
