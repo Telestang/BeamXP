@@ -259,7 +259,14 @@ class SourceDefaultTests(unittest.TestCase):
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.box_source, "edge")
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.edge_operator, "laplacian")
         self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_rotated_bounds_filter)
-        self.assertTrue(DEFAULT_RELIEF_DETECTION_CONFIG.enable_symmetry_rotation)
+        # Symmetry rotation is off in both: the shape fit states a mark's
+        # axis directly, so it is no longer estimated from the hull.
+        self.assertFalse(DEFAULT_RELIEF_DETECTION_CONFIG.enable_symmetry_rotation)
+        self.assertFalse(DEFAULT_CONFIG.enable_symmetry_rotation)
+        self.assertNotEqual(
+            DEFAULT_RELIEF_DETECTION_CONFIG.min_rotated_fill,
+            DEFAULT_CONFIG.min_rotated_fill,
+        )
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_box_width_px, 8)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.min_box_height_px, 8)
         self.assertEqual(DEFAULT_RELIEF_DETECTION_CONFIG.merge_distance_px, 21)
@@ -716,3 +723,61 @@ class PerIslandHarnessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromotionTargetTests(unittest.TestCase):
+    """Which shipped literal each tuning path promotes into.
+
+    A build never selects a harness pipeline: it imports one colour config and
+    one relief config.  So every colour front end has to promote into the
+    colour literal and every relief one into the relief literal, or a value
+    tuned on the GPU path would never reach a build running the CPU one.
+    """
+
+    def test_every_pipeline_promotes_into_a_config_the_exporter_imports(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_tuning_app import PIPELINES
+        from mesh_segmentation_transform.promote_detection_defaults import (
+            PROMOTION_TARGETS,
+        )
+
+        for pipeline in PIPELINES:
+            with self.subTest(pipeline=pipeline.pipeline_id):
+                key = pipeline.defaults_key()
+                self.assertIn(key, PROMOTION_TARGETS)
+                self.assertEqual(
+                    key, "relief" if pipeline.renders_relief else "colour"
+                )
+
+    def test_both_targets_are_actually_used(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_tuning_app import PIPELINES
+        from mesh_segmentation_transform.promote_detection_defaults import (
+            PROMOTION_TARGETS,
+        )
+
+        self.assertEqual(
+            {pipeline.defaults_key() for pipeline in PIPELINES},
+            set(PROMOTION_TARGETS),
+        )
+
+    def test_relief_is_promoted_as_a_delta_on_colour(self) -> None:
+        """Its literal is declared that way, so its diff base must match.
+
+        Comparing relief against a bare MserConfig instead would restate every
+        colour value inside the relief block, and the two would then drift.
+        """
+        from mesh_segmentation_transform.annotate_texture_tuning_app import (
+            PIPELINES,
+        )
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DEFAULT_COLOUR_CONFIG,
+            MserConfig,
+        )
+
+        for pipeline in PIPELINES:
+            with self.subTest(pipeline=pipeline.pipeline_id):
+                expected = (
+                    DEFAULT_COLOUR_CONFIG
+                    if pipeline.renders_relief
+                    else MserConfig()
+                )
+                self.assertEqual(pipeline.promotion_base(), expected)

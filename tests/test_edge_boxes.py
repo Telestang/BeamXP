@@ -424,7 +424,18 @@ class ConservativeGroupingTests(unittest.TestCase):
     def test_circles_begin_at_initial_grouping_not_overlap_collapse(self) -> None:
         """Overlap collapse is rectilinear housekeeping, not a shape fit."""
         image = np.full((80, 80, 3), 128, dtype=np.uint8)
-        boxes = np.asarray(((20, 20, 32, 32), (25, 25, 12, 12)), dtype=np.int32)
+        # Four detected marks, because a circle is a claim about a cluster:
+        # see ``circular_group_min_regions``.  Their union is unchanged, so
+        # this still measures *when* the circle appears.
+        boxes = np.asarray(
+            (
+                (20, 20, 32, 32),
+                (25, 25, 12, 12),
+                (22, 42, 8, 8),
+                (42, 22, 8, 8),
+            ),
+            dtype=np.int32,
+        )
         config = replace(
             DEFAULT_CONFIG,
             enable_box_feature_filter=False,
@@ -733,6 +744,9 @@ class ConservativeGroupingTests(unittest.TestCase):
         # but their enclosing square is an unambiguous, UV-valid circle.
         groups = [(92, 40, 20, 20), (40, 92, 20, 20),
                   (144, 92, 20, 20), (92, 144, 20, 20)]
+        # Also the originally detected boxes: four marks, which is what earns
+        # the circle in the first place.
+        raw = np.asarray(groups, dtype=np.int32)
         config = replace(
             DEFAULT_CONFIG,
             merge_distance_px=100,
@@ -742,7 +756,7 @@ class ConservativeGroupingTests(unittest.TestCase):
 
         state, stage = _step_overlap_group(
             image, np.ones(image.shape[:2], dtype=bool), config,
-            DetectionState(np.empty((0, 4), dtype=np.int32), groups),
+            DetectionState(raw, groups),
         )
 
         self.assertEqual(stage.kept, ((40, 40, 124, 124),))
@@ -759,11 +773,18 @@ class ConservativeGroupingTests(unittest.TestCase):
         # The same D-pad can arrive as one vertical and one horizontal edge
         # component.  They overlap, but only their square union earns a circle.
         groups = [(92, 40, 20, 124), (40, 92, 124, 20)]
+        # The arms are an intermediate grouping; the detection underneath them
+        # is still four marks, and that is the level the circle rule counts at.
+        raw = np.asarray(
+            [(92, 40, 20, 20), (40, 92, 20, 20),
+             (144, 92, 20, 20), (92, 144, 20, 20)],
+            dtype=np.int32,
+        )
         config = replace(DEFAULT_CONFIG, merge_distance_px=100)
 
         state, stage = _step_overlap_group(
             image, np.ones(image.shape[:2], dtype=bool), config,
-            DetectionState(np.empty((0, 4), dtype=np.int32), groups),
+            DetectionState(raw, groups),
         )
 
         self.assertEqual(stage.kept, ((40, 40, 124, 124),))
@@ -1472,7 +1493,15 @@ class MagicFeatureFilterTests(unittest.TestCase):
         expanded = extended.rotations[0]
         self.assertIsNotNone(expanded)
         self.assertNotEqual(expanded, original)
-        self.assertEqual(final.rotations, [expanded])
+        # Padding grows it further rather than leaving it alone, so the
+        # relationship to assert is containment, not equality.
+        (padded,) = final.rotations
+        self.assertIsNotNone(padded)
+        padded_polygon = np.asarray(padded, dtype=np.float32)
+        for point in expanded:
+            self.assertGreaterEqual(
+                cv2.pointPolygonTest(padded_polygon, tuple(point), True), -1e-4
+            )
         expanded_polygon = np.asarray(expanded, dtype=np.float32)
         for point in ((49, 49), (79, 49), (79, 79), (49, 79)):
             self.assertGreaterEqual(
@@ -1869,6 +1898,12 @@ class RotatedBoundsTests(unittest.TestCase):
         image = np.full((96, 96, 3), 128, dtype=np.uint8)
         cv2.circle(image, (48, 48), 24, (220, 220, 220), -1)
         group = (22, 22, 52, 52)
+        # Four detected marks inside it: a circle describes an arrangement, so
+        # one squarish mark no longer earns one.  See circular_group_min_regions.
+        boxes = np.asarray(
+            [(44, 26, 8, 8), (26, 44, 8, 8), (62, 44, 8, 8), (44, 62, 8, 8)],
+            dtype=np.int32,
+        )
         config = replace(
             DEFAULT_CONFIG,
             enable_circular_groups=True,
@@ -1880,13 +1915,15 @@ class RotatedBoundsTests(unittest.TestCase):
             min_rotated_elongation=0.0,
         )
 
-        self.assertIsNotNone(inscribed_circle_radius(image, None, group, config))
+        self.assertIsNotNone(
+            inscribed_circle_radius(image, None, group, config, None, boxes)
+        )
 
         _state, stage = _step_rotated_bounds(
             image,
             None,
             config,
-            DetectionState(np.empty((0, 4), np.int32), [group]),
+            DetectionState(boxes, [group]),
         )
 
         self.assertEqual(stage.kept, (group,))
@@ -1924,16 +1961,51 @@ class RotatedBoundsTests(unittest.TestCase):
             rotated_feature_bounds(mask, (0, 0, 40, 40), DEFAULT_CONFIG)
         )
 
-    def test_the_stage_is_a_no_op_until_enabled(self) -> None:
+    def test_the_filter_rejects_nothing_until_enabled(self) -> None:
+        """Shape fitting is not the filter, and is not gated behind it.
+
+        ``enable_rotated_bounds_filter`` decides whether a region is *rejected*
+        for filling its box badly.  Which shape describes a region it keeps is
+        a different question, and a sheared mark needs its parallelogram
+        whether or not that filter is on -- gating one on the other left the
+        stage reporting "disabled" while the marks it exists for went out as
+        plain boxes.
+        """
         run = run_detection(embossed_text(), None, EDGE_CONFIG)
         stage = next(s for s in run.stages if s.key == "rotated_bounds")
-        self.assertEqual(stage.detail, "disabled")
         self.assertEqual(len(stage.rejected), 0)
 
-    def test_it_runs_immediately_before_region_flatness(self) -> None:
+    def test_the_stage_is_a_no_op_when_both_jobs_are_off(self) -> None:
+        from mesh_segmentation_transform.annotate_texture_regions import (
+            DetectionState, _step_rotated_bounds,
+        )
+        state = DetectionState(np.empty((0, 4), dtype=np.int32), [(4, 4, 40, 20)])
+        _new, stage = _step_rotated_bounds(
+            embossed_text(), None,
+            replace(
+                EDGE_CONFIG,
+                enable_rotated_bounds_filter=False,
+                enable_parallelogram_bounds=False,
+            ),
+            state,
+        )
+        self.assertIn("disabled", stage.detail)
+        self.assertEqual(len(stage.rejected), 0)
+        self.assertEqual(len(stage.kept), 1)
+
+    def test_it_runs_before_the_filters_that_read_its_shape(self) -> None:
+        """The repeating-pattern score is measured over the axis-aligned crop.
+
+        For a tilted or sheared mark most of that crop is the material around
+        it, so run ahead of the fit it scored the background's periodicity and
+        called the answer the region's.
+        """
         from mesh_segmentation_transform.annotate_texture_regions import STEP_INDEX
         self.assertEqual(
-            STEP_INDEX["rotated_bounds"] + 1, STEP_INDEX["region_flatness"]
+            STEP_INDEX["rotated_bounds"] + 1, STEP_INDEX["pattern_group"]
+        )
+        self.assertLess(
+            STEP_INDEX["pattern_group"], STEP_INDEX["region_flatness"]
         )
 
     def test_the_defaults_admit_real_lettering(self) -> None:
@@ -2337,13 +2409,66 @@ class RotatedBoundsPersistenceTests(unittest.TestCase):
         for group, outline in zip(size.kept, size.rotations):
             self.assertEqual(outline, carried[group])
 
-    def test_padding_does_not_grow_the_outline(self) -> None:
-        # The outline describes the feature, not the box grown around it.
+    def test_padding_grows_the_outline_as_well_as_the_box(self) -> None:
+        """The outline is the shape the mirror writes through.
+
+        Growing only the box left every rotated and sheared region with no
+        margin at all, which are the ones whose corners need it most: the
+        padding exists so a glyph's antialiased edge is carried over with it.
+        """
         run = self._run(final_region_padding_px=6)
         size = next(s for s in run.stages if s.key == "size")
         padding = next(s for s in run.stages if s.key == "final_padding")
         self.assertNotEqual(size.kept, padding.kept, "padding changed nothing")
+        compared = 0
+        for before, after in zip(size.rotations, padding.rotations):
+            if before is None:
+                self.assertIsNone(after)
+                continue
+            compared += 1
+            self.assertNotEqual(before, after)
+            grown = np.asarray(after, dtype=np.float32)
+            for point in before:
+                self.assertGreaterEqual(
+                    cv2.pointPolygonTest(grown, tuple(point), True), -1e-4
+                )
+        self.assertGreater(compared, 0, "no outline was exercised")
+
+    def test_padding_keeps_the_angle_it_was_given(self) -> None:
+        """Clipping to the image would change it; reducing the margin does not."""
+        run = self._run(final_region_padding_px=6)
+        size = next(s for s in run.stages if s.key == "size")
+        padding = next(s for s in run.stages if s.key == "final_padding")
+        for before, after in zip(size.rotations, padding.rotations):
+            if before is None:
+                continue
+            for index in range(4):
+                first = np.asarray(before[(index + 1) % 4]) - np.asarray(before[index])
+                second = np.asarray(after[(index + 1) % 4]) - np.asarray(after[index])
+                cross = float(first[0] * second[1] - first[1] * second[0])
+                self.assertAlmostEqual(
+                    cross / (np.linalg.norm(first) * np.linalg.norm(second)),
+                    0.0,
+                    places=6,
+                )
+
+    def test_no_padding_leaves_every_shape_alone(self) -> None:
+        """Zero padding grows nothing -- but the bounds may still widen.
+
+        An outline can already reach slightly outside the box it was fitted
+        in, and the bounds have to contain what gets written through them, so
+        the union is applied whatever the padding is.  What must not happen is
+        a shape changing, or a box shrinking.
+        """
+        run = self._run(final_region_padding_px=0)
+        size = next(s for s in run.stages if s.key == "size")
+        padding = next(s for s in run.stages if s.key == "final_padding")
         self.assertEqual(size.rotations, padding.rotations)
+        for before, after in zip(size.kept, padding.kept):
+            self.assertLessEqual(after[0], before[0])
+            self.assertLessEqual(after[1], before[1])
+            self.assertGreaterEqual(after[0] + after[2], before[0] + before[2])
+            self.assertGreaterEqual(after[1] + after[3], before[1] + before[3])
 
     def test_a_subset_realignment_survives_duplicate_bounds(self) -> None:
         # Two regions can share bounds; matching by lookup would give them the
@@ -2444,15 +2569,15 @@ class FeatureShapeTests(unittest.TestCase):
         # Declining the outline must not remove the region: how well a shape
         # describes a mark is not evidence about whether it is one.
         #
-        # Tightness is the lever under test, and it gates the edge and plain
-        # paths only -- symmetry is asked ahead of it, deliberately, and would
-        # answer for both configurations here.
+        # The fit decides the shape now, so its own fill is the lever: a
+        # boundary wrapping mostly empty space describes the mark badly, which
+        # is a statement about the boundary and not about the mark.
         base = replace(MARKS_CONFIG, enable_symmetry_rotation=False)
         loose = run_detection(
-            separated_marks(), None, replace(base, min_feature_tightness=0.0),
+            separated_marks(), None, replace(base, parallelogram_min_fill=0.0),
         )
         strict = run_detection(
-            separated_marks(), None, replace(base, min_feature_tightness=1.5),
+            separated_marks(), None, replace(base, parallelogram_min_fill=1.5),
         )
         a = next(s for s in loose.stages if s.key == "rotated_bounds")
         b = next(s for s in strict.stages if s.key == "rotated_bounds")

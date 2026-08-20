@@ -265,16 +265,21 @@ class NormalChannelNegationTests(unittest.TestCase):
     def test_rotated_flip_resamples_between_texels(self) -> None:
         image = np.zeros((16, 16, 4), dtype=np.uint8)
         image[:, :, 3] = 255
-        image[5, 13, 0] = 255
+        image[5, 5, 0] = 255
         stencil = np.ones((16, 16), dtype=bool)
+        # A leaning outline: the two edges are 5.2 degrees off square, so this
+        # takes the oblique reflection rather than the right-angled one.
         corners = ((2.0, 4.0), (13.0, 5.0), (13.0, 8.0), (2.0, 7.0))
 
         apply_masked_rotated_flip(image, stencil, corners, "long")
 
-        # Destination (3,4) reflects to roughly (12.29, 4.84).  Nearest-neighbour
-        # sampling would read the dark texel at (12,5); filtered resampling
-        # picks up part of the bright texel at (13,5).
-        self.assertGreater(int(image[4, 3, 0]), 20)
+        # The partner of a whole texel is not a whole texel once the outline
+        # leans, so the mark reflects to a fractional row and its energy splits
+        # between two of them.  Nearest-neighbour sampling would put all of it
+        # in one row and leave the other empty.
+        self.assertGreater(int(image[5, 10, 0]), 20)
+        self.assertGreater(int(image[6, 10, 0]), 20)
+        self.assertLess(int(image[5, 10, 0]), 235)
 
     def test_rotated_normal_flip_reflects_the_vector_direction(self) -> None:
         image = flat_normal(16, 16)

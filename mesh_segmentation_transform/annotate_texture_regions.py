@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections.abc import Sequence
@@ -38,6 +39,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image as _PILImage
+
+if __package__ in (None, ""):  # this module is also run directly as a script
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from mesh_segmentation_transform.parallelogram_fit import (  # noqa: E402
+    fit_parallelogram,
+    pad_outline,
+    squared_outline,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -242,6 +252,95 @@ class MserConfig:
     # this the region keeps its axis-aligned box, which claims nothing.
     min_rotated_elongation:      float = 2.5  # default: 2.5
 
+    # Sheared marks.  A rotated rectangle cannot describe a glyph that leans:
+    # artists pre-skew artwork so that it reads upright once it is mapped onto
+    # a raked panel, and the atlas then holds a perfectly legible mark that no
+    # rectangle fits.  Fitting the parallelogram first and degrading from it is
+    # the only order that can find this -- a rotated rectangle fits a sheared
+    # glyph badly and still clears ``min_rotated_fill``, so trying the cheaper
+    # shape first never discovers that the shear was there.
+    #
+    # Which shape comes out is read from how much of the parallelogram the
+    # hull actually supports, side by side.  See ``parallelogram_fit``.
+    enable_parallelogram_bounds:   bool  = True  # default: True
+    # Hull edges shorter than this do not seed a candidate direction.
+    parallelogram_min_edge_px:     float = 2.0  # default: 2.0
+    # Fits within this much of the smallest area are treated as equally tight,
+    # and the squarest of them wins.  A word set upright but holding one
+    # slanted stroke -- a capital A, a 4, a 7 -- offers that stroke as a hull
+    # edge, and a parallelogram leaning to hug it encloses the word in exactly
+    # the same area as the upright box: measured on a synthetic 100x30 word,
+    # both come to 2000.0 px.
+    parallelogram_area_tie_ratio:  float = 0.02  # default: 0.02
+    # How far off a right angle the fit may sit before the shear is believed,
+    # when the directions are perfectly evidenced.  Scaled up towards this
+    # from ``min_rotation_angle_degrees`` as the evidence weakens, so a
+    # well-supported 3-degree lean is kept while a barely-supported 6-degree
+    # one is squared off.
+    parallelogram_max_snap_degrees: float = 8.0  # default: 8.0
+    # And the floor it closes to when the evidence is perfect.  Shear gets
+    # its own floor rather than sharing ``min_rotation_angle_degrees``:
+    # reflecting about a sheared frame resamples anisotropically, so it
+    # costs more detail than a rotation of the same size and has to earn
+    # more to be worth claiming.  Below this the mark is squared off, which
+    # is also what keeps a fitted parallelogram distinguishable from an
+    # ordinary rectangle carrying a fraction of a degree of float noise.
+    parallelogram_min_shear_degrees: float = 1.5  # default: 1.5
+    # Both directions must be this well evidenced before a shear is claimed.
+    # Per *direction*, taking the stronger of its two sides: an angle between
+    # two directions can only be asserted when each of them is real, and one
+    # close side is enough to make a direction real.  Requiring all four sides
+    # instead is stricter than the question and throws away a genuinely
+    # sheared mark that happens to have one ragged edge.
+    #
+    # This is also what keeps text out.  A word offers one close side -- its
+    # baseline -- while the left and right sides are only the first and last
+    # glyph's extremes, so it presents one real direction and the honest
+    # reading is a rectangle set to that baseline, not a shear.  A
+    # parallelogram is still free to lean onto the diagonal of an A, a V, a W
+    # or a 4 and report an angle, which is why the gate has to be measured
+    # rather than assumed: rendered upright, AVA reaches 0.65, W4 0.58 and
+    # AUTO 0.50, and the ardente's AUTO/headlight legend column 0.58, against
+    # 0.86 for its lock switches and 0.96 upwards for a solid sheared bar.
+    #
+    # Replaces ``min_rotated_elongation`` on this path rather than joining it:
+    # elongation is a proxy for "is there a direction to claim at all", and
+    # side support answers that directly, which matters because the marks this
+    # is for -- switch icons, lock glyphs -- are square enough to fail an
+    # elongation test outright.
+    parallelogram_min_direction_evidence: float = 0.80  # default: 0.80
+    # Hull area over parallelogram area.  Not the feature-texels-over-area that
+    # ``min_feature_tightness`` measures: that mixes in how solid the mark is,
+    # and a hollow outlined icon scores badly on it while being a perfect
+    # parallelogram.
+    parallelogram_min_fill:        float = 0.35  # default: 0.35
+    # And the parallelogram must enclose the hull this much more tightly than
+    # the rectangle does.  This is the test that says the extra freedom was
+    # worth taking: a rectangle is a parallelogram with its angle fixed, so a
+    # lean that does not shrink the enclosure has bought nothing and is being
+    # read off noise.
+    #
+    # For a true shear the saving is arithmetic rather than a matter of taste.
+    # A parallelogram of sides a and b at interior angle t encloses in
+    # ab*sin(t) where the rectangle along a needs (a + b*cos(t))*b*sin(t), so
+    # the ratio is a/(a + b*cos(t)) -- it falls as the lean grows and as the
+    # mark gets longer against it.  Measured: a 100x40 bar sheared by 0.35
+    # comes to 0.886, a square-ish glyph sheared by 0.30 to 0.830, and the
+    # ardente's lock switches to 0.902, against 0.998 for a rotated rectangle
+    # and 1.002 for upright AVA.
+    #
+    # Swept over the ardente's 346 detected regions, 40 of the 50 that claimed
+    # shear scored 0.94 or worse and several exceeded 1.0 -- a parallelogram
+    # *larger* than the rectangle, which the area tie-break can select because
+    # it prefers support within its band.  Those are the leaning outlines that
+    # kept appearing on upright icons.
+    #
+    # The cost of the cut is shallow shears on compact marks: 0.10 on that
+    # same bar only reaches 0.970 and is squared off.  That is the right way
+    # to be wrong, because a shear that saves nothing also costs nothing to
+    # leave as a rectangle.
+    parallelogram_max_area_ratio:  float = 0.93  # default: 0.93
+
     # A rotation smaller than this is declined and the axis-aligned box kept,
     # whichever way the angle was arrived at.  Measured over the 147 marks the
     # shipped plans under segmentation_outputs flipped, 55% sit within a
@@ -273,7 +372,7 @@ class MserConfig:
     # the vent symbol adopts at 7.6 degrees off axis, the AIRBAG block is
     # recognised as symmetric and left square because it already is, and both
     # horn pictograms are declined.
-    enable_symmetry_rotation:    bool = True  # default: True
+    enable_symmetry_rotation:    bool = False  # default: False
     # Reflection intersection-over-union at the best axis, the same statistic
     # ``analyse_uv_island_symmetry`` uses for UV islands.  Lettering separates
     # cleanly on it -- A scores 0.99 and T 1.00 against F 0.31, L 0.32 and
@@ -594,6 +693,16 @@ class MserConfig:
     circular_group_min_squareness:     float = 0.80  # default: 0.80 (min side / max side)
     circular_group_colour_tolerance:   int   = 24  # default: 24
     circular_group_max_corner_content: float = 0.05  # default: 0.05 of the corner area
+    # How many originally detected regions must sit inside a group before it is
+    # allowed to become a circle.  A round control is a *cluster* -- a dial
+    # with cardinal marks, a D-pad, a vent wheel -- so a circle is a claim
+    # about an arrangement of several marks, not about one mark that happens
+    # to be squarish.  Counted from the raw front-end boxes rather than from
+    # whatever intermediate groups exist at the calling stage, because merges
+    # are an artefact of the pipeline and the marks are not: the ardente's
+    # lock switch is a single glyph that inscribed a circle and so never
+    # reached the shape fit at all.
+    circular_group_min_regions: int = 4  # default: 4
 
     # UV island mask used when the caller does not pass one in
     uv_island_mask_path:                   str   = "mesh_segmentation_transform/segmentation_outputs/scintilla_interior_b.color.full_uv_filled_mask.png"  # black UV islands on white background
@@ -712,6 +821,8 @@ DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     # holds while a neighbouring switch stays off is not a pin.
     min_region_uv_coverage=1.0,
     feature_extension_min_ratio=0.25,
+    # Promoted 2026-08-20 from the tuning harness.
+    final_region_padding_px=4,
 )
 DEFAULT_CONFIG = DEFAULT_COLOUR_CONFIG
 
@@ -1835,6 +1946,10 @@ class FeatureShape:
     hull_area: float
     rectangle: tuple[tuple[float, float], tuple[float, float], float]
     rectangle_area: float
+    # The feature texels themselves, absolute, as an (N, 2) float array.  Kept
+    # because the hull cannot be used to judge its own edges: see
+    # ``parallelogram_fit._gap_profile``.
+    points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), float))
 
     def tightness(self, shape: str = SHAPE_ROTATED) -> float:
         """Share of the enclosing shape that is actually feature.
@@ -2046,8 +2161,12 @@ def feature_shape(
     hull = cv2.convexHull(points)
     rectangle = cv2.minAreaRect(hull)
     (cx, cy), size, angle = rectangle
+    absolute = points.reshape(-1, 2).astype(float) + np.array(
+        (float(x0), float(y0)), dtype=float
+    )
     return FeatureShape(
         area_px=float(len(points)),
+        points=absolute,
         hull=tuple(
             (float(px) + x0, float(py) + y0) for px, py in hull.reshape(-1, 2)
         ),
@@ -3752,12 +3871,38 @@ def circle_uv_coverage(
     return float(np.bincount(within).max()) / float(area)
 
 
+def contained_region_count(
+    boxes: np.ndarray | None,
+    group: tuple[int, int, int, int],
+) -> int:
+    """How many originally detected boxes sit inside a group's bounds.
+
+    Membership is by box centre, so a mark counts for the group it is in rather
+    than for every group its edge touches.
+    """
+    if boxes is None or len(boxes) == 0:
+        return 0
+    array = np.asarray(boxes, dtype=float).reshape(-1, 4)
+    centre_x = array[:, 0] + array[:, 2] / 2.0
+    centre_y = array[:, 1] + array[:, 3] / 2.0
+    x, y, w, h = group
+    return int(
+        np.count_nonzero(
+            (centre_x >= x)
+            & (centre_x < x + w)
+            & (centre_y >= y)
+            & (centre_y < y + h)
+        )
+    )
+
+
 def inscribed_circle_radius(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
     group: tuple[int, int, int, int],
     config: MserConfig,
     domain_index: UvDomainIndex | None = None,
+    boxes: np.ndarray | None = None,
 ) -> int | None:
     """Return an inscribed-circle radius when the corners it drops are empty.
 
@@ -3773,6 +3918,13 @@ def inscribed_circle_radius(
     avoid.
     """
     if not config.enable_circular_groups:
+        return None
+    if boxes is not None and contained_region_count(boxes, group) < max(
+        int(config.circular_group_min_regions), 0
+    ):
+        # One mark, however round its box.  A circle here would describe the
+        # button rather than the glyph printed on it, and would take the region
+        # before any shape is fitted to what is actually drawn.
         return None
 
     x, y, w, h = group
@@ -3837,6 +3989,7 @@ def cached_inscribed_circle_radius(
     config: MserConfig,
     cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None,
     domain_index: UvDomainIndex | None = None,
+    boxes: np.ndarray | None = None,
 ) -> int | None:
     """Memoise the pure circle test for one detection run.
 
@@ -3852,11 +4005,15 @@ def cached_inscribed_circle_radius(
     already binds that name to the cropped mask.
     """
     if cache is None:
-        return inscribed_circle_radius(image, uv_mask, group, config, domain_index)
+        return inscribed_circle_radius(
+            image, uv_mask, group, config, domain_index, boxes
+        )
+    # The raw boxes are fixed for a run, so the count they decide is a function
+    # of the bounds already in the key.
     key = (config, group)
     if key not in cache:
         cache[key] = inscribed_circle_radius(
-            image, uv_mask, group, config, domain_index
+            image, uv_mask, group, config, domain_index, boxes
         )
     return cache[key]
 
@@ -4140,6 +4297,12 @@ def _merge_region_group_candidates(
         return []
 
     height, width = image.shape[:2]
+    # The originally detected boxes, gathered before any merging happens, so
+    # the circle rule counts marks rather than merge steps.
+    raw_boxes = np.asarray(
+        [member for candidate in seed_candidates for member in candidate.members],
+        dtype=np.int32,
+    ).reshape(-1, 4)
     distance = max(0, config.merge_distance_px)
     min_union_area = max(1, config.min_group_union_region_px)
     box_tuples = [candidate.bounds for candidate in seed_candidates]
@@ -4217,7 +4380,7 @@ def _merge_region_group_candidates(
         x0, y0, x1, y1 = rect
         _radius, coverage = _region_shape_and_coverage(
             image, uv_mask, (x0, y0, x1 - x0, y1 - y0), config, domain,
-            circle_cache,
+            circle_cache, raw_boxes,
         )
         return coverage >= config.min_region_uv_coverage
 
@@ -5203,16 +5366,32 @@ def _step_pattern_group(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
+    """Re-test assembled regions for repeating material.
+
+    Runs after the shape fit, not before it.  The score is measured over the
+    axis-aligned crop, and for a tilted or sheared mark most of that crop is
+    the material around it -- so ahead of the fit this was scoring the
+    background's periodicity and calling the answer the region's.
+    """
     groups, rejected = filter_groups_by_pattern(image, state.groups, config)
+    # Realign the fitted outlines onto the surviving subset.  Dropping them
+    # here would silently undo the stage that just ran; the shape a region is
+    # mirrored about has to outlive every later filter.
+    rotations = _rotations_for_subset(list(state.rotations), state.groups, groups)
     return DetectionState(
-        state.boxes, groups, relief_bridge_response=state.relief_bridge_response,
+        state.boxes, groups,
+        domain=state.domain,
+        rotations=rotations,
+        relief_bridge_response=state.relief_bridge_response,
         island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
+        circle_radii=state.circle_radii,
     ), DetectionStage(
         key="pattern_group",
         title="Repeating pattern (groups)",
         kept=tuple(groups),
         rejected=tuple(rejected),
+        rotations=tuple(rotations),
         detail=(
             f"reject above {config.max_pattern_autocorrelation} autocorrelation "
             f"at lags {config.pattern_min_period_px}-{config.pattern_max_period_px} px"
@@ -5243,6 +5422,170 @@ def _rotations_for_subset(
     return aligned
 
 
+def region_feature_mask(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> np.ndarray:
+    """The signal a region's shape should be measured from.
+
+    It has to be the signal the region was *found* in.  Measuring a colour
+    glyph against relief has nothing to measure: the ardente's lock switches
+    are printed rather than moulded, and their normal map reads 125 to 128
+    across the whole mark -- flat to within half a level -- so fitting their
+    shape from the relief edges found no feature at all, and every region fell
+    through unfitted while the stage reported itself as running normally.
+
+    For a relief front end the relief mask is still the right answer, and is
+    returned unchanged.
+    """
+    if config.box_source in ("edge", "edge_gpu"):
+        if state.relief_edge_mask is not None:
+            return state.relief_edge_mask
+        if state.relief_bridge_response is not None:
+            mask, _response = edge_mask_from_response(
+                state.relief_bridge_response, uv_mask, config,
+            )
+            return mask
+    if state.contrast_response is not None and state.contrast_threshold is not None:
+        # Exactly the texels the local-contrast front end called glyph, so the
+        # shape is fitted to the thing that was detected rather than to a
+        # second opinion about where it is.
+        return state.contrast_response >= state.contrast_threshold
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mask, _response = edge_mask(grey, uv_mask, config)
+    return mask
+
+
+def _snap_tolerance_degrees(evidence: float, config: MserConfig) -> float:
+    """How far from square a fit may sit before it is squared off.
+
+    A fixed angle threshold asks the wrong question.  Whether a two-degree
+    lean is real depends entirely on how well the hull supports the sides that
+    claim it: flush along their whole length, two degrees is a measurement; on
+    sides the hull touches at one vertex each, it is where the noise happened
+    to settle.  So the tolerance opens up as the evidence weakens, and closes
+    to ``parallelogram_min_shear_degrees`` when the evidence is perfect.
+    """
+    floor = max(float(config.parallelogram_min_shear_degrees), 0.0)
+    ceiling = max(float(config.parallelogram_max_snap_degrees), floor)
+    return floor + (ceiling - floor) * (1.0 - min(max(evidence, 0.0), 1.0))
+
+
+def _polygon_area(corners) -> float:
+    """Shoelace area of a closed outline."""
+    points = np.asarray(corners, dtype=float).reshape(-1, 2)
+    rolled = np.roll(points, -1, axis=0)
+    return float(
+        abs(np.sum(points[:, 0] * rolled[:, 1] - rolled[:, 0] * points[:, 1])) / 2.0
+    )
+
+
+def fitted_outline(
+    shape: FeatureShape,
+    config: MserConfig,
+) -> tuple[tuple[tuple[float, float], ...] | None, str]:
+    """The outline a region's own fit justifies, and which shape that is.
+
+    One fit decides all three members of the family.  The parallelogram is
+    fitted first because it is the only one that can discover a shear, and the
+    rectangle then falls out of it by squaring off the weaker direction rather
+    than being found a second way.
+
+    That replaces estimating an axis of reflective symmetry from the hull.
+    Symmetry was a reasonable proxy while a rotated rectangle was all there
+    was -- the axis a mark is mirrored about is a property of the mark, and an
+    edge fit could not claim one for a squarish mark.  It is the weaker answer
+    now: the fit measures both directions against the feature and reports how
+    well each is supported, so the mark states its own axis instead of having
+    one inferred from how nearly it reflects onto itself.  A script logo has no
+    honest symmetry axis at all, and asking for one anyway returns wherever the
+    sweep settled.
+
+    Returns ``(None, ...)`` when the region keeps its axis-aligned box.
+    """
+    if not config.enable_parallelogram_bounds or len(shape.hull) < 3:
+        return None, "disabled"
+    hull = np.asarray(shape.hull, dtype=float)
+    fit = fit_parallelogram(
+        hull,
+        feature=shape.points if len(shape.points) else None,
+        min_edge_px=float(config.parallelogram_min_edge_px),
+        area_tie_ratio=float(config.parallelogram_area_tie_ratio),
+    )
+    if fit is None:
+        return None, "unfitted"
+    if fit.fill < float(config.parallelogram_min_fill):
+        return None, "loose"
+
+    evidence = fit.direction_evidence
+    weakest = min(evidence)
+    rectangle_area = float(shape.rectangle_area)
+    off_square = abs(fit.interior_angle_degrees - 90.0)
+    shear_is_earned = (
+        weakest >= float(config.parallelogram_min_direction_evidence)
+        and off_square >= _snap_tolerance_degrees(weakest, config)
+        and (
+            rectangle_area <= 0.0
+            or fit.area <= rectangle_area * float(config.parallelogram_max_area_ratio)
+        )
+    )
+    if shear_is_earned:
+        return fit.corners, "parallelogram"
+
+    # No shear worth claiming, so the mark is a rectangle.  The fit supplies
+    # its angle where it has evidence for one, but the minimum-area rectangle
+    # stays the floor.
+    #
+    # The distinction matters because ``minAreaRect`` is minimal by definition:
+    # a rectangle built along any other direction can only be the same size or
+    # looser, so preferring the fit unconditionally makes every rotated region
+    # slightly worse, and declining to emit one at all when the evidence is
+    # short throws away an outline the region already had.  Measured on the
+    # scintilla dash badge, the fit's own direction encloses in 2123 px against
+    # 2104 for the minimum-area rectangle, and at the shipped evidence bar the
+    # region produced no outline whatsoever and fell back to a flat flip.
+    #
+    # So: take the fit's direction when it is evidenced *and* encloses no worse,
+    # and otherwise take the rectangle that was already the best available.
+    rectangle = shape.outline(SHAPE_ROTATED)
+    angle = float(shape.rectangle[2])
+    evidenced = False
+    strongest = 0 if evidence[0] >= evidence[1] else 1
+    if evidence[strongest] >= float(config.parallelogram_min_direction_evidence):
+        direction = fit.directions[strongest]
+        candidate = squared_outline(hull, direction)
+        if candidate is not None and _polygon_area(candidate) <= _polygon_area(
+            rectangle
+        ) * (1.0 + float(config.parallelogram_area_tie_ratio)):
+            rectangle = candidate
+            angle = math.degrees(math.atan2(direction[1], direction[0]))
+            evidenced = True
+    if rectangle is None:
+        return None, "unfitted"
+    if rotation_off_axis_degrees(angle) < _snap_tolerance_degrees(
+        max(evidence), config
+    ):
+        return None, "axis-aligned"
+    # "rotated" means the fit named this angle and stands behind it;
+    # "rectangle" means it did not, and the minimum-area fit is standing in.
+    return tuple(rectangle), "rotated" if evidenced else "rectangle"
+
+
+def sheared_outline(
+    shape: FeatureShape,
+    config: MserConfig,
+) -> tuple[tuple[float, float], ...] | None:
+    """Parallelogram corners where the fit justifies a shear, else None.
+
+    Retained as the narrow question ``is this region sheared``; ``fitted_outline``
+    answers the wider one the pipeline actually asks.
+    """
+    corners, kind = fitted_outline(shape, config)
+    return corners if kind == "parallelogram" else None
+
+
 def _rotation_is_negligible(angle_degrees: float, config: MserConfig) -> bool:
     """Say whether an angle is too small to be worth turning the box for.
 
@@ -5263,47 +5606,57 @@ def _step_rotated_bounds(
     config: MserConfig,
     state: DetectionState,
 ) -> tuple[DetectionState, DetectionStage]:
-    """Judge each region by the true shape of the feature inside it."""
-    if not config.enable_rotated_bounds_filter or not state.groups:
+    """Fit each region's shape, and judge it by that shape where asked to.
+
+    Two jobs, deliberately independent.  ``enable_rotated_bounds_filter``
+    rejects regions whose feature fills its box badly, and is off by default.
+    Fitting the shape a region is *described* by is not that question, and must
+    not be gated behind it: a sheared glyph is perfectly legible and perfectly
+    keepable, and its parallelogram is the only thing that says how to mirror
+    it.  Hanging one on the other left the whole stage reporting "disabled"
+    while the marks it exists for went out as plain boxes.
+    """
+    filtering = bool(config.enable_rotated_bounds_filter)
+    shaping = bool(config.enable_parallelogram_bounds)
+    if not state.groups or not (filtering or shaping):
         return state, DetectionStage(
             key="rotated_bounds",
-            title="Rotated bounds",
+            title="Region shape",
             kept=tuple(state.groups),
+            rotations=tuple(state.rotations),
             detail=(
-                "disabled"
-                if not config.enable_rotated_bounds_filter
-                else "no regions to test"
+                "no regions to test"
+                if not state.groups
+                else "rotated-bounds filter and parallelogram bounds both disabled"
             ),
         )
 
-    mask = state.relief_edge_mask
-    if mask is None:
-        if state.relief_bridge_response is not None:
-            mask, _response = edge_mask_from_response(
-                state.relief_bridge_response, uv_mask, config,
-            )
-        else:
-            grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            mask, _response = edge_mask(grey, uv_mask, config)
-    if mask is None:  # keeps static typing honest; the branches always fill it.
-        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        mask, _response = edge_mask(grey, uv_mask, config)
+    mask = region_feature_mask(image, uv_mask, config, state)
     kept: list[tuple[int, int, int, int]] = []
     rejected: list[tuple[int, int, int, int]] = []
     rotations: list[tuple[tuple[float, float], ...] | None] = []
+    # Carried so a region that earned a circle upstream still draws as one
+    # here.  Without it the stage that exists to show a region's shape was the
+    # one stage that drew every circle as a plain box.
+    circles: list[int | None] = []
     unfitted = 0
     unadopted = 0
     symmetry_adopted = 0
     symmetry_unadopted = 0
     straightened = 0
+    sheared_adopted = 0
+    fit_rotated = 0
     symmetry_scores: list[float] = []
     domain = state.domain or build_uv_domain_index(uv_mask)
     for group in state.groups:
-        if cached_inscribed_circle_radius(
+        radius = cached_inscribed_circle_radius(
             image, uv_mask, group, config, state.circle_radii, domain,
-        ) is not None:
+            state.boxes,
+        )
+        if radius is not None:
             kept.append(group)
             rotations.append(None)
+            circles.append(radius)
             continue
         shape = feature_shape(mask, group, config)
         if shape is None:
@@ -5311,12 +5664,55 @@ def _step_rotated_bounds(
             unfitted += 1
             kept.append(group)
             rotations.append(None)
+            circles.append(None)
             continue
         fill, aspect = rotated_bounds_measures(shape.rectangle, group)
-        if fill < config.min_rotated_fill or aspect > config.max_rotated_aspect:
+        if filtering and (
+            fill < config.min_rotated_fill or aspect > config.max_rotated_aspect
+        ):
             rejected.append(group)
             continue
         kept.append(group)
+        circles.append(None)
+        # The fit is the authority on this region's shape and its axis: it
+        # measured both directions against the feature and can say how well
+        # each is supported, which is the question the paths below could only
+        # approach indirectly.
+        fitted, kind = fitted_outline(shape, config)
+        if kind == "parallelogram":
+            sheared_adopted += 1
+            rotations.append(fitted)
+            continue
+        if kind == "rotated":
+            # No elongation gate here.  That gate exists because an edge fit
+            # cannot claim a direction for a squarish mark; side evidence can,
+            # and carries its own guard, so applying it as well would discard
+            # exactly the marks the measurement was introduced to rescue.
+            fit_rotated += 1
+            rotations.append(fitted)
+            continue
+        if kind == "rectangle":
+            # The fit had no angle of its own, so this is the minimum-area
+            # rectangle under its long-standing gates.  Failing them falls
+            # through rather than ending the region, so symmetry still gets
+            # asked -- it is the path that can answer for a squarish mark.
+            if not filtering or (
+                shape.tightness(SHAPE_ROTATED) >= config.min_feature_tightness
+                and aspect >= config.min_rotated_elongation
+            ):
+                fit_rotated += 1
+                rotations.append(fitted)
+                continue
+        if kind in ("axis-aligned", "loose"):
+            straightened += 1
+            rotations.append(None)
+            continue
+        if not filtering:
+            # The symmetry and rotated-rectangle outlines below are the
+            # filter's own, and turning them on here would change what every
+            # shipped config already produces.
+            rotations.append(None)
+            continue
         if config.enable_symmetry_rotation:
             # Deliberately ahead of the elongation and tightness gates below.
             # Those exist because the *edge fit* cannot claim a direction for a
@@ -5390,16 +5786,33 @@ def _step_rotated_bounds(
         relief_edge_mask=mask,
     ), DetectionStage(
         key="rotated_bounds",
-        title="Rotated bounds",
+        title="Region shape",
         kept=tuple(kept),
         rejected=tuple(rejected),
         rotations=tuple(rotations),
+        circles=tuple(circles),
         detail=(
-            f"keep fill >= {config.min_rotated_fill:g} of the axis-aligned box "
-            f"and true aspect <= {config.max_rotated_aspect:g}; adopt the "
-            f"rotated outline only where it is >= "
-            f"{config.min_feature_tightness:.0%} feature and elongated "
-            f">= {config.min_rotated_elongation:g}"
+            (
+                f"keep fill >= {config.min_rotated_fill:g} of the axis-aligned "
+                f"box and true aspect <= {config.max_rotated_aspect:g}; adopt "
+                f"the rotated outline only where it is >= "
+                f"{config.min_feature_tightness:.0%} feature and elongated "
+                f">= {config.min_rotated_elongation:g}"
+                if filtering
+                else "rotated-bounds filter off, so shapes are fitted but no "
+                "region is rejected on its fill or aspect"
+            )
+            + (
+                f"; {unfitted} region"
+                f"{'s' if unfitted != 1 else ''} had no feature to fit"
+                f"; {fit_rotated} rotated to the fit's own axis"
+                f"; {sheared_adopted} parallelogram"
+                f"{'s' if sheared_adopted != 1 else ''} adopted above "
+                f"{config.parallelogram_min_direction_evidence:g} direction evidence "
+                f"and {config.parallelogram_min_fill:g} hull fill"
+                if config.enable_parallelogram_bounds
+                else "; parallelogram bounds disabled"
+            )
             + (
                 f"; symmetry adopted {symmetry_adopted} and declined "
                 f"{symmetry_unadopted} below {config.min_rotation_symmetry:g} "
@@ -5998,10 +6411,11 @@ def _region_shape_and_coverage(
     config: MserConfig,
     domain: UvDomainIndex | None = None,
     circle_cache: dict[tuple[MserConfig, tuple[int, int, int, int]], int | None] | None = None,
+    boxes: np.ndarray | None = None,
 ) -> tuple[int | None, float]:
     """Infer a region's circle, then measure that circle or its rectangle."""
     radius = cached_inscribed_circle_radius(
-        image, uv_mask, group, config, circle_cache, domain,
+        image, uv_mask, group, config, circle_cache, domain, boxes,
     )
     if radius is not None:
         x, y, w, h = group
@@ -6061,6 +6475,7 @@ def _step_region_domain(
     for candidate in candidates:
         _radius, initial_coverage = _region_shape_and_coverage(
             image, uv_mask, candidate.bounds, config, domain, state.circle_radii,
+            state.boxes,
         )
         if initial_coverage >= config.min_region_uv_coverage:
             kept_candidates.append(candidate)
@@ -6075,6 +6490,7 @@ def _step_region_domain(
         for unit_index, unit in enumerate(candidate.recovery_units()):
             _unit_radius, unit_coverage = _region_shape_and_coverage(
                 image, uv_mask, unit, config, domain, state.circle_radii,
+                state.boxes,
             )
             if unit_coverage < config.min_region_uv_coverage:
                 rejected.append(unit)
@@ -6084,6 +6500,7 @@ def _step_region_domain(
                         continue
                     _member_radius, member_coverage = _region_shape_and_coverage(
                         image, uv_mask, member, config, domain, state.circle_radii,
+                        state.boxes,
                     )
                     if member_coverage < config.min_region_uv_coverage:
                         rejected.append(member)
@@ -6131,7 +6548,7 @@ def _step_region_domain(
         for rebuilt_candidate in rebuilt:
             _rebuilt_radius, rebuilt_coverage = _region_shape_and_coverage(
                 image, uv_mask, rebuilt_candidate.bounds, config, domain,
-                state.circle_radii,
+                state.circle_radii, state.boxes,
             )
             if rebuilt_coverage >= config.min_region_uv_coverage:
                 kept_candidates.append(rebuilt_candidate)
@@ -6157,7 +6574,7 @@ def _step_region_domain(
             for retry_candidate in retry_candidates:
                 _retry_radius, retry_coverage = _region_shape_and_coverage(
                     image, uv_mask, retry_candidate.bounds, config, domain,
-                    state.circle_radii,
+                    state.circle_radii, state.boxes,
                 )
                 if retry_coverage < config.min_region_uv_coverage:
                     rejected.append(retry_candidate.bounds)
@@ -6414,6 +6831,7 @@ def _step_overlap_group(
             continue
         radius = cached_inscribed_circle_radius(
             image, uv_mask, bounds, config, state.circle_radii, domain,
+            state.boxes,
         )
         if radius is None:
             continue
@@ -6466,18 +6884,36 @@ def _step_final_padding(
 ) -> tuple[DetectionState, DetectionStage]:
     """Pad final regions without feeding the larger bounds back into detection.
 
-    Rectangles are expanded independently to the image edges.  A circular
-    region is expanded symmetrically so its centre remains unchanged; when an
-    image edge is too close, its usable padding is reduced accordingly.
+    Last in the pipeline, which is what makes that promise true.  Every filter
+    ahead of it measures the region it was given; run any of them afterwards
+    and they would be reading a margin instead -- relief text projects bands
+    across the bounds it is handed, so padding first diluted exactly the
+    statistic it exists to measure.
+
+    Every shape grows, not just the box.  Rectangles are expanded independently
+    to the image edges; a circle is expanded symmetrically so its centre stays
+    put; and a rotated or sheared outline is expanded perpendicular to its own
+    sides, keeping its angle.
+
+    The outline used to pass through untouched, on the grounds that it
+    described the feature rather than the box grown around it.  That stopped
+    being true once the outline became the shape the mirror is applied
+    through -- leaving it alone did not preserve the fit, it silently threw the
+    padding away for every region that was not axis-aligned, which are exactly
+    the ones whose corners need the margin most.
     """
     requested = max(int(config.final_region_padding_px), 0)
     padded: list[tuple[int, int, int, int]] = []
     circles: list[int | None] = []
+    rotations: list[tuple[tuple[float, float], ...] | None] = []
     adjusted = 0
     image_height, image_width = image.shape[:2]
 
     domain = state.domain or build_uv_domain_index(uv_mask)
-    for group in state.groups:
+    for index, group in enumerate(state.groups):
+        outline = (
+            state.rotations[index] if index < len(state.rotations) else None
+        )
         radius = cached_inscribed_circle_radius(
             image, uv_mask, group, config, state.circle_radii, domain,
         )
@@ -6514,6 +6950,34 @@ def _step_final_padding(
                 result = group
             circles.append(None)
 
+        if outline is not None:
+            grown = pad_outline(
+                outline, float(requested), (image_height, image_width)
+            )
+            rotations.append(grown)
+            # The bounds must still contain what will be written through them,
+            # and a rotated outline grown perpendicular to its own sides can
+            # reach past a box grown square to the image.  Union rather than
+            # replace, so a region whose box was already looser than its
+            # outline does not quietly shrink here.
+            points = np.asarray(grown, dtype=float)
+            x0 = min(result[0], int(math.floor(float(points[:, 0].min()))))
+            y0 = min(result[1], int(math.floor(float(points[:, 1].min()))))
+            x1 = max(
+                result[0] + result[2],
+                int(math.ceil(float(points[:, 0].max()))) + 1,
+            )
+            y1 = max(
+                result[1] + result[3],
+                int(math.ceil(float(points[:, 1].max()))) + 1,
+            )
+            x0, y0 = max(x0, 0), max(y0, 0)
+            x1, y1 = min(x1, image_width), min(y1, image_height)
+            if x1 > x0 and y1 > y0:
+                result = (x0, y0, x1 - x0, y1 - y0)
+        else:
+            rotations.append(None)
+
         if result != group:
             adjusted += 1
         padded.append(result)
@@ -6523,10 +6987,8 @@ def _step_final_padding(
         if requested
         else "0 px; final bounds unchanged"
     )
-    # Outlines pass through unpadded: they describe the feature, not the box
-    # that was grown around it, and growing one would misreport the fit.
     return DetectionState(
-        state.boxes, padded, rotations=list(state.rotations),
+        state.boxes, padded, rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
         island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
@@ -6537,7 +6999,7 @@ def _step_final_padding(
         detail=detail,
         adjusted=adjusted,
         circles=tuple(circles),
-        rotations=tuple(state.rotations),
+        rotations=tuple(rotations),
     )
 
 
@@ -6604,6 +7066,8 @@ def _step_relief_text(
 ) -> tuple[DetectionState, DetectionStage]:
     """Keep final relief regions whose edge projection reads as text."""
     if not config.enable_relief_text_filter or not state.groups:
+        # ``state`` is passed on whole, so the domain index and circle cache
+        # reach the padding stage that now follows rather than being rebuilt.
         return state, DetectionStage(
             key="relief_text",
             title="Relief text",
@@ -6643,10 +7107,13 @@ def _step_relief_text(
         else:
             rejected.append(group)
     return DetectionState(
-        state.boxes, kept, rotations=rotations,
+        state.boxes, kept,
+        domain=state.domain,
+        rotations=rotations,
         relief_bridge_response=state.relief_bridge_response,
         island_bits=state.island_bits,
         relief_edge_mask=state.relief_edge_mask,
+        circle_radii=state.circle_radii,
     ), DetectionStage(
         key="relief_text",
         title="Relief text",
@@ -6692,8 +7159,8 @@ PIPELINE_STEPS = (
     _step_grouped,
     _step_region_domain,
     _step_overlap_group,
-    _step_pattern_group,
     _step_rotated_bounds,
+    _step_pattern_group,
     _step_region_flatness,
     _step_relief_glyph_structure,
     _step_blob_shape,
@@ -6701,8 +7168,8 @@ PIPELINE_STEPS = (
     _step_feature_extension,
     _step_text_line,
     _step_size,
-    _step_final_padding,
     _step_relief_text,
+    _step_final_padding,
 )
 
 # Named so the table below cannot drift when a step is inserted.  It was ints
@@ -6721,8 +7188,8 @@ STEP_INDEX = {
             "grouped",
             "region_domain",
             "overlap_group",
-            "pattern_group",
             "rotated_bounds",
+            "pattern_group",
             "region_flatness",
             "relief_glyph_structure",
             "blob_shape",
@@ -6730,8 +7197,8 @@ STEP_INDEX = {
             "feature_extension",
             "text_line",
             "size",
-            "final_padding",
             "relief_text",
+            "final_padding",
         )
     )
 }
@@ -6831,6 +7298,7 @@ PARAMETER_STEP = {
     "circular_group_min_squareness": STEP_INDEX["grouped"],
     "circular_group_colour_tolerance": STEP_INDEX["grouped"],
     "circular_group_max_corner_content": STEP_INDEX["grouped"],
+    "circular_group_min_regions": STEP_INDEX["grouped"],
     "enable_region_domain_filter": STEP_INDEX["grouped"],
     "min_region_uv_coverage": STEP_INDEX["region_domain"],
     "enable_pattern_group_filter": STEP_INDEX["pattern_group"],
@@ -6845,6 +7313,14 @@ PARAMETER_STEP = {
     "max_rotated_aspect": STEP_INDEX["rotated_bounds"],
     "min_feature_tightness": STEP_INDEX["rotated_bounds"],
     "min_rotated_elongation": STEP_INDEX["rotated_bounds"],
+    "enable_parallelogram_bounds": STEP_INDEX["rotated_bounds"],
+    "parallelogram_min_edge_px": STEP_INDEX["rotated_bounds"],
+    "parallelogram_area_tie_ratio": STEP_INDEX["rotated_bounds"],
+    "parallelogram_max_snap_degrees": STEP_INDEX["rotated_bounds"],
+    "parallelogram_min_shear_degrees": STEP_INDEX["rotated_bounds"],
+    "parallelogram_min_direction_evidence": STEP_INDEX["rotated_bounds"],
+    "parallelogram_min_fill": STEP_INDEX["rotated_bounds"],
+    "parallelogram_max_area_ratio": STEP_INDEX["rotated_bounds"],
     "min_rotation_angle_degrees": STEP_INDEX["rotated_bounds"],
     "enable_symmetry_rotation": STEP_INDEX["rotated_bounds"],
     "min_rotation_symmetry": STEP_INDEX["rotated_bounds"],
@@ -7075,7 +7551,7 @@ def run_detection(
                 circles=tuple(
                     cached_inscribed_circle_radius(
                         image, uv_mask, group, config, state.circle_radii,
-                        state.domain,
+                        state.domain, state.boxes,
                     )
                     for group in stage.kept
                 ),

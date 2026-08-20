@@ -116,6 +116,9 @@ from mesh_segmentation_transform.production_texture_detection import (  # noqa: 
     ProductionDetectionSession,
     run_colour_and_relief_jobs,
 )
+from mesh_segmentation_transform.parallelogram_fit import (  # noqa: E402
+    enclosing_parallelogram,
+)
 from mesh_segmentation_transform.extract_uv_island_paths import (  # noqa: E402
     merge_overlapping_mask_crops,
     overlapping_mask_crop_groups,
@@ -3235,7 +3238,13 @@ def rotated_axis_for_surface_axis(
     corners: tuple[tuple[float, float], ...],
     axis: str,
 ) -> str | None:
-    """Choose the rectangle direction closest to the surface's flip direction."""
+    """Choose the outline direction closest to the surface's flip direction.
+
+    Which way the mesh points still decides this, exactly as it did for a
+    rectangle: the direction reversed is whichever of the outline's two edges
+    lies closest to the axis the surface is mirrored about.  A parallelogram
+    changes how the reflection is applied, not what it is reflecting.
+    """
     axes = _rotated_rectangle_axes(corners)
     if axes is None:
         return None
@@ -3274,7 +3283,12 @@ def _reflect_normal_direction(
     columns: np.ndarray,
     direction: np.ndarray,
 ) -> None:
-    """Reflect tangent-space normal XY components along an arbitrary direction."""
+    """Reflect tangent-space normal XY components along an arbitrary direction.
+
+    Used by the axis-aligned and island flips, whose reflections are always
+    right-angled.  ``_reflect_normal_samples`` takes a matrix instead because
+    an oblique reflection needs its transpose rather than a mirror direction.
+    """
     if image.shape[2] < 2 or rows.size == 0:
         return
     xy = image[rows, columns, :2].astype(np.float32) / 127.5 - 1.0
@@ -3286,17 +3300,177 @@ def _reflect_normal_direction(
     )
 
 
-def _reflect_normal_samples(samples: np.ndarray, direction: np.ndarray) -> np.ndarray:
-    """Return tangent-space normal samples reflected along ``direction``."""
-    if samples.shape[1] < 2 or samples.size == 0:
+def _reflect_normal_samples(samples: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Return tangent-space normal samples carried through a reflection.
+
+    A normal is not carried by the map itself but by its inverse-transpose.
+    The reflection is an involution, so its inverse is itself and the transform
+    reduces to the plain transpose -- which for an *oblique* reflection is not
+    the same matrix.
+
+    This is worth stating because the rectangle case hides it: a right-angled
+    reflection is symmetric, so transpose and original coincide and reflecting
+    the vector along the mirror direction gave the right answer for free.  A
+    sheared outline breaks that silently, leaving the relief lit from a
+    direction the geometry never turned towards.
+
+    The XY pair is transformed and the vector renormalised; Z is a height and
+    the reflection does not touch it.
+    """
+    if samples.size == 0 or samples.shape[1] < 2:
         return samples
     reflected = samples.astype(np.float32, copy=True)
+    vector = reflected[:, :3] / 127.5 - 1.0 if samples.shape[1] >= 3 else None
     xy = reflected[:, :2] / 127.5 - 1.0
-    projection = xy[:, 0] * float(direction[0]) + xy[:, 1] * float(direction[1])
-    xy[:, 0] -= 2.0 * projection * float(direction[0])
-    xy[:, 1] -= 2.0 * projection * float(direction[1])
-    reflected[:, :2] = np.clip(np.rint((xy + 1.0) * 127.5), 0, 255)
+    # Rows are vectors, so ``xy @ matrix`` applies the transpose -- which is
+    # what is wanted, and writing it the other way round is the easy mistake.
+    # The flip resamples ``h'(p) = h(A(p))`` with ``A`` the reflection, so by
+    # the chain rule ``grad h' = matrix^T grad h``, and a normal's XY pair is
+    # the negated gradient.  Measured against a height field flipped directly,
+    # the transpose lands within a degree while the matrix itself is 26 degrees
+    # out.
+    xy = xy @ np.asarray(matrix, dtype=np.float32)
+    if vector is not None:
+        vector[:, :2] = xy
+        length = np.linalg.norm(vector, axis=1, keepdims=True)
+        vector = np.divide(
+            vector, length, out=np.zeros_like(vector), where=length > 1e-6
+        )
+        reflected[:, :3] = np.clip(np.rint((vector + 1.0) * 127.5), 0, 255)
+    else:
+        reflected[:, :2] = np.clip(np.rint((xy + 1.0) * 127.5), 0, 255)
     return np.clip(np.rint(reflected), 0, 255).astype(np.uint8)
+
+
+# An oblique reflection preserves area but not shape: it stretches along one
+# direction by its largest singular value and compresses along another by the
+# reciprocal, and it is the compression that aliases.  Below this there is
+# nothing worth spending samples on -- a right-angled outline sits at exactly
+# 1.0, and the shallowest shear the detector will claim on a compact mark
+# reaches about 1.16.
+_OBLIQUE_SUPERSAMPLE_THRESHOLD = 1.3
+# Sub-samples per axis are capped here.  Across the shear range the area test
+# admits, the anisotropy runs to about 1.55, so two per axis already brings the
+# compressed direction back under one texel per sample.
+_OBLIQUE_SUPERSAMPLE_MAX = 3
+
+
+def oblique_supersample_factor(matrix: np.ndarray) -> int:
+    """Sub-samples per axis needed to resolve a reflection's compression.
+
+    Supersampling does not recover detail the source never had; it integrates
+    the resampling filter with more samples per output texel, which is what
+    removes the aliasing a compressed axis introduces.  So it is spent only
+    where there is compression to answer for.
+    """
+    anisotropy = outline_anisotropy(matrix)
+    if anisotropy <= _OBLIQUE_SUPERSAMPLE_THRESHOLD:
+        return 1
+    return int(min(math.ceil(anisotropy), _OBLIQUE_SUPERSAMPLE_MAX))
+
+
+def _resample_reflected(
+    source: np.ndarray,
+    partner_x: np.ndarray,
+    partner_y: np.ndarray,
+    matrix: np.ndarray,
+) -> np.ndarray:
+    """Sample the reflection, supersampling where it compresses an axis.
+
+    The reflection is affine, so a sub-texel offset moves every partner by the
+    same ``matrix @ offset``.  That makes each extra sample one vector add on
+    the grid already computed rather than a second pass over the geometry, and
+    it is exact rather than an interpolation of an interpolation.
+    """
+    factor = oblique_supersample_factor(matrix)
+    if factor <= 1:
+        return cv2.remap(
+            source, partner_x, partner_y,
+            cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE,
+        )
+    steps = [(index + 0.5) / factor - 0.5 for index in range(factor)]
+    total = np.zeros(
+        (partner_x.shape[0], partner_x.shape[1]) + source.shape[2:],
+        dtype=np.float32,
+    )
+    for offset_y in steps:
+        for offset_x in steps:
+            shift = matrix @ np.asarray((offset_x, offset_y), dtype=np.float64)
+            total += cv2.remap(
+                source,
+                (partner_x + np.float32(shift[0])),
+                (partner_y + np.float32(shift[1])),
+                cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE,
+            ).astype(np.float32)
+    total /= float(factor * factor)
+    return np.clip(np.rint(total), 0, 255).astype(source.dtype)
+
+
+def outline_local_grid(
+    corners: tuple[tuple[float, float], ...],
+    rotated_axis: str,
+    shape: tuple[int, int],
+) -> tuple | None:
+    """Texel window of an outline, which texels are inside, and their partners.
+
+    Shared by the sampler and by the share estimate that decides whether the
+    flip is worth applying, because two implementations of "inside" drift and
+    the estimate then promises a flip the sampler will not perform.
+    """
+    frame = outline_frame(corners)
+    if frame is None:
+        return None
+    origin, long_edge, short_edge = frame
+    cross = float(long_edge[0] * short_edge[1] - long_edge[1] * short_edge[0])
+    if abs(cross) <= 1e-9:
+        return None
+    height, width = shape
+    points = np.asarray(corners, dtype=np.float64)
+    x0 = max(int(math.floor(float(points[:, 0].min()))), 0)
+    y0 = max(int(math.floor(float(points[:, 1].min()))), 0)
+    x1 = min(int(math.ceil(float(points[:, 0].max()))) + 1, width)
+    y1 = min(int(math.ceil(float(points[:, 1].max()))) + 1, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    columns = np.arange(x0, x1, dtype=np.float64)[None, :]
+    rows = np.arange(y0, y1, dtype=np.float64)[:, None]
+    dx = columns - float(origin[0])
+    dy = rows - float(origin[1])
+    # Outline coordinates: p = origin + s_long * long + s_short * short, each
+    # in [0, 1] inside the shape whatever the angle between the edges is.
+    local_long = (dx * float(short_edge[1]) - dy * float(short_edge[0])) / cross
+    local_short = (dy * float(long_edge[0]) - dx * float(long_edge[1])) / cross
+    # Half a texel of tolerance, carried into each coordinate through the
+    # perpendicular distance that coordinate spans, so the edge of a sheared
+    # outline is exactly as forgiving as the edge of a square one.
+    long_tolerance = 0.5 * float(np.linalg.norm(short_edge)) / abs(cross)
+    short_tolerance = 0.5 * float(np.linalg.norm(long_edge)) / abs(cross)
+    inside = (
+        (local_long >= -long_tolerance)
+        & (local_long <= 1.0 + long_tolerance)
+        & (local_short >= -short_tolerance)
+        & (local_short <= 1.0 + short_tolerance)
+    )
+    if rotated_axis == "long":
+        partner_long, partner_short = 1.0 - local_long, local_short
+    else:
+        partner_long, partner_short = local_long, 1.0 - local_short
+    partner_x = np.broadcast_to(
+        float(origin[0])
+        + partner_long * float(long_edge[0])
+        + partner_short * float(short_edge[0]),
+        inside.shape,
+    ).astype(np.float32)
+    partner_y = np.broadcast_to(
+        float(origin[1])
+        + partner_long * float(long_edge[1])
+        + partner_short * float(short_edge[1]),
+        inside.shape,
+    ).astype(np.float32)
+    return (x0, y0, x1, y1), inside, partner_x, partner_y, (
+        origin, long_edge, short_edge
+    )
 
 
 def rotated_exchangeable_share(
@@ -3310,37 +3484,15 @@ def rotated_exchangeable_share(
     ``within`` narrows the rectangle to the texels that are writable at all,
     for the reason ``exchangeable_share`` gives.
     """
-    axes = _rotated_rectangle_axes(corners)
-    if axes is None:
+    grid = outline_local_grid(corners, rotated_axis, stencil.shape[:2])
+    if grid is None:
         return 0.0
-    long, short, long_half, short_half, centre = axes
-    direction = long if rotated_axis == "long" else short
+    (x0, y0, x1, y1), inside, partner_x_float, partner_y_float, _frame = grid
     height, width = stencil.shape[:2]
-    points = np.asarray(corners, dtype=np.float32)
-    x0 = max(int(math.floor(float(points[:, 0].min()))), 0)
-    y0 = max(int(math.floor(float(points[:, 1].min()))), 0)
-    x1 = min(int(math.ceil(float(points[:, 0].max()))) + 1, width)
-    y1 = min(int(math.ceil(float(points[:, 1].max()))) + 1, height)
-    if x1 <= x0 or y1 <= y0:
-        return 0.0
-
-    columns = np.arange(x0, x1, dtype=np.float32)[None, :]
-    rows = np.arange(y0, y1, dtype=np.float32)[:, None]
-    dx = columns - float(centre[0])
-    dy = rows - float(centre[1])
-    local_long = dx * float(long[0]) + dy * float(long[1])
-    local_short = dx * float(short[0]) + dy * float(short[1])
-    inside = (np.abs(local_long) <= long_half + 0.5) & (
-        np.abs(local_short) <= short_half + 0.5
-    )
     if within is not None:
         inside = inside & within[y0:y1, x0:x1]
     if not bool(inside.any()):
         return 0.0
-
-    projection = local_long if rotated_axis == "long" else local_short
-    partner_x_float = columns - 2.0 * projection * float(direction[0])
-    partner_y_float = rows - 2.0 * projection * float(direction[1])
     partner_x = np.rint(partner_x_float).astype(np.int32)
     partner_y = np.rint(partner_y_float).astype(np.int32)
     partner_inside_image = (
@@ -3356,6 +3508,69 @@ def rotated_exchangeable_share(
         & stencil[partner_y, partner_x]
     )
     return float(exchangeable.sum()) / float(max(int(inside.sum()), 1))
+
+
+def outline_frame(
+    corners: tuple[tuple[float, float], ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Origin corner and the two edge vectors of a fitted outline.
+
+    A rectangle and a parallelogram are the same object here: the rectangle is
+    the case where the two edges happen to be perpendicular.  Everything the
+    flip needs is expressed in the outline own [0, 1] edge coordinates, so no
+    later step has to know which of the two it was handed.
+
+    The longer edge is returned first, matching the long/short names the plan
+    already uses to say which direction a step reverses.
+    """
+    if len(corners) != 4:
+        return None
+    points = np.asarray(corners, dtype=np.float64)
+    edges = np.roll(points, -1, axis=0) - points
+    lengths = np.linalg.norm(edges, axis=1)
+    long_index = int(np.argmax(lengths))
+    short_index = (long_index + 1) % 4
+    if float(lengths[long_index]) <= 1e-6 or float(lengths[short_index]) <= 1e-6:
+        return None
+    return points[long_index], edges[long_index], edges[short_index]
+
+
+def outline_reflection_matrix(
+    long_edge: np.ndarray,
+    short_edge: np.ndarray,
+    rotated_axis: str,
+) -> np.ndarray | None:
+    """Linear part of the reflection that reverses one local direction.
+
+    ``A M A^-1``, with ``A`` the edge basis and ``M`` reversing one coordinate.
+    For perpendicular edges this is the ordinary reflection; for a sheared
+    outline it is an *oblique* one, whose mirror line is the direction being
+    kept and whose texels move parallel to the direction being reversed.  That
+    is exactly what leaves the parallelogram where it was.
+
+    An involution either way, since ``(A M A^-1)^2 = A M^2 A^-1 = I``, so a
+    texel and its partner still exchange and every stencil, feather and detail
+    gate downstream keeps working unchanged.
+    """
+    basis = np.column_stack((long_edge, short_edge)).astype(np.float64)
+    if abs(float(np.linalg.det(basis))) <= 1e-9:
+        return None
+    reverse = (
+        np.array(((-1.0, 0.0), (0.0, 1.0)))
+        if rotated_axis == "long"
+        else np.array(((1.0, 0.0), (0.0, -1.0)))
+    )
+    return basis @ reverse @ np.linalg.inv(basis)
+
+
+def outline_anisotropy(matrix: np.ndarray) -> float:
+    """Largest singular value of a reflection linear part.
+
+    An oblique reflection preserves area but not shape: it stretches by this
+    much along one direction and compresses by its reciprocal along another,
+    and it is the compression that aliases.  A right-angled outline returns 1.
+    """
+    return float(max(np.linalg.svd(matrix, compute_uv=False)))
 
 
 def apply_masked_rotated_flip(
@@ -3375,36 +3590,25 @@ def apply_masked_rotated_flip(
     scalar_detail_floor: float = 4.0,
     scalar_detail_percentile: float = 70.0,
 ) -> int:
-    """Flip a rotated rectangle in place along one of its local directions."""
-    axes = _rotated_rectangle_axes(corners)
-    if axes is None:
-        return 0
-    long, short, long_half, short_half, centre = axes
-    direction = long if rotated_axis == "long" else short
-    height, width = image.shape[:2]
-    points = np.asarray(corners, dtype=np.float32)
-    x0 = max(int(math.floor(float(points[:, 0].min()))), 0)
-    y0 = max(int(math.floor(float(points[:, 1].min()))), 0)
-    x1 = min(int(math.ceil(float(points[:, 0].max()))) + 1, width)
-    y1 = min(int(math.ceil(float(points[:, 1].max()))) + 1, height)
-    if x1 <= x0 or y1 <= y0:
-        return 0
+    """Flip a fitted outline in place along one of its local directions.
 
-    columns = np.arange(x0, x1, dtype=np.float32)[None, :]
-    rows = np.arange(y0, y1, dtype=np.float32)[:, None]
-    dx = columns - float(centre[0])
-    dy = rows - float(centre[1])
-    local_long = dx * float(long[0]) + dy * float(long[1])
-    local_short = dx * float(short[0]) + dy * float(short[1])
-    inside = (np.abs(local_long) <= long_half + 0.5) & (
-        np.abs(local_short) <= short_half + 0.5
-    )
+    The outline may be a rotated rectangle or a parallelogram; both take the
+    same reflection, expressed in the outline own edge coordinates by reversing
+    one of them and keeping the other.  Deskewing, mirroring and reskewing
+    compose into that single map and it is applied as a single resample --
+    three passes would cost three interpolations to arrive in the same place.
+    """
+    grid = outline_local_grid(corners, rotated_axis, image.shape[:2])
+    if grid is None:
+        return 0
+    (x0, y0, x1, y1), inside, partner_x_float, partner_y_float, frame = grid
+    _origin, long_edge, short_edge = frame
+    reflection = outline_reflection_matrix(long_edge, short_edge, rotated_axis)
+    if reflection is None:
+        return 0
+    height, width = image.shape[:2]
     if not bool(inside.any()):
         return 0
-
-    projection = local_long if rotated_axis == "long" else local_short
-    partner_x_float = columns - 2.0 * projection * float(direction[0])
-    partner_y_float = rows - 2.0 * projection * float(direction[1])
     partner_x = np.rint(partner_x_float).astype(np.int32)
     partner_y = np.rint(partner_y_float).astype(np.int32)
     partner_inside_image = (
@@ -3426,16 +3630,15 @@ def apply_masked_rotated_flip(
     dest_y, dest_x = np.nonzero(exchangeable)
     absolute_y = dest_y + y0
     absolute_x = dest_x + x0
-    remapped = cv2.remap(
+    remapped = _resample_reflected(
         source,
         partner_x_float.astype(np.float32),
         partner_y_float.astype(np.float32),
-        cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_REPLICATE,
+        reflection,
     )
     samples = remapped[dest_y, dest_x]
     if reflect_normals:
-        samples = _reflect_normal_samples(samples, direction)
+        samples = _reflect_normal_samples(samples, reflection)
     activity = None
     partner_activity = None
     if (normal_detail_gate or correct_normal_background) and reflect_normals:
@@ -3711,9 +3914,21 @@ def deduplicate_region_detections(
                     or _near_duplicate_rectangles(first, second)
                 ):
                     continue
-                deduplicated[left] = _union_rectangle([first, second])
+                union = _union_rectangle([first, second])
+                deduplicated[left] = union
                 if deduplicated_rotations[left] != deduplicated_rotations[right]:
-                    deduplicated_rotations[left] = None
+                    # Keep the axis rather than falling back to the box.  Two
+                    # atlas consumers of the same mark disagreeing about its
+                    # outline by a pixel is not a reason to mirror it about the
+                    # image axis instead of its own, which is what dropping the
+                    # outline here quietly did.
+                    deduplicated_rotations[left] = union_outline(
+                        union,
+                        (
+                            deduplicated_rotations[left],
+                            deduplicated_rotations[right],
+                        ),
+                    )
                 del deduplicated[right]
                 del deduplicated_rotations[right]
                 removed += 1
@@ -3760,6 +3975,50 @@ def merge_region_sets(
     return merged, contributed
 
 
+def _outline_area(corners) -> float:
+    points = np.asarray(corners, dtype=float).reshape(-1, 2)
+    rolled = np.roll(points, -1, axis=0)
+    return float(
+        abs(np.sum(points[:, 0] * rolled[:, 1] - rolled[:, 0] * points[:, 1])) / 2.0
+    )
+
+
+def union_outline(
+    union: tuple[int, int, int, int],
+    outlines,
+) -> tuple[tuple[float, float], ...] | None:
+    """The merged region's shape, keeping the axis its marks were fitted with.
+
+    A mark found in both the colour and the relief layer arrives here twice and
+    the two are folded into one region.  Dropping the fitted outline at that
+    point dropped the region to the flat flip, which mirrors about the image
+    axis -- so a leaning mark was carried straight out of its own envelope, and
+    it happened to precisely the marks that matter most, the ones legible
+    enough to be found twice.
+
+    The direction comes from the largest shape merged in, because that is the
+    one whose fit had the most evidence behind it, and the extent is grown to
+    cover everything the union contains.  So the region keeps the axis it is
+    mirrored about and still covers what was merged.
+    """
+    usable = [outline for outline in outlines if outline]
+    if not usable:
+        return None
+    frame = outline_frame(max(usable, key=_outline_area))
+    if frame is None:
+        return None
+    _origin, long_edge, short_edge = frame
+    first = long_edge / max(float(np.linalg.norm(long_edge)), 1e-9)
+    second = short_edge / max(float(np.linalg.norm(short_edge)), 1e-9)
+    x, y, w, h = union
+    points = np.asarray(
+        [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        + [point for outline in usable for point in outline],
+        dtype=float,
+    )
+    return enclosing_parallelogram(points, tuple(first), tuple(second))
+
+
 def merge_region_sets_with_rotations(
     primary: list[tuple[int, int, int, int]],
     extra: list[tuple[int, int, int, int]],
@@ -3795,11 +4054,12 @@ def merge_region_sets_with_rotations(
         base = sum(w * h for _x, _y, w, h in (merged[index] for index in hits))
         if union[2] * union[3] > base * config.max_relief_union_growth:
             continue
+        absorbed = [rotations[index] for index in hits] + [rotation]
         for index in sorted(hits, reverse=True):
             merged.pop(index)
             rotations.pop(index)
         merged.append(union)
-        rotations.append(None)
+        rotations.append(union_outline(union, absorbed))
         contributed += 1
     ordered = sorted(zip(merged, rotations), key=lambda item: (item[0][1], item[0][0]))
     if not ordered:
@@ -4996,13 +5256,16 @@ def _detect_flip_regions_in_view(
     )
     final = detection.stages[-1]
     detected = list(final.kept)
-    # Every outline this stage adopts is a rotated rectangle, so one is used
-    # wherever one was adopted.
-    use_rotated_regions = mser_config.enable_symmetry_rotation
+    # Whatever shape the stage fitted is the shape this region is mirrored
+    # about.  There is deliberately no second opinion here about whether to
+    # believe it: this used to be gated on ``enable_symmetry_rotation``, back
+    # when symmetry was the only thing that produced an outline, and the gate
+    # silently outlived the reason for it.  Every outline reaching production
+    # was dropped the moment that switch went off, so every region took the
+    # flat flip and no fitted shape had any effect on a build.
     detected_rotations = [
         final.rotations[index]
-        if use_rotated_regions
-        and index < len(final.rotations)
+        if index < len(final.rotations)
         and final.rotations[index]
         and len(final.rotations[index]) == 4
         else None

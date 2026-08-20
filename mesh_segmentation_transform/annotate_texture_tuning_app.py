@@ -55,6 +55,11 @@ from PIL import Image, ImageDraw, ImageTk
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from mesh_segmentation_transform.promote_detection_defaults import (  # noqa: E402
+    plan_promotion,
+    promote_defaults,
+    promotion_is_possible,
+)
 from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     DEFAULT_CONFIG,
     DEFAULT_COLOUR_CONFIG,
@@ -213,6 +218,26 @@ class DetectionPipeline:
 
     def detector_defaults(self) -> MserConfig:
         return DEFAULT_RELIEF_DETECTION_CONFIG if self.renders_relief else DEFAULT_COLOUR_CONFIG
+
+    def defaults_key(self) -> str:
+        """Which shipped literal this path promotes into.
+
+        Every colour front end shares one and every relief front end the other,
+        because that is the split the exporter consumes: it imports one colour
+        config and one relief config, and never selects a harness pipeline.  So
+        tuning any colour path sets the colour defaults for all of them.
+        """
+        return "relief" if self.renders_relief else "colour"
+
+    def promotion_base(self) -> MserConfig:
+        """The config the promoted literal is written as a difference from.
+
+        The relief preset is declared as a delta on the colour one, so its
+        values are compared against colour rather than against a bare
+        ``MserConfig`` -- otherwise promoting relief would restate every colour
+        value inside the relief block and the two would drift apart.
+        """
+        return DEFAULT_COLOUR_CONFIG if self.renders_relief else MserConfig()
 
     def effective_relief_config(self, config: ReliefConfig) -> ReliefConfig:
         return replace(config, mode=MODE_SLOPE) if self.force_slope_relief else config
@@ -612,6 +637,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
             "enable_island_bounded_grouping",
             "enable_circular_groups",
             "circular_group_min_squareness",
+            "circular_group_min_regions",
             "circular_group_colour_tolerance",
             "circular_group_max_corner_content",
         ),
@@ -641,19 +667,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
         None,
     ),
     (
-        "8. Repeating pattern",
-        (
-            "enable_pattern_group_filter",
-            "max_pattern_autocorrelation",
-            "pattern_window_scale",
-            "pattern_min_window_px",
-            "pattern_min_period_px",
-            "pattern_max_period_px",
-        ),
-        None,
-    ),
-    (
-        "9. Rotated bounds",
+        "8. Region shape",
         (
             "min_rotation_angle_degrees",
             "enable_symmetry_rotation",
@@ -670,6 +684,26 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
             "max_rotated_aspect",
             "min_feature_tightness",
             "min_rotated_elongation",
+            "enable_parallelogram_bounds",
+            "parallelogram_min_edge_px",
+            "parallelogram_area_tie_ratio",
+            "parallelogram_max_snap_degrees",
+            "parallelogram_min_shear_degrees",
+            "parallelogram_min_direction_evidence",
+            "parallelogram_min_fill",
+            "parallelogram_max_area_ratio",
+        ),
+        None,
+    ),
+    (
+        "9. Repeating pattern",
+        (
+            "enable_pattern_group_filter",
+            "max_pattern_autocorrelation",
+            "pattern_window_scale",
+            "pattern_min_window_px",
+            "pattern_min_period_px",
+            "pattern_max_period_px",
         ),
         None,
     ),
@@ -763,12 +797,7 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
         None,
     ),
     (
-        "16. Final padding",
-        ("final_region_padding_px",),
-        None,
-    ),
-    (
-        "17. Relief text",
+        "16. Relief text",
         (
             "enable_relief_text_filter",
             "relief_text_response_percentile",
@@ -777,6 +806,11 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
             "relief_text_min_band_scale",
         ),
         (SOURCE_RELIEF, SOURCE_RELIEF_GPU),
+    ),
+    (
+        "17. Final padding",
+        ("final_region_padding_px",),
+        None,
     ),
 )
 
@@ -1157,11 +1191,16 @@ def run_detection_by_uv_island(
             for x0, y0, run in per_island
         ]
         first = members[0]
+        # Report from a domain that actually had regions.  Most of the 400-odd
+        # atlas domains hold nothing, so taking member zero's line unconditionally
+        # showed "no regions to test" over a stage that had just fitted 59
+        # shapes, and hid every count worth tuning against.
+        speaking = next((stage for stage in members if stage.kept), first)
         adjusted = sum(stage.adjusted for stage in members)
         kept = tuple(box for stage in members for box in stage.kept)
         circles = tuple(circle for stage in members for circle in stage.circles)
         rotations = tuple(rotation for stage in members for rotation in stage.rotations)
-        detail = first.detail
+        detail = speaking.detail
         if first.key == "overlap_box_group":
             candidates = overlap_region_group_candidates(
                 np.asarray(kept, dtype=np.int32),
@@ -1949,6 +1988,9 @@ class TuningApp(tk.Tk):
         ttk.Button(header, text="Copy", command=self._copy_parameters).pack(
             side="right", padx=(0, 6)
         )
+        ttk.Button(
+            header, text="Ship as defaults", command=self._promote_parameters
+        ).pack(side="right", padx=(0, 6))
 
         # Scrollable parameter grid: MserConfig is long and grows over time.
         container = ttk.Frame(parent)
@@ -2308,8 +2350,8 @@ class TuningApp(tk.Tk):
                 ("grouped", "Initial grouping"),
                 ("region_domain", "Domain recovery"),
                 ("overlap_group", "Post-circle forced merge"),
+                ("rotated_bounds", "Region shape"),
                 ("pattern_group", "Repeating pattern"),
-                ("rotated_bounds", "Rotated bounds"),
                 ("region_flatness", "Region flatness"),
                 ("relief_glyph_structure", "Relief glyph structure"),
                 ("blob_shape", "Blob shape"),
@@ -2317,8 +2359,8 @@ class TuningApp(tk.Tk):
                 ("feature_extension", "Feature extension"),
                 ("text_line", "Text lines"),
                 ("size", "Final size"),
-                ("final_padding", "Final padding"),
                 ("relief_text", "Relief text"),
+                ("final_padding", "Final padding"),
             )
         ]
 
@@ -2482,7 +2524,84 @@ class TuningApp(tk.Tk):
         # looked at and must not be thrown away from behind a hidden panel.
         self._remember_parameters()
         self.status_var.set(
-            f"{self.active_source} parameters reset to the module defaults."
+            f"{self.active_source} parameters reset to the current defaults, "
+            "which include anything previously saved."
+        )
+
+    def _promote_parameters(self) -> None:
+        """Write the parameters on screen into the shipped defaults.
+
+        The session remembers what you are experimenting with; this is the step
+        that makes it the product.  It edits the literal in
+        ``annotate_texture_regions`` that a build reads, so the file stays the
+        record of what the tool actually does -- and so the change is a diff
+        that can be reviewed, committed and reverted like any other.
+        """
+        possible, reason = promotion_is_possible()
+        if not possible:
+            messagebox.showerror(APP_NAME, reason)
+            return
+        try:
+            config = self.current_config()
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+
+        pipeline = pipeline_for_source(self.detect_source_var.get())
+        key = pipeline.defaults_key()
+        base = pipeline.promotion_base()
+        values = {
+            field.name: getattr(config, field.name)
+            for field in fields(MserConfig)
+            if getattr(config, field.name) != getattr(base, field.name)
+        }
+        try:
+            changes = plan_promotion(values, key)
+        except (OSError, LookupError, SyntaxError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, f"Could not read the defaults: {exc}")
+            return
+        if not changes:
+            messagebox.showinfo(
+                APP_NAME,
+                f"The {key} defaults already match what is on screen; "
+                "nothing to ship.",
+            )
+            return
+
+        detail = "\n".join(
+            f"    {change.field}: "
+            + (
+                f"new, = {change.after!r}"
+                if change.is_new
+                else f"{change.before!r} -> {change.after!r}"
+            )
+            for change in changes
+        )
+        if not messagebox.askokcancel(
+            APP_NAME,
+            f"Ship {len(changes)} {key} value"
+            f"{'' if len(changes) == 1 else 's'} as the new defaults?\n\n"
+            f"{detail}\n\n"
+            "This edits annotate_texture_regions.py, so every conversion from "
+            "here on uses these values and they go out in the next build.\n\n"
+            "It is a normal source change: review the diff and commit or revert "
+            "it as usual.",
+            icon=messagebox.WARNING,
+            default=messagebox.CANCEL,
+        ):
+            return
+        try:
+            promote_defaults(values, key)
+        except (OSError, RuntimeError) as exc:
+            messagebox.showerror(
+                APP_NAME,
+                f"The defaults were left unchanged: {exc}",
+            )
+            return
+        self.status_var.set(
+            f"Shipped {len(changes)} {key} default"
+            f"{'' if len(changes) == 1 else 's'}. "
+            "Restart the harness and the conversion tool to load them."
         )
 
     def _copy_parameters(self) -> None:
