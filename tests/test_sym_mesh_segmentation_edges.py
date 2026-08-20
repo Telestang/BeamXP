@@ -14,6 +14,7 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
     _classify_region,
     _find_eager_child_adoptions,
     _IslandGeometry,
+    _resolve_late_host_adoptions,
     _resolve_touching_symmetric_unions,
     _surface_points_and_samples,
     analyse_symmetry_sweep,
@@ -106,6 +107,43 @@ def _flat_panel_with_proud_child_topology():
         ],
         dtype=np.int64,
     )
+    source_faces = [
+        SourceFaceRef(0, "test", 0, triangle_index)
+        for triangle_index in range(len(triangles))
+    ]
+    return build_topology(vertices, triangles, source_faces)
+
+
+def _panel_with_capped_knob_topology():
+    """A flat fascia with a separate knob standing on it: a cap and a wall.
+
+    The cap is flat and its perimeter is a square, so it passes the depth and
+    symmetry filters on its own; the wall behind it does not.  That is the shape
+    the Hopper's radio volume knob has, and the shape that used to ship in two
+    halves on opposite sides of the car.
+    """
+    vertices = np.array(
+        [
+            [-1.0, 0.0, -1.0],
+            [1.0, 0.0, -1.0],
+            [1.0, 0.0, 1.0],
+            [-1.0, 0.0, 1.0],
+            [-0.050, 0.0, -0.050],
+            [0.050, 0.0, -0.050],
+            [0.050, 0.0, 0.050],
+            [-0.050, 0.0, 0.050],
+            [-0.050, 0.030, -0.050],
+            [0.050, 0.030, -0.050],
+            [0.050, 0.030, 0.050],
+            [-0.050, 0.030, 0.050],
+        ],
+        dtype=float,
+    )
+    triangles = [[0, 1, 2], [0, 2, 3], [8, 9, 10], [8, 10, 11]]
+    for first, second in ((4, 5), (5, 6), (6, 7), (7, 4)):
+        triangles.append([first, second, second + 4])
+        triangles.append([first, second + 4, first + 4])
+    triangles = np.array(triangles, dtype=np.int64)
     source_faces = [
         SourceFaceRef(0, "test", 0, triangle_index)
         for triangle_index in range(len(triangles))
@@ -487,6 +525,60 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
         self.assertEqual(adoptions[0].island_index, 2)
         self.assertGreaterEqual(adoptions[0].extruded_perimeter_sample_ratio, 0.05)
         self.assertGreater(adoptions[0].median_surface_gap, 0.015)
+
+    def test_late_adoption_carries_the_child_s_whole_island(self) -> None:
+        # The knob's cap is accepted on its own; the wall behind it never is.
+        # Adopting the cap alone hands it the fascia's transform while the wall
+        # keeps the carrier's, which is how the two ended up on opposite sides
+        # of the car.
+        topology = _panel_with_capped_knob_topology()
+        cap = _candidate_for_faces(topology, (2, 1), (2, 3))
+        cap.island_index = 2
+        cap.accepted_level = 1
+        panel = _candidate_for_faces(topology, (1, 1), (0, 1))
+        panel.accepted_level = 2
+
+        survivors, absorbed = _resolve_late_host_adoptions(
+            topology,
+            [cap, panel],
+            {(2, 1): 1, (1, 1): 2},
+            ((0, 1), (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+        )
+
+        self.assertEqual(absorbed, {(2, 1): (1, 1)})
+        self.assertEqual([candidate.key for candidate in survivors], [(1, 1)])
+        host = survivors[0]
+        wall = tuple(range(4, 12))
+        self.assertTrue(set(wall).issubset(host.faces))
+        self.assertEqual(host.adoptions[0].adoption_mode, "late_candidate")
+        self.assertEqual(host.adoptions[0].faces, tuple(range(2, 12)))
+
+    def test_late_adoption_is_refused_when_the_island_cannot_follow(self) -> None:
+        # Another candidate owns part of the knob, so no single transform can
+        # keep it whole. Refuse rather than tear it: the cap's own transform
+        # still leaves it where the mirrored carrier leaves its island-mates.
+        topology = _panel_with_capped_knob_topology()
+        cap = _candidate_for_faces(topology, (2, 1), (2, 3))
+        cap.island_index = 2
+        cap.accepted_level = 1
+        rival = _candidate_for_faces(topology, (2, 2), (4, 5))
+        rival.island_index = 2
+        rival.accepted_level = 1
+        panel = _candidate_for_faces(topology, (1, 1), (0, 1))
+        panel.accepted_level = 2
+
+        survivors, absorbed = _resolve_late_host_adoptions(
+            topology,
+            [cap, rival, panel],
+            {(2, 1): 1, (2, 2): 2, (1, 1): 3},
+            ((0, 1), (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+        )
+
+        self.assertEqual(absorbed, {})
+        self.assertEqual(
+            sorted(candidate.key for candidate in survivors),
+            [(1, 1), (2, 1), (2, 2)],
+        )
 
     def test_touching_symmetric_candidates_merge_on_union_perimeter(self) -> None:
         topology = _touching_symmetric_regions_topology()

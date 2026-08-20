@@ -2908,6 +2908,7 @@ def _late_candidate_adoption(
     host: IslandCandidate,
     child: IslandCandidate,
     source_candidate_id: int,
+    island_remainder: frozenset[int] = frozenset(),
 ) -> ChildAdoption | None:
     """Return a late-host adoption when a later facade supports an earlier root.
 
@@ -2916,6 +2917,17 @@ def _late_candidate_adoption(
     overlap and extruded-perimeter containment tests after the sweep, but only allows
     a later accepted candidate from another geometric island to absorb the earlier
     candidate.
+
+    ``island_remainder`` carries the rest of the child's geometric island -- the faces
+    no candidate claimed.  An adoption hands the child the host's transform, and the
+    host's transform is built from the host's own symmetry plane, not the child's, so
+    a child adopted without its island-mates is moved somewhere they are not.  Eager
+    adoption avoids that by only ever claiming untouched whole islands; this path has
+    to reassemble the island first.  The Hopper's radio volume knob is why: its flat
+    cap is accepted as a candidate in its own right, and the centred fascia that then
+    adopted the cap does not move at all, so the cap stayed on the driver's side of
+    the radio while the carrier reflected the barrel to the other side of the car.
+    Qualifying against the whole island keeps object and transform together.
     """
     if host.accepted_level <= child.accepted_level:
         return None
@@ -2926,8 +2938,10 @@ def _late_candidate_adoption(
 
     area_ratio = child.area / host.area
 
+    adopted_faces = tuple(sorted({*child.host_faces, *island_remainder}))
+    qualifying_faces = tuple(sorted({*child.faces, *island_remainder}))
     host_points, host_samples = _surface_points_and_samples(topology, host.host_faces)
-    child_points, child_samples = _surface_points_and_samples(topology, child.faces)
+    child_points, child_samples = _surface_points_and_samples(topology, qualifying_faces)
     if len(host_points) < 3 or len(host_samples) == 0 or len(child_points) == 0:
         return None
     frame = _host_projection_frame(host_points)
@@ -2953,7 +2967,7 @@ def _late_candidate_adoption(
 
     return ChildAdoption(
         island_index=child.island_index,
-        faces=child.host_faces,
+        faces=adopted_faces,
         area=child.area,
         area_ratio=area_ratio,
         projected_overlap=projected_overlap,
@@ -2969,6 +2983,7 @@ def _resolve_late_host_adoptions(
     topology: Topology,
     candidates: list[IslandCandidate],
     premerge_id_by_key: dict[tuple[int, int], int],
+    islands: tuple[tuple[int, ...], ...] = (),
 ) -> tuple[list[IslandCandidate], dict[tuple[int, int], tuple[int, int]]]:
     """Merge early roots into later-discovered supported hosts.
 
@@ -2976,18 +2991,36 @@ def _resolve_late_host_adoptions(
     every edge, so the resulting ownership graph is acyclic. Merges are applied from
     small to large, allowing a recovered assembly to be absorbed again if an even
     larger parent is found later.
+
+    A child brings its whole geometric island with it, because the host transform it
+    inherits places the island's unclaimed faces nowhere near where the mirrored
+    carrier leaves them.  Where another candidate has already claimed part of that
+    island the object cannot be reassembled, so the adoption is refused and the child
+    keeps its own transform -- which, being built from the child's own symmetry plane,
+    still leaves it where the carrier would have.
     """
     candidate_by_key = {candidate.key: candidate for candidate in candidates}
     parent_for: dict[tuple[int, int], tuple[int, int]] = {}
     adoption_for: dict[tuple[int, int], ChildAdoption] = {}
+    remainder_for: dict[tuple[int, int], frozenset[int]] = {}
+
+    island_faces = {
+        island_offset + 1: frozenset(faces)
+        for island_offset, faces in enumerate(islands)
+    }
+    claimed = {face for candidate in candidates for face in candidate.faces}
 
     for child in candidates:
+        remainder = island_faces.get(child.island_index, frozenset()) - set(child.faces)
+        if remainder & claimed:
+            continue
+        remainder_for[child.key] = remainder
         best: tuple[tuple[float, float, float, float, float], IslandCandidate, ChildAdoption] | None = None
         for host in candidates:
             if host.key == child.key:
                 continue
             adoption = _late_candidate_adoption(
-                topology, host, child, premerge_id_by_key[child.key]
+                topology, host, child, premerge_id_by_key[child.key], remainder
             )
             if adoption is None:
                 continue
@@ -3011,7 +3044,9 @@ def _resolve_late_host_adoptions(
         child = candidate_by_key[child_key]
         host = candidate_by_key[host_key]
         late_adoption = adoption_for[child_key]
-        host.faces = tuple(sorted(set(host.faces) | set(child.faces)))
+        host.faces = tuple(
+            sorted(set(host.faces) | set(child.faces) | remainder_for[child_key])
+        )
         host.adoptions = tuple(
             sorted(
                 (*host.adoptions, late_adoption, *child.adoptions),
@@ -3456,7 +3491,7 @@ def analyse_symmetry_sweep(
         max_depth_ratio,
     )
     accepted_candidates, absorbed_key_to_host_key = _resolve_late_host_adoptions(
-        topology, accepted_candidates, premerge_id_by_key
+        topology, accepted_candidates, premerge_id_by_key, islands
     )
     accepted_candidates.sort(
         key=lambda candidate: (
