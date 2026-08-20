@@ -1388,12 +1388,41 @@ def local_to_world(frame: tuple[Vec3, Vec3, Vec3, Vec3], values: Vec3) -> Vec3:
     )
 
 
+def _solve_along_axes(axes: tuple[Vec3, Vec3, Vec3], vector: Vec3) -> Vec3:
+    """The three coefficients that rebuild ``vector`` from ``axes``.
+
+    A real solve rather than three dot products, because the frame an offset
+    is measured along is not orthonormal -- see trigger_placement_frame. The
+    transpose only inverts an orthonormal basis, so dotting silently returns
+    the wrong offset the moment the two ref vectors are not perpendicular,
+    and badly wrong once a repointed triple spans the whole car.
+    """
+    rows = [[axes[0][i], axes[1][i], axes[2][i], vector[i]] for i in range(3)]
+    for column in range(3):
+        pivot = max(range(column, 3), key=lambda r: abs(rows[r][column]))
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        lead = rows[column][column]
+        if abs(lead) < 1e-12:
+            # Collinear axes: no unique answer, so fall back to the projection
+            # rather than dividing by nothing.
+            return tuple(
+                sum(vector[i] * axis[i] for i in range(3)) for axis in axes
+            )
+        rows[column] = [value / lead for value in rows[column]]
+        for other in range(3):
+            if other == column or not rows[other][column]:
+                continue
+            factor = rows[other][column]
+            rows[other] = [
+                rows[other][k] - factor * rows[column][k] for k in range(4)
+            ]
+    return (rows[0][3], rows[1][3], rows[2][3])
+
+
 def world_to_local(frame: tuple[Vec3, Vec3, Vec3, Vec3], point: Vec3) -> Vec3:
     origin, x_axis, y_axis, z_axis = frame
     delta = tuple(point[i] - origin[i] for i in range(3))
-    return tuple(
-        sum(delta[i] * axis[i] for i in range(3)) for axis in (x_axis, y_axis, z_axis)
-    )
+    return _solve_along_axes((x_axis, y_axis, z_axis), delta)
 
 
 def _matrix_transform_vector(matrix: TriggerMatrix, vector: Vec3) -> Vec3:
@@ -1468,9 +1497,8 @@ def transform_trigger_vector(
         for i in range(3)
     )
     transformed = _owner_transform_vector(world, action, matrix)
-    return tuple(
-        sum(transformed[i] * axis[i] for i in range(3))
-        for axis in (target_frame[1], target_frame[2], target_frame[3])
+    return _solve_along_axes(
+        (target_frame[1], target_frame[2], target_frame[3]), transformed
     )
 
 
@@ -1795,7 +1823,65 @@ def _mirror_box_size(values: Vec3) -> Vec3:
     # BeamNG box sizes behave like a signed local corner, not just absolute
     # extents. The Ardente dash boxes match the mirrored controls when local y
     # changes sign under the reflected trigger frame.
+    #
+    # Only correct when the ref triple was repointed at the mirrored nodes, so
+    # that the frame itself flips in z; _reflected_box_size derives the right
+    # answer either way and falls back here when it cannot.
     return (values[0], -values[1], values[2])
+
+
+# How far a transformed box edge may tilt off its target axis and still be
+# called that axis, as a fraction of the edge's own length. Node pairs are
+# rarely exactly symmetric, so an exact test would throw away the answer over
+# a couple of degrees of cage asymmetry; a tenth of the edge is about six
+# degrees, well short of any edge that has genuinely swung onto another axis.
+_BOX_EDGE_AXIS_TOLERANCE = 0.1
+
+
+def _reflected_box_size(
+    values: Vec3,
+    source_axes: tuple[Vec3, Vec3, Vec3],
+    target_axes: tuple[Vec3, Vec3, Vec3],
+    action: str,
+    matrix: TriggerMatrix | None = None,
+) -> Vec3 | None:
+    """The size column that grows the box the way its owner's move needs.
+
+    A box is its corner plus three signed edge vectors, ``axis * extent``.
+    Moving the box moves each edge with it, and the row can only say how far
+    to grow along the axes the target frame gives it -- so the new extent is
+    the transformed edge re-expressed on the matching target axis.
+
+    Derived rather than case-split, and it reproduces the old fixed rule
+    wherever that rule was right: on a repointed triple the frame flips in z,
+    which is exactly what turns the frame-z extent negative. On an unrepointed
+    one -- a lever whose third ref has no counterpart, so the frame stays put
+    -- it is the frame-x extent that flips instead, which is what the hopper's
+    transfer-case box needed and the old rule got backwards.
+
+    The projection is taken whenever the transformed edge is near enough to
+    its target axis to be about that axis, which keeps the answer for a node
+    pair that is only roughly symmetric -- most of them are, and the ref
+    triples that mirror cleanly are the exception. Returns None once an edge
+    has swung far enough that it is no longer the same axis at all: no signed
+    extent can express that, so the caller keeps its own answer rather than
+    writing a box that is merely differently wrong.
+    """
+    extents = trigger_box_size_vector(values)
+    solved: list[float] = []
+    for axis in range(3):
+        edge = tuple(source_axes[axis][i] * extents[axis] for i in range(3))
+        reflected = _owner_transform_vector(edge, action, matrix)
+        length = sum(reflected[i] * target_axes[axis][i] for i in range(3))
+        residual = max(
+            abs(reflected[i] - length * target_axes[axis][i]) for i in range(3)
+        )
+        if residual > _BOX_EDGE_AXIS_TOLERANCE * abs(extents[axis]) + 1e-9:
+            return None
+        solved.append(length)
+    # Back through the swap trigger_box_size_vector undoes: size.y is the
+    # frame's z extent and size.z its y.
+    return (solved[0], solved[2], solved[1])
 
 
 def _trigger_row_vector(
@@ -1966,10 +2052,24 @@ def _mirror_trigger_row(
         repointed = False
         target_ids = list(source_ids)
 
+    # Two frames per triple, and they are not interchangeable. Orientation is
+    # read off the squared-up frame, which is what BeamNG turns the box with;
+    # the translation columns are measured along the raw one, which is what it
+    # places the box on. Squaring the frame up first is exact only while the
+    # two ref vectors are perpendicular, and repointing one ref across the car
+    # leaves a triple that is nothing of the sort.
     source_frame = trigger_frame(*(node_positions[node_id] for node_id in source_ids))
     target_frame = trigger_frame(*(node_positions[node_id] for node_id in target_ids))
     if source_frame is None or target_frame is None:
         return row, "ref nodes are collinear"
+    source_placement = (
+        trigger_placement_frame(*(node_positions[node_id] for node_id in source_ids))
+        or source_frame
+    )
+    target_placement = (
+        trigger_placement_frame(*(node_positions[node_id] for node_id in target_ids))
+        or target_frame
+    )
 
     edits: list[tuple[int, int, str]] = []
     if repointed:
@@ -1978,6 +2078,11 @@ def _mirror_trigger_row(
             edits.append(
                 (start, end, re.sub(r'"(?:[^"\\]|\\.)*"', f'"{node_id}"', row[start:end], count=1))
             )
+
+    # Whether the euler columns get mirrored decides the axes the box will be
+    # built on, and the size has to be answered against those, so settle it
+    # once here rather than twice.
+    flips_in_z = _frames_differ_by_z_flip(source_frame, target_frame)
 
     type_position = index_of.get("type")
     size_position = index_of.get("size")
@@ -1992,7 +2097,23 @@ def _mirror_trigger_row(
         start, end = spans[size_position]
         values = _parse_vector(row[start:end])
         if values is not None:
-            updated = _replace_vector_numbers(row[start:end], _mirror_box_size(values))
+            base_rotation = _trigger_row_vector(row, spans, index_of, "baseRotation")
+            rotation = _trigger_row_vector(row, spans, index_of, "rotation")
+            mirrored = (
+                _reflected_box_size(
+                    values,
+                    trigger_box_axes(source_frame, base_rotation, rotation),
+                    trigger_box_axes(
+                        target_frame,
+                        _mirror_euler(base_rotation) if flips_in_z else base_rotation,
+                        _mirror_euler(rotation) if flips_in_z else rotation,
+                    ),
+                    owner_action,
+                    owner_matrix,
+                )
+                or _mirror_box_size(values)
+            )
+            updated = _replace_vector_numbers(row[start:end], mirrored)
             if updated is not None:
                 edits.append((start, end, updated))
 
@@ -2010,14 +2131,16 @@ def _mirror_trigger_row(
         replacement_values = (
             transform_trigger_position(
                 values,
-                source_frame,
-                target_frame,
+                source_placement,
+                target_placement,
                 owner_action,
                 owner_delta,
                 owner_matrix,
             )
             if carries_origin
-            else transform_trigger_vector(values, source_frame, target_frame, owner_action, owner_matrix)
+            else transform_trigger_vector(
+                values, source_placement, target_placement, owner_action, owner_matrix
+            )
         )
         carries_origin = False
         updated = _replace_vector_numbers(row[start:end], replacement_values)
@@ -2031,7 +2154,7 @@ def _mirror_trigger_row(
     # baseTranslationGlobal and copies its rotation across untouched (the
     # Ardente steering wheel keeps {"x":90,"y":90,"z":180} into RHD), because
     # the mirroring lives in the DAE rather than in the euler columns.
-    if _frames_differ_by_z_flip(source_frame, target_frame):
+    if flips_in_z:
         for column in _TRIGGER_ROTATION_COLUMNS:
             position = index_of.get(column)
             if position is None or position >= len(spans):

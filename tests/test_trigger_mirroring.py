@@ -26,6 +26,11 @@ from beamxp.hand_drive_core import authored_trigger_positions, trigger_modes_for
 from beamxp.hand_drive_parts.rewriting import (
     TRIGGER_BOX_TRIANGLES,
     _mirror_euler,
+    _row_element_spans,
+    _row_string_value,
+    _trigger_row_shape,
+    _trigger_row_size,
+    _trigger_row_vector,
     trigger_box_axes,
     trigger_box_centre,
     trigger_box_corners,
@@ -216,7 +221,11 @@ class TriggerRewriteTest(unittest.TestCase):
         # all-zero rotations need no approximation, so nothing is flagged
         self.assertNotIn("//BeamXP:", out)
 
-        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr")))
+        # Read back the way the engine reads: offsets run along the raw frame,
+        # and this triple is one of the skewed ones where that matters.
+        frame = trigger_placement_frame(
+            *(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr"))
+        )
         before = [
             frame[0][i] + sum((0.2, 0.0, 0.0)[a] * frame[a + 1][i] for a in range(3))
             for i in range(3)
@@ -283,7 +292,9 @@ class TriggerRewriteTest(unittest.TestCase):
         )
         # ardente_signalstalk sits at x=+0.4186 and moves by the steering offset
         owners = ([((0.4186, -0.4588, 0.7969), "translate", -0.71, None)], {}, [])
-        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr")))
+        frame = trigger_placement_frame(
+            *(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr"))
+        )
         before = local_to_world(frame, (0.2, 0.0, 0.0))
 
         out = mirror(text, ARDENTE_NODES, owners)
@@ -330,7 +341,9 @@ class TriggerRewriteTest(unittest.TestCase):
         self.assertNotEqual(out, text)  # not the skipped wiper stalk
         self.assertIn('"int_strw","int_stalk","dshr"', out)  # not the mirrored wheel
         row = [line for line in out.splitlines() if "headlights" in line][0]
-        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr")))
+        frame = trigger_placement_frame(
+            *(ARDENTE_NODES[n] for n in ("int_strw", "int_stalk", "dshr"))
+        )
         values = tuple(
             float(part.split(":")[1])
             for part in row.rsplit("{", 1)[1].rstrip("}],").replace('"', "").split(",")
@@ -388,7 +401,7 @@ class TriggerRewriteTest(unittest.TestCase):
         out = mirror(text, ARDENTE_NODES)
         self.assertNotIn("dsh2r", out)
         self.assertIn('"int_strw","dshl","dshr"', out)  # kept, box slid instead
-        frame = trigger_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "dshl", "dshr")))
+        frame = trigger_placement_frame(*(ARDENTE_NODES[n] for n in ("int_strw", "dshl", "dshr")))
         row = [line for line in out.splitlines() if "sw_ignition" in line][0]
         values = tuple(
             float(part.split(":")[1])
@@ -1579,6 +1592,133 @@ class EngineGroundTruthTests(unittest.TestCase):
                 self.assertLess(
                     error, 0.00005, f"{name}: {error * 1000:.3f} mm from the engine"
                 )
+
+
+# hopper_interior.jbeam and hopper_seat_F*.jbeam: the dash and column cage, the
+# seat pair the transfer-case box hangs off, and the handbrake node that has no
+# counterpart on the other side. int_strw_xp_rhd is the twin BeamXP generates
+# for the relocated steering column.
+HOPPER_NODES = {
+    "dsh": (0.0, -0.105, 1.029),
+    "dshl": (0.395, -0.105, 1.029),
+    "dshr": (-0.395, -0.105, 1.029),
+    "int_strw": (0.395, 0.012, 1.081),
+    "int_strw_xp_rhd": (-0.395, 0.012, 1.081),
+    "sf1l": (0.13, 0.05, 0.78),
+    "sf1r": (-0.13, 0.05, 0.78),
+    "int_pbrk": (-0.1, 0.25, 0.72),
+}
+
+
+def engine_shape(row_text: str, nodes: dict) -> list:
+    """The box BeamNG will draw for one written row, as its corner set.
+
+    Offsets along the raw ref vectors, orientation on the squared-up frame --
+    the split EngineGroundTruthTests pins against the running game.
+    """
+    columns = trigger_column_names(section(row_text))
+    index_of = {name: idx for idx, name in enumerate(columns) if name}
+    row = row_text.strip().rstrip(",")
+    spans = _row_element_spans(row)
+    refs = [
+        _row_string_value(row[spans[index_of[c]][0] : spans[index_of[c]][1]])
+        for c in ("idRef", "idX", "idY")
+    ]
+    points = [nodes[node_id] for node_id in refs]
+    square = trigger_frame(*points)
+    place = trigger_placement_frame(*points) or square
+    anchor = local_to_world(
+        place, _trigger_row_vector(row, spans, index_of, "baseTranslation")
+    )
+    extra = _trigger_row_vector(row, spans, index_of, "translation")
+    anchor = tuple(
+        anchor[i] + sum(extra[a] * place[a + 1][i] for a in range(3)) for i in range(3)
+    )
+    axes = trigger_box_axes(
+        square,
+        _trigger_row_vector(row, spans, index_of, "baseRotation"),
+        _trigger_row_vector(row, spans, index_of, "rotation"),
+    )
+    corners, _faces = trigger_shape_mesh(
+        anchor,
+        axes,
+        _trigger_row_size(row, spans, index_of),
+        _trigger_row_shape(row, spans, index_of),
+    )
+    return list(corners)
+
+
+def shape_distance(want: list, got: list) -> float:
+    """How far apart two corner sets are; a reflection reorders them."""
+    def one_way(a, b):
+        return max(min(math.dist(p, q) for q in b) for p in a)
+
+    return max(one_way(want, got), one_way(got, want))
+
+
+class HopperMisplacedBoxTests(unittest.TestCase):
+    """Two boxes the hopper put metres of interior away from their controls.
+
+    Both were visible in the game and invisible in the app: the preview draws
+    the reflection or the slide of the authored corners directly, so it was
+    right both times and only the written row disagreed.
+    """
+
+    def test_a_skewed_target_triple_still_lands_on_the_moved_control(self) -> None:
+        """The ignition switch is set to Move, so only its idY picks up the
+        relocated column's twin and idRef/idX stay on the left of the dash.
+        That leaves a triple spanning the whole car, whose raw y runs almost
+        along x -- and squaring it up before measuring put the switch 97 mm
+        away, down on the dash fascia instead of on the column."""
+        authored = (
+            '        ["sw_ignition", "dshl","dsh", "int_strw", "sphere", 0.025,'
+            ' {"x":25,"y":0,"z":0}, {"x":0,"y":0,"z":0}, {"x":0,"y":0,"z":0},'
+            ' {"x":0.07,"y":0.075,"z":-0.03}],'
+        )
+        out = rewrite_triggers(
+            section(authored),
+            HOPPER_NODES,
+            build_node_mirror_map(HOPPER_NODES),
+            None,
+            {"int_strw": "int_strw_xp_rhd"},
+            {"sw_ignition": ("translate", -0.79, None)},
+        )
+        row = [line for line in out.splitlines() if "sw_ignition" in line][0]
+        self.assertIn("int_strw_xp_rhd", row)  # it did follow the column
+        before = engine_shape(authored, HOPPER_NODES)
+        want = [(x - 0.79, y, z) for x, y, z in before]
+        self.assertLess(shape_distance(want, engine_shape(row, HOPPER_NODES)), 1e-6)
+
+    def test_an_unrepointed_mirror_flips_the_extent_the_frame_kept(self) -> None:
+        """The transfer-case box hangs off the seat pair and the handbrake node,
+        and the handbrake has no counterpart, so nothing repoints and the frame
+        does not flip. Negating the frame-z extent anyway -- right only when the
+        triple was repointed -- grew the box the wrong way from a correctly
+        mirrored corner, landing it 150 mm off, over the shifter and 14 cm high.
+        """
+        authored = (
+            '        ["transfercaseToggle","sf1r","sf1l","int_pbrk","box",'
+            '{"x":0.05,"y":0.14,"z":0.16},{"x":15,"y":0,"z":0},'
+            '{"x":0,"y":0,"z":0},{"x":0,"y":0,"z":0},'
+            '{"x":0.205,"y":0.01,"z":-0.07}],'
+        )
+        out = rewrite_triggers(
+            section(authored),
+            HOPPER_NODES,
+            build_node_mirror_map(HOPPER_NODES),
+            None,
+            None,
+            {"transfercaseToggle": ("mirror", 0.0, None)},
+        )
+        row = [line for line in out.splitlines() if "transfercaseToggle" in line][0]
+        self.assertIn('"sf1r","sf1l","int_pbrk"', row)  # nothing to repoint at
+        # The frame's x axis is the one the reflection turned around, and after
+        # the size column's own y/z swap that is size.x.
+        self.assertIn('{"x":-0.05,"y":0.14,"z":0.16}', row)
+        before = engine_shape(authored, HOPPER_NODES)
+        want = [(-x, y, z) for x, y, z in before]
+        # Only the written row's own six-decimal rounding is left.
+        self.assertLess(shape_distance(want, engine_shape(row, HOPPER_NODES)), 1e-6)
 
 
 if __name__ == "__main__":
