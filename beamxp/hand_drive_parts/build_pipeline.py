@@ -2427,31 +2427,110 @@ def _rigid_only_material_aliases(
     return rigid - mirrored
 
 
+_MIRROR_COLOUR_MAP_KEYS = ("baseColorMap", "colorMap", "diffuseMap")
+
+
+def _is_engine_mirror_material(value: Mapping[str, object]) -> bool:
+    """Whether a ``*.materials.json`` entry is a mirror's reflective face.
+
+    Recognised by what makes it a reflection rather than by its name: it has no
+    colour map of its own (the image comes from the cubemap the engine renders),
+    it asks for that cubemap, and it composites as emissive translucency with no
+    blend over a normal map that gives the glass its slight waviness.
+
+    Across the fleet's material libraries this picks out the four the game
+    defines in ``vehicles/common/main.materials.json`` -- ``mirror``,
+    ``mirror_CE``, ``mirror_CX``, ``mirror_F`` -- and nothing else.
+    """
+    stages = [stage for stage in (value.get("Stages") or []) if isinstance(stage, dict)]
+    if not stages:
+        return False
+    if any(
+        isinstance(stage.get(key), str) and str(stage.get(key)).strip()
+        for stage in stages
+        for key in _MIRROR_COLOUR_MAP_KEYS
+    ):
+        return False
+    if value.get("dynamicCubemap") is not True or not value.get("translucent"):
+        return False
+    if str(value.get("translucentBlendOp") or "").strip().lower() != "none":
+        return False
+    if stages[0].get("emissive") is not True:
+        return False
+    return any(
+        isinstance(stage.get("normalMap"), str) and str(stage.get("normalMap")).strip()
+        for stage in stages
+    )
+
+
+def engine_mirror_materials(context: VehicleContext) -> set[str]:
+    """Every material this vehicle can paint a reflective surface with.
+
+    Read from the vehicle's own libraries and the game's common ones, the same
+    places the engine resolves a material name from. Cached on the context under
+    its own attribute, so a context unpickled from an older build recomputes it
+    rather than quietly answering with a set that predates this lookup.
+    """
+    cached = getattr(context, "_engine_mirror_materials", None)
+    if cached is not None:
+        return cached
+    found: set[str] = set()
+    for zip_path in [context.source_zip, *common_zip_candidates(context.source_zip)]:
+        try:
+            archive = zipfile.ZipFile(zip_path)
+        except (OSError, zipfile.BadZipFile):
+            continue
+        with archive:
+            for name in archive.namelist():
+                if not name.replace("\\", "/").endswith(".materials.json"):
+                    continue
+                try:
+                    data = parse_beamng_json(
+                        archive.read(name).decode("utf-8", errors="replace"), label=name
+                    )
+                except Exception:
+                    continue
+                for key, value in data.items():
+                    if not isinstance(value, dict) or not _is_engine_mirror_material(value):
+                        continue
+                    found.add(
+                        _normalise_material_alias(
+                            str(value.get("mapTo") or value.get("name") or key)
+                        )
+                    )
+    context._engine_mirror_materials = found
+    return found
+
+
 def _mirror_row_split_target(
     pieces: Iterable[str],
     piece_materials: dict[str, set[str]],
-    corrected_materials: set[str],
+    mirror_materials: set[str],
 ) -> str:
     """Which split piece a ``mirrors`` row should follow, or "" when unclear.
 
-    Splitting a mesh for texture correction renames it, and ``addMirror`` binds
-    by mesh name (``lua/common/jbeam/sections/mirror.lua``), so a row left
-    naming the whole mesh binds nothing at all and the glass stops reflecting --
-    the same failure the rename fix cured, arriving by a later rename.
+    Splitting a mesh renames it, and ``addMirror`` binds by mesh name
+    (``lua/common/jbeam/sections/mirror.lua``, which gives up on the row
+    entirely when the name resolves to nothing), so a row left naming the whole
+    mesh stops reflecting -- the same failure the rename fix cured, arriving by
+    a later rename.
 
     A row names one mesh, so it has to be the piece holding the reflective
-    surface rather than the housing. A mirror material is the reflection: it
-    carries no base colour of its own, which is exactly why the texture
-    correction never records it and never renames it, so the glass is the piece
-    the correction did not touch. Where that does not pick out a single piece
-    the row is left alone -- a mirrors row aimed at a dashboard would turn the
-    dashboard into a mirror, which is worse than the reflection staying broken.
+    surface rather than the housing. That piece is the one that paints with a
+    mirror material: asked positively, off the engine's own material
+    definitions. Asking it negatively -- the piece the texture correction left
+    alone -- said nothing whenever the correction had nothing to do on this mesh
+    in the first place, which is the usual case for a mirror and left every
+    piece looking equally untouched.
+
+    Where that does not pick out a single piece the row is left alone -- a
+    mirrors row aimed at a dashboard would turn the dashboard into a mirror,
+    which is worse than the reflection staying broken -- and the caller says so.
     """
     candidates = [
         piece
         for piece in pieces
-        if (symbols := piece_materials.get(piece))
-        and not symbols & corrected_materials
+        if piece_materials.get(piece, set()) & mirror_materials
     ]
     return candidates[0] if len(candidates) == 1 else ""
 
@@ -3018,6 +3097,7 @@ def _patch_texture_correction_jbeams(
     patched_files: list[str] = []
     replaced_rows = 0
     mirror_rows = 0
+    dangling_mirror_rows: set[str] = set()
     mirror_row_targets = mirror_row_targets or {}
     material_alias_sets = tuple(material_alias_sets)
     switch_base_aliases = set(switch_base_aliases)
@@ -3054,6 +3134,7 @@ def _patch_texture_correction_jbeams(
             "files": patched_files,
             "replacedRows": replaced_rows,
             "mirrorRows": mirror_rows,
+            "danglingMirrorRows": [],
         }
     for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
         original = path.read_text(encoding="utf-8")
@@ -3067,15 +3148,26 @@ def _patch_texture_correction_jbeams(
 
         def replace_mirrors(array_text: str) -> tuple[str, int]:
             nonlocal mirror_rows
+            for row in array_text.splitlines():
+                mesh = mirror_row_mesh(row)
+                # A mesh that was split no longer exists under its own name, so
+                # a row still naming it is one addMirror will refuse. Anything
+                # else in the row is none of this pass's business.
+                if mesh and mesh != "mesh" and mesh in replacements:
+                    if mesh not in mirror_row_targets:
+                        dangling_mirror_rows.add(mesh)
             new_text = rewrite_mirror_rows(array_text, mirror_row_targets, {})
             changed = 1 if new_text != array_text else 0
             mirror_rows += changed
             return new_text, changed
 
         updated = _replace_all_jbeam_array_regions(original, "flexbodies", replace_array)
-        if mirror_row_targets:
+        if replacements:
             # The glass followed its mesh into the split; the row that binds it
             # has to follow too, or addMirror finds nothing to reflect into.
+            # Run even with no targets resolved: that is exactly the case worth
+            # hearing about, and the rewrite is a no-op when there is nothing
+            # to repoint.
             updated = _replace_all_jbeam_array_regions(updated, "mirrors", replace_mirrors)
         if material_alias_sets:
             updated = _replace_all_jbeam_object_regions(
@@ -3116,6 +3208,7 @@ def _patch_texture_correction_jbeams(
         "files": patched_files,
         "replacedRows": replaced_rows,
         "mirrorRows": mirror_rows,
+        "danglingMirrorRows": sorted(dangling_mirror_rows),
     }
 
 
@@ -4591,14 +4684,7 @@ def integrate_texture_correction_artifacts(
                     glass = _mirror_row_split_target(
                         appended,
                         piece_materials,
-                        {
-                            # The states only. A per-mesh base is a renamed
-                            # handle rather than a corrected texture, and the
-                            # glass is picked out by which piece carries no
-                            # corrected texture.
-                            _normalise_material_alias(name)
-                            for name in state_alias_to_material.values()
-                        },
+                        engine_mirror_materials(context),
                     )
                     for target_mesh in row_target_meshes:
                         for hand in hands:
@@ -4941,6 +5027,21 @@ def build_batch(
             flexbody_meshes=flexbody_meshes,
             baked_mesh_copies=baked_mesh_copies_by_target(baked_shared_specs),
         )
+        # A mirrors row whose mesh was split and could not be repointed is a
+        # reflection that will be dead in game, and the engine says nothing
+        # about it: addMirror just returns -1 and the row is skipped. Say it
+        # here instead of letting it ship looking like a flat grey pane.
+        integration_result = texture_correction_report["integration"]
+        dangling = []
+        if isinstance(integration_result, dict):
+            patch = integration_result.get("jbeamPatch")
+            if isinstance(patch, dict):
+                dangling = list(patch.get("danglingMirrorRows") or [])
+        if dangling:
+            emit_progress(
+                f"WARNING: {len(dangling)} mirrors row(s) left unbound after the mesh "
+                f"was split, so these will not reflect: {', '.join(dangling)}"
+            )
         texture_correction_report["pruned"] = prune_unused_texture_correction_assets(
             output_root, output_vehicle_dir
         )
@@ -5093,4 +5194,4 @@ def build_batch(
         texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'baked_mesh_copies_by_target', 'integrate_texture_correction_artifacts', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'baked_mesh_copies_by_target', 'engine_mirror_materials', 'integrate_texture_correction_artifacts', 'build_batch']

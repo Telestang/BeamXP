@@ -1245,6 +1245,154 @@ def _generated_clone_excluded(
     return any("seat" in token for token in tokens)
 
 
+def mirror_plane_sources_for_meshes(
+    mesh_hits: Iterable[str],
+    object_modes: dict[str, str],
+    mirror_rows: dict[str, str],
+) -> dict[str, str]:
+    """Which meshes need their ``mirrors`` plane reflected, and from whose row.
+
+    A mirror's reflection plane belongs to the side of the car the glass is
+    bolted to, not to the geometry the part happens to render.
+
+    A plain Mirror carries the glass across the centreline, so its plane travels
+    with it and is reflected -- an interior mirror authored to the left of the
+    windscreen has to end up the same distance to the right of it.
+
+    Swap Mesh and Replace Source move nothing. They hand an object the opposite
+    side's art while it stays bolted where it was, so the plane is left exactly
+    as authored and those meshes are absent from the map.
+
+    That is what the game itself does. The Covet ships both hands, and its RHD
+    wing mirrors differ from the LHD ones by the mesh name alone -- each side
+    keeps its own ``refBaseTranslation`` and aim, which are not even symmetric
+    between the sides (left x=-0.09 z=-13.4 against right x=0.095 z=13.4).
+    Reflecting the twin's plane onto a swap traded those across the car and left
+    each mirror aimed the way the other one had been, which shows up as the
+    wrong amount of the car's own flank in the glass.
+    """
+    return {
+        mesh: mirror_rows[mesh]
+        for mesh in mesh_hits
+        if object_modes.get(mesh) == MODE_MIRROR and mesh in mirror_rows
+    }
+
+
+_BEAM_ROW_RE = re.compile(
+    r'^(?P<head>\s*\[\s*"(?P<a>[^"]+)"\s*,\s*"(?P<b>[^"]+)"\s*)'
+    r'(?:,\s*(?P<options>\{[^\n]*\}))?'
+    r'(?P<tail>\s*\],?\s*)$'
+)
+
+
+def _beam_row_options(array_text: str) -> dict[tuple[str, str], str]:
+    """Each two-node beam row's own inline options, keyed by its node pair."""
+    found: dict[tuple[str, str], str] = {}
+    for line in array_text.splitlines():
+        match = _BEAM_ROW_RE.match(line)
+        if match:
+            found[(match.group("a"), match.group("b"))] = match.group("options") or ""
+    return found
+
+
+def swapped_beam_options(
+    context: VehicleContext,
+    part_body: str,
+    object_modes: dict[str, str],
+    structural_sources: dict[str, str],
+) -> dict[tuple[str, str], str]:
+    """Beam options this part has to take from its opposite-side twin.
+
+    A mirror's aim is not always in its ``mirrors`` row. The hopper toes its
+    wing mirrors with ``beamPrecompression`` on the mount beams -- 0.94 on the
+    left against 0.85 on the right -- while ``baseRotationGlobal`` is (-5,0,0)
+    on both sides and carries no lateral aim at all. The pre-load pulls each
+    mount as the vehicle settles, which is why two mounts that are exact mirror
+    images at rest measure 11.3 degrees apart once settled, on the stock car as
+    much as on the converted one.
+
+    So a part handed the other side's glass has to be handed the other side's
+    pre-load with it, or the driver's mirror keeps the figure tuned for the
+    passenger's. A mirror turned through an angle turns what it shows by twice
+    that, which left the hopper's wing mirrors about 22 degrees out -- past the
+    +/-20 the in-game adjustment can even reach.
+
+    Only rows whose options actually differ between the sides are returned: a
+    pair that agrees has nothing handed about it, and rewriting it would be
+    churn. The far side is found the same way a swapped lamp finds its lens --
+    whoever declares the mesh this part was reskinned from -- and an unresolved
+    or contradictory far side is left alone rather than guessed at.
+    """
+    rendered = {
+        match.group(1)
+        for match in re.finditer(
+            r'\[\s*"([^"]+)"',
+            transform_helpers.extract_named_array(part_body, "flexbodies") or "",
+        )
+        if match.group(1) != "mesh"
+    }
+    swapped = {
+        mesh
+        for mesh in rendered
+        if object_modes.get(mesh) in {MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
+        and mesh in structural_sources
+    }
+    if not swapped:
+        return {}
+    mine = _beam_row_options(transform_helpers.extract_named_array(part_body, "beams") or "")
+    if not mine:
+        return {}
+    twin_parts = sorted({
+        owner
+        for mesh in sorted(swapped)
+        for owner in mesh_owner_parts(context, structural_sources[mesh])
+    })
+    theirs: dict[tuple[str, str], str] = {}
+    for part_id in twin_parts:
+        found = part_body_for_context(context, part_id)
+        if found is None:
+            continue
+        for (a, b), options in _beam_row_options(
+            transform_helpers.extract_named_array(found[0], "beams") or ""
+        ).items():
+            # named on the far side, so read it back onto this side's nodes
+            key = (mirror_lateral_node_id(a), mirror_lateral_node_id(b))
+            if key in theirs and theirs[key] != options:
+                theirs[key] = ""  # two twins disagree; take neither
+            else:
+                theirs.setdefault(key, options)
+    return {
+        pair: theirs[pair]
+        for pair, options in mine.items()
+        if pair in theirs and theirs[pair] and theirs[pair] != options
+    }
+
+
+def rewrite_beam_options(array_text: str, options_by_pair: dict[tuple[str, str], str]) -> str:
+    """Put each named row's options back as its twin authored them."""
+    if not options_by_pair:
+        return array_text
+    out: list[str] = []
+    for line in array_text.splitlines(keepends=True):
+        content, ending = line, ""
+        for suffix in ("\r\n", "\n"):
+            if content.endswith(suffix):
+                content, ending = content[: -len(suffix)], suffix
+                break
+        match = _BEAM_ROW_RE.match(content)
+        if match:
+            replacement = options_by_pair.get((match.group("a"), match.group("b")))
+            if replacement:
+                content = (
+                    match.group("head").rstrip()
+                    + ", "
+                    + replacement
+                    + match.group("tail")
+                )
+        out.append(content + ending)
+    return "".join(out)
+
+
 def swapped_light_slot_placements(
     context: VehicleContext,
     part_body: str,
@@ -1689,22 +1837,21 @@ def write_generated_jbeam_and_configs(
                     flexbody_row_transforms[mesh] = ("mirror", mesh_nudge(mesh))
                 elif object_modes.get(mesh) in {MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
                     flexbody_row_transforms[mesh] = ("mirror", 0.0)
-            # A mirror's reflection plane belongs to its glass. Whatever the
-            # part ends up rendering is the mesh named here reflected across the
-            # centreline -- itself for a plain mirror, its structural twin for a
-            # swap -- so the converted row inherits that mesh's authored plane,
-            # reflected. Modes that leave the glass alone are absent and keep it.
-            mirror_plane_sources = {
-                mesh: mirror_rows[structural_sources.get(mesh, mesh)]
-                for mesh in mesh_hits
-                if object_modes.get(mesh)
-                in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
-                and structural_sources.get(mesh, mesh) in mirror_rows
-            }
+            mirror_plane_sources = mirror_plane_sources_for_meshes(
+                mesh_hits, object_modes, mirror_rows
+            )
             # An indicator repeater is a lamp inside a lens. Swap the lens for
             # the other side's and the lamp has to travel with it, or it goes
             # on shining out of a casing that is no longer there.
             part_light_placements = swapped_light_slot_placements(
+                context,
+                part_body,
+                object_modes,
+                structural_sources,
+            )
+            # A swapped mirror's toe-in can live in its mount's beam pre-load
+            # rather than its mirrors row, and that has to travel with the glass.
+            part_beam_options = swapped_beam_options(
                 context,
                 part_body,
                 object_modes,
@@ -1808,6 +1955,7 @@ def write_generated_jbeam_and_configs(
                     part_trigger_follows,
                     part_light_placements,
                     light_pattern_bulb_slot_types(context),
+                    part_beam_options,
                 )
             )
 
@@ -2922,4 +3070,4 @@ def preview_trigger_boxes(
     boxes.sort(key=lambda box: (str(box["id"]), tuple(box["at"])))
     return boxes
 
-__all__ = ['converted_trigger_corners', 'preview_trigger_boxes', 'authored_trigger_placements', 'authored_trigger_positions', 'trigger_modes_for_part', 'trigger_owners_for_config', 'trigger_owners_for_part', 'generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload', 'swapped_light_slot_placements', 'light_pattern_bulb_slot_types']
+__all__ = ['converted_trigger_corners', 'preview_trigger_boxes', 'authored_trigger_placements', 'authored_trigger_positions', 'trigger_modes_for_part', 'trigger_owners_for_config', 'trigger_owners_for_part', 'generate_daes', 'variant_output_name', 'original_plate_output_name', 'append_hand_label', 'generated_info_display_name', 'generated_info_description', 'apply_hand_authored_group', 'relocated_part_name', 'write_converted_config', 'write_generated_jbeam_and_configs', 'write_original_plate_configs', 'variant_target_hand', 'output_config_sources', 'load_beamng_json_file', 'prop_row_world_matrix', 'preview_node_names', 'extract_preview_dae', 'output_vehicle_preview_payload', '_changed_selected_slot_paths', 'full_vehicle_preview_payload', 'mirror_plane_sources_for_meshes', 'swapped_beam_options', 'rewrite_beam_options', 'swapped_light_slot_placements', 'light_pattern_bulb_slot_types']

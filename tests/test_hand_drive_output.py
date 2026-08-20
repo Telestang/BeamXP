@@ -700,12 +700,6 @@ class GeneratedMirrorTests(unittest.TestCase):
         '"baseRotationGlobal":{"x":0,"y":0,"z":-15}}],\n'
         "]"
     )
-    WING_R_ROW = (
-        '["mirror_R","mi4r","mi3r","mi2r",'
-        '{"refBaseTranslation":{"x":0.085,"y":-0.034,"z":0.05},'
-        '"baseRotationGlobal":{"x":0,"y":0,"z":22}}],'
-    )
-
     def test_row_binds_the_mesh_the_converted_part_renders(self) -> None:
         # addMirror() looks the mesh up among the part's own meshes, so a row
         # left on the pre-conversion name reflects nothing at all.
@@ -723,22 +717,31 @@ class GeneratedMirrorTests(unittest.TestCase):
             {"bx_mirror_int_lhd": "bx_mirror_int_lhd_xp_rhd"},
             {"bx_mirror_int_lhd": row},
         )
-        # bx_mirror_int_rhd, authored: same offset, z negated.
+        # bx_mirror_int_rhd, authored: same nodes, offset x negated (it is 0
+        # here, mounted on the centreline), z negated.
         self.assertIn('"refBaseTranslation":{"x":0,"y":-0.08,"z":-0.12}', rewritten)
         self.assertIn('"baseRotationGlobal":{"x":6,"y":0,"z":-19}', rewritten)
+        data_row = rewritten.splitlines()[2]
+        self.assertEqual(core.mirror_row_node_ids(data_row), ["rf1", "rf1r", "rf2"])
 
-    def test_a_swapped_wing_mirror_inherits_the_other_side_s_plane(self) -> None:
-        # Swap Mesh renders the twin's glass reflected, so the plane comes from
-        # the twin's row -- the left mirror keeps its left offset but takes the
-        # aim the right mirror had, reflected.
+    def test_a_swapped_wing_mirror_keeps_its_own_plane(self) -> None:
+        """Swap Mesh changes the glass, not the side the glass is bolted to.
+
+        The game ships both hands of the Covet, and its RHD wing mirrors differ
+        from the LHD ones by the mesh name alone -- each side keeps its own
+        refBaseTranslation and aim, which are not even symmetric. So a swap
+        passes no plane source at all and the row's plane is left untouched.
+        """
         rewritten = core.rewrite_mirror_rows(
             self.WING_L,
             {"mirror_L": "mirror_L_xp_rhd"},
-            {"mirror_L": self.WING_R_ROW},
+            {},
         )
         self.assertIn('["mirror_L_xp_rhd","mi4l"', rewritten)
         self.assertIn('"refBaseTranslation":{"x":-0.085,"y":-0.034,"z":0.05}', rewritten)
-        self.assertIn('"baseRotationGlobal":{"x":0,"y":0,"z":-22}', rewritten)
+        self.assertIn('"baseRotationGlobal":{"x":0,"y":0,"z":-15}', rewritten)
+        # the aim the right mirror had must not have crossed over
+        self.assertNotIn('"z":-22}', rewritten)
 
     def test_a_mesh_the_build_left_alone_keeps_its_authored_plane(self) -> None:
         rewritten = core.rewrite_mirror_rows(self.WING_L, {}, {})

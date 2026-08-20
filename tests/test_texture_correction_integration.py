@@ -2007,7 +2007,8 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result["rowReplacements"], {})
         self.assertEqual(
-            result["jbeamPatch"], {"files": [], "replacedRows": 0, "mirrorRows": 0}
+            result["jbeamPatch"],
+            {"files": [], "replacedRows": 0, "mirrorRows": 0, "danglingMirrorRows": []},
         )
         self.assertEqual(result["daePatches"][0]["appendedNodes"], [])
         self.assertEqual(result["daePatches"][0]["retargetedNodes"], ["doorpanel_FL_xp_rhd"])
@@ -2663,16 +2664,27 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         "glass": "scintilla_interior_mirror__beamxp_rigid_003",
     }
 
-    def _split_dae(self, path: Path) -> None:
-        """A split mesh: two housing pieces on the corrected atlas, one glass."""
+    def _split_dae(self, path: Path, housing_material: str = "scintilla_interior_beamxp_tc") -> None:
+        """A split mesh: two housing pieces, and one that carries the glass.
+
+        ``housing_material`` is what the housing pieces paint with. The default
+        is a corrected atlas; pass the plain source material for the far more
+        common case of a mirror the correction had no work to do on.
+        """
+        painted = {
+            self.MIRROR_SPLIT["carrier"]: [housing_material],
+            self.MIRROR_SPLIT["housing"]: [housing_material],
+            # the glass piece carries housing triangles of its own as well, the
+            # way a real split piece does
+            self.MIRROR_SPLIT["glass"]: ["mirror_F-material", housing_material],
+        }
         pieces = "".join(
-            f'<geometry id="g_{name}"><mesh><triangles material="{material}" count="0"/>'
-            f"</mesh></geometry>"
-            for name, material in (
-                (self.MIRROR_SPLIT["carrier"], "scintilla_interior_beamxp_tc"),
-                (self.MIRROR_SPLIT["housing"], "scintilla_interior_beamxp_tc"),
-                (self.MIRROR_SPLIT["glass"], "mirror_F-material"),
+            f'<geometry id="g_{name}"><mesh>'
+            + "".join(
+                f'<triangles material="{material}" count="0"/>' for material in materials
             )
+            + "</mesh></geometry>"
+            for name, materials in painted.items()
         )
         nodes = "".join(
             # every piece keeps the whole mesh's binding table, which is exactly
@@ -2692,31 +2704,110 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_the_glass_piece_is_the_one_the_correction_did_not_touch(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            dae = Path(raw) / "gen.dae"
-            self._split_dae(dae)
-            pieces = list(self.MIRROR_SPLIT.values())
-            materials = build_pipeline._node_material_symbols(dae, set(pieces))
-            glass = build_pipeline._mirror_row_split_target(
-                pieces, materials, {"scintilla_interior_beamxp_tc"}
-            )
+    def test_the_glass_piece_is_the_one_painting_with_a_mirror_material(self) -> None:
+        for label, housing in (
+            ("correction ran on the housing", "scintilla_interior_beamxp_tc"),
+            # The usual case, and the one that used to lose the row: a mirror
+            # is rarely worth correcting, so nothing on the mesh is renamed and
+            # asking which piece the correction skipped picks out all of them.
+            ("correction had nothing to do", "scintilla_interior-material"),
+        ):
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory() as raw:
+                    dae = Path(raw) / "gen.dae"
+                    self._split_dae(dae, housing)
+                    pieces = list(self.MIRROR_SPLIT.values())
+                    materials = build_pipeline._node_material_symbols(dae, set(pieces))
+                    glass = build_pipeline._mirror_row_split_target(
+                        pieces, materials, {"mirror_f"}
+                    )
 
-        self.assertEqual(glass, self.MIRROR_SPLIT["glass"])
+                self.assertEqual(glass, self.MIRROR_SPLIT["glass"])
 
-    def test_a_split_with_no_single_untouched_piece_leaves_the_row_alone(self) -> None:
+    def test_a_split_with_no_single_glass_piece_leaves_the_row_alone(self) -> None:
         """Better a mirror that does not reflect than a dashboard that does."""
         with tempfile.TemporaryDirectory() as raw:
             dae = Path(raw) / "gen.dae"
             self._split_dae(dae)
             pieces = list(self.MIRROR_SPLIT.values())
             materials = build_pipeline._node_material_symbols(dae, set(pieces))
-            # nothing corrected: every piece qualifies, so none is picked
+            # no piece paints with a mirror material: nothing to point the row at
             self.assertEqual(build_pipeline._mirror_row_split_target(pieces, materials, set()), "")
             # a piece with no geometry at all is never a candidate
             self.assertEqual(
-                build_pipeline._mirror_row_split_target(["absent"], materials, set()), ""
+                build_pipeline._mirror_row_split_target(["absent"], materials, {"mirror_f"}), ""
             )
+            # two pieces of glass is as unclear as none
+            shared = {piece: {"mirror_f"} for piece in pieces}
+            self.assertEqual(
+                build_pipeline._mirror_row_split_target(pieces, shared, {"mirror_f"}), ""
+            )
+
+    def test_a_mirror_material_is_recognised_by_how_it_reflects(self) -> None:
+        """The four the game defines, and nothing that merely looks shiny."""
+        mirror_f = {
+            "Stages": [
+                {
+                    "emissive": True,
+                    "metallicFactor": 1,
+                    "normalMap": "vehicles/common/mirror_n.normal.png",
+                    "roughnessFactor": 0,
+                }
+            ],
+            "dynamicCubemap": True,
+            "translucent": True,
+            "translucentBlendOp": "None",
+        }
+        self.assertTrue(build_pipeline._is_engine_mirror_material(mirror_f))
+
+        # chrome: a cubemap, but it composites opaquely
+        self.assertFalse(
+            build_pipeline._is_engine_mirror_material({**mirror_f, "translucent": False})
+        )
+        # glass: translucent and cubemapped, but it blends
+        self.assertFalse(
+            build_pipeline._is_engine_mirror_material(
+                {**mirror_f, "translucentBlendOp": "LerpAlpha"}
+            )
+        )
+        # anything with an image of its own is painted, not reflected
+        self.assertFalse(
+            build_pipeline._is_engine_mirror_material(
+                {**mirror_f, "Stages": [{**mirror_f["Stages"][0], "baseColorMap": "d.dds"}]}
+            )
+        )
+        self.assertFalse(build_pipeline._is_engine_mirror_material({"Stages": []}))
+
+    def test_a_mirrors_row_that_cannot_follow_its_split_is_reported(self) -> None:
+        """A dead reflection is silent in game: addMirror just returns -1."""
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw) / "vehicles/scintilla"
+            vehicle_dir.mkdir(parents=True)
+            (vehicle_dir / "car.jbeam").write_text(
+                """{
+"scintilla_interior_xp_rhd": {
+    "flexbodies": [
+        ["mesh", "[group]:"],
+        ["scintilla_interior_mirror_xp_rhd", ["scintilla_interior"]],
+    ],
+    "mirrors": [
+        ["mesh", "idRef:", "id1:", "id2:"],
+        ["scintilla_interior_mirror_xp_rhd","rf1","rf1rr","f6l",{}],
+    ],
+}
+}""",
+                encoding="utf-8",
+            )
+            result = build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {"scintilla_interior_mirror_xp_rhd": list(self.MIRROR_SPLIT.values())},
+                # the split happened but no glass piece was identified
+                mirror_row_targets={},
+            )
+
+        self.assertEqual(
+            result["danglingMirrorRows"], ["scintilla_interior_mirror_xp_rhd"]
+        )
 
     def test_a_mirrors_row_follows_its_mesh_into_the_split(self) -> None:
         """addMirror binds by mesh name, so a stale row reflects nothing.
