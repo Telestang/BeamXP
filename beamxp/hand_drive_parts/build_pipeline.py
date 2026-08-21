@@ -616,6 +616,7 @@ def export_texture_correction_artifacts(
     whole_mesh_mirror_ids: set[str] | None = None,
     texture_member_scope_by_source: dict[tuple[Path, str], set[str]] | None = None,
     bc7_quality: str | None = None,
+    uv_flipped_materials: Mapping[str, frozenset[str]] | None = None,
 ) -> dict[str, object]:
     """Run the standalone atlas-correction exporter for marked meshes.
 
@@ -836,6 +837,7 @@ def export_texture_correction_artifacts(
                 texture_member_scope=selected_texture_members,
                 force_mirrored_part_keys=forced_part_keys,
                 texture_part_scope=texture_parts,
+                uv_flipped_materials=uv_flipped_materials,
             )
             (job_dir / "texture_correction.log").write_text(
                 "\n".join(log_lines) + ("\n" if log_lines else ""),
@@ -958,6 +960,7 @@ def export_texture_correction_artifacts(
             whole_mesh_mirror_ids=whole_mesh_mirror_ids,
             texture_member_scope_by_source=deferred_forced_scope,
             bc7_quality=bc7_quality,
+            uv_flipped_materials=uv_flipped_materials,
         )
         for key in ("jobs", "missing", "failures"):
             values = forced_report.get(key, [])
@@ -5041,6 +5044,9 @@ def build_batch(
             force_mirrored_dependency_ids=force_mirrored_dependency_ids,
             whole_mesh_mirror_ids=whole_mesh_mirror_ids,
             bc7_quality=texture_quality_setting(conversion),
+            # A mesh whose display island the geometry pass already mirrors
+            # must not have that material's atlas mirrored under it as well.
+            uv_flipped_materials=display_texture_flip_scope(context),
         )
         auto_included = texture_correction_report.get("autoIncludedTargets", {})
         if isinstance(auto_included, dict):

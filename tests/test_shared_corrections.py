@@ -170,5 +170,87 @@ class JobGroupingTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
 
 
+class UvFlippedMaterialTests(unittest.TestCase):
+    """A display already turned round by its UV island must not be turned again.
+
+    The LC500's centre tachometer is scoped for a UV flip on both interiors and
+    also had its whole 2048-square page island-flipped as a texture, which is
+    the same reflection twice: it read backwards on every trim.
+    """
+
+    def _binding(self, material: str):
+        return rhd.MaterialTextureLayerBinding(
+            dae_material=material,
+            material_key=material,
+            materials_member="vehicles/lc500/main.materials.json",
+            texture_reference="/vehicles/lc500/textures/screen.dds",
+            texture_member="vehicles/lc500/textures/screen.dds",
+        )
+
+    def _part(self, key: str):
+        part = rhd.DaePart.__new__(rhd.DaePart)
+        for field, value in (
+            ("key", key), ("node_id", key), ("node_name", key), ("label", key)
+        ):
+            object.__setattr__(part, field, value)
+        return part
+
+    def test_a_uv_flipped_material_is_not_corrected_for_that_mesh(self):
+        interior = self._part("lc500_interior")
+        bindings = {
+            "vehicles/lc500/textures/screen.dds": [
+                (interior, self._binding("lc500_centralscreen")),
+                (interior, self._binding("lc500_screens")),
+            ]
+        }
+        kept = rhd.drop_uv_flipped_bindings(
+            bindings, {"lc500_interior": frozenset({"lc500_centralscreen"})}
+        )
+        remaining = [
+            b.dae_material for _p, b in kept["vehicles/lc500/textures/screen.dds"]
+        ]
+        self.assertEqual(remaining, ["lc500_screens"])
+
+    def test_another_mesh_on_the_same_material_is_still_corrected(self):
+        """The UV flip is per mesh, so the exclusion has to be too."""
+        flipped = self._part("lc500_interior")
+        plain = self._part("lc500_door_L")
+        bindings = {
+            "vehicles/lc500/textures/screen.dds": [
+                (flipped, self._binding("lc500_centralscreen")),
+                (plain, self._binding("lc500_centralscreen")),
+            ]
+        }
+        kept = rhd.drop_uv_flipped_bindings(
+            bindings, {"lc500_interior": frozenset({"lc500_centralscreen"})}
+        )
+        remaining = [
+            p.key for p, _b in kept["vehicles/lc500/textures/screen.dds"]
+        ]
+        self.assertEqual(remaining, ["lc500_door_L"])
+
+    def test_a_texture_left_with_nothing_to_correct_is_dropped(self):
+        interior = self._part("lc500_interior")
+        bindings = {
+            "vehicles/lc500/textures/screen.dds": [
+                (interior, self._binding("lc500_centralscreen")),
+            ]
+        }
+        kept = rhd.drop_uv_flipped_bindings(
+            bindings, {"lc500_interior": frozenset({"lc500_centralscreen"})}
+        )
+        self.assertEqual(kept, {})
+
+    def test_no_scope_changes_nothing(self):
+        interior = self._part("lc500_interior")
+        bindings = {
+            "vehicles/lc500/textures/screen.dds": [
+                (interior, self._binding("lc500_centralscreen")),
+            ]
+        }
+        self.assertIs(rhd.drop_uv_flipped_bindings(bindings, None), bindings)
+        self.assertIs(rhd.drop_uv_flipped_bindings(bindings, {}), bindings)
+
+
 if __name__ == "__main__":
     unittest.main()

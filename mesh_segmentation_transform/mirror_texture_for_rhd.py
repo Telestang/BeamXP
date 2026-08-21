@@ -2616,6 +2616,46 @@ def group_shareable_jobs(
     return groups
 
 
+def drop_uv_flipped_bindings(
+    bindings_by_texture: dict[str, list[tuple[DaePart, MaterialTextureLayerBinding]]],
+    uv_flipped_materials: Mapping[str, frozenset[str]] | None,
+) -> dict[str, list[tuple[DaePart, MaterialTextureLayerBinding]]]:
+    """Drop the meshes whose UV islands the geometry pass already mirrored.
+
+    A live display -- an instrument cluster, a satnav -- is turned round by
+    flipping its UV island when the mesh is mirrored, because what it shows is
+    drawn at runtime and no static atlas can carry it. Mirroring the atlas as
+    well applies the same reflection twice and puts the screen back exactly as
+    it started: the LC500's centre tachometer is scoped for a UV flip on both
+    interiors *and* had its whole 2048-square page island-flipped, so it read
+    backwards on every trim.
+
+    Scoped per mesh, the same way ``generation.generate_daes`` scopes the UV
+    flip it passes as ``flip_materials``. Another mesh binding the same
+    material without a UV flip of its own still has its atlas corrected.
+    """
+    if not uv_flipped_materials:
+        return bindings_by_texture
+    flipped = {
+        str(mesh): {_normalise_material_alias(alias) for alias in aliases}
+        for mesh, aliases in uv_flipped_materials.items()
+    }
+
+    def keep(part: DaePart, binding: MaterialTextureLayerBinding) -> bool:
+        for alias in (part.key, part.node_id, part.node_name):
+            owned = flipped.get(str(alias or ""))
+            if owned and _normalise_material_alias(binding.dae_material) in owned:
+                return False
+        return True
+
+    kept: dict[str, list[tuple[DaePart, MaterialTextureLayerBinding]]] = {}
+    for member, entries in bindings_by_texture.items():
+        remaining = [(part, binding) for part, binding in entries if keep(part, binding)]
+        if remaining:
+            kept[member] = remaining
+    return kept
+
+
 def correction_jobs_for_texture(
     loaded: LoadedDae,
     entries: list[tuple[DaePart, MaterialTextureLayerBinding]],
@@ -8535,6 +8575,7 @@ def export_parts_preview(
     texture_member_scope: set[str] | None = None,
     force_mirrored_part_keys: set[str] | None = None,
     texture_part_scope: list[DaePart] | None = None,
+    uv_flipped_materials: Mapping[str, frozenset[str]] | None = None,
 ) -> PartPreview:
     """Export selected parts, converted and retextured, ready to open in Blender.
 
@@ -8575,6 +8616,9 @@ def export_parts_preview(
     )
     texture_parts = texture_part_scope if texture_part_scope is not None else parts
     bindings_by_texture = texture_bindings_for_parts(archive, loaded, texture_parts)
+    bindings_by_texture = drop_uv_flipped_bindings(
+        bindings_by_texture, uv_flipped_materials
+    )
     if texture_member_scope is not None:
         scoped_members = {member.lower() for member in texture_member_scope}
         bindings_by_texture = {
