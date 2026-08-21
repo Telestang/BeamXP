@@ -2543,6 +2543,79 @@ def build_domain_masks(
     )
 
 
+# Two domains over one unwrap never rasterise to quite the same texels -- a
+# structural left/right pair is the common case -- so "the same layout" has to
+# be a share of the union rather than an identity.
+SHARED_DOMAIN_MIN_OVERLAP = 0.97
+
+
+def domains_can_share_a_correction(a: DomainMasks, b: DomainMasks) -> bool:
+    """Whether two meshes' domains can be corrected into one file.
+
+    One corrected file per mesh per material is what an atlas costs today, and
+    most of those copies are of meshes that never meet on it: etk800's dash
+    holds 34.1% of its interior atlas and the door panels 7.2% somewhere else
+    entirely, and each was corrected and shipped separately. Over four built
+    vehicles that is 357 corrections where 214 would do.
+
+    Two domains may share when they do not overlap on the image:
+
+    * Disjoint. Neither mesh samples a texel the other does, so a correction
+      built from both leaves each exactly what it would have had alone.
+      Touching is not overlapping -- an atlas packs charts edge to edge, and
+      two meshes owning neighbouring charts is the ordinary case, not a clash.
+    * The same layout, give or take rasterisation. A left and right panel over
+      one unwrap agree on all but a rim of texels.
+
+    Anything between is a real collision: one island lying inside another, or
+    two perimeters crossing. There each mesh wants something different from the
+    same texels, and they get a file each.
+
+    A texel one mesh mirrors and another holds rigid is a collision however the
+    islands lie, and is checked first: build_domain_masks subtracts it from the
+    mirror domain, so the mesh that needed it flipped would quietly ship
+    uncorrected. On the LC500 that is 75.6% of both door meshes' domain on
+    lc500_screws2, which is the case this test exists to keep apart.
+    """
+    if (a.mirror & b.rigid).any() or (b.mirror & a.rigid).any():
+        return False
+    overlap = float((a.mirror & b.mirror).sum())
+    if not overlap:
+        return True
+    union = float((a.mirror | b.mirror).sum())
+    return overlap / max(union, 1.0) >= SHARED_DOMAIN_MIN_OVERLAP
+
+
+def group_shareable_jobs(
+    jobs: list[tuple[TextureCorrectionJob, DomainMasks]],
+) -> list[list[tuple[TextureCorrectionJob, DomainMasks]]]:
+    """Partition this texture's jobs into the fewest files they can share.
+
+    Materials never share, whatever their domains look like. Pooling them is
+    what put the LC500's HVAC strip inside lc500_centralscreen's full-atlas
+    quad and mirrored it about the atlas instead of about itself.
+
+    Greedy over the jobs in DAE order, so a group appears where its first
+    member did and a texture nothing merges on keeps the output names it has
+    always had. Every member of a group has to accept a newcomer, because
+    sharing is not transitive: two domains either side of a third can each be
+    disjoint from it and collide with each other.
+    """
+    groups: list[list[tuple[TextureCorrectionJob, DomainMasks]]] = []
+    for job, masks in jobs:
+        for group in groups:
+            if group[0][0].material != job.material:
+                continue
+            if all(
+                domains_can_share_a_correction(masks, other) for _job, other in group
+            ):
+                group.append((job, masks))
+                break
+        else:
+            groups.append([(job, masks)])
+    return groups
+
+
 def correction_jobs_for_texture(
     loaded: LoadedDae,
     entries: list[tuple[DaePart, MaterialTextureLayerBinding]],
@@ -7161,7 +7234,7 @@ def build_rhd_texture(
     # reasoning from the step bounds would not be -- a rotated flip writes
     # through a stencil, blending widens what it touches, and a step can write
     # a texel back to the value it already had.
-    before = rgba.copy()
+    before = rgba.copy() if steps else None
     apply_flip_plan(
         rgba,
         steps,
@@ -7181,8 +7254,15 @@ def build_rhd_texture(
         correct_normal_background=config.correct_flipped_normal_background,
         reflect_normal_vectors=config.reflect_flipped_normal_vectors,
     )
-    changed_texels = np.any(rgba != before, axis=2) if rgba.ndim == 3 else rgba != before
-    del before
+    if before is None:
+        # An empty plan writes nothing and the caller skips the encode, so
+        # there is no mask to measure and no copy worth having made.
+        changed_texels = np.zeros(rgba.shape[:2], bool)
+    else:
+        changed_texels = (
+            np.any(rgba != before, axis=2) if rgba.ndim == 3 else rgba != before
+        )
+    before = None
     timing = record_phase(
         phase_timings,
         "apply_texture_flips",
@@ -8565,19 +8645,23 @@ def export_parts_preview(
         try:
             with Image.open(extract_archive_member(archive, member)) as image:
                 size = image.size
-            # One domain per mesh per material: that is the unit a UV layout is
-            # actually defined over.  Pooling meshes cost the LC500's base
-            # interior its whole screen atlas to the facelift's rigid domain,
-            # and pooling materials put the HVAC strip's 8.9% island inside
-            # lc500_centralscreen's full-atlas quad, so the strip was flipped
-            # about the atlas rather than about itself.
+            # A UV layout belongs to one mesh's use of one material, so that
+            # is the unit a domain is measured over.  Measuring above it is
+            # what broke the LC500 twice: pooling its two interiors let the
+            # facelift's rigid domain erase the base interior's whole screen
+            # atlas, and pooling materials put the HVAC strip's 8.9% island
+            # inside lc500_centralscreen's full-atlas quad, so the strip was
+            # mirrored about the atlas rather than about itself.
             #
-            # This costs texture count where meshes used to share a correction:
-            # scintilla's interior atlas goes from one corrected copy to five,
-            # ardente's from six to twenty-three.  Taken deliberately -- those
-            # copies are small beside the DDS/PNG round trip each correction
-            # already performs, and the alternative is knowingly leaving
-            # correct-looking meshes on a domain that was never theirs.
+            # Measuring per mesh does not mean writing per mesh, though, and
+            # for a while it did: scintilla's interior atlas went to five
+            # corrected copies and ardente's to twenty-three.  Meshes that
+            # never meet on the image can be corrected together without either
+            # of them noticing, so the domains are measured apart and then
+            # grouped by whether they actually collide.  etk800's dash holds
+            # 34.1% of its interior atlas and its door panels 7.2% elsewhere;
+            # correcting them together plans the same 525 flips the separate
+            # corrections did, in half the files.
             phase_started = time.perf_counter()
             emit_progress(
                 progress,
@@ -8589,11 +8673,8 @@ def export_parts_preview(
                 texture_total=len(bindings_by_texture),
                 selected_parts=len(jobs),
             )
-            # Measured separately, then merged only where two domains come out
-            # exactly equal -- a left and right panel over one unwrap.  That is
-            # an identity, not a tolerance, so it can only collapse work that
-            # would have produced the same image twice.
-            merged: dict[tuple[str, bytes], tuple[list[DaePart], DomainMasks]] = {}
+            # Measured one mesh at a time; grouped afterwards.
+            measured: list[tuple[TextureCorrectionJob, DomainMasks]] = []
             for job in jobs:
                 mask_key = (frozenset(job.symbols), size, job.part.key)
                 masks = mask_cache.get(mask_key)
@@ -8612,16 +8693,54 @@ def export_parts_preview(
                         }
                     )
                     continue
-                identity = (
-                    job.material,
-                    masks.mirror.tobytes() + masks.rigid.tobytes(),
+                measured.append((job, masks))
+
+            merged: list[tuple[str, list[DaePart], DomainMasks]] = []
+            for group in group_shareable_jobs(measured):
+                material = group[0][0].material
+                parts = [job.part for job, _masks in group]
+                first = group[0][1]
+                if len(group) == 1:
+                    merged.append((material, parts, first))
+                    continue
+                same_domain = all(
+                    np.array_equal(masks.mirror, first.mirror)
+                    and np.array_equal(masks.rigid, first.rigid)
+                    for _job, masks in group[1:]
                 )
-                if identity in merged:
-                    merged[identity][0].append(job.part)
-                    log(f"  {job.label}: same UV domain as an earlier mesh here; "
-                        f"sharing one correction")
-                else:
-                    merged[identity] = ([job.part], masks)
+                if same_domain:
+                    # One unwrap measured several times over. Nothing to
+                    # rebuild: the domain the correction will be planned over
+                    # is the one already in hand.
+                    for job, _masks in group[1:]:
+                        log(f"  {job.label}: same UV domain as an earlier mesh "
+                            f"here; sharing one correction")
+                    merged.append((material, parts, first))
+                    continue
+                log(
+                    f"  {', '.join(job.part.label for job, _m in group)}: "
+                    f"domains do not meet on this atlas; sharing one correction"
+                )
+                # Rebuilt over the whole group rather than composed from the
+                # members' masks: the axis map, the skew frames and the
+                # mirrored triangle list all have to describe the domain the
+                # correction is actually planned over.
+                symbols: set[str] = set()
+                for job, _masks in group:
+                    symbols |= set(job.symbols)
+                group_key = (
+                    frozenset(symbols),
+                    size,
+                    tuple(sorted(part.key for part in parts)),
+                )
+                group_masks = mask_cache.get(group_key)
+                if group_masks is None:
+                    group_masks = build_domain_masks(
+                        loaded, parts, symbols, size,
+                        config, sweep_cache, log, force_mirrored_part_keys,
+                    )
+                    mask_cache[group_key] = group_masks
+                merged.append((material, parts, group_masks))
             timing = record_phase(
                 phase_timings,
                 "build_domain_masks",
@@ -8644,9 +8763,7 @@ def export_parts_preview(
             )
             # A texture corrected once keeps the file name it has always had.
             scoped = len(merged) > 1
-            for index, ((material, _identity), (scope, masks)) in enumerate(
-                merged.items(), start=1
-            ):
+            for index, (material, scope, masks) in enumerate(merged, start=1):
                 detection_attempted_members.add(member)
                 tasks.append(
                     TextureCorrectionTask(
