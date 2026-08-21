@@ -5,11 +5,13 @@ import types
 import unittest
 from xml.etree import ElementTree as ET
 
+import cv2
 import numpy as np
 
 from beamxp import hand_drive_core as core
 from beamxp import transform_helpers as th
 from mesh_segmentation_transform.annotate_texture_regions import (
+    DEFAULT_UV_ISLAND_SYMMETRY_CONFIG,
     STEP_INDEX,
     MserConfig,
     detect_foreground_boxes,
@@ -146,6 +148,194 @@ class TextureFlipTests(unittest.TestCase):
             "panel": core.MODE_SKIP,        # display but nothing reflects it
         }
         self.assertEqual(core.texture_flip_mesh_ids(context, modes), {"screen"})
+
+
+class IslandMirrorLineTests(unittest.TestCase):
+    """Which line pass 2 turns a whole island over about.
+
+    The ETK K-series console controller is the case these describe: a rounded
+    pad whose rasterised silhouette carries a small spur on one side.  The spur
+    moves the bounding box without moving the pad, so a reflection about the
+    box scored it 0.970 -- and turned over about the box it would land every
+    texel three columns off the partner it was meant to exchange with.
+    """
+
+    def spurred_island(self) -> tuple[np.ndarray, np.ndarray]:
+        """A symmetric pad whose box is dragged three texels to the left."""
+        mirror = np.zeros((120, 240), dtype=bool)
+        mirror[10:110, 20:220] = True
+        mirror[59:61, 17:20] = True
+        axis_map = np.full(mirror.shape, rhd.AXIS_HORIZONTAL, dtype=np.uint8)
+        return mirror, axis_map
+
+    def test_the_exporter_uses_the_harness_s_symmetry_threshold(self) -> None:
+        # One question, one number: an island the tuning app draws as
+        # symmetric is one the exporter has to be willing to turn over.
+        self.assertEqual(
+            rhd.DEFAULT_RHD_CONFIG.min_island_symmetry,
+            DEFAULT_UV_ISLAND_SYMMETRY_CONFIG.min_uv_island_symmetry,
+        )
+
+    def test_the_flip_is_planned_about_the_island_s_own_line(self) -> None:
+        mirror, axis_map = self.spurred_island()
+
+        flips, flipped = rhd.plan_island_flips(
+            mirror, [(40, 30, 20, 12)], rhd.DEFAULT_RHD_CONFIG, axis_map
+        )
+
+        self.assertEqual(len(flips), 1)
+        x, _y, w, _h = flips[0].bounds
+        # The pad spans 20..219, so its own line is 119.5; the box runs 17..219
+        # and centres on 118.  It is the pad's line the rectangle must reflect
+        # about, because it is the pad the flip has to land back on.
+        self.assertEqual((x + x + w - 1) / 2.0, 119.5)
+        self.assertEqual(flips[0].axis_shift, 3)
+        self.assertTrue(bool(flipped[30:42, 40:60].all()))
+
+    def test_the_island_scores_better_on_its_own_line_than_on_its_box(self) -> None:
+        mirror, axis_map = self.spurred_island()
+        component = mirror[10:110, 17:220]
+
+        flips, _flipped = rhd.plan_island_flips(
+            mirror, [(40, 30, 20, 12)], rhd.DEFAULT_RHD_CONFIG, axis_map
+        )
+
+        self.assertGreater(
+            flips[0].horizontal_similarity,
+            rhd._reflection_similarity(component, np.fliplr(component)),
+        )
+
+    def test_an_island_already_centred_on_its_line_is_left_where_it_is(self) -> None:
+        # Nothing to recover, so nothing moves: the search must not trade a
+        # correct rectangle for an equal-scoring one a texel away.
+        mirror = np.zeros((120, 240), dtype=bool)
+        mirror[10:110, 20:220] = True
+        axis_map = np.full(mirror.shape, rhd.AXIS_HORIZONTAL, dtype=np.uint8)
+
+        flips, _flipped = rhd.plan_island_flips(
+            mirror, [(40, 30, 20, 12)], rhd.DEFAULT_RHD_CONFIG, axis_map
+        )
+
+        self.assertEqual(flips[0].bounds, (20, 10, 200, 100))
+        self.assertEqual(flips[0].axis_shift, 0)
+
+    def test_a_genuinely_lopsided_island_is_still_refused(self) -> None:
+        # No line within reach reflects this onto itself, so none is taken and
+        # the glyphs inside fall to pass 3 to be handled one at a time.
+        mirror = np.zeros((120, 260), dtype=bool)
+        mirror[10:110, 20:220] = True
+        mirror[10:60, 220:236] = True
+        axis_map = np.full(mirror.shape, rhd.AXIS_HORIZONTAL, dtype=np.uint8)
+
+        flips, _flipped = rhd.plan_island_flips(
+            mirror, [(40, 30, 20, 12)], rhd.DEFAULT_RHD_CONFIG, axis_map
+        )
+
+        self.assertEqual(flips, [])
+
+    def test_a_line_that_would_leave_the_atlas_is_not_taken(self) -> None:
+        # The rectangle grows to move its centre, and a rectangle clipped by
+        # the atlas edge is re-centred by the flip, so it must not be planned.
+        mirror = np.zeros((120, 203), dtype=bool)
+        mirror[10:110, 0:200] = True
+        mirror[59:61, 200:203] = True
+        axis_map = np.full(mirror.shape, rhd.AXIS_HORIZONTAL, dtype=np.uint8)
+
+        flips, _flipped = rhd.plan_island_flips(
+            mirror, [(90, 30, 20, 12)], rhd.DEFAULT_RHD_CONFIG, axis_map
+        )
+
+        self.assertEqual(flips, [])
+
+
+class IslandLabellingTests(unittest.TestCase):
+    """What pass 2 counts as one island.
+
+    An atlas packs its charts hard against each other -- the ETK K-series
+    console has four separate 155x25 strips stacked with no gutter at all --
+    so pixel adjacency answers a question about the image while pass 2 is
+    asking one about the mesh.
+    """
+
+    def chart(
+        self,
+        u0: float,
+        v0: float,
+        u1: float,
+        v1: float,
+        x: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """One quad's two triangles in UV, placed at world ``x``."""
+        uv = np.asarray(
+            [[(u0, v0), (u1, v0), (u1, v1)], [(u0, v0), (u1, v1), (u0, v1)]],
+            dtype=float,
+        )
+        xyz = np.asarray(
+            [
+                [(x, 0.0, 0.0), (x + 1.0, 0.0, 0.0), (x + 1.0, 1.0, 0.0)],
+                [(x, 0.0, 0.0), (x + 1.0, 1.0, 0.0), (x, 1.0, 0.0)],
+            ],
+            dtype=float,
+        )
+        return uv, xyz
+
+    def stacked_charts(self, shared_world: bool = False) -> rhd.DomainMasks:
+        """Two charts touching along a UV edge, on unrelated geometry."""
+        lower = self.chart(0.25, 0.25, 0.75, 0.5, 0.0)
+        upper = self.chart(0.25, 0.5, 0.75, 0.75, 0.0 if shared_world else 10.0)
+        mirror = np.zeros((64, 64), dtype=bool)
+        mirror[16:48, 16:48] = True
+        return rhd.DomainMasks(
+            mirror=mirror,
+            rigid=~mirror,
+            conflict_coverage=0.0,
+            mirrored_triangles=4,
+            rigid_triangles=0,
+            parts_analysed=1,
+            mirrored_uv=(lower[0][0], lower[0][1], upper[0][0], upper[0][1]),
+            mirrored_xyz=(lower[1][0], lower[1][1], upper[1][0], upper[1][1]),
+        )
+
+    def test_charts_touching_along_an_edge_stay_apart(self) -> None:
+        masks = self.stacked_charts()
+
+        count, labels, _stats = rhd.domain_island_labels(masks)
+
+        fused = cv2.connectedComponentsWithStats(
+            masks.mirror.astype(np.uint8), connectivity=8
+        )[0]
+        self.assertEqual(fused - 1, 1)  # pixel adjacency sees one blob
+        self.assertEqual(count - 1, 2)  # the mesh has two charts
+        self.assertNotEqual(labels[24, 32], labels[40, 32])
+
+    def test_two_meshes_on_one_atlas_region_are_one_island(self) -> None:
+        # Not two competing labels: they are the same texels, and whichever
+        # was painted second would otherwise be left a partial island.
+        masks = self.stacked_charts()
+        masks.mirrored_uv = masks.mirrored_uv + masks.mirrored_uv[:2]
+        masks.mirrored_xyz = masks.mirrored_xyz + masks.mirrored_xyz[:2]
+
+        count, _labels, _stats = rhd.domain_island_labels(masks)
+
+        self.assertEqual(count - 1, 2)
+
+    def test_every_labelled_texel_belongs_to_exactly_one_island(self) -> None:
+        masks = self.stacked_charts()
+
+        _count, labels, stats = rhd.domain_island_labels(masks)
+
+        for label in range(1, int(labels.max()) + 1):
+            claimed = labels == label
+            self.assertEqual(int(claimed.sum()), int(stats[label, 4]))
+            self.assertEqual(int(np.nonzero(claimed.any(axis=0))[0].min()),
+                             int(stats[label, 0]))
+
+    def test_the_labels_are_cached_on_the_masks(self) -> None:
+        masks = self.stacked_charts()
+
+        first = rhd.domain_island_labels(masks)[1]
+
+        self.assertIs(rhd.domain_island_labels(masks)[1], first)
 
 
 class ForegroundMaskDetectorTests(unittest.TestCase):

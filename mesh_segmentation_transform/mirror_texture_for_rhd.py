@@ -77,6 +77,7 @@ if __package__ in (None, ""):
 from mesh_segmentation_transform.annotate_texture_regions import (  # noqa: E402
     DEFAULT_CONFIG,
     DEFAULT_RELIEF_DETECTION_CONFIG,
+    DEFAULT_UV_ISLAND_SYMMETRY_CONFIG,
     LocalContrastDetection,
     MserConfig,
     build_repeat_texture_index,
@@ -177,11 +178,35 @@ class RhdTextureConfig:
     sample_spacing_metres: float = 0.002
 
     # How exactly an island must match its own reflection before the whole
-    # island is flipped.  Measured as mask intersection-over-union, so 0.98
-    # tolerates 2% of rasterised area disagreeing.
-    min_island_symmetry: float = 0.98
+    # island is flipped.  Measured as mask intersection-over-union, so 0.95
+    # tolerates 5% of rasterised area disagreeing.
+    #
+    # This is the harness's own threshold, not a second opinion on the same
+    # question.  The blue contours in the tuning app are the surface this is
+    # tuned on -- they are read off a UV mask by the same intersection-over-
+    # union, and an island the harness draws as symmetric is one the exporter
+    # should be willing to turn over.  Kept as two literals it was tuned to
+    # 0.95 there and left at 0.98 here, and the ETK K-series console
+    # controller sat in the gap: drawn blue in the harness, refused by the
+    # exporter, shipped with MODE/MENU/TEL/BACK/ENTER reading backwards.
+    min_island_symmetry: float = (
+        DEFAULT_UV_ISLAND_SYMMETRY_CONFIG.min_uv_island_symmetry
+    )
     # Islands below this area are not worth testing for symmetry.
     min_island_area_px: int = 64
+    # Reflecting an island in its own bounding box assumes the box centre is
+    # the island's mirror line.  The box is set by extreme texels, so one spur
+    # on an otherwise symmetric silhouette moves the line without moving the
+    # island, and every texel then meets a partner a couple of pixels off its
+    # own.  The ETK K-series console controller scored 0.970 that way against
+    # the 0.98 floor -- its box sits two pixels left of its axis -- and shipped
+    # MODE/MENU/TEL/BACK/ENTER reading backwards.  Where the box-centred test
+    # fails, the line is searched this far either side of it, as a share of
+    # the island's extent along the flip axis, and the flip is applied about
+    # whichever line the island actually agrees with.  Kept small: this is
+    # meant to recover the island's own axis, not to hunt for a better-looking
+    # one somewhere else in the box.
+    island_axis_search_ratio: float = 0.02
     # Share of a detected region that must sit inside the mirror mask before
     # the region counts as ours to fix.
     min_region_mirror_overlap: float = 0.5
@@ -442,6 +467,9 @@ class IslandFlip:
     horizontal_similarity: float
     vertical_similarity: float
     glyph_count: int
+    # Whole texels the applied mirror line sits away from twice the bounding
+    # box centre, so a plan says which line it turned the island over about.
+    axis_shift: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2248,9 +2276,9 @@ class DomainMasks:
     mirrored_xyz: tuple[np.ndarray, ...] = ()
     foreground_islands: tuple[UvIslandCrop, ...] | None = None
     foreground_island_padding_px: int = -1
-    component_count: int = 0
-    component_labels: np.ndarray | None = None
-    component_stats: np.ndarray | None = None
+    island_label_count: int = 0
+    island_labels: np.ndarray | None = None
+    island_stats: np.ndarray | None = None
     skew_frames: tuple[
         tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...
     ] | None = None
@@ -2278,18 +2306,71 @@ def domain_uv_islands(
     return islands
 
 
-def domain_mask_components(
+# How much of the smaller chart two islands must share before they are treated
+# as one region drawn by two meshes rather than two neighbours.  The two cases
+# are nowhere near each other: meshes sharing an atlas region cover essentially
+# all of it, while charts packed edge to edge share only whatever single row or
+# column the rasteriser hands to both -- 155 texels of a 3,875-texel ETK strip,
+# or 4%.  Merging on any shared texel at all would fuse exactly the neighbours
+# this labelling exists to keep apart, and which of them the shared edge falls
+# to is a rounding accident.
+ISLAND_SHARED_REGION_OVERLAP = 0.5
+
+
+def domain_island_labels(
     masks: DomainMasks,
+    padding_px: int = 0,
 ) -> tuple[int, np.ndarray, np.ndarray]:
-    """Return connected mirror-domain components, computing them only once."""
-    if masks.component_labels is None or masks.component_stats is None:
-        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
-            masks.mirror.astype(np.uint8), connectivity=8
+    """Label the mirror domain by UV island rather than by pixel adjacency.
+
+    ``connectedComponentsWithStats`` answers a question about the image: which
+    texels touch.  Pass 2 is asking one about the mesh: which texels are one
+    surface.  An atlas packs its charts hard against each other -- the ETK
+    K-series console has four separate 155x25 strips stacked with no gutter at
+    all -- and pixel adjacency fuses those into a single component.  Scored as
+    one silhouette the stack is not the shape any of them is, and turned over
+    as one it exchanges texels between charts that share nothing but an edge.
+    ``domain_uv_islands`` joins two triangles only where their meshes meet at
+    that UV corner as well, which is the question actually being asked.
+
+    Charts that share occupied texels are unioned first: two meshes drawing on
+    one atlas region are one island here, not two competing ones.  Edge contact
+    shares no texels, so packed neighbours stay apart.
+
+    The result is shaped like ``cv2.connectedComponentsWithStats``' first three
+    returns, because that is what every reader downstream already understands:
+    a step names a label, and the stencil is the texels carrying it.
+    """
+    if masks.island_labels is None or masks.island_stats is None:
+        islands = domain_uv_islands(masks, padding_px)
+        merged = merge_overlapping_mask_crops(
+            tuple((crop.bounds[0], crop.bounds[1], crop.mask) for crop in islands),
+            ISLAND_SHARED_REGION_OVERLAP,
         )
-        masks.component_count = int(count)
-        masks.component_labels = labels
-        masks.component_stats = stats
-    return masks.component_count, masks.component_labels, masks.component_stats
+        labels = np.zeros(masks.mirror.shape[:2], dtype=np.int32)
+        stats = np.zeros((len(merged) + 1, 5), dtype=np.int32)
+        for index, (x, y, mask) in enumerate(merged, start=1):
+            height, width = mask.shape[:2]
+            window = labels[y : y + height, x : x + width]
+            # Merged islands share no occupied texels, so this only ever
+            # claims free ones; the test is here so a future grouping change
+            # cannot silently hand one texel to two labels.
+            claim = mask & (window == 0)
+            if not bool(claim.any()):
+                continue
+            window[claim] = index
+            rows, columns = np.nonzero(claim)
+            stats[index] = (
+                x + int(columns.min()),
+                y + int(rows.min()),
+                int(columns.max() - columns.min()) + 1,
+                int(rows.max() - rows.min()) + 1,
+                int(claim.sum()),
+            )
+        masks.island_labels = labels
+        masks.island_stats = stats
+        masks.island_label_count = len(merged) + 1
+    return masks.island_label_count, masks.island_labels, masks.island_stats
 
 
 def domain_skew_frames(
@@ -2962,6 +3043,69 @@ def _reflection_similarity(component: np.ndarray, reflected: np.ndarray) -> floa
     return float((component & reflected).sum()) / float(union)
 
 
+def _shifted_reflection_similarity(
+    component: np.ndarray,
+    axis: str,
+    max_shift: int,
+) -> tuple[float, int]:
+    """Best agreement between an island and its reflection, and the line used.
+
+    ``fliplr``/``flipud`` reflect about the centre of the component's own
+    bounding box, which is the island's mirror line only while the box is
+    centred on it.  Searching whole-texel shifts of that line recovers the
+    axis the island actually has.  A shift of ``s`` moves the line by ``s/2``,
+    so odd shifts reach the half-texel positions an even one cannot; the
+    component is padded first so nothing wraps around the far edge into the
+    comparison.
+    """
+    index = 1 if axis == "horizontal" else 0
+    limit = max(int(max_shift), 0)
+    if limit == 0:
+        reflected = np.flip(component, axis=index)
+        return _reflection_similarity(component, reflected), 0
+    padding = [(0, 0), (0, 0)]
+    padding[index] = (limit, limit)
+    padded = np.pad(component, padding)
+    reflected = np.flip(padded, axis=index)
+    best_score, best_shift = -1.0, 0
+    # Nearest line first, so an island that agrees with itself equally well
+    # about several of them keeps the one its own box already names.
+    for shift in sorted(range(-limit, limit + 1), key=lambda value: (abs(value), value)):
+        rolled = np.roll(reflected, shift, axis=index)
+        score = _reflection_similarity(padded, rolled)
+        if score > best_score:
+            best_score, best_shift = score, shift
+    return best_score, best_shift
+
+
+def _bounds_about_shifted_axis(
+    bounds: tuple[int, int, int, int],
+    axis: str,
+    shift: int,
+    shape: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    """Grow a box so a flat flip of it reflects about a shifted mirror line.
+
+    ``apply_masked_flip`` always reflects about the centre of the rectangle it
+    is given, so the line is moved by moving the rectangle's far edge out.  The
+    result must still lie inside the image: the flip clips its window to the
+    image first, and a clipped window has a different centre again.
+    """
+    if shift == 0:
+        return bounds
+    x, y, w, h = bounds
+    height, width = shape
+    if axis == "horizontal":
+        moved = (x, y, w + shift, h) if shift > 0 else (x + shift, y, w - shift, h)
+        if moved[0] < 0 or moved[0] + moved[2] > width:
+            return None
+    else:
+        moved = (x, y, w, h + shift) if shift > 0 else (x, y + shift, w, h - shift)
+        if moved[1] < 0 or moved[1] + moved[3] > height:
+            return None
+    return moved
+
+
 def plan_island_flips(
     mirror_mask: np.ndarray,
     regions: list[tuple[int, int, int, int]],
@@ -3032,19 +3176,38 @@ def plan_island_flips(
         # The surface has named the axis; the outline only says whether the
         # whole island may be turned over on it.  If not, the glyphs inside it
         # are handled individually rather than flipped on the wrong axis.
-        similarity = horizontal if axis == "horizontal" else vertical
-        if similarity < threshold:
+        #
+        # Which line on that axis is the island's own, not its bounding box's.
+        # The box names the line only while it is centred on it, and a spur on
+        # one side moves the box without moving the island: measured there the
+        # island understates how symmetric it is, and flipped there every texel
+        # lands a few columns off the partner it was meant to exchange with.
+        extent = w if axis == "horizontal" else h
+        similarity, shift = _shifted_reflection_similarity(
+            component,
+            axis,
+            int(round(extent * max(config.island_axis_search_ratio, 0.0))),
+        )
+        bounds = _bounds_about_shifted_axis(
+            (x, y, w, h), axis, shift, mirror_mask.shape[:2]
+        )
+        if similarity < threshold or bounds is None:
             continue
+        if axis == "horizontal":
+            horizontal = similarity
+        else:
+            vertical = similarity
 
         flips.append(
             IslandFlip(
                 label=label,
-                bounds=(x, y, w, h),
+                bounds=bounds,
                 area_px=area,
                 axis=axis,
                 horizontal_similarity=horizontal,
                 vertical_similarity=vertical,
                 glyph_count=glyphs,
+                axis_shift=shift,
             )
         )
         flipped_mask[y : y + h, x : x + w] |= component
@@ -7126,7 +7289,7 @@ def build_rhd_texture(
         f"Planning texture flips for {texture_name}",
         texture=texture_member,
     )
-    components = domain_mask_components(masks)
+    components = domain_island_labels(masks, config.detection_crop_padding_px)
     flips, flipped_islands = plan_island_flips(
         mirror_mask, mirrored_regions, config, masks.axis_map, components
     )
@@ -7715,6 +7878,7 @@ def build_rhd_texture(
                 "horizontal_similarity": round(flip.horizontal_similarity, 6),
                 "vertical_similarity": round(flip.vertical_similarity, 6),
                 "glyph_count": flip.glyph_count,
+                "axis_shift": flip.axis_shift,
             }
             for flip in flips
         ],
