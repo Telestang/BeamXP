@@ -3630,6 +3630,39 @@ def rotated_exchangeable_share(
     return float(exchangeable.sum()) / float(max(int(inside.sum()), 1))
 
 
+def outline_partner_share(
+    corners: tuple[tuple[float, float], ...],
+    rotated_axis: str,
+    shape: tuple[int, int],
+) -> float:
+    """Share of an outline whose reflected partner is on the atlas at all.
+
+    ``rotated_exchangeable_share`` asks whether a texel's partner is legal to
+    write.  This asks the prior question -- whether it exists.  An outline that
+    runs off the edge of the texture cannot be turned over whole however
+    permissive the stencil is: the texels whose partner would land past the
+    edge keep their original content, so the flip reaches part of the mark and
+    tears it along the line where the outline left the atlas.
+
+    Asked against an all-true stencil, so the answer is a property of the
+    outline and the atlas and of nothing else.  That is what makes it safe to
+    ask on the authoritative-mask path as well, whose stencil deliberately
+    admits every texel and whose share is otherwise never measured.
+    """
+    height, width = shape
+    grid = outline_local_grid(corners, rotated_axis, shape)
+    if grid is None:
+        return 0.0
+    _bounds, inside, partner_x, partner_y, _frame = grid
+    total = int(inside.sum())
+    if total == 0:
+        return 0.0
+    x = np.rint(partner_x).astype(np.int32)
+    y = np.rint(partner_y).astype(np.int32)
+    on_atlas = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    return float((inside & on_atlas).sum()) / float(total)
+
+
 def outline_frame(
     corners: tuple[tuple[float, float], ...],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -7115,6 +7148,7 @@ def build_rhd_texture(
     in_place_shares: list[float] = []
     imperfect: list[tuple[int, int, int, int, str, float]] = []
     skewed: list[tuple[int, int, int, int, str, float]] = []
+    derotated: list[tuple[int, int, int, int, str, float]] = []
     expanded = 0
     authoritative_expanded = 0
     skipped = 0
@@ -7147,6 +7181,24 @@ def build_rhd_texture(
             if rotation is not None
             else None
         )
+        # An outline is only a frame to mirror in while the whole of it is on
+        # the atlas.  Where it overhangs, the texels whose partner would sit
+        # past the edge are silently left alone and the mark is torn along
+        # that line -- so the outline is rejected, not the region: dropping it
+        # here falls through to the flat flip of the region box below, which
+        # is bounded by the box and always has its partner to hand.  Skipping
+        # the region instead would ship it unmirrored, which is worse than
+        # mirroring it about the image axis.
+        if rotation is not None and rotated_axis is not None:
+            partner_share = outline_partner_share(
+                rotation, rotated_axis, (height, width)
+            )
+            if partner_share < config.min_region_exchangeable:
+                derotated.append((x, y, w, h, axis, partner_share))
+                log(f"    ~ ({x},{y}) {w}x{h}: fitted outline leaves the "
+                    f"atlas, only {partner_share:.0%} of it has a partner; "
+                    f"flipping the region box on {axis} instead")
+                rotation, rotated_axis = None, None
         if config.enable_skewed_region_filter and not authoritative_mask_regions:
             if cached_skew_frames is None:
                 cached_skew_frames = domain_skew_frames(masks, (width, height))
@@ -7244,6 +7296,8 @@ def build_rhd_texture(
             f"; {authoritative_expanded} used opacity bounds"
             if authoritative_expanded else ""
         )
+        + (f"; {len(derotated)} outline(s) off-atlas, flipped flat"
+           if derotated else "")
         + (f"; {skipped} skipped" if skipped else "") + ")")
     timing = record_phase(
         phase_timings,
@@ -7695,6 +7749,11 @@ def build_rhd_texture(
                 in_place_stencils,
                 in_place_shares,
             )
+        ],
+        "derotated_regions": [
+            {"x": x, "y": y, "w": w, "h": h, "axis": axis,
+             "partner_share": round(share, 4)}
+            for x, y, w, h, axis, share in derotated
         ],
         "skewed_regions": [
             {"x": x, "y": y, "w": w, "h": h, "axis": axis,

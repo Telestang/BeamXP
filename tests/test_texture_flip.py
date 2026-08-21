@@ -949,3 +949,65 @@ class ScopedTextureFlipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutlinePartnerShareTests(unittest.TestCase):
+    """A fitted outline is only a frame to mirror in while it is on the atlas.
+
+    The lexlc500 shifter gate is the case these are drawn from: its outline
+    reached 22.5 texels past the right edge of a 512 atlas, so a ninth of it
+    had no partner to exchange with, the flip reached only part of the legend
+    and tore the R.  Nothing measured it -- the authoritative-mask path
+    asserted a share of 1.0 rather than taking one -- so it shipped.
+    """
+
+    # The outline the LC500 shifter gate was actually flipped about.
+    OVERHANGING = (
+        (459.8, 286.3), (425.5, 406.4), (499.2, 461.7), (533.5, 341.6),
+    )
+
+    def test_outline_inside_the_atlas_keeps_every_partner(self) -> None:
+        corners = ((40.0, 40.0), (40.0, 140.0), (110.0, 140.0), (110.0, 40.0))
+        self.assertAlmostEqual(
+            rhd.outline_partner_share(corners, "short", (256, 256)), 1.0
+        )
+
+    def test_overhanging_outline_loses_the_share_that_ran_off(self) -> None:
+        share = rhd.outline_partner_share(self.OVERHANGING, "short", (512, 512))
+        self.assertLess(share, rhd.RhdTextureConfig().min_region_exchangeable)
+        self.assertAlmostEqual(share, 0.890, places=2)
+
+    def test_the_same_outline_on_a_larger_atlas_is_whole(self) -> None:
+        # Nothing about the shape is wrong; it is the edge it meets.
+        self.assertAlmostEqual(
+            rhd.outline_partner_share(self.OVERHANGING, "short", (1024, 1024)),
+            1.0,
+        )
+
+    def test_a_flat_flip_of_the_region_box_is_always_exchangeable(self) -> None:
+        # Why dropping the outline is a fallback and not another failure.
+        stencil = np.ones((512, 512), dtype=bool)
+        self.assertAlmostEqual(
+            rhd.exchangeable_share(stencil, (449, 324, 61, 100), "horizontal"),
+            1.0,
+        )
+
+    def test_derotated_region_is_flipped_flat_rather_than_left_alone(self) -> None:
+        # The point of the fallback: the legend still ends up mirrored, in
+        # place, and whole.  Leaving it unflipped would ship it backwards.
+        image = np.zeros((512, 512, 3), np.uint8)
+        image[330:360, 455:470] = 255          # a mark inside the region box
+        stencil = np.ones((512, 512), dtype=bool)
+
+        flat = image.copy()
+        moved = rhd.apply_masked_flip(flat, stencil, (449, 324, 61, 100), "horizontal")
+        self.assertEqual(moved, 61 * 100)
+        self.assertFalse(np.array_equal(flat, image))
+        # bounded by the box: nothing outside it was touched
+        outside = np.ones(image.shape[:2], bool)
+        outside[324:424, 449:510] = False
+        self.assertTrue(np.array_equal(flat[outside], image[outside]))
+        # and it is a true mirror of the box, so no texel was left behind
+        box_before = image[324:424, 449:510]
+        box_after = flat[324:424, 449:510]
+        self.assertTrue(np.array_equal(box_after, box_before[:, ::-1]))
