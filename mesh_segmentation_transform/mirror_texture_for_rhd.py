@@ -385,6 +385,13 @@ class RhdTextureConfig:
     # compression still writes its PNG, deflated, because there it is the asset.
     write_preview_png: bool = True
     write_debug_overlays: bool = True
+    # Copy the source DDS's compressed blocks for every 4x4 group no flip
+    # touched, and encode only the rest.  A correction reaches 1.8% of an
+    # atlas's blocks across the built fleet, so this is most of the encode --
+    # which was 85% of a texture-correction pass -- and it spares the untouched
+    # remainder a second lossy generation.  Turn it off to encode every block
+    # from this module's own mip chain, as builds before it always did.
+    reuse_unchanged_dds_blocks: bool = True
 
 
 DEFAULT_RHD_CONFIG = RhdTextureConfig()
@@ -4173,6 +4180,13 @@ def mip_chain(rgba: np.ndarray) -> list[np.ndarray]:
 _DDS_SERIAL_CODECS = frozenset({"bc4", "bc5"})
 _DDS_MIN_BANDED_ROWS = 256
 _DDS_BANDS_PER_WORKER = 4
+# Below this many touched blocks the gather costs more than the threads save.
+_DDS_MIN_PARTIAL_BLOCKS = 4096
+# Above this share of the surface, reusing blocks stops paying for itself and
+# the whole level is cheaper -- and simpler -- to encode outright.
+_DDS_MAX_PARTIAL_SHARE = 0.5
+# Nor is a level of a handful of blocks worth gathering.
+_DDS_MIN_PARTIAL_LEVEL_BLOCKS = 64
 
 
 def _dds_encode_workers() -> int:
@@ -4217,6 +4231,159 @@ def _compress_level_blocks(
     return b"".join(executor.map(padded, bands))
 
 
+@dataclass(frozen=True, slots=True)
+class DdsSurfaceLayout:
+    """Where each mip level lives in a DDS file, and what encodes it."""
+
+    width: int
+    height: int
+    codec: str
+    block_bytes: int
+    data_offset: int
+    # (width, height, byte offset, byte length) per level, largest first
+    levels: tuple[tuple[int, int, int, int], ...]
+
+
+def dds_surface_layout(data: bytes) -> DdsSurfaceLayout | None:
+    """Read a DDS header and say where its blocks are, or None if it cannot.
+
+    Only the block formats this module writes are described.  Anything else --
+    an uncompressed surface, a cubemap, a volume, a file whose payload is not
+    the length its own header implies -- returns None, which every caller reads
+    as "encode this from scratch".
+    """
+    if len(data) < 128 or data[:4] != b"DDS ":
+        return None
+    _size, _flags, height, width, _pitch, _depth, mips = struct.unpack(
+        "<7I", data[4:32]
+    )
+    fourcc = data[84:88]
+    if fourcc == b"DX10":
+        if len(data) < 148:
+            return None
+        dxgi = int.from_bytes(data[128:132], "little")
+        codec = _DXGI_CODECS.get(dxgi)
+        offset = 148
+    else:
+        codec = _FOURCC_CODECS.get(fourcc)
+        offset = 128
+    if codec is None or width <= 0 or height <= 0:
+        return None
+    block_bytes = DDS_CODECS[codec].block_bytes
+    spans: list[tuple[int, int, int, int]] = []
+    cursor = offset
+    for index in range(max(int(mips), 1)):
+        level_width = max(width >> index, 1)
+        level_height = max(height >> index, 1)
+        length = (
+            ((level_width + 3) // 4) * ((level_height + 3) // 4) * block_bytes
+        )
+        spans.append((level_width, level_height, cursor, length))
+        cursor += length
+    # A header that does not account for the whole file is describing something
+    # this cannot slice safely -- an array, a cubemap, trailing data.
+    if cursor != len(data):
+        return None
+    return DdsSurfaceLayout(
+        width=width,
+        height=height,
+        codec=codec,
+        block_bytes=block_bytes,
+        data_offset=offset,
+        levels=tuple(spans),
+    )
+
+
+def _halve_any(mask: np.ndarray) -> np.ndarray:
+    """Halve a boolean mask, keeping a texel set if any of its four sources is.
+
+    Averaging would lose an isolated changed texel long before the chain ends:
+    one set texel in a 4096-square box filters to 1/16777216, which rounds to
+    nothing, and the block holding it would then be copied unchanged from the
+    source.  Max-pooling cannot drop one.
+    """
+    height, width = mask.shape
+    padded = mask
+    if height % 2 or width % 2:
+        padded = np.zeros((height + height % 2, width + width % 2), bool)
+        padded[:height, :width] = mask
+    return (
+        padded[0::2, 0::2] | padded[1::2, 0::2]
+        | padded[0::2, 1::2] | padded[1::2, 1::2]
+    )
+
+
+def changed_block_indices(
+    changed: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Indices of the 4x4 blocks a change touches, in DDS block order."""
+    blocks_wide, blocks_high = (width + 3) // 4, (height + 3) // 4
+    padded = np.zeros((blocks_high * 4, blocks_wide * 4), bool)
+    padded[:height, :width] = changed[:height, :width]
+    touched = padded.reshape(blocks_high, 4, blocks_wide, 4).any(axis=(1, 3))
+    return np.flatnonzero(touched.ravel())
+
+
+def _gather_blocks(level: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """Lay the named 4x4 blocks out as one block-row surface, in index order.
+
+    A block-compressed surface is a row-major sequence of independent 4x4
+    blocks, so a 4-row strip of them encodes to exactly the blocks that would
+    have been produced in place.
+
+    Only the named blocks are read.  Reshaping the whole level into blocks and
+    then selecting from it would copy the entire surface to gather the 2% of it
+    a correction reached, which cost more than encoding a BC4 level outright.
+    """
+    height, width = level.shape[:2]
+    blocks_wide = (width + 3) // 4
+    rows = (indices // blocks_wide) * 4
+    columns = (indices % blocks_wide) * 4
+    step = np.arange(4)
+    # Clamped rather than zero-filled: a level whose size is not a multiple of
+    # four has no texels past its edge, and repeating the last row is what the
+    # encoder sees when it is handed the partial surface itself.
+    row_index = np.minimum(rows[:, None] + step, height - 1)
+    column_index = np.minimum(columns[:, None] + step, width - 1)
+    tiles = level[row_index[:, :, None], column_index[:, None, :]]
+    return tiles.transpose(1, 0, 2, 3).reshape(4, indices.size * 4, -1)
+
+
+def _reencode_changed_blocks(
+    level: np.ndarray,
+    source_blocks: bytes,
+    indices: np.ndarray,
+    encode: Callable[[np.ndarray], bytes],
+    block_bytes: int,
+    executor: ThreadPoolExecutor | None,
+    workers: int,
+) -> bytes:
+    """One mip level: the source's blocks, with the touched ones re-encoded."""
+    blocks = np.frombuffer(source_blocks, np.uint8).reshape(-1, block_bytes).copy()
+    if indices.size:
+        if executor is None or workers < 2 or indices.size < _DDS_MIN_PARTIAL_BLOCKS:
+            encoded = encode(_gather_blocks(level, indices))
+        else:
+            chunks = [
+                chunk
+                for chunk in np.array_split(indices, workers * _DDS_BANDS_PER_WORKER)
+                if chunk.size
+            ]
+            encoded = b"".join(
+                executor.map(lambda c: encode(_gather_blocks(level, c)), chunks)
+            )
+        expected = int(indices.size) * block_bytes
+        if len(encoded) != expected:
+            raise ValueError(
+                f"encoder returned {len(encoded)} bytes for {indices.size} "
+                f"block(s); expected {expected}"
+            )
+        blocks[indices] = np.frombuffer(encoded, np.uint8).reshape(-1, block_bytes)
+    return blocks.tobytes()
+
+
 def resolve_bc7_profile(profile: str, has_alpha: bool) -> str:
     """Name the ispc profile for one image, from a tier and its alpha.
 
@@ -4234,11 +4401,50 @@ def resolve_bc7_profile(profile: str, has_alpha: bool) -> str:
     return f"alpha_{tier}" if has_alpha else tier
 
 
+def _reusable_source_layout(
+    source: Path | None,
+    changed: np.ndarray | None,
+    format: DdsCodec,
+    rgba: np.ndarray,
+    level_count: int,
+) -> tuple[bytes, DdsSurfaceLayout] | None:
+    """The source's bytes and layout, when its blocks can be reused verbatim.
+
+    Every property that would make a copied block mean something different in
+    the new file has to match: the codec (a BC7 block is not a BC5 one, and
+    UNORM is not UNORM_SRGB), the dimensions, and the number of mip levels.
+    Anything else -- a PNG source, a DDS with no mip chain, a format with no
+    encoder here -- falls back to encoding the whole surface.
+    """
+    if source is None or changed is None:
+        return None
+    height, width = rgba.shape[:2]
+    if changed.shape[:2] != (height, width):
+        return None
+    try:
+        data = source.read_bytes()
+    except OSError:
+        return None
+    layout = dds_surface_layout(data)
+    if layout is None:
+        return None
+    if (
+        layout.codec != format.name
+        or layout.width != width
+        or layout.height != height
+        or len(layout.levels) != level_count
+    ):
+        return None
+    return data, layout
+
+
 def write_dds(
     path: Path,
     rgba: np.ndarray,
     codec: str = "bc7",
     profile: str = "alpha_basic",
+    source: Path | None = None,
+    changed: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Write a block-compressed DDS with a full mip chain.
 
@@ -4252,6 +4458,22 @@ def write_dds(
 
     Large levels are encoded in parallel row bands; the output is byte-for-byte
     what the serial encoder produced.
+
+    ``source`` and ``changed`` together turn this into a partial re-encode: the
+    DDS the image was decoded from, and which of its texels the correction
+    actually wrote.  A flip touches very little of an atlas -- 1.8% of the
+    blocks across the built fleet -- so the rest can be copied out of the
+    source as compressed blocks rather than decoded, corrected by nothing, and
+    encoded again.  That is both the bulk of the time (the encode was 85% of a
+    texture-correction pass) and a second lossy generation the untouched 98%
+    never needed: a full re-encode returns only 11.5% of an etk800 interior
+    atlas's blocks unchanged, so the other 88.5% shifted for nothing.
+
+    Copied blocks keep the mips the texture shipped with, which are the
+    author's own; only blocks a correction touches get this module's box
+    filter.  Where the two meet inside a mip level there is a filter seam, far
+    below the one the correction itself makes, and every level today is box
+    filtered anyway.  Passing no ``source`` restores exactly that.
     """
     import ispc_texcomp
 
@@ -4282,17 +4504,73 @@ def write_dds(
 
     levels = mip_chain(rgba)
     workers = _dds_encode_workers()
+    reuse = _reusable_source_layout(source, changed, format, rgba, len(levels))
     banded = (
         format.name not in _DDS_SERIAL_CODECS
         and workers > 1
         and any(level.shape[0] >= _DDS_MIN_BANDED_ROWS for level in levels)
     )
-    executor = ThreadPoolExecutor(max_workers=workers) if banded else None
+    executor = (
+        ThreadPoolExecutor(max_workers=workers)
+        if banded or reuse is not None
+        else None
+    )
+    reused_blocks = encoded_blocks = 0
     try:
-        blocks = [
-            _compress_level_blocks(level, encode, format.block_bytes, executor, workers)
-            for level in levels
-        ]
+        if reuse is None:
+            blocks = [
+                _compress_level_blocks(
+                    level, encode, format.block_bytes, executor, workers
+                )
+                for level in levels
+            ]
+        else:
+            source_bytes, layout = reuse
+            blocks = []
+            level_changed = np.ascontiguousarray(changed, dtype=bool)
+            for index, (level, (_w, _h, offset, length)) in enumerate(
+                zip(levels, layout.levels)
+            ):
+                if index:
+                    level_changed = _halve_any(level_changed)
+                height, width = level.shape[:2]
+                indices = changed_block_indices(level_changed, width, height)
+                total = ((width + 3) // 4) * ((height + 3) // 4)
+                if not indices.size:
+                    # Nothing reached this level, whatever its size: hand back
+                    # the bytes the texture shipped with.  A correction that
+                    # moved no texel therefore rewrites the file exactly.
+                    blocks.append(source_bytes[offset : offset + length])
+                    reused_blocks += total
+                    continue
+                # A level narrower or shorter than one block has no whole block
+                # to gather, and the tail of the chain is far too cheap to be
+                # worth a special case: encode those outright.
+                if (
+                    min(width, height) < 4
+                    or total < _DDS_MIN_PARTIAL_LEVEL_BLOCKS
+                    or indices.size > total * _DDS_MAX_PARTIAL_SHARE
+                ):
+                    blocks.append(
+                        _compress_level_blocks(
+                            level, encode, format.block_bytes, executor, workers
+                        )
+                    )
+                    encoded_blocks += total
+                    continue
+                blocks.append(
+                    _reencode_changed_blocks(
+                        level,
+                        source_bytes[offset : offset + length],
+                        indices,
+                        encode,
+                        format.block_bytes,
+                        executor,
+                        workers,
+                    )
+                )
+                encoded_blocks += int(indices.size)
+                reused_blocks += total - int(indices.size)
     finally:
         if executor is not None:
             executor.shutdown()
@@ -4332,11 +4610,15 @@ def write_dds(
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(header + b"".join(blocks))
-    return {
+    info: dict[str, object] = {
         "levels": len(levels),
         "bytes": path.stat().st_size,
         "codec": format.name,
     }
+    if reuse is not None:
+        info["reusedBlocks"] = reused_blocks
+        info["encodedBlocks"] = encoded_blocks
+    return info
 
 
 def write_debug_overlay(
@@ -6873,6 +7155,13 @@ def build_rhd_texture(
         f"Applying texture flips for {texture_name}",
         texture=texture_member,
     )
+    # Kept only until the plan has been applied, then reduced to one bit per
+    # texel: the encoder needs to know which blocks a flip actually reached so
+    # it can copy the rest out of the source DDS.  Diffing is exact where
+    # reasoning from the step bounds would not be -- a rotated flip writes
+    # through a stencil, blending widens what it touches, and a step can write
+    # a texel back to the value it already had.
+    before = rgba.copy()
     apply_flip_plan(
         rgba,
         steps,
@@ -6892,12 +7181,15 @@ def build_rhd_texture(
         correct_normal_background=config.correct_flipped_normal_background,
         reflect_normal_vectors=config.reflect_flipped_normal_vectors,
     )
+    changed_texels = np.any(rgba != before, axis=2) if rgba.ndim == 3 else rgba != before
+    del before
     timing = record_phase(
         phase_timings,
         "apply_texture_flips",
         phase_started,
         texture=texture_member,
         steps=len(steps),
+        changed_texels=int(changed_texels.sum()),
     )
     emit_progress(
         progress,
@@ -6961,10 +7253,22 @@ def build_rhd_texture(
         ships_as_dds = beamng_compressed_texture_size_supported(width, height)
         if ships_as_dds:
             info = write_dds(
-                dds_path, rgba, source_dds_codec(texture_path), config.bc7_profile
+                dds_path,
+                rgba,
+                source_dds_codec(texture_path),
+                config.bc7_profile,
+                source=texture_path if config.reuse_unchanged_dds_blocks else None,
+                changed=changed_texels,
             )
+            reused = int(info.get("reusedBlocks") or 0)
             log(f"  wrote {dds_path.name}  {str(info['codec']).upper()} "
-                f"{info['levels']} mips  {info['bytes']:,} bytes")
+                f"{info['levels']} mips  {info['bytes']:,} bytes"
+                + (
+                    f"  ({reused:,} of {reused + int(info['encodedBlocks']):,} "
+                    "blocks reused)"
+                    if reused
+                    else ""
+                ))
             if config.write_preview_png:
                 Image.fromarray(rgba).save(png_path, compress_level=0)
                 log(f"  wrote {png_path.name}")

@@ -143,5 +143,175 @@ class DdsEncodingTests(unittest.TestCase):
         self.assertGreater(len(calls), 1)
 
 
+class PartialReencodeTests(unittest.TestCase):
+    """Reusing a source DDS's blocks must be indistinguishable from encoding it.
+
+    The stand-in encoder makes every block a function of its own 4x4 texels, so
+    a block gathered out of the middle of a surface has to come back with the
+    bytes it would have had in place -- which is exactly the property the real
+    partial path relies on.
+    """
+
+    def _write(self, codec, image, *, workers=1, source=None, changed=None):
+        fake = _FakeIspc()
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "out.dds"
+            with (
+                patch.dict(sys.modules, {"ispc_texcomp": fake}),
+                patch.object(mt, "_dds_encode_workers", return_value=workers),
+            ):
+                info = mt.write_dds(path, image, codec, source=source, changed=changed)
+            return path.read_bytes(), info, fake.calls
+
+    def _source(self, directory, codec, image):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"source_{codec}.dds"
+        fake = _FakeIspc()
+        with (
+            patch.dict(sys.modules, {"ispc_texcomp": fake}),
+            patch.object(mt, "_dds_encode_workers", return_value=1),
+        ):
+            mt.write_dds(path, image, codec)
+        return path
+
+    def test_partial_matches_a_full_encode_byte_for_byte(self):
+        original = _image(256, 256)
+        for codec in ("bc7", "bc7_srgb", "bc4", "bc5"):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as raw:
+                source = self._source(Path(raw), codec, original)
+                corrected = original.copy()
+                corrected[64:96, 32:80] = corrected[64:96, 32:80][:, ::-1]
+                changed = np.any(corrected != original, axis=2)
+                full, _info, _calls = self._write(codec, corrected)
+                partial, info, _calls = self._write(
+                    codec, corrected, source=source, changed=changed
+                )
+                self.assertEqual(partial, full)
+                self.assertGreater(info["reusedBlocks"], 0)
+
+    def test_untouched_blocks_come_from_the_source_unaltered(self):
+        """The point of the exercise: no second encode where nothing changed."""
+        original = _image(256, 256)
+        with tempfile.TemporaryDirectory() as raw:
+            source = self._source(Path(raw), "bc7", original)
+            corrected = original.copy()
+            corrected[8:24, 8:24] = 0
+            changed = np.any(corrected != original, axis=2)
+            partial, _info, _calls = self._write(
+                "bc7", corrected, source=source, changed=changed
+            )
+            layout = mt.dds_surface_layout(source.read_bytes())
+            width, height, offset, length = layout.levels[0]
+            kept = np.ones(((width + 3) // 4) * ((height + 3) // 4), bool)
+            kept[mt.changed_block_indices(changed, width, height)] = False
+            block = layout.block_bytes
+            source_blocks = np.frombuffer(
+                source.read_bytes()[offset : offset + length], np.uint8
+            ).reshape(-1, block)
+            written = np.frombuffer(
+                partial[offset : offset + length], np.uint8
+            ).reshape(-1, block)
+            self.assertTrue((source_blocks[kept] == written[kept]).all())
+            self.assertFalse(kept.all(), "the change touched no block")
+
+    def test_an_unchanged_image_reencodes_nothing(self):
+        original = _image(256, 256)
+        with tempfile.TemporaryDirectory() as raw:
+            source = self._source(Path(raw), "bc7", original)
+            changed = np.zeros(original.shape[:2], bool)
+            partial, info, calls = self._write(
+                "bc7", original, source=source, changed=changed
+            )
+            self.assertEqual(partial, source.read_bytes())
+            self.assertEqual(info["encodedBlocks"], 0)
+            self.assertEqual(calls, [], "the encoder ran with nothing to encode")
+
+    def test_threaded_partial_matches_serial_partial(self):
+        original = _image(512, 512)
+        with tempfile.TemporaryDirectory() as raw:
+            source = self._source(Path(raw), "bc7", original)
+            corrected = original.copy()
+            corrected[16:400, 16:400] = corrected[16:400, 16:400][:, ::-1]
+            changed = np.any(corrected != original, axis=2)
+            serial, _i, _c = self._write(
+                "bc7", corrected, workers=1, source=source, changed=changed
+            )
+            threaded, _i, _c = self._write(
+                "bc7", corrected, workers=8, source=source, changed=changed
+            )
+            self.assertEqual(threaded, serial)
+
+    def test_a_mismatched_source_falls_back_to_a_full_encode(self):
+        """Anything that would make a copied block mean something else."""
+        original = _image(256, 256)
+        changed = np.zeros(original.shape[:2], bool)
+        changed[10, 10] = True
+        full, _info, _calls = self._write("bc7", original)
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            wrong_codec = self._source(directory, "bc5", original)
+            wrong_size = self._source(directory / "other", "bc7", _image(128, 128))
+            for label, source in (
+                ("different codec", wrong_codec),
+                ("different size", wrong_size),
+                ("no such file", directory / "absent.dds"),
+            ):
+                with self.subTest(case=label):
+                    written, info, _calls = self._write(
+                        "bc7", original, source=source, changed=changed
+                    )
+                    self.assertEqual(written, full)
+                    self.assertNotIn("reusedBlocks", info)
+            written, info, _calls = self._write(
+                "bc7", original, source=wrong_codec, changed=None
+            )
+            self.assertEqual(written, full)
+            self.assertNotIn("reusedBlocks", info)
+
+    def test_halving_a_mask_keeps_an_isolated_texel(self):
+        """Averaging would lose it long before the chain ends, and copy a stale
+        block over the one place the correction landed."""
+        mask = np.zeros((64, 64), bool)
+        mask[37, 21] = True
+        level = mask
+        for _ in range(6):
+            level = mt._halve_any(level)
+            self.assertTrue(level.any(), "the changed texel was filtered away")
+        self.assertEqual(level.shape, (1, 1))
+
+    def test_odd_sized_masks_halve_without_losing_the_edge(self):
+        mask = np.zeros((7, 5), bool)
+        mask[6, 4] = True
+        halved = mt._halve_any(mask)
+        self.assertEqual(halved.shape, (4, 3))
+        self.assertTrue(halved[3, 2])
+
+
+class DdsSurfaceLayoutTests(unittest.TestCase):
+    def test_layout_round_trips_every_codec(self):
+        image = _image(64, 64)
+        for codec, fmt in mt.DDS_CODECS.items():
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as raw:
+                path = Path(raw) / "s.dds"
+                fake = _FakeIspc()
+                with (
+                    patch.dict(sys.modules, {"ispc_texcomp": fake}),
+                    patch.object(mt, "_dds_encode_workers", return_value=1),
+                ):
+                    mt.write_dds(path, image, codec)
+                data = path.read_bytes()
+                layout = mt.dds_surface_layout(data)
+                self.assertIsNotNone(layout, f"{codec} layout unreadable")
+                self.assertEqual(layout.codec, fmt.name)
+                self.assertEqual((layout.width, layout.height), (64, 64))
+                self.assertEqual(layout.levels[-1][:2], (1, 1))
+                last = layout.levels[-1]
+                self.assertEqual(last[2] + last[3], len(data))
+
+    def test_a_truncated_or_foreign_file_is_refused(self):
+        self.assertIsNone(mt.dds_surface_layout(b"not a dds at all"))
+        self.assertIsNone(mt.dds_surface_layout(b"DDS " + bytes(200)))
+
+
 if __name__ == "__main__":
     unittest.main()
