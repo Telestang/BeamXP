@@ -2443,6 +2443,44 @@ def _retarget_runtime_screen_nodes(
     return sorted(node_id for node_id in retargeted_nodes if node_id)
 
 
+def _rigid_only_generated_materials(output_vehicle_dir: Path) -> set[str]:
+    """Materials the conversion carries only on pieces it never reflected.
+
+    ``_rigid_only_material_aliases`` over every generated piece in the folder,
+    rather than one split: a material is only safe to treat as unreflected when
+    no piece anywhere mirrored it, and the LC500 binds its cluster on both the
+    base interior and the facelift.
+    """
+    pieces: dict[str, set[str]] = {}
+    for dae_path in sorted(output_vehicle_dir.rglob("*.dae")):
+        try:
+            root = ET.parse(dae_path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        geometry_materials: dict[str, set[str]] = {}
+        for geometry in root.findall(".//c:geometry", NS):
+            geometry_id = geometry.get("id")
+            if not geometry_id:
+                continue
+            geometry_materials[geometry_id] = {
+                _normalise_material_alias(symbol)
+                for primitive in geometry.iter()
+                if (symbol := primitive.get("material"))
+            }
+        for node in root.findall(".//c:node", NS):
+            node_id = node.get("id") or ""
+            if "__beamxp_" not in node_id:
+                continue
+            symbols: set[str] = set()
+            for instance in node.findall(".//c:instance_geometry", NS):
+                symbols |= geometry_materials.get(
+                    (instance.get("url") or "").lstrip("#"), set()
+                )
+            if symbols:
+                pieces[f"{dae_path}:{node_id}"] = symbols
+    return _rigid_only_material_aliases(pieces)
+
+
 def _rigid_only_material_aliases(
     piece_materials: dict[str, set[str]],
 ) -> set[str]:
@@ -4357,6 +4395,16 @@ def isolate_converted_runtime_screens(
         for alias in display_scope.get(source_mesh, ())
         if _runtime_alias(alias)
     }
+    # A UV flip is not the only way a screen can end up already the right way
+    # round.  A perimeter-symmetric piece is moved across by a rotation, never
+    # a reflection, so its screen never reversed and a reflected page would be
+    # the only reversal it ever got.  The LC500's cluster is exactly that on
+    # both interiors, which is why it read backwards on every trim.
+    rigid_only_materials = {
+        _runtime_alias(alias)
+        for alias in _rigid_only_generated_materials(output_vehicle_dir)
+        if _runtime_alias(alias)
+    }
     controller_specs, controller_materials, controller_lua, controller_pages = (
         _controller_owned_screen_specs(
             context,
@@ -4364,6 +4412,7 @@ def isolate_converted_runtime_screens(
             suffix,
             reflect_pages=reflected_geometry,
             uv_owned_materials=uv_owned_materials,
+            rigid_only_materials=rigid_only_materials,
         )
     )
     material_definitions.update(controller_materials)
@@ -4440,6 +4489,7 @@ def _controller_owned_screen_specs(
     suffix: str,
     reflect_pages: bool = False,
     uv_owned_materials: Iterable[str] = (),
+    rigid_only_materials: Iterable[str] = (),
 ) -> tuple[list[dict[str, object]], dict[str, object], dict[str, str], dict[str, str]]:
     """Plan the isolation of runtime tags a mod's own controller hard-codes.
 
@@ -4464,6 +4514,9 @@ def _controller_owned_screen_specs(
     page_files: dict[str, str] = {}
     geometry_owned = {
         _runtime_alias(alias) for alias in uv_owned_materials if _runtime_alias(alias)
+    }
+    never_reflected = {
+        _runtime_alias(alias) for alias in rigid_only_materials if _runtime_alias(alias)
     }
     for source_alias, source_controller in sorted(owners.items()):
         entry = lua_sources.get(source_controller)
@@ -4506,7 +4559,11 @@ def _controller_owned_screen_specs(
             for alias in (source_alias, *renames, *glow_entries)
             if _runtime_alias(alias)
         }
-        if reflect_pages and controller_materials.isdisjoint(geometry_owned):
+        if (
+            reflect_pages
+            and controller_materials.isdisjoint(geometry_owned)
+            and controller_materials.isdisjoint(never_reflected)
+        ):
             # The glow trigger keys are the symbols the DAE binds, which is what
             # tells us how much of the page this screen actually shows.
             origin = _sampled_u_centre(context, set(glow_entries))
