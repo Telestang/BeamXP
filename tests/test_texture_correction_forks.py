@@ -34,6 +34,19 @@ from beamxp import hand_drive_core as _core  # noqa: F401
 from beamxp.hand_drive_parts import build_pipeline
 
 
+def _placeholder_dds(path: Path) -> Path:
+    """Write a corrected-texture stand-in whose bytes are its own name.
+
+    Distinct content matters here: staging folds byte-identical maps of one
+    stage into a single file, so placeholders that were all ``b"dds"`` could
+    no longer show which source a stage ended up wired to -- two opacity masks
+    became indistinguishable, and the assertion that each stage keeps its own
+    map could pass or fail on nothing.
+    """
+    path.write_bytes(b"dds:" + path.name.encode())
+    return path
+
+
 class ForkedSwitchBaseTests(unittest.TestCase):
     """A glowMap base corrected per mesh needs an entry per mesh."""
 
@@ -80,7 +93,7 @@ class ForkedSwitchBaseTests(unittest.TestCase):
         job = tmp / "job"
         job.mkdir(exist_ok=True)
         for entry in entries:
-            (job / entry["maps"]["baseColorMap"]).write_bytes(b"dds")
+            _placeholder_dds(job / entry["maps"]["baseColorMap"])
         (job / "rhd_materials.json").write_text(
             json.dumps({"materials": entries}) + "\n", encoding="utf-8"
         )
@@ -201,7 +214,7 @@ class ForkedSwitchBaseTests(unittest.TestCase):
             for base in ("auto_P", "auto_R", "auto_N", "auto_D"):
                 for state in ("interior_text", "interior_text_on"):
                     texture = f"{base.lower()}_{state}.dds"
-                    (job / texture).write_bytes(b"dds")
+                    _placeholder_dds(job / texture)
                     entries.append(
                         {
                             "aliases": [base, state],
@@ -386,7 +399,7 @@ class ForkedSkinTests(unittest.TestCase):
                 self._entry("scintilla_interior.skin_interior.luxe", "c_rhd.dds", None),
             ]
             for entry in entries:
-                (job / entry["maps"]["baseColorMap"]).write_bytes(b"dds")
+                _placeholder_dds(job / entry["maps"]["baseColorMap"])
             (job / "rhd_materials.json").write_text(
                 json.dumps({"materials": entries}) + "\n", encoding="utf-8"
             )
@@ -419,7 +432,7 @@ class ForkedSkinTests(unittest.TestCase):
             entries = [
                 self._entry("scintilla_interior.skin_interior.luxe", "c_rhd.dds", None)
             ]
-            (job / "c_rhd.dds").write_bytes(b"dds")
+            _placeholder_dds(job / "c_rhd.dds")
             (job / "rhd_materials.json").write_text(
                 json.dumps({"materials": entries}) + "\n", encoding="utf-8"
             )

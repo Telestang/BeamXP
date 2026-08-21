@@ -154,6 +154,19 @@ def minimal_context(tmp: Path) -> VehicleContext:
     )
 
 
+def _placeholder_dds(path: Path) -> Path:
+    """Write a corrected-texture stand-in whose bytes are its own name.
+
+    Distinct content matters here: staging folds byte-identical maps of one
+    stage into a single file, so placeholders that were all ``b"dds"`` could
+    no longer show which source a stage ended up wired to -- two opacity masks
+    became indistinguishable, and the assertion that each stage keeps its own
+    map could pass or fail on nothing.
+    """
+    path.write_bytes(b"dds:" + path.name.encode())
+    return path
+
+
 class TextureCorrectionIntegrationTests(unittest.TestCase):
     def test_texture_asset_search_excludes_its_installed_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1852,7 +1865,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             vehicle_dir = tmp / "vehicles/car"
             vehicle_dir.mkdir(parents=True)
             for name in ("base.dds", "on.dds", "unused.dds"):
-                (vehicle_dir / name).write_bytes(b"dds")
+                _placeholder_dds(vehicle_dir / name)
             (vehicle_dir / "car.dae").write_text(
                 """<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
   <library_materials>
@@ -2248,7 +2261,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 "dash_leather_o.data_rhd.dds",
                 "dash_carpet_o.data_rhd.dds",
             ):
-                (job / name).write_bytes(b"dds")
+                _placeholder_dds(job / name)
             (job / "rhd_materials.json").write_text(
                 json.dumps(
                     {
@@ -2336,7 +2349,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 "ardente_interior_b.color_rhd.dds",
                 "ardente_interior_g.color_rhd.dds",
             ):
-                (job / name).write_bytes(b"dds")
+                _placeholder_dds(job / name)
             (job / "rhd_materials.json").write_text(
                 json.dumps(
                     {
@@ -2486,7 +2499,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             job = tmp / "job"
             target = tmp / "vehicles/lc500"
             job.mkdir()
-            (job / "LEX_LC5_rhd.dds").write_bytes(b"dds")
+            _placeholder_dds(job / "LEX_LC5_rhd.dds")
             (job / "rhd_materials.json").write_text(
                 json.dumps(
                     {
@@ -2558,7 +2571,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             job = tmp / "job"
             target = tmp / "vehicles/lc500"
             job.mkdir()
-            (job / "lc500_bootscreen_rhd.dds").write_bytes(b"dds")
+            _placeholder_dds(job / "lc500_bootscreen_rhd.dds")
             (job / "rhd_materials.json").write_text(
                 json.dumps(
                     {
@@ -2618,7 +2631,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 job = tmp / name
                 job.mkdir()
                 texture = f"{name}_b.color_rhd.dds"
-                (job / texture).write_bytes(b"dds")
+                _placeholder_dds(job / texture)
                 (job / "rhd_materials.json").write_text(
                     json.dumps(
                         {
@@ -2864,7 +2877,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             "interior_luxe_b.color_rhd.dds",
             "interior_race_b.color_rhd.dds",
         ):
-            (job / name).write_bytes(b"dds")
+            _placeholder_dds(job / name)
 
         def entry(key: str, source: str, output: str) -> dict:
             return {
@@ -2988,7 +3001,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             vehicle_dir = tmp / "vehicles/scintilla"
             vehicle_dir.mkdir(parents=True)
             for name in ("base.dds", "luxe.dds", "other.dds", "other_luxe.dds"):
-                (vehicle_dir / name).write_bytes(b"dds")
+                _placeholder_dds(vehicle_dir / name)
             (vehicle_dir / "car.dae").write_text(
                 '<x><instance_material symbol="interior_beamxp_tc" target="#a"/></x>',
                 encoding="utf-8",
@@ -3200,7 +3213,7 @@ class PartScopedCorrectedMaterialTests(unittest.TestCase):
             job.mkdir()
             target = tmp / "vehicles/lc500"
             for entry in entries:
-                (job / entry["maps"]["baseColorMap"]).write_bytes(b"dds")
+                _placeholder_dds(job / entry["maps"]["baseColorMap"])
             (job / "rhd_materials.json").write_text(
                 json.dumps({"materials": entries}) + "\n", encoding="utf-8"
             )
@@ -3268,6 +3281,101 @@ class PartScopedCorrectedMaterialTests(unittest.TestCase):
                 "lc500_screens": "lc500_screens_beamxp_tc",
             },
         )
+
+
+class SharedCorrectedTextureTests(unittest.TestCase):
+    """Staging folds repeats of one image, but only within the stage reading it."""
+
+    def _stage(self, entry, files):
+        tmp = Path(self._tmp)
+        job = tmp / "job"
+        job.mkdir(exist_ok=True)
+        target = tmp / "vehicles/car"
+        for name, payload in files.items():
+            (job / name).write_bytes(payload)
+        return build_pipeline._entry_corrected_texture_outputs(
+            job, target, tmp, "mat", entry, self._shared
+        )
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self._tmp = self._dir.name
+        self._shared = {}
+        self.addCleanup(self._dir.cleanup)
+
+    def test_one_stage_folds_two_identical_sources_into_one_file(self):
+        """etk800 ships its base and white normals as the same bytes."""
+        _by_source, by_stage = self._stage(
+            {
+                "maps": {
+                    "normalMap": "base_nm.normal_rhd.dds",
+                    "detailNormalMap": "white_nm.normal_rhd.dds",
+                }
+            },
+            {
+                "base_nm.normal_rhd.dds": b"identical normal",
+                "white_nm.normal_rhd.dds": b"identical normal",
+            },
+        )
+        # Different stages, so both are staged even though the bytes match.
+        self.assertNotEqual(by_stage["normalMap"], by_stage["detailNormalMap"])
+
+        _by_source, second = self._stage(
+            {"maps": {"normalMap": "other_nm.normal_rhd.dds"}},
+            {"other_nm.normal_rhd.dds": b"identical normal"},
+        )
+        self.assertEqual(
+            second["normalMap"],
+            by_stage["normalMap"],
+            "a second material's identical normal was staged again",
+        )
+        staged = sorted(p.name for p in (Path(self._tmp) / "vehicles/car").iterdir())
+        self.assertEqual(len(staged), 2, staged)
+
+    def test_two_stages_never_share_a_file_however_alike(self):
+        """BeamNG spells roughness and opacity alike; the stage tells them apart."""
+        _by_source, by_stage = self._stage(
+            {
+                "maps": {
+                    "roughnessMap": "dash_r.data_rhd.dds",
+                    "opacityMap": "dash_leather_o.data_rhd.dds",
+                }
+            },
+            {
+                "dash_r.data_rhd.dds": b"same bytes",
+                "dash_leather_o.data_rhd.dds": b"same bytes",
+            },
+        )
+        self.assertIn("dash_r.data_rhd.dds", by_stage["roughnessMap"])
+        self.assertIn("dash_leather_o.data_rhd.dds", by_stage["opacityMap"])
+
+    def test_maps_that_differ_are_each_staged(self):
+        _by_source, by_stage = self._stage(
+            {
+                "maps": {
+                    "baseColorMap": "a_b.color_rhd.dds",
+                    "normalMap": "a_nm.normal_rhd.dds",
+                }
+            },
+            {
+                "a_b.color_rhd.dds": b"colour",
+                "a_nm.normal_rhd.dds": b"normal",
+            },
+        )
+        self.assertNotEqual(by_stage["baseColorMap"], by_stage["normalMap"])
+        staged = sorted(p.name for p in (Path(self._tmp) / "vehicles/car").iterdir())
+        self.assertEqual(len(staged), 2, staged)
+
+    def test_one_output_file_named_twice_is_still_staged_once(self):
+        """The original saving: several materials naming one corrected file."""
+        _by_source, first = self._stage(
+            {"maps": {"baseColorMap": "shared_b.color_rhd.dds"}},
+            {"shared_b.color_rhd.dds": b"colour"},
+        )
+        _by_source, second = self._stage(
+            {"maps": {"baseColorMap": "shared_b.color_rhd.dds"}}, {}
+        )
+        self.assertEqual(first["baseColorMap"], second["baseColorMap"])
 
 
 if __name__ == "__main__":

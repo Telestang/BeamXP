@@ -1319,21 +1319,52 @@ def _shared_corrected_texture(
     output_root: Path,
     material_name: str,
     shared: dict[tuple[str, str], str],
+    stage_key: str = "",
 ) -> str:
-    """Copy one corrected texture in, reusing the copy already made of it.
+    """Copy one corrected texture in, reusing any copy already staged of it.
 
     A corrected image was copied once per material that named it, and several
     materials routinely name one image: a switch base's off and on states are
     the same corrected file, and every skin of a trim carries its base's normal
     and roughness unchanged. Andronisk's V60 shipped 504.7 MB of corrected DDS
     holding 219.3 MB of distinct images -- one fabric atlas copied five times,
-    once per skin, and its normal five times beside it.
+    once per skin, and its normal five times beside it. Keying on the
+    exporter's own output file collapses exactly those.
 
-    Keyed on the exporter's own output file, so what collapses is exactly the
-    copies of one corrected image. Keying on content instead would also fold
-    together maps that merely happen to match, leaving a normal map reading a
-    file named for a colour one.
+    Two corrected images can also be identical without sharing an output file,
+    because their *sources* were: etk800 ships ``etk800_interior_nm.normal``
+    and ``etk800_interior_white_nm.normal``, the same bytes in the stock
+    archive, since those skins differ only in colour. Over the eleven built
+    vehicles 553 MB of 4.93 GB is a byte-for-byte repeat of something already
+    staged, 316 MB of it on scintilla.
+
+    Content alone is the wrong key for those -- it would leave a normal map
+    reading a file named for a colour one -- so the content key is scoped to
+    the stage that will read it. Stage, not the file-name suffix: BeamNG spells
+    roughness, metallic, AO and opacity alike as ``.data``, and keying on that
+    let scintilla's ``dash_leather_o.data`` opacity map answer a request for
+    its ``dash_r.data`` roughness. A caller with no stage in hand keys on the
+    output file, exactly as before.
     """
+    if stage_key:
+        try:
+            payload = source.read_bytes()
+        except OSError:
+            payload = None
+        if payload is not None:
+            key = (str(target_dir), f"{stage_key}\0{hashlib.sha1(payload).hexdigest()}")
+            existing = shared.get(key)
+            if existing is not None:
+                return existing
+            destination = target_dir / _corrected_texture_file_name(
+                target_dir, material_name, source.name
+            )
+            destination.write_bytes(payload)
+            shutil.copystat(source, destination)
+            virtual_path = _vehicle_virtual_path(output_root, destination)
+            shared[key] = virtual_path
+            return virtual_path
+
     key = (str(target_dir), str(source))
     existing = shared.get(key)
     if existing is not None:
@@ -1373,7 +1404,12 @@ def _entry_corrected_texture_outputs(
             if not source.is_file():
                 continue
             virtual_path = _shared_corrected_texture(
-                source, target_dir, output_root, material_name, shared
+                source,
+                target_dir,
+                output_root,
+                material_name,
+                shared,
+                stage_key if isinstance(stage_key, str) else "",
             )
             _register_texture_output(by_source, member, virtual_path)
             if isinstance(stage_key, str):
@@ -1388,7 +1424,7 @@ def _entry_corrected_texture_outputs(
             if not source.is_file():
                 continue
             virtual_path = _shared_corrected_texture(
-                source, target_dir, output_root, material_name, shared
+                source, target_dir, output_root, material_name, shared, stage_key
             )
             by_stage.setdefault(stage_key, virtual_path)
             _register_texture_output(by_source, relative, virtual_path)
