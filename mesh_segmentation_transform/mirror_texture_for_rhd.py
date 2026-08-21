@@ -4588,12 +4588,16 @@ def write_dds(
         if banded or reuse is not None
         else None
     )
+    # BC4 and BC5 encode a whole 4096-square in well under a second, so a
+    # surface handed to _compress_level_blocks must not be banded for them even
+    # though the partial path wants an executor of its own.
+    band_executor = executor if banded else None
     reused_blocks = encoded_blocks = 0
     try:
         if reuse is None:
             blocks = [
                 _compress_level_blocks(
-                    level, encode, format.block_bytes, executor, workers
+                    level, encode, format.block_bytes, band_executor, workers
                 )
                 for level in levels
             ]
@@ -4626,7 +4630,7 @@ def write_dds(
                 ):
                     blocks.append(
                         _compress_level_blocks(
-                            level, encode, format.block_bytes, executor, workers
+                            level, encode, format.block_bytes, band_executor, workers
                         )
                     )
                     encoded_blocks += total
