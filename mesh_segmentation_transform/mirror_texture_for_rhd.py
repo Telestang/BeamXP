@@ -8702,10 +8702,15 @@ def export_parts_preview(
             merged: list[tuple[str, list[DaePart], DomainMasks]] = []
             for group in group_shareable_jobs(measured):
                 material = group[0][0].material
-                parts = [job.part for job, _masks in group]
+                # Never ``parts``: that is this function's own parameter, and
+                # the DAE export below iterates it to convert every selected
+                # mesh. Shadowing it left scintilla exporting one mesh instead
+                # of fifteen, so the retarget never saw the dashboard and its
+                # corrected material was minted, bound by nothing and pruned.
+                group_parts = [job.part for job, _masks in group]
                 first = group[0][1]
                 if len(group) == 1:
-                    merged.append((material, parts, first))
+                    merged.append((material, group_parts, first))
                     continue
                 same_domain = all(
                     np.array_equal(masks.mirror, first.mirror)
@@ -8719,7 +8724,7 @@ def export_parts_preview(
                     for job, _masks in group[1:]:
                         log(f"  {job.label}: same UV domain as an earlier mesh "
                             f"here; sharing one correction")
-                    merged.append((material, parts, first))
+                    merged.append((material, group_parts, first))
                     continue
                 log(
                     f"  {', '.join(job.part.label for job, _m in group)}: "
@@ -8735,16 +8740,16 @@ def export_parts_preview(
                 group_key = (
                     frozenset(symbols),
                     size,
-                    tuple(sorted(part.key for part in parts)),
+                    tuple(sorted(part.key for part in group_parts)),
                 )
                 group_masks = mask_cache.get(group_key)
                 if group_masks is None:
                     group_masks = build_domain_masks(
-                        loaded, parts, symbols, size,
+                        loaded, group_parts, symbols, size,
                         config, sweep_cache, log, force_mirrored_part_keys,
                     )
                     mask_cache[group_key] = group_masks
-                merged.append((material, parts, group_masks))
+                merged.append((material, group_parts, group_masks))
             timing = record_phase(
                 phase_timings,
                 "build_domain_masks",

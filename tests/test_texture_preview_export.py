@@ -3057,6 +3057,18 @@ class PerMeshCorrectionJobTests(unittest.TestCase):
 class PerMeshCorrectionOutputTests(unittest.TestCase):
     """Each job builds its own texture, scoped to its own mesh and material."""
 
+    def _record_export(self, _loaded, _sweep, path, **_kwargs):
+        """Remember which mesh was converted, so a test can check the set.
+
+        Read off the output path: the sweep is a stub here, and the exporter
+        names each file for the part it is converting.
+        """
+        self.exported.append(Path(path).name[: -len("_rhd.dae")])
+        return {"rigid_symmetric_nodes": []}
+
+    def setUp(self):
+        self.exported: list[str] = []
+
     def _preview(self, entries, mirrored_by_part, layouts=None):
         parts: list[SimpleNamespace] = []
         for part, _binding in entries:
@@ -3112,7 +3124,7 @@ class PerMeshCorrectionOutputTests(unittest.TestCase):
                 patch.object(rhd, "sweep_part", return_value=object()),
                 patch.object(
                     rhd, "export_transformed_part_dae",
-                    return_value={"rigid_symmetric_nodes": []},
+                    side_effect=self._record_export,
                 ),
             ):
                 rhd.export_parts_preview(
@@ -3141,6 +3153,35 @@ class PerMeshCorrectionOutputTests(unittest.TestCase):
         self.assertEqual(calls[0]["part_group_index"], 0)
         self.assertEqual(calls[0]["part_scope"], [dash])
         self.assertEqual(calls[0]["material_scope"], ("interior",))
+
+    def test_every_selected_mesh_is_still_converted_whatever_the_grouping(self) -> None:
+        """The hand conversion is the point; grouping only decides file count.
+
+        Grouping the texture jobs must not touch which meshes get converted.
+        A local named ``parts`` inside the grouping shadowed this function's
+        own parameter, so the DAE export below iterated the last group instead
+        of the selection: scintilla converted one mesh of fifteen, and the
+        thirteen whose corrected material was scoped to them were minted,
+        bound by nothing and pruned. Nothing about the corrected textures
+        themselves was wrong, which is why every plan-level check passed.
+        """
+        interior = self._part("lc500_interior")
+        facelift = self._part("lc500_interior_facelift")
+        badge = self._part("lc500_badge")
+        self._preview(
+            [
+                (interior, self._binding("lc500_screens")),
+                (facelift, self._binding("lc500_centralscreen")),
+                (badge, self._binding("lc500_badges")),
+            ],
+            {},
+        )
+
+        self.assertEqual(
+            self.exported,
+            ["lc500_interior", "lc500_interior_facelift", "lc500_badge"],
+            "a selected mesh was left unconverted",
+        )
 
     def test_each_mesh_and_material_builds_its_own_texture(self) -> None:
         interior = self._part("lc500_interior")
