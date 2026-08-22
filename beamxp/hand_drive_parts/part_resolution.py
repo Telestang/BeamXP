@@ -1058,10 +1058,33 @@ def _side_pair_ref_path(ref: object) -> str:
     return text.split("@@", 1)[1] if "@@" in text else ""
 
 
-def _selected_instance_ref(instance: dict[str, object]) -> str:
-    part_id = str(instance.get("part_id") or "")
-    slot_path = str(instance.get("slot_path") or "")
-    return f"{part_id}@@{slot_path}" if slot_path else part_id
+def _side_pair_ref_slot(ref: object) -> str:
+    """The slot a ref's path ends at -- the only part of it a row may hold.
+
+    A ref is captured from whichever trim was on screen when the row was
+    written, so it carries that trim's whole route to the part: the hopper's
+    racing-seat row names ``racing_seat_FL@@/hopper_frame/hopper_body_crawler/
+    hopper_seat_FL/race_seat_FL/``. Other trims reach the same seat through
+    ``hopper_body`` instead, and the table is vehicle-level, so matching on the
+    full route pins a row to the one trim that authored it. The slot the path
+    ends at is what the row is really pointing at, and it survives the trim.
+    """
+    segments = [segment for segment in _side_pair_ref_path(ref).split("/") if segment]
+    return segments[-1] if segments else ""
+
+
+def _side_pair_ref_at_instance(ref: object, instance: dict[str, object]) -> bool:
+    """Whether a ref's slot, if it names one, is the one this instance sits in."""
+    ref_slot = _side_pair_ref_slot(ref)
+    return not ref_slot or ref_slot == str(instance.get("slot_id") or "")
+
+
+def _side_pair_names_part(ref: object, instance: dict[str, object]) -> bool:
+    """Whether the ref names this part instance by its own part id."""
+    text = str(ref or "")
+    if not text or _side_pair_base_ref(text) != str(instance.get("part_id") or ""):
+        return False
+    return _side_pair_ref_at_instance(text, instance)
 
 
 _MESH_OWNER_INDEX_ATTR = "_mesh_owner_part_index"
@@ -1105,14 +1128,13 @@ def _side_pair_matches_ref(
     text = str(ref or "")
     if not text:
         return False
-    if text == str(instance.get("part_id") or "") or text == _selected_instance_ref(instance):
+    if _side_pair_names_part(text, instance):
         return True
     if not by_mesh:
         return False
     # A mesh-level row still names one part instance: the one whose body
-    # declares that mesh at that slot path.
-    ref_path = _side_pair_ref_path(text)
-    if ref_path and ref_path != str(instance.get("slot_path") or ""):
+    # declares that mesh in the slot the row points at.
+    if not _side_pair_ref_at_instance(text, instance):
         return False
     part_id = str(instance.get("part_id") or "")
     if not part_id:
@@ -1141,11 +1163,12 @@ def _refs_answered_by_part_name(
         for side in ("left", "right")
     }
     refs.discard("")
-    answered: set[str] = set()
-    for instance in instances:
-        names = {str(instance.get("part_id") or ""), _selected_instance_ref(instance)}
-        answered |= refs & names
-    return answered
+    instances = list(instances)
+    return {
+        ref
+        for ref in refs
+        if any(_side_pair_names_part(ref, instance) for instance in instances)
+    }
 
 
 def _side_pair_counterpart_ref(
@@ -1235,7 +1258,7 @@ def _lifted_side_pair_target(
 ) -> dict[str, str] | None:
     """Raise a row to the level where the destination it names can exist.
 
-    An Equivalent Parts row carries the whole slot path of the part on the
+    An Equivalent Parts row usually carries the slot path of the part on the
     other side: the etkc's row names
     ``racing_seat_FR@@/etkc_body/etkc_seat_FR/race_seat_FR/``. On the drift
     trim ``race_seat_FR`` is not a slot at all -- the passenger seat slot is
@@ -1251,13 +1274,24 @@ def _lifted_side_pair_target(
 
     Returns the lifted source and target, or None when the row needs no lift.
     """
-    ref_path = _side_pair_ref_path(counterpart_ref)
-    if not ref_path:
-        return None
-    target_segments = [segment for segment in ref_path.split("/") if segment]
     source_segments = [
         segment for segment in str(instance.get("slot_path") or "").split("/") if segment
     ]
+    ref_path = _side_pair_ref_path(counterpart_ref)
+    if ref_path:
+        target_segments = [segment for segment in ref_path.split("/") if segment]
+    else:
+        # A side picked as a bare name carries no path, but the row is a
+        # mirror statement, so the place it asks for is the source's own path
+        # reflected. Deriving it leaves a bare ref as liftable as a qualified
+        # one: on the hopper's single-seat drag trim ``race_seat_FR`` is not a
+        # slot at all, so without the lift the seat has nowhere to go and
+        # stays on the left.
+        target_segments = [
+            mirror_lateral_node_id(segment) or segment for segment in source_segments
+        ]
+        if target_segments == source_segments:
+            return None
     # The two sides describe the same place on opposite sides of the car, so a
     # path of a different shape is not something to reason about.
     if not target_segments or len(target_segments) != len(source_segments):
@@ -1277,9 +1311,14 @@ def _lifted_side_pair_target(
         return None
 
     target_slot = target_segments[depth]
+    source_path = "/" + "/".join(source_segments[: depth + 1]) + "/"
     target_usage = usage[target_slot]
-    target_path = "/" + "/".join(target_segments[: depth + 1]) + "/"
-    if str(target_usage.paths_by_config.get(config_name) or "") != target_path:
+    target_path = str(target_usage.paths_by_config.get(config_name) or "")
+    # The ancestry above the slot is the authoring trim's, not this one's, so
+    # the trim's own path for the slot is the one to lift into. What has to
+    # hold is the invariant the whole lift rests on: the place we open is the
+    # reflection of the place we are emptying, by the same route.
+    if not target_path or target_path != mirror_lateral_node_id(source_path):
         return None  # the trim reaches that slot by another route
     if str(target_usage.part_by_config.get(config_name) or ""):
         return None  # occupied: filling it would discard a chosen part
@@ -1296,7 +1335,6 @@ def _lifted_side_pair_target(
     if len(candidates) != 1:
         return None  # nothing fits, or the choice is not ours to make
 
-    source_path = "/" + "/".join(source_segments[: depth + 1]) + "/"
     source_part = next(
         (
             str(other.get("part_id") or "")

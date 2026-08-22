@@ -159,6 +159,42 @@ CHILD_ROW = {
 }
 
 
+# The hopper: the frame declares two body slots and each trim fills one of
+# them, so the same seat is reached through `body` on one trim and through
+# `body_crawler` on another. An Equivalent Parts row is captured from whichever
+# trim was on screen, so its path names one of those routes -- and the table is
+# vehicle-level, so it has to apply on both.
+TWO_BODY_PARTS = {
+    "car": (
+        part("car", "main", "Car", (("body", "body"), ("body_crawler", ""))),
+        "car.jbeam",
+    ),
+    "body": (
+        part("body", "body", "Body", (("seat_FL", "seat_FL"), ("seat_FR", "seat_FR"))),
+        "body.jbeam",
+    ),
+    "body_crawler": (
+        part(
+            "body_crawler",
+            "body_crawler",
+            "Crawler Body",
+            (("seat_FL", "seat_FL"), ("seat_FR", "seat_FR")),
+        ),
+        "body.jbeam",
+    ),
+    "race_base_FL": (
+        part("race_base_FL", "seat_FL", "Race Base L", (("race_seat_FL", "race_seat_FL"),)),
+        "seats.jbeam",
+    ),
+    "race_base_FR": (
+        part("race_base_FR", "seat_FR", "Race Base R", (("race_seat_FR", "race_seat_FR"),)),
+        "seats.jbeam",
+    ),
+    "race_seat_FL": (part("race_seat_FL", "race_seat_FL", "Race Seat L"), "seats.jbeam"),
+    "race_seat_FR": (part("race_seat_FR", "race_seat_FR", "Race Seat R"), "seats.jbeam"),
+}
+
+
 def flexbodies(*meshes: str) -> str:
     rows = ",\n".join(f'["{mesh}", ["body"]]' for mesh in meshes)
     return (
@@ -566,16 +602,53 @@ class EquivalentPartPlanTests(unittest.TestCase):
         selections = plan["selections"] if plan else []
         self.assertNotIn("seat_FR", [entry["slotId"] for entry in selections])
 
-    def test_a_row_with_no_path_is_never_lifted(self) -> None:
-        # A bare mesh name says nothing about where the counterpart lives, so
-        # there is no named destination to open a slot for.
+    def test_a_row_applies_to_a_trim_that_reaches_the_part_another_way(self) -> None:
+        # The row was drawn on the crawler trim, so it names the crawler's
+        # route. The road trim reaches the same seat through its own body, and
+        # the table is vehicle-level -- holding the authoring trim's ancestry
+        # against it left the hopper's single-seat drag trim unconverted, its
+        # seat still on the left with the wheel already on the right.
+        context = context_with_parts(TWO_BODY_PARTS, {"trim": selection((
+            ("car", "main", "/"),
+            ("body", "body", "/body/"),
+            ("race_base_FL", "seat_FL", "/body/seat_FL/"),
+            ("race_seat_FL", "race_seat_FL", "/body/seat_FL/race_seat_FL/"),
+        ))})
         plan = core.resolve_side_pair_plan(
-            self._empty_opposite_context(),
+            context,
+            "trim",
+            [{
+                "left": "race_seat_FL@@/body_crawler/seat_FL/race_seat_FL/",
+                "right": "race_seat_FR@@/body_crawler/seat_FR/race_seat_FR/",
+                "kind": "seat",
+            }],
+        )
+        assert plan is not None
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["selections"]],
+            [("seat_FR", "race_base_FR"), ("race_seat_FR", "race_seat_FR")],
+        )
+        self.assertIn(
+            ("seat_FL", "1"),
+            [(entry["slotId"], entry.get("setEmpty")) for entry in plan["clears"]],
+        )
+
+    def test_a_row_with_no_path_lifts_to_the_mirrored_place(self) -> None:
+        # A bare name carries no path, but the row is still a mirror
+        # statement: the place it asks for is the source's own path reflected,
+        # so it opens the same slot the fully qualified row does. The hopper's
+        # single-seat drag trim depends on it -- its racing-seat row was drawn
+        # against a trim that has both sides, so the counterpart is bare.
+        context = self._empty_opposite_context()
+        bare = core.resolve_side_pair_plan(
+            context,
             "trim",
             [{"left": "race_seat_FL", "right": "race_seat_FR", "kind": "seat"}],
         )
-        selections = plan["selections"] if plan else []
-        self.assertNotIn("seat_FR", [entry["slotId"] for entry in selections])
+        qualified = core.resolve_side_pair_plan(context, "trim", [dict(CHILD_ROW)])
+        assert bare is not None and qualified is not None
+        self.assertEqual(bare["selections"], qualified["selections"])
+        self.assertEqual(bare["clears"], qualified["clears"])
 
     def test_equivalent_row_naming_a_mesh_reaches_the_part_that_carries_it(self) -> None:
         # The table is filled from the Parts Used rows, which are mesh
