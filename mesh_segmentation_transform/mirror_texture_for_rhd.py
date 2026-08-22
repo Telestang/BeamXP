@@ -3124,6 +3124,67 @@ def _bounds_about_shifted_axis(
     return moved
 
 
+def region_island_flip_boxes(
+    island_labels: np.ndarray | None,
+    bounds: tuple[int, int, int, int],
+    mirror_mask: np.ndarray,
+    domain_mask: np.ndarray,
+    axis: str,
+    floor: float,
+) -> list[tuple[tuple[int, int, int, int], float]]:
+    """Split a region that spans several UV islands into one box per island.
+
+    A detected region is not always one mark.  Detection groups neighbours --
+    ``detection_tile_group_gap_px`` is 32 -- so a cluster of separate glyphs
+    arrives as a single rectangle, and most of that rectangle is the gaps
+    between them.  Reflected about its own centre each glyph lands on the space
+    beside the next one, so almost nothing has a partner and
+    ``exchangeable_share`` rightly refuses the whole box: the Audi R8 dash
+    scored two such clusters at 49% and 51%, one holding ten UV islands and the
+    other seven, and shipped the R/N gate letters, OFF and START/ENGINE/STOP
+    reading backwards.
+
+    Each island's own box is a different question, and usually a trivial one --
+    a glyph quad's footprint is a filled rectangle, which is symmetric about
+    its own centre whatever the glyph drawn on it looks like.  The same two
+    clusters score 91% and 99% split this way.
+
+    Only offered once the whole box has been declined, so nothing that flips
+    today changes: this can add flips, never move one.  Boxes are clipped to
+    the region, since the region is what detection claimed is a mark, and each
+    is measured on the plain mirror mask it will actually be flipped through --
+    an island whose box a neighbour intrudes on still scores low and is still
+    declined.
+    """
+    if island_labels is None:
+        return []
+    x, y, w, h = bounds
+    height, width = mirror_mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, width), min(y + h, height)
+    if x1 <= x0 or y1 <= y0:
+        return []
+    window = island_labels[y0:y1, x0:x1]
+    present = [int(label) for label in np.unique(window) if int(label) > 0]
+    if len(present) < 2:
+        return []
+    out: list[tuple[tuple[int, int, int, int], float]] = []
+    for label in present:
+        rows, cols = np.nonzero(window == label)
+        if rows.size == 0:
+            continue
+        box = (
+            x0 + int(cols.min()),
+            y0 + int(rows.min()),
+            int(cols.max() - cols.min()) + 1,
+            int(rows.max() - rows.min()) + 1,
+        )
+        share = exchangeable_share(mirror_mask, box, axis, domain_mask)
+        if share >= floor:
+            out.append((box, share))
+    return out
+
+
 def plan_island_flips(
     mirror_mask: np.ndarray,
     regions: list[tuple[int, int, int, int]],
@@ -7333,6 +7394,8 @@ def build_rhd_texture(
     expanded = 0
     authoritative_expanded = 0
     skipped = 0
+    split_clusters = 0
+    split_islands = 0
     marginal = 0
     cached_skew_frames = None
     for (x, y, w, h), rotation in zip(mirrored_regions, mirrored_rotations):
@@ -7446,6 +7509,33 @@ def build_rhd_texture(
                     f"({domain_exchangeable:.0%})")
                 exchangeable = domain_exchangeable
             else:
+                # The box may be a cluster rather than a mark.  Before giving
+                # up on it, try each UV island in it on its own.
+                split = region_island_flip_boxes(
+                    components[1] if components is not None else None,
+                    (x, y, w, h),
+                    mirror_mask,
+                    domain_mask,
+                    axis,
+                    config.min_region_exchangeable,
+                )
+                if split:
+                    for box, box_share in split:
+                        steps.append(
+                            FlipStep(box, axis, None, None, None, STENCIL_MIRROR)
+                        )
+                        in_place.append(box)
+                        in_place_axes.append(axis)
+                        in_place_rotated_axes.append(None)
+                        in_place_rotations.append(None)
+                        in_place_stencils.append(STENCIL_MIRROR)
+                        in_place_shares.append(box_share)
+                    split_clusters += 1
+                    split_islands += len(split)
+                    log(f"    ~ ({x},{y}) {w}x{h}: {exchangeable:.0%} exchangeable "
+                        f"as one box; it spans several UV islands, so flipping "
+                        f"{len(split)} of them in their own bounds instead")
+                    continue
                 skipped += 1
                 imperfect.append((x, y, w, h, axis, exchangeable))
                 log(f"    ~ ({x},{y}) {w}x{h}: {exchangeable:.0%} exchangeable on "
@@ -7473,6 +7563,10 @@ def build_rhd_texture(
         f"{in_place_axes.count('vertical')} vertical"
         + (f", {marginal} marginal" if marginal else "")
         + (f"; {expanded} used full domain" if expanded else "")
+        + (
+            f"; {split_islands} island(s) split out of {split_clusters} cluster(s)"
+            if split_clusters else ""
+        )
         + (
             f"; {authoritative_expanded} used opacity bounds"
             if authoritative_expanded else ""

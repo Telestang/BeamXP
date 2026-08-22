@@ -1141,6 +1141,94 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ClusterRegionSplitTests(unittest.TestCase):
+    """A detected region is not always one mark.
+
+    Detection groups neighbours -- detection_tile_group_gap_px is 32 -- so a
+    row of separate glyphs arrives as a single rectangle whose area is mostly
+    the gaps between them. Reflected about its own centre each glyph lands on
+    the space beside the next one, so almost nothing has a partner and the
+    whole box is refused. The Audi R8 dash scored two such clusters at 49% and
+    51% -- ten UV islands in one, seven in the other -- and shipped the R/N
+    gate letters, OFF and START/ENGINE/STOP reading backwards.
+    """
+
+    ATLAS = (256, 256)
+    # Three glyph quads at irregular spacing. Evenly spaced ones would be
+    # symmetric about the cluster centre and the whole box would flip fine --
+    # glyphs 1 and 3 swapping, 2 reversing in place -- which is not the case
+    # that fails.
+    QUADS = ((10, 100, 20, 24), (40, 100, 20, 24), (120, 100, 20, 24))
+    CLUSTER = (10, 100, 130, 24)
+
+    def _masks(self):
+        mirror = np.zeros(self.ATLAS, bool)
+        labels = np.zeros(self.ATLAS, np.int32)
+        for index, (x, y, w, h) in enumerate(self.QUADS, start=1):
+            mirror[y:y + h, x:x + w] = True
+            labels[y:y + h, x:x + w] = index
+        return mirror, labels
+
+    def test_the_cluster_box_really_is_unflippable(self) -> None:
+        # Not an artefact of the split: the box the detector produced scores
+        # far below the floor, and correctly so.
+        mirror, _labels = self._masks()
+        share = rhd.exchangeable_share(mirror, self.CLUSTER, "horizontal", mirror)
+        self.assertLess(share, rhd.RhdTextureConfig().min_region_exchangeable)
+
+    def test_each_island_flips_cleanly_in_its_own_bounds(self) -> None:
+        mirror, labels = self._masks()
+        floor = rhd.RhdTextureConfig().min_region_exchangeable
+        split = rhd.region_island_flip_boxes(
+            labels, self.CLUSTER, mirror, mirror, "horizontal", floor
+        )
+        self.assertEqual(len(split), 3)
+        for _box, share in split:
+            self.assertEqual(share, 1.0)
+        self.assertEqual([box for box, _ in split], list(self.QUADS))
+
+    def test_a_single_island_region_is_not_split(self) -> None:
+        # One island is the case the existing path already handles; offering a
+        # split there would only churn the plan.
+        mirror, labels = self._masks()
+        floor = rhd.RhdTextureConfig().min_region_exchangeable
+        self.assertEqual(
+            rhd.region_island_flip_boxes(
+                labels, self.QUADS[0], mirror, mirror, "horizontal", floor
+            ),
+            [],
+        )
+
+    def test_an_island_that_is_not_symmetric_in_its_box_is_still_declined(self) -> None:
+        # Splitting does not lower the bar. Each box is measured on the plain
+        # mirror mask it will be flipped through, so an island whose own
+        # footprint is lopsided in its bounds scores low and is dropped like
+        # any other -- the floor still does its job, on a fairer question.
+        mirror, labels = self._masks()
+        x, y, w, h = self.QUADS[1]
+        mirror[y:y + 8, x + w - 8:x + w] = False   # bite out of one corner
+        labels[y:y + 8, x + w - 8:x + w] = 0
+        floor = rhd.RhdTextureConfig().min_region_exchangeable
+        split = rhd.region_island_flip_boxes(
+            labels, self.CLUSTER, mirror, mirror, "horizontal", floor
+        )
+        kept = [box for box, _ in split]
+        self.assertNotIn(self.QUADS[1], kept)
+        # and the sound ones are still recovered
+        self.assertIn(self.QUADS[0], kept)
+        self.assertIn(self.QUADS[2], kept)
+
+    def test_no_labels_means_no_split(self) -> None:
+        mirror, _labels = self._masks()
+        floor = rhd.RhdTextureConfig().min_region_exchangeable
+        self.assertEqual(
+            rhd.region_island_flip_boxes(
+                None, self.CLUSTER, mirror, mirror, "horizontal", floor
+            ),
+            [],
+        )
+
+
 class OutlinePartnerShareTests(unittest.TestCase):
     """A fitted outline is only a frame to mirror in while it is on the atlas.
 
