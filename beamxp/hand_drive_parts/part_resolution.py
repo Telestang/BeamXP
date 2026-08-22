@@ -1218,6 +1218,105 @@ def _side_pair_counterpart_part(
     return candidates[0]
 
 
+def _part_declares_slot(context: VehicleContext, part_id: str, slot_type: str) -> bool:
+    found = part_body_for_context(context, part_id)
+    if found is None:
+        return False
+    return any(slot.slot_type == slot_type for slot in extract_slot_defs(found[0]))
+
+
+def _lifted_side_pair_target(
+    context: VehicleContext,
+    config_name: str,
+    usage: dict[str, SlotUsage],
+    instances: list[dict[str, object]],
+    instance: dict[str, object],
+    counterpart_ref: str,
+) -> dict[str, str] | None:
+    """Raise a row to the level where the destination it names can exist.
+
+    An Equivalent Parts row carries the whole slot path of the part on the
+    other side: the etkc's row names
+    ``racing_seat_FR@@/etkc_body/etkc_seat_FR/race_seat_FR/``. On the drift
+    trim ``race_seat_FR`` is not a slot at all -- the passenger seat slot is
+    empty, and the slot the row wants is one the race seat base *would*
+    declare once fitted into it. Asking for the cushion is therefore asking
+    for the assembly that carries it, so the swap rises to the deepest
+    ancestor the trim really has: exactly the plan pairing the two bases
+    directly already produces.
+
+    Only an empty ancestor slot is opened, and only when one authored part
+    both fits it and declares the next segment of the named path. Anything
+    less certain is left alone rather than guessed at.
+
+    Returns the lifted source and target, or None when the row needs no lift.
+    """
+    ref_path = _side_pair_ref_path(counterpart_ref)
+    if not ref_path:
+        return None
+    target_segments = [segment for segment in ref_path.split("/") if segment]
+    source_segments = [
+        segment for segment in str(instance.get("slot_path") or "").split("/") if segment
+    ]
+    # The two sides describe the same place on opposite sides of the car, so a
+    # path of a different shape is not something to reason about.
+    if not target_segments or len(target_segments) != len(source_segments):
+        return None
+
+    depth = next(
+        (
+            index
+            for index in range(len(target_segments) - 1, -1, -1)
+            if target_segments[index] in usage
+        ),
+        None,
+    )
+    # None: the trim has no part of this path. Last segment: the slot is
+    # already there, so the ordinary route applies and nothing needs lifting.
+    if depth is None or depth == len(target_segments) - 1:
+        return None
+
+    target_slot = target_segments[depth]
+    target_usage = usage[target_slot]
+    target_path = "/" + "/".join(target_segments[: depth + 1]) + "/"
+    if str(target_usage.paths_by_config.get(config_name) or "") != target_path:
+        return None  # the trim reaches that slot by another route
+    if str(target_usage.part_by_config.get(config_name) or ""):
+        return None  # occupied: filling it would discard a chosen part
+
+    slot_def = slot_def_for_usage(context, target_usage)
+    if slot_def is None:
+        return None
+    needed_slot = target_segments[depth + 1]
+    candidates = [
+        part_id
+        for part_id in parts_fitting_slot(context, slot_def)
+        if _part_declares_slot(context, part_id, needed_slot)
+    ]
+    if len(candidates) != 1:
+        return None  # nothing fits, or the choice is not ours to make
+
+    source_path = "/" + "/".join(source_segments[: depth + 1]) + "/"
+    source_part = next(
+        (
+            str(other.get("part_id") or "")
+            for other in instances
+            if str(other.get("slot_path") or "") == source_path
+        ),
+        "",
+    )
+    if not source_part or source_part == candidates[0]:
+        return None
+    return {
+        "sourceSlot": source_segments[depth],
+        "sourcePath": source_path,
+        "sourcePart": source_part,
+        "targetSlot": target_slot,
+        "targetPath": target_path,
+        "targetPart": candidates[0],
+    }
+
+
 def resolve_side_pair_plan(
     context: VehicleContext,
     config_name: str,
@@ -1263,10 +1362,28 @@ def resolve_side_pair_plan(
         )
         if not counterpart_ref:
             continue
+        lifted = _lifted_side_pair_target(
+            context, config_name, usage, instances, instance, counterpart_ref
+        )
+        if lifted is not None:
+            if lifted["sourceSlot"] in handled_sources:
+                continue  # a sibling row already swapped this assembly
+            source_part = lifted["sourcePart"]
+            source_slot = lifted["sourceSlot"]
+            source_path = lifted["sourcePath"]
         target_slot = mirror_lateral_node_id(source_slot)
         if not target_slot or target_slot == source_slot:
             continue
         target_usage = usage.get(target_slot)
+        # slot_usage_for_configs reports a slot that exists but is empty, so
+        # None here means no part the trim currently fits *declares* the
+        # mirrored slot. On the etkc's drift trim the passenger seat slot is
+        # empty, so nothing there declares race_seat_FR -- the slot only comes
+        # into being once a race seat base is fitted into it. Until then there
+        # is nowhere to put a counterpart, so the row clones the source across
+        # instead; the stand-in slot def below exists only to keep the
+        # relocation's bookkeeping shaped like the fitted case.
+        target_slot_exists = target_usage is not None
         target_path = (
             str(target_usage.paths_by_config.get(config_name) or "")
             if target_usage is not None
@@ -1278,8 +1395,14 @@ def resolve_side_pair_plan(
             else None
         ) or SlotDef(target_slot, "", allow_types=(target_slot,))
 
-        target_part = _side_pair_counterpart_part(
-            context, counterpart_ref, source_part, target_slot_def
+        # A lifted row already knows its part: the ref names the child, which
+        # does not fit the assembly slot the swap has risen to.
+        target_part = (
+            lifted["targetPart"]
+            if lifted is not None
+            else _side_pair_counterpart_part(
+                context, counterpart_ref, source_part, target_slot_def
+            )
         )
         if not target_part:
             continue
@@ -1298,9 +1421,19 @@ def resolve_side_pair_plan(
             continue
 
         found = part_body_for_context(context, target_part)
-        fits = found is not None and part_fits_slot(
-            transform_helpers.extract_part_slot_types(found[0]),
-            target_slot_def,
+        # Fitting the counterpart is only an option where the slot is really
+        # there. Measuring it against the stand-in def instead would pass every
+        # time -- that def allows exactly the slot's own type -- and emit a
+        # selection into a path nothing declares, which resolution drops while
+        # keeping the clear: the seat vanished from both sides rather than
+        # moving.
+        fits = (
+            target_slot_exists
+            and found is not None
+            and part_fits_slot(
+                transform_helpers.extract_part_slot_types(found[0]),
+                target_slot_def,
+            )
         )
         # A part that only carries the named mesh may hand a fitting
         # counterpart across, but it must never be the thing that moves: a row

@@ -105,6 +105,60 @@ CABIN_PARTS = {
 }
 
 
+# The etkc's drift trim: a race seat sits in a race-seat base on the left, and
+# the right seat position holds an ordinary seat that declares no race seat
+# slot at all. The mirrored slot an equivalent row wants does not exist in this
+# trim, and inventing one used to delete the seat from both sides.
+ONE_SIDED_PARTS = {
+    "car": (
+        part("car", "main", "Car", (("seat_FL", "seat_FL"), ("seat_FR", "seat_FR"))),
+        "car.jbeam",
+    ),
+    "race_base_FL": (
+        part("race_base_FL", "seat_FL", "Race Base", (("race_seat_FL", "race_seat_FL"),)),
+        "seats.jbeam",
+    ),
+    "plain_seat_FR": (part("plain_seat_FR", "seat_FR", "Seat"), "seats.jbeam"),
+    "race_seat_FL": (part("race_seat_FL", "race_seat_FL", "Race Seat L"), "seats.jbeam"),
+    # Authored by the vehicle, but nothing in this trim opens a slot for it.
+    "race_seat_FR": (part("race_seat_FR", "race_seat_FR", "Race Seat R"), "seats.jbeam"),
+}
+
+
+# The etkc's drift trim: a race seat sits in a race-seat base on the left, and
+# the passenger seat slot on the right is empty. The mirrored slot an
+# equivalent row names does not exist yet -- it is declared by the right race
+# base that would go into that empty slot.
+EMPTY_OPPOSITE_PARTS = {
+    "car": (
+        part("car", "main", "Car", (("seat_FL", "seat_FL"), ("seat_FR", "seat_FR"))),
+        "car.jbeam",
+    ),
+    "race_base_FL": (
+        part("race_base_FL", "seat_FL", "Race Base L", (("race_seat_FL", "race_seat_FL"),)),
+        "seats.jbeam",
+    ),
+    "race_base_FR": (
+        part("race_base_FR", "seat_FR", "Race Base R", (("race_seat_FR", "race_seat_FR"),)),
+        "seats.jbeam",
+    ),
+    # Also fits the empty slot, but declares no race seat slot, so it is never
+    # the part that opens the path.
+    "plain_seat_FR": (part("plain_seat_FR", "seat_FR", "Seat R"), "seats.jbeam"),
+    "race_seat_FL": (part("race_seat_FL", "race_seat_FL", "Race Seat L"), "seats.jbeam"),
+    "race_seat_FR": (part("race_seat_FR", "race_seat_FR", "Race Seat R"), "seats.jbeam"),
+}
+
+
+# The row the user draws in Equivalent Parts: it names the seat inside the
+# base, and carries the full path of the counterpart on the other side.
+CHILD_ROW = {
+    "left": "race_seat_FL@@/seat_FL/race_seat_FL/",
+    "right": "race_seat_FR@@/seat_FR/race_seat_FR/",
+    "kind": "seat",
+}
+
+
 def flexbodies(*meshes: str) -> str:
     rows = ",\n".join(f'["{mesh}", ["body"]]' for mesh in meshes)
     return (
@@ -364,6 +418,164 @@ class EquivalentPartPlanTests(unittest.TestCase):
             [(entry["slotId"], entry["partId"]) for entry in plan["relocations"]],
             [("seat_FR", "rally_seat_FL")],
         )
+
+    def _one_sided_context(self) -> core.VehicleContext:
+        return context_with_parts(
+            ONE_SIDED_PARTS,
+            {"trim": selection((
+                ("car", "main", "/"),
+                ("race_base_FL", "seat_FL", "/seat_FL/"),
+                ("race_seat_FL", "race_seat_FL", "/seat_FL/race_seat_FL/"),
+                ("plain_seat_FR", "seat_FR", "/seat_FR/"),
+            ))},
+        )
+
+    def test_a_mirrored_slot_the_trim_lacks_never_becomes_a_selection(self) -> None:
+        # The slot def stood in for a slot that is not there, and every
+        # counterpart fits a def that allows exactly its own type -- so the
+        # plan wrote a part into /seat_FL/race_seat_FR/, a path nothing
+        # declares. Resolution dropped it and kept the clear, which is how the
+        # seat disappeared from the preview and the build.
+        plan = core.resolve_side_pair_plan(
+            self._one_sided_context(),
+            "trim",
+            [{"left": "race_seat_FL", "right": "race_seat_FR", "kind": "seat"}],
+        )
+        selections = plan["selections"] if plan else []
+        self.assertEqual(
+            [entry["slotPath"] for entry in selections],
+            [],
+            "a slot no part in the trim declares cannot be selected into",
+        )
+
+    def test_the_source_part_is_never_cleared_without_a_replacement(self) -> None:
+        # The destructive half: whatever the row decides, it must not empty the
+        # slot the seat is in unless something takes its place.
+        plan = core.resolve_side_pair_plan(
+            self._one_sided_context(),
+            "trim",
+            [{"left": "race_seat_FL", "right": "race_seat_FR", "kind": "seat"}],
+        )
+        if plan is None:
+            return
+        emptied = {
+            entry["slotId"] for entry in plan["clears"] if entry.get("setEmpty")
+        }
+        filled = {entry["slotId"] for entry in plan["selections"]}
+        filled |= {entry["sourceSlotId"] for entry in plan["relocations"]}
+        moved_into = {entry["slotId"] for entry in plan["relocations"]}
+        self.assertEqual(
+            emptied - filled - moved_into,
+            set(),
+            "a slot was emptied with nothing put anywhere in its place",
+        )
+
+    def test_a_part_row_still_relocates_when_the_slot_is_missing(self) -> None:
+        # The documented fallback: no slot to fit into means clone the source
+        # across, exactly as when a slot exists but no part fits it.
+        plan = core.resolve_side_pair_plan(
+            self._one_sided_context(),
+            "trim",
+            [{"left": "race_seat_FL", "right": "race_seat_FR", "kind": "seat"}],
+        )
+        assert plan is not None
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["relocations"]],
+            [("race_seat_FR", "race_seat_FL")],
+        )
+
+    def test_an_empty_mirrored_slot_is_still_fitted_normally(self) -> None:
+        # The case the existence check must not break: the slot is declared by
+        # a part the trim fits, it just has nothing in it.
+        context = self._context((
+            ("car", "main", "/"),
+            ("seat_FL", "seat_FL", "/seat_FL/"),
+        ))
+        plan = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{"left": "seat_FL", "right": "seat_FR", "kind": "seat"}],
+        )
+        assert plan is not None
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["selections"]],
+            [("seat_FR", "seat_FR")],
+        )
+
+    def _empty_opposite_context(self) -> core.VehicleContext:
+        return context_with_parts(
+            EMPTY_OPPOSITE_PARTS,
+            {"trim": selection((
+                ("car", "main", "/"),
+                ("race_base_FL", "seat_FL", "/seat_FL/"),
+                ("race_seat_FL", "race_seat_FL", "/seat_FL/race_seat_FL/"),
+            ))},
+        )
+
+    def test_a_row_naming_a_slot_the_trim_can_open_rises_to_the_assembly(self) -> None:
+        # The row asks for a seat inside a base that is not fitted yet, so the
+        # swap happens at the base: fit the right base into the empty slot,
+        # and the seat follows it as a paired child.
+        plan = core.resolve_side_pair_plan(
+            self._empty_opposite_context(), "trim", [dict(CHILD_ROW)]
+        )
+        assert plan is not None
+        self.assertEqual(
+            [(entry["slotId"], entry["partId"]) for entry in plan["selections"]],
+            [("seat_FR", "race_base_FR"), ("race_seat_FR", "race_seat_FR")],
+        )
+
+    def test_the_lifted_swap_empties_the_side_it_came_from(self) -> None:
+        plan = core.resolve_side_pair_plan(
+            self._empty_opposite_context(), "trim", [dict(CHILD_ROW)]
+        )
+        assert plan is not None
+        self.assertIn(
+            ("seat_FL", "1"),
+            [(entry["slotId"], entry.get("setEmpty")) for entry in plan["clears"]],
+        )
+
+    def test_the_lift_matches_pairing_the_assemblies_by_hand(self) -> None:
+        # The whole justification: naming the child is a longer way of saying
+        # what pairing the two bases says, so both must plan the same swap.
+        context = self._empty_opposite_context()
+        by_child = core.resolve_side_pair_plan(context, "trim", [dict(CHILD_ROW)])
+        by_base = core.resolve_side_pair_plan(
+            context,
+            "trim",
+            [{"left": "race_base_FL", "right": "race_base_FR", "kind": "seat"}],
+        )
+        assert by_child is not None and by_base is not None
+        self.assertEqual(by_child["selections"], by_base["selections"])
+        self.assertEqual(by_child["clears"], by_base["clears"])
+
+    def test_an_occupied_opposite_slot_is_never_taken_over(self) -> None:
+        # Opening a slot is only safe while it is empty: a part already fitted
+        # there was chosen, by the trim or by the user, and is not ours to
+        # discard on the strength of a row about someone else's child.
+        context = context_with_parts(
+            EMPTY_OPPOSITE_PARTS,
+            {"trim": selection((
+                ("car", "main", "/"),
+                ("race_base_FL", "seat_FL", "/seat_FL/"),
+                ("race_seat_FL", "race_seat_FL", "/seat_FL/race_seat_FL/"),
+                ("plain_seat_FR", "seat_FR", "/seat_FR/"),
+            ))},
+        )
+        plan = core.resolve_side_pair_plan(context, "trim", [dict(CHILD_ROW)])
+        selections = plan["selections"] if plan else []
+        self.assertNotIn("seat_FR", [entry["slotId"] for entry in selections])
+
+    def test_a_row_with_no_path_is_never_lifted(self) -> None:
+        # A bare mesh name says nothing about where the counterpart lives, so
+        # there is no named destination to open a slot for.
+        plan = core.resolve_side_pair_plan(
+            self._empty_opposite_context(),
+            "trim",
+            [{"left": "race_seat_FL", "right": "race_seat_FR", "kind": "seat"}],
+        )
+        selections = plan["selections"] if plan else []
+        self.assertNotIn("seat_FR", [entry["slotId"] for entry in selections])
 
     def test_equivalent_row_naming_a_mesh_reaches_the_part_that_carries_it(self) -> None:
         # The table is filled from the Parts Used rows, which are mesh
