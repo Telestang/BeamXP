@@ -721,6 +721,12 @@ def load_app_settings() -> dict[str, object]:
             data = {}
     return {
         "modsFolder": data.get("modsFolder") or str(default_mods),
+        # Empty until the folder is either auto-detected or chosen; unlike the
+        # mods folder there is no fixed install path to guess at.
+        "gameVehiclesFolder": data.get("gameVehiclesFolder") or "",
+        # Set once the user ticks "Don't show this again" on the folder setup
+        # prompt, so a deliberate dismissal survives a restart.
+        "folderSetupPromptDismissed": bool(data.get("folderSetupPromptDismissed")),
         "blenderExecutable": data.get("blenderExecutable") or "",
         "lastVehicleZipPath": data.get("lastVehicleZipPath") or "",
         "lastVehicleId": data.get("lastVehicleId") or "",

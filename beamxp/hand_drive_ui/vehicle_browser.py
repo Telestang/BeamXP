@@ -21,26 +21,51 @@ class VehicleBrowserMixin:
 
     def _game_vehicles_folder(self) -> Path | None:
         raw = str(self.settings.get("gameVehiclesFolder") or "").strip()
-        if raw:
+        # A remembered folder that has since gone (moved install, unplugged
+        # drive) falls back to detection rather than pinning the app to a path
+        # that cannot be scanned.
+        if raw and Path(raw).is_dir():
             return Path(raw)
         found = core.default_beamng_vehicles_dir()
         if found is not None:
             # Remember the auto-detected folder so the button shows a path.
             self.settings["gameVehiclesFolder"] = str(found)
-        return found
+            return found
+        return Path(raw) if raw else None
 
     def _mods_folder(self) -> Path | None:
         raw = self.mods_folder_var.get().strip()
         return Path(raw) if raw else None
 
     @staticmethod
-    def _folder_button_text(prefix: str, folder: Path | None) -> str:
+    def _folder_is_usable(folder: Path | None) -> bool:
+        """A folder counts as configured only once it is really there.
+
+        The mods setting defaults to BeamNG's standard install path whether or
+        not the game is installed, so a non-empty setting is not on its own
+        evidence that the folder exists to scan or install into.
+        """
+        return folder is not None and str(folder).strip() != "" and Path(folder).is_dir()
+
+    def _missing_folder_names(self) -> list[str]:
+        """Which of the two folders still needs pointing at something real."""
+        return [
+            name
+            for name, folder in (
+                ("game vehicles", self._game_vehicles_folder()),
+                ("mods", self._mods_folder()),
+            )
+            if not self._folder_is_usable(folder)
+        ]
+
+    @classmethod
+    def _folder_button_text(cls, prefix: str, folder: Path | None) -> str:
         """Enough tail of the path to tell two installs apart.
 
         The leaf alone is useless here -- every install ends in
         .../content/vehicles and .../current/mods.
         """
-        if folder is None or not str(folder).strip():
+        if not cls._folder_is_usable(folder):
             return f"{prefix}: set folder..."
         parts = [part for part in folder.parts if part not in ("/", "\\")]
         tail = "/".join(parts[-3:]) if len(parts) > 3 else str(folder)
@@ -53,11 +78,7 @@ class VehicleBrowserMixin:
             text=self._folder_button_text("Game vehicles", game_folder)
         )
         self.mods_folder_button.configure(text=self._folder_button_text("Mods", mods_folder))
-        missing = [
-            name
-            for name, folder in (("game vehicles", game_folder), ("mods", mods_folder))
-            if folder is None or not Path(folder).is_dir()
-        ]
+        missing = self._missing_folder_names()
         self.folder_hint_var.set(
             f"Set the {' and '.join(missing)} folder to list vehicles" if missing else ""
         )
@@ -168,7 +189,7 @@ class VehicleBrowserMixin:
                 key = (os.path.normcase(str(self.source_zip)), vid)
                 if key in labels:
                     continue
-                label = self._model_history_label(self.source_zip, vid, entries)
+                label = self._model_history_label(vid, entries)
                 entries[label] = (self.source_zip, vid)
                 labels[key] = label
 
@@ -275,24 +296,49 @@ class VehicleBrowserMixin:
         # Tk drops an image with no live Python reference.
         self.model_preview_photo = photo
 
+    def _preview_bytes_for_label(self, label: str) -> bytes | None:
+        """The tile image behind a dropdown entry, however it got there.
+
+        A folder-scanned vehicle carries its preview on its listing. A zip
+        opened through Load Zip has no listing, so its own catalog entry is
+        read instead -- otherwise the thumbnail sat empty for exactly the
+        vehicles the user had gone to the trouble of picking by hand.
+        """
+        listing = self._listing_for_label(label)
+        if listing is not None:
+            return vehicle_inventory.read_preview_image_bytes(listing)
+        entry = self.model_entries.get(label)
+        if entry is None:
+            return None
+        zip_path, vehicle_id = entry
+        blob = vehicle_inventory.read_preview_bytes_for_vehicle(zip_path, vehicle_id)
+        # A mod that extends a stock vehicle ships no preview of its own. The
+        # folder scan lends it the stock one; do the same here when the game
+        # vehicles folder has already been scanned.
+        return blob if blob is not None else self._stock_preview_bytes(vehicle_id)
+
+    def _stock_preview_bytes(self, vehicle_id: str) -> bytes | None:
+        for listing in self.vehicle_listings:
+            if not listing.is_mod and listing.vehicle_id == vehicle_id:
+                return vehicle_inventory.read_preview_image_bytes(listing)
+        return None
+
     def _preview_photo_for(self, label: str):
         if not label or label == RECENT_SEPARATOR:
             return None
         if label in self.preview_photo_cache:
             return self.preview_photo_cache[label]
-        listing = self._listing_for_label(label)
         photo = None
-        if listing is not None:
-            blob = vehicle_inventory.read_preview_image_bytes(listing)
-            if blob:
-                try:
-                    from PIL import Image, ImageTk
+        blob = self._preview_bytes_for_label(label)
+        if blob:
+            try:
+                from PIL import Image, ImageTk
 
-                    image = Image.open(io.BytesIO(blob))
-                    image.thumbnail(PREVIEW_THUMB_SIZE)
-                    photo = ImageTk.PhotoImage(image.convert("RGB"))
-                except Exception:
-                    photo = None
+                image = Image.open(io.BytesIO(blob))
+                image.thumbnail(PREVIEW_THUMB_SIZE)
+                photo = ImageTk.PhotoImage(image.convert("RGB"))
+            except Exception:
+                photo = None
         self.preview_photo_cache[label] = photo
         return photo
 

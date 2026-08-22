@@ -50,6 +50,14 @@ BLENDER_CANDIDATES = (
 
 UI_STALL_LOG_MS = float(os.environ.get("BEAMXP_UI_STALL_LOG_MS", "100"))
 
+# Shown where the loaded zip's path goes, so the empty window says what to do
+# next rather than only what is missing. Both routes are named: the dropdown
+# lists the configured folders, and Load Zip reaches anything outside them.
+NO_VEHICLE_LOADED = (
+    "No vehicle loaded — choose one from the Model list, "
+    "or use Load Zip... to open a vehicle zip"
+)
+
 
 def log_ui_timing(label: str, elapsed_ms: float) -> None:
     if elapsed_ms >= UI_STALL_LOG_MS:
@@ -218,6 +226,7 @@ def app_icon_path() -> Path | None:
 
 __all__ = [
     "APP_ICON_NAME",
+    "NO_VEHICLE_LOADED",
     "APP_ROOT",
     "BLENDER_CANDIDATES",
     "BLENDER_PREVIEW_SCRIPT",

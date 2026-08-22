@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .build_and_preview import BuildAndPreviewMixin
+from .folder_setup import FolderSetupMixin
 from .layout import LayoutMixin
 from .part_editing import PartEditingMixin
 from .parts_workflow import PartsWorkflowMixin
@@ -20,6 +21,7 @@ class HandDriveToolApp(
     WindowingMixin,
     LayoutMixin,
     VehicleBrowserMixin,
+    FolderSetupMixin,
     VehicleWorkflowMixin,
     VariantWorkflowMixin,
     PartsWorkflowMixin,
@@ -109,7 +111,7 @@ class HandDriveToolApp(
         self._tree_combo_focus_after_id: str | None = None
         self.part_filter_entry: ttk.Entry | None = None
 
-        self.source_var = tk.StringVar(value="No source zip loaded")
+        self.source_var = tk.StringVar(value=NO_VEHICLE_LOADED)
         self.vehicle_var = tk.StringVar()
         self.project_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Ready")
@@ -124,6 +126,9 @@ class HandDriveToolApp(
         self.plate_choice_to_id: dict[str, str] = {}
         self.mods_folder_var = tk.StringVar(value=str(self.settings.get("modsFolder") or ""))
         self.folder_hint_var = tk.StringVar(value="")
+        # Live widgets of the first-run folder prompt, empty while it is closed.
+        self._folder_setup_modal: tk.Toplevel | None = None
+        self._folder_setup_rows: dict[str, dict[str, object]] = {}
         self.include_automation_var = tk.BooleanVar(
             value=bool(self.settings.get("includeAutomationVehicles"))
         )
@@ -198,6 +203,8 @@ class HandDriveToolApp(
         # Folder scan is ~1s over 190 zips, so it runs off the UI thread once
         # the window is up rather than blocking startup.
         self.after(60, self._start_inventory_scan)
+        # After the maximise, so the prompt centres on the window's real size.
+        self.after(300, self._maybe_prompt_for_folders)
 
 
 def parse_args() -> argparse.Namespace:
