@@ -957,9 +957,13 @@ def extract_archive_member(archive: VehicleArchive, member: str) -> Path:
 # the source it was cooked from. `.bmp` is new here and last, because BeamNG
 # accepts it and we did not.
 _TEXTURE_EXTENSIONS = (".dds", ".png", ".tga", ".jpg", ".jpeg", ".bmp")
-# BeamNG's texture cooker names a map `<stem>.color.png` / `.normal.` / `.data.`
-# and a material may point at the bare stem.
-_TEXTURE_COOKER_INFIXES = (".color", ".normal", ".data")
+# No cooker-infix probing here. `.color.png` / `.normal.png` / `.data.png` name
+# a cooker source beside its cooked `.dds`, always on a path that already
+# carries an extension -- `editor/materialEditor.lua` pairs them that way, and
+# separately raises "Mapped texture is missing file extension" for a map with
+# no extension at all. So the engine treats a bare stem as a defect it
+# tolerates, not as a stem to try cooker names against; guessing `<stem>.color
+# .png` would be inventing a rule BeamNG does not have, at 3x the candidates.
 
 
 def _texture_reference_candidates(reference: str, materials_member: str) -> tuple[str, ...]:
@@ -1014,9 +1018,6 @@ def _texture_reference_candidates(reference: str, materials_member: str) -> tupl
         # Nothing has been named yet, so the whole reference is the stem.
         for replacement in _TEXTURE_EXTENSIONS:
             add(candidate + replacement)
-        for infix in _TEXTURE_COOKER_INFIXES:
-            for replacement in _TEXTURE_EXTENSIONS:
-                add(candidate + infix + replacement)
     return tuple(candidates)
 
 

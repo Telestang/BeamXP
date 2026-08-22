@@ -904,11 +904,18 @@ class ExtensionlessTextureReferenceTests(unittest.TestCase):
         )
         self.assertEqual(resolved, "vehicles/car/decal.bmp")
 
-    def test_a_bare_stem_finds_a_texture_cooker_name(self) -> None:
+    def test_a_bare_stem_does_not_guess_texture_cooker_names(self) -> None:
+        # `.color.png` / `.normal.png` / `.data.png` name a cooker source beside
+        # its cooked .dds, always on a path that already carries an extension
+        # (editor/materialEditor.lua pairs them that way). The same file raises
+        # "Mapped texture is missing file extension" for a bare stem, so BeamNG
+        # treats that as a defect it tolerates -- not a stem to try cooker names
+        # against. Guessing them would invent a rule the engine does not have
+        # and triple the candidates, each one a full archive scan on a miss.
         resolved, _ = self._resolve(
             ["vehicles/car/badge.color.png"], "/vehicles/car/badge"
         )
-        self.assertEqual(resolved, "vehicles/car/badge.color.png")
+        self.assertIsNone(resolved)
 
     def test_a_non_image_suffix_is_treated_as_part_of_the_stem(self) -> None:
         resolved, _ = self._resolve(
