@@ -165,7 +165,6 @@ class ForkedSwitchBaseTests(unittest.TestCase):
                 [dict(materials)],
                 build_pipeline._texture_correction_switch_base_aliases(tmp / "job"),
                 (),
-                None,
                 materials.switch_forks,
             )
             updated = jbeam.read_text(encoding="utf-8")
@@ -302,7 +301,6 @@ class ForkedSwitchBaseTests(unittest.TestCase):
                     '{"lowbeam":0.49}, "off":"lc500_intemis_off", '
                     '"on":"lc500_intemis_on"}}}}',
                 ),
-                None,
                 materials.switch_forks,
                 {"lc500_door_L_xp_rhd": "lc500_door_L"},
             )
@@ -354,7 +352,6 @@ class ForkedSwitchBaseTests(unittest.TestCase):
                     '{"lowbeam":0.49}, "off":"lc500_intemis_off", '
                     '"on":"lc500_intemis_on"}}}}',
                 ),
-                None,
                 materials.switch_forks,
                 {"lc500_door_L_xp_rhd": "lc500_door_L"},
             )

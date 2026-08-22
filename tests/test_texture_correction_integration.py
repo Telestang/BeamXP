@@ -225,12 +225,12 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             output = tmp / "out" / "vehicles" / "lc500"
             output.mkdir(parents=True)
             target_mesh = core.generated_mesh_name("lc500_screen", core.HAND_RHD)
-            split_screen_mesh = "lc500_screen__beamxp_mirrored_carrier"
             other_mesh = core.generated_mesh_name("lc500_body", core.HAND_RHD)
+            dash_mesh = core.generated_mesh_name("lc500_dash", core.HAND_RHD)
             generated_jbeam = output / "handdrive_visual_conversion.jbeam"
             generated_jbeam.write_text(
                 '{"lc500":{"slotType":"main","flexbodies":[["mesh","[group]:"],["'
-                + target_mesh
+                + dash_mesh
                 + '",["lc500_body"]]]},'
                 '"lc500_body_xp_rhd":{"slotType":"lc500_body",'
                 '"flexbodies":[["mesh","[group]:"],["'
@@ -238,7 +238,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 + '",["lc500_body"]]]},'
                 '"lc500_interior_xp_rhd":{"slotType":"lc500_interior",'
                 '"flexbodies":[["mesh","[group]:"],["'
-                + split_screen_mesh
+                + target_mesh
                 + '",["lc500_body"]]],'
                 # Texture correction runs first and has already claimed the
                 # "off" state; isolating the live state must not undo that.
@@ -270,7 +270,6 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 output,
                 {"lc500_screen"},
                 {core.HAND_RHD},
-                generated_mesh_replacements={target_mesh: [split_screen_mesh]},
             )
             patched = generated_jbeam.read_text(encoding="utf-8")
             materials = json.loads(
@@ -287,12 +286,11 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         self.assertEqual(materials[target_alias]["Stages"][0]["colorMap"], "@" + target_alias)
         self.assertIn('"off":"lc500_screens_off_beamxp_tc"', patched)
         self.assertNotIn('"on_intense":"lc500_GPS"', patched)
-        # Mesh and part identities are independent, and texture correction may
-        # have replaced the generated mesh with a split carrier before runtime
-        # isolation runs.  The containing generated interior part still owns
-        # the navigator controller/glow rebind.
-        self.assertIn(split_screen_mesh, patched)
-        self.assertEqual(patched.count(target_mesh), 1)  # untouched donor row only
+        # Mesh and part identities are independent: the screen mesh is carried
+        # by the generated interior part, not by the part the navigator
+        # controller was authored on, and that part owns the rebind.
+        self.assertIn(target_mesh, patched)
+        self.assertEqual(patched.count(target_mesh), 1)  # its one carrying row
 
     def test_direct_navigator_binding_survives_stale_child_and_clones_dim_state(self) -> None:
         """A child glowMap cannot hand a private screen back to the donor tag."""
@@ -356,14 +354,13 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             output.mkdir(parents=True)
             source_mesh = "ardente_screens"
             generated_mesh = core.generated_mesh_name(source_mesh, core.HAND_RHD)
-            split_mesh = "ardente_screens__beamxp_mirrored_carrier"
             generated_jbeam = output / "handdrive_visual_conversion.jbeam"
             generated_jbeam.write_text(
                 f'''{{
                   "ardente_dash_xp_rhd": {{
                     "slotType":"ardente_dash",
                     "flexbodies":[["mesh","[group]:"],
-                      ["{split_mesh}",["ardente_dash"]]],
+                      ["{generated_mesh}",["ardente_dash"]]],
                     "controller":[["fileName"],["beamNavigator",{{
                       "screenMaterialName":"@ardente_gps_screen",
                       "htmlFilePath":"local://local/vehicles/vivace/ardente/nav.html",
@@ -395,7 +392,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                     <triangles material="ardente_gps_screen-material" count="0"/>
                   </mesh></geometry></library_geometries>
                   <library_visual_scenes><visual_scene id="Scene">
-                    <node id="{split_mesh}" name="{split_mesh}">
+                    <node id="{generated_mesh}" name="{generated_mesh}">
                       <instance_geometry url="#shared-screen"><bind_material>
                         <technique_common><instance_material
                           symbol="ardente_gps_screen-material"
@@ -436,7 +433,6 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 output,
                 {source_mesh},
                 {core.HAND_RHD},
-                generated_mesh_replacements={generated_mesh: [split_mesh]},
             )
             patched = generated_jbeam.read_text(encoding="utf-8")
             materials = json.loads(
@@ -448,11 +444,11 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             target_alias = f"ardente_gps_screen_beamxp_{suffix}"
             target_dim = f"ardente_gps_screen_dim_beamxp_{suffix}"
             symbols = build_pipeline._node_material_symbols(
-                generated_dae, {split_mesh, "stock_screen"}
+                generated_dae, {generated_mesh, "stock_screen"}
             )
 
         self.assertTrue(report["enabled"])
-        self.assertEqual(symbols[split_mesh], {target_alias})
+        self.assertEqual(symbols[generated_mesh], {target_alias})
         # The shared geometry was copied before retargeting; the stock consumer
         # remains on its authored material.
         self.assertEqual(symbols["stock_screen"], {"ardente_gps_screen"})
@@ -516,7 +512,6 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             output.mkdir(parents=True)
             source_mesh = "car_screen"
             generated_mesh = core.generated_mesh_name(source_mesh, core.HAND_RHD)
-            split_mesh = "car_screen__beamxp_mirrored_carrier"
             fork_material = "car_nav_screen_beamxp_tc"
             generated_jbeam = output / "handdrive_visual_conversion.jbeam"
             generated_jbeam.write_text(
@@ -534,7 +529,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                   "car_interior_xp_rhd": {{
                     "slotType":"car_interior",
                     "flexbodies":[["mesh","[group]:"],
-                      ["{split_mesh}",["car_body"]]],
+                      ["{generated_mesh}",["car_body"]]],
                     "controller":[["fileName"],["beamNavigator",{{
                       "screenMaterialName":"@car_nav_screen",
                       "htmlFilePath":"local://local/vehicles/car/nav.html",
@@ -567,7 +562,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                     </mesh></geometry>
                   </library_geometries>
                   <library_visual_scenes><visual_scene id="Scene">
-                    <node id="{split_mesh}" name="{split_mesh}">
+                    <node id="{generated_mesh}" name="{generated_mesh}">
                       <instance_geometry url="#screen-geometry"/>
                     </node>
                   </visual_scene></library_visual_scenes>
@@ -595,7 +590,6 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 output,
                 {source_mesh},
                 {core.HAND_RHD},
-                generated_mesh_replacements={generated_mesh: [split_mesh]},
                 generated_switch_forks=[
                     {
                         "alias": "car_nav_screen",
@@ -632,8 +626,8 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                     )
                 }
             bound_symbols = build_pipeline._node_material_symbols(
-                generated_dae, {split_mesh}
-            )[split_mesh]
+                generated_dae, {generated_mesh}
+            )[generated_mesh]
 
         target_alias = report["materials"][0]
         self.assertEqual(bound_symbols, {fork_material})
@@ -1572,41 +1566,41 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertIn("carbon", report["failures"][0]["error"])
             self.assertTrue(any("skipped 1" in message for message in progress_messages))
 
-    def test_jbeam_patch_replaces_every_flexbody_array(self) -> None:
-        source = """{
-          "part_a": {
-            "flexbodies": [
-              ["scintilla_dashboard_xp_rhd", ["dash"]]
-            ]
-          },
-          "part_b": {
-            "flexbodies": [
-              ["scintilla_controls_xp_rhd", ["dash"]]
-            ]
-          }
-        }"""
+    def test_a_corrected_mesh_leaves_every_flexbody_row_as_it_found_it(self) -> None:
+        """The ETK K-Series drift trim: five segments of a console it never had.
 
-        updated = build_pipeline._replace_all_jbeam_array_regions(
-            source,
-            "flexbodies",
-            lambda text: build_pipeline._expand_texture_correction_flexbody_array(
-                text,
-                {
-                    "scintilla_dashboard_xp_rhd": [
-                        "scintilla_dashboard__beamxp_mirrored_carrier",
-                        "scintilla_dashboard__beamxp_rigid_001",
-                    ],
-                    "scintilla_controls_xp_rhd": [
-                        "scintilla_controls__beamxp_mirrored_carrier",
-                    ],
-                },
-            ),
-        )
+        ``etkc_dash_race_lower`` is commented out of the stripped interior, and
+        while the correction expanded a row into one row per piece the ``//``
+        stayed on the first piece alone -- the other four became live rows and
+        the drift trim wore them on the floor. Grouping the pieces back into
+        the mesh means no row is rewritten at all, so a commented one stays
+        commented whatever the correction did to the mesh it names.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            vehicle_dir = Path(raw)
+            jbeam = vehicle_dir / "handdrive_visual_conversion.jbeam"
+            source = """{
+  "etkc_dash_xp_rhd": {
+    "flexbodies": [
+      ["etkc_dash_race_lower_xp_rhd", ["etkc_dash"]]
+    ]
+  },
+  "etkc_dash_stripped_xp_rhd": {
+    "flexbodies": [
+      //["etkc_dash_race_lower_xp_rhd", ["etkc_dash"]],
+      ["etkc_intcarpet_stripped_xp_rhd", ["etkc_body"]]
+    ]
+  }
+}"""
+            jbeam.write_text(source, encoding="utf-8")
 
-        self.assertNotIn('"scintilla_dashboard_xp_rhd"', updated)
-        self.assertNotIn('"scintilla_controls_xp_rhd"', updated)
-        self.assertIn('"scintilla_dashboard__beamxp_rigid_001"', updated)
-        self.assertIn('"scintilla_controls__beamxp_mirrored_carrier"', updated)
+            result = build_pipeline._patch_texture_correction_jbeams(
+                vehicle_dir,
+                {"etkc_dash_race_lower_xp_rhd"},
+            )
+
+            self.assertEqual(result["files"], [])
+            self.assertEqual(jbeam.read_text(encoding="utf-8"), source)
 
     def test_jbeam_patch_clones_glowmap_for_corrected_material_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1638,7 +1632,6 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
 
             updated = jbeam.read_text(encoding="utf-8")
 
-        self.assertEqual(result["replacedRows"], 0)
         self.assertEqual(result["files"], [str(jbeam)])
         self.assertIn('"ardente_interior_beamxp_tc"', updated)
         self.assertIn('"off":"ardente_interior_beamxp_tc"', updated)
@@ -2018,12 +2011,9 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             jbeam = (jbeam_dir / "handdrive_visual_conversion.jbeam").read_text(encoding="utf-8")
             root = ET.parse(target_dae).getroot()
 
-        self.assertEqual(result["rowReplacements"], {})
-        self.assertEqual(
-            result["jbeamPatch"],
-            {"files": [], "replacedRows": 0, "mirrorRows": 0, "danglingMirrorRows": []},
-        )
-        self.assertEqual(result["daePatches"][0]["appendedNodes"], [])
+        self.assertEqual(result["groupedMeshes"], [])
+        self.assertEqual(result["jbeamPatch"], {"files": [], "renamedRows": 0})
+        self.assertEqual(result["daePatches"][0]["groupedNodes"], [])
         self.assertEqual(result["daePatches"][0]["retargetedNodes"], ["doorpanel_FL_xp_rhd"])
         self.assertIn('"doorpanel_FL_xp_rhd", ["door_FL"]', jbeam)
         self.assertNotIn("doorpanel_FR__beamxp_mirrored_carrier", jbeam)
@@ -2142,7 +2132,6 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 {core.HAND_RHD},
                 texture_correction_targets={"signalstalk": {"signalstalk"}},
                 prop_meshes={"signalstalk"},
-                flexbody_meshes=set(),
                 baked_mesh_copies={("signalstalk", core.HAND_RHD): [baked]},
             )
 
@@ -2151,9 +2140,10 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
 
         patch_report = result["daePatches"][0]
         self.assertEqual(patch_report["propTargetMeshes"], ["signalstalk"])
-        # No pieces appended and no row rewritten: a prop cannot carry a split.
-        self.assertEqual(patch_report["appendedNodes"], [])
-        self.assertEqual(result["rowReplacements"], {})
+        # Nothing grouped and no row rewritten: rebuilding the node would move
+        # the frame the prop is placed from.
+        self.assertEqual(patch_report["groupedNodes"], [])
+        self.assertEqual(result["groupedMeshes"], [])
         self.assertIn(baked, patch_report["retargetedNodes"])
         self.assertIn(f'"turnsignal", "{baked}"', jbeam)
         self.assertIsNone(
@@ -2169,7 +2159,150 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         assert triangle is not None
         self.assertEqual(triangle.get("material"), "buttons_off_beamxp_tc")
 
-    def test_append_texture_correction_dae_bakes_transform_and_material(self) -> None:
+    def test_a_mesh_bound_as_both_keeps_a_copy_for_each_binding(self) -> None:
+        """The Ardente's ``grp_shifter_knob_a``: a prop and a flexbody at once.
+
+        Its race shifter renders the knob as a flexbody and its sequential
+        shifter animates the same mesh as a prop, in different configs of one
+        conversion. The prop has to keep the whole-mesh copy it is placed
+        from, so the grouped correction is added beside it and only the
+        flexbody and ``mirrors`` rows are moved onto it -- one name for one
+        name, which is what leaves a commented row commented.
+        """
+        generated = core.generated_mesh_name("grp_shifter_knob_a", core.HAND_RHD)
+        corrected = f"{generated}__beamxp_corrected"
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            context = minimal_context(tmp)
+            output_root = tmp / "unpacked_output"
+            output_vehicle_dir = output_root / context.vehicle_path
+            output_vehicle_dir.mkdir(parents=True)
+            target_dae = output_vehicle_dir / "scintilla_handdrive.dae"
+            target_dae.write_text(
+                f"""<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="knob_mat-material" name="knob_mat"/></library_materials><library_geometries>
+<geometry id="geom_whole"><mesh><triangles material="knob_mat-material" count="0"/></mesh></geometry>
+</library_geometries><library_visual_scenes><visual_scene id="Scene">
+<node id="{generated}" name="{generated}"><matrix>1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1</matrix>
+<instance_geometry url="#geom_whole"><bind_material><technique_common>
+<instance_material symbol="knob_mat-material" target="#knob_mat-material"/>
+</technique_common></bind_material></instance_geometry></node>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            jbeam_dir = output_vehicle_dir / "jbeam"
+            jbeam_dir.mkdir()
+            jbeam_path = jbeam_dir / "handdrive_visual_conversion.jbeam"
+            jbeam_path.write_text(
+                f"""{{
+  "shifter_race_xp_rhd": {{
+    "flexbodies": [
+      ["mesh", "[group]:"],
+      ["{generated}", ["shifter_lever"]],
+    ],
+    "mirrors": [
+      ["mesh", "idRef:", "id1:", "id2:"],
+      ["{generated}","rf1","rf1r","rf2"],
+    ],
+  }},
+  "shiftknob_sq_xp_rhd": {{
+    "props": [
+      ["func", "mesh", "idRef:", "idX:", "idY:"],
+      ["sequentialLeverY", "{generated}", "st_1r", "st_1l", "st_2r"],
+    ],
+  }},
+}}""",
+                encoding="utf-8",
+            )
+            job = tmp / "texture_job"
+            job.mkdir()
+            source_dae = job / "knob_rhd.dae"
+            source_dae.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema"><library_materials>
+<material id="knob_mat-material" name="knob_mat"/></library_materials>
+<library_geometries>
+<geometry id="piece"><mesh><triangles material="knob_mat-material" count="0"/></mesh></geometry>
+</library_geometries>
+<library_visual_scenes><visual_scene id="Scene">
+<node id="grp_shifter_knob_a__beamxp_mirrored_carrier" name="grp_shifter_knob_a__beamxp_mirrored_carrier">
+<instance_geometry url="#piece"/></node>
+</visual_scene></library_visual_scenes></COLLADA>""",
+                encoding="utf-8",
+            )
+            (job / "rhd_materials.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {"aliases": ["knob_mat", "knob_mat-material"], "maps": {}}
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            detail_path = job / "texture.report.json"
+            detail_path.write_text(
+                json.dumps(
+                    {
+                        "dae_exports": [
+                            {
+                                "source_part": {"key": "grp_shifter_knob_a"},
+                                "generated_flexbody_rows": [
+                                    {"node_id": "grp_shifter_knob_a__beamxp_mirrored_carrier"}
+                                ],
+                                "dae_path": str(source_dae),
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = build_pipeline.integrate_texture_correction_artifacts(
+                context,
+                output_root,
+                output_vehicle_dir,
+                {
+                    "jobs": [
+                        {
+                            "dae": "vehicles/scintilla/scintilla.dae",
+                            "outputDirectory": str(job),
+                            "reportPath": str(detail_path),
+                        }
+                    ]
+                },
+                {core.HAND_RHD},
+                texture_correction_targets={"grp_shifter_knob_a": {"grp_shifter_knob_a"}},
+                prop_meshes={"grp_shifter_knob_a"},
+                flexbody_meshes={"grp_shifter_knob_a"},
+            )
+
+            jbeam = jbeam_path.read_text(encoding="utf-8")
+            root = ET.parse(target_dae).getroot()
+
+        self.assertEqual(result["renamedMeshes"], {generated: corrected})
+        self.assertEqual(result["daePatches"][0]["groupedNodes"], [corrected])
+        self.assertEqual(result["jbeamPatch"]["renamedRows"], 1)
+        # The flexbody and the reflection follow; the prop stays on the copy
+        # it is placed from.
+        self.assertIn(f'["{corrected}", ["shifter_lever"]]', jbeam)
+        self.assertIn(f'["{corrected}","rf1"', jbeam)
+        self.assertIn(f'["sequentialLeverY", "{generated}"', jbeam)
+        self.assertIsNotNone(root.find(f".//c:node[@id='{generated}']", core.NS))
+        self.assertIsNotNone(root.find(f".//c:node[@id='{corrected}']", core.NS))
+
+    def test_the_correction_pieces_are_grouped_into_the_mesh_they_came_from(self) -> None:
+        """One node, under the name the flexbody row already had.
+
+        The sweep hands back a mirrored carrier and a rigidly moved piece,
+        each on its own node with its own placement. Both are baked flat and
+        merged into a single mesh so the conversion ships exactly the mesh
+        count it started with, and the whole-mesh copy they supersede goes
+        with its geometry.
+        """
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             target = tmp / "target.dae"
@@ -2177,8 +2310,15 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             target.write_text(
                 """<?xml version="1.0" encoding="utf-8"?>
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
-  <library_geometries/>
-  <library_visual_scenes><visual_scene id="Scene"/></library_visual_scenes>
+  <library_geometries>
+    <geometry id="geom_whole"><mesh><triangles material="dash_mat-material" count="0"/></mesh></geometry>
+  </library_geometries>
+  <library_visual_scenes><visual_scene id="Scene">
+    <node id="etkc_dash_xp_rhd" name="etkc_dash_xp_rhd">
+      <matrix>1 0 0 9 0 1 0 9 0 0 1 9 0 0 0 1</matrix>
+      <instance_geometry url="#geom_whole"/>
+    </node>
+  </visual_scene></library_visual_scenes>
 </COLLADA>
 """,
                 encoding="utf-8",
@@ -2186,28 +2326,70 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             source.write_text(
                 """<?xml version="1.0" encoding="utf-8"?>
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">
-  <library_effects>
-    <effect id="dash_mat-effect"/>
-  </library_effects>
+  <library_effects><effect id="dash_mat-effect"/></library_effects>
   <library_materials>
     <material id="dash_mat-material" name="dash_mat">
       <instance_effect url="#dash_mat-effect"/>
     </material>
+    <material id="trim_mat-material" name="trim_mat"/>
   </library_materials>
   <library_geometries>
-    <geometry id="geom_001"><mesh>
-      <source id="geom_001-positions"><float_array id="geom_001-positions-array" count="3">1 2 3</float_array></source>
-      <source id="geom_001-normals"><float_array id="geom_001-normals-array" count="3">0 1 0</float_array></source>
-      <triangles material="dash_mat-material" count="0"/>
+    <geometry id="dash__beamxp_mirrored_carrier"><mesh>
+      <source id="dash__beamxp_mirrored_carrier-positions">
+        <float_array id="dash__beamxp_mirrored_carrier-positions-array" count="9">1.0 1.0 1.0 2.0 2.0 2.0 3.0 3.0 3.0</float_array>
+        <technique_common><accessor source="#dash__beamxp_mirrored_carrier-positions-array" count="3" stride="3">
+          <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+        </accessor></technique_common>
+      </source>
+      <source id="dash__beamxp_mirrored_carrier-normals">
+        <float_array id="dash__beamxp_mirrored_carrier-normals-array" count="9">0 1 0 0 1 0 0 1 0</float_array>
+        <technique_common><accessor source="#dash__beamxp_mirrored_carrier-normals-array" count="3" stride="3">
+          <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+        </accessor></technique_common>
+      </source>
+      <vertices id="dash__beamxp_mirrored_carrier-vertices"><input semantic="POSITION" source="#dash__beamxp_mirrored_carrier-positions"/></vertices>
+      <triangles material="dash_mat-material" count="1">
+        <input semantic="VERTEX" offset="0" source="#dash__beamxp_mirrored_carrier-vertices"/>
+        <input semantic="NORMAL" offset="1" source="#dash__beamxp_mirrored_carrier-normals"/>
+        <p>0 0 1 1 2 2</p>
+      </triangles>
+    </mesh></geometry>
+    <geometry id="dash__beamxp_rigid_001"><mesh>
+      <source id="dash__beamxp_rigid_001-positions">
+        <float_array id="dash__beamxp_rigid_001-positions-array" count="9">10.0 10.0 10.0 11.0 11.0 11.0 12.0 12.0 12.0</float_array>
+        <technique_common><accessor source="#dash__beamxp_rigid_001-positions-array" count="3" stride="3">
+          <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+        </accessor></technique_common>
+      </source>
+      <source id="dash__beamxp_rigid_001-normals">
+        <float_array id="dash__beamxp_rigid_001-normals-array" count="9">0 1 0 0 1 0 0 1 0</float_array>
+        <technique_common><accessor source="#dash__beamxp_rigid_001-normals-array" count="3" stride="3">
+          <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+        </accessor></technique_common>
+      </source>
+      <vertices id="dash__beamxp_rigid_001-vertices"><input semantic="POSITION" source="#dash__beamxp_rigid_001-positions"/></vertices>
+      <triangles material="trim_mat-material" count="1">
+        <input semantic="VERTEX" offset="0" source="#dash__beamxp_rigid_001-vertices"/>
+        <input semantic="NORMAL" offset="1" source="#dash__beamxp_rigid_001-normals"/>
+        <p>0 0 1 1 2 2</p>
+      </triangles>
     </mesh></geometry>
   </library_geometries>
   <library_visual_scenes>
     <visual_scene id="Scene">
-      <node id="dash_split" name="dash_split">
+      <node id="dash__beamxp_mirrored_carrier" name="dash__beamxp_mirrored_carrier">
         <matrix>1 0 0 2 0 1 0 3 0 0 1 4 0 0 0 1</matrix>
-        <instance_geometry url="#geom_001">
+        <instance_geometry url="#dash__beamxp_mirrored_carrier">
           <bind_material><technique_common>
             <instance_material symbol="dash_mat-material" target="#dash_mat-material"/>
+          </technique_common></bind_material>
+        </instance_geometry>
+      </node>
+      <node id="dash__beamxp_rigid_001" name="dash__beamxp_rigid_001">
+        <matrix>1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1</matrix>
+        <instance_geometry url="#dash__beamxp_rigid_001">
+          <bind_material><technique_common>
+            <instance_material symbol="trim_mat-material" target="#trim_mat-material"/>
           </technique_common></bind_material>
         </instance_geometry>
       </node>
@@ -2218,33 +2400,63 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            appended = build_pipeline._append_texture_correction_dae(
+            grouped, piece_materials = build_pipeline._group_texture_correction_dae(
                 target,
                 source,
-                {"dash_split"},
+                {"dash__beamxp_mirrored_carrier", "dash__beamxp_rigid_001"},
                 {"dash_mat": "dash_beamxp_tc"},
+                ["etkc_dash_xp_rhd"],
             )
 
-            self.assertEqual(appended, ["dash_split"])
+            self.assertEqual(grouped, ["etkc_dash_xp_rhd"])
+            self.assertEqual(
+                piece_materials,
+                {
+                    "dash__beamxp_mirrored_carrier": {"dash_beamxp_tc"},
+                    "dash__beamxp_rigid_001": {"trim_mat"},
+                },
+            )
             root = ET.parse(target).getroot()
             ns = {"c": "http://www.collada.org/2005/11/COLLADASchema"}
-            positions = root.find(".//c:source[@id='geom_001-positions']/c:float_array", ns)
-            normals = root.find(".//c:source[@id='geom_001-normals']/c:float_array", ns)
-            node_matrix = root.find(".//c:node[@id='dash_split']/c:matrix", ns)
-            triangle = root.find(".//c:triangles", ns)
-            binding = root.find(".//c:instance_material", ns)
-            material = root.find(".//c:material[@id='dash_beamxp_tc-material']", ns)
-            effect = root.find(".//c:effect[@id='dash_mat-effect']", ns)
+            nodes = root.findall(".//c:visual_scene/c:node", ns)
+            self.assertEqual([node.get("id") for node in nodes], ["etkc_dash_xp_rhd"])
+            instances = nodes[0].findall("c:instance_geometry", ns)
+            self.assertEqual(len(instances), 1)
+            self.assertEqual(
+                nodes[0].find("c:matrix", ns).text, "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
+            )
+            self.assertIsNone(root.find(".//c:geometry[@id='geom_whole']", ns))
 
-            self.assertEqual(positions.text, "3 5 7")
-            self.assertEqual(normals.text, "0 1 0")
-            self.assertEqual(node_matrix.text, "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1")
-            self.assertEqual(triangle.get("material"), "dash_beamxp_tc")
-            self.assertEqual(binding.get("symbol"), "dash_beamxp_tc")
-            self.assertEqual(binding.get("target"), "#dash_beamxp_tc-material")
-            self.assertIsNotNone(material)
-            self.assertEqual(material.get("name"), "dash_beamxp_tc")
-            self.assertIsNotNone(effect)
+            merged = root.find(
+                ".//c:geometry[@id='" + instances[0].get("url").lstrip("#") + "']", ns
+            )
+            positions = merged.find(".//c:vertices/c:input", ns).get("source").lstrip("#")
+            array = merged.find(".//c:source[@id='" + positions + "']/c:float_array", ns)
+            # The carrier's own placement is baked in; the rigid piece sat at
+            # the origin and keeps its coordinates.
+            self.assertEqual(
+                array.text, "3 4 5 4 5 6 5 6 7 10 10 10 11 11 11 12 12 12"
+            )
+            self.assertEqual(array.get("count"), "18")
+            triangles = merged.findall("c:mesh/c:triangles", ns)
+            self.assertEqual(
+                [element.get("material") for element in triangles],
+                ["dash_beamxp_tc", "trim_mat-material"],
+            )
+            # The second piece's vertices moved to the back of the shared pool.
+            self.assertEqual(triangles[0].find("c:p", ns).text, "0 0 1 1 2 2")
+            self.assertEqual(triangles[1].find("c:p", ns).text, "3 0 4 1 5 2")
+            self.assertEqual(
+                {
+                    binding.get("symbol")
+                    for binding in nodes[0].findall(".//c:instance_material", ns)
+                },
+                {"dash_beamxp_tc", "trim_mat-material"},
+            )
+            self.assertIsNotNone(
+                root.find(".//c:material[@id='dash_beamxp_tc-material']", ns)
+            )
+            self.assertIsNotNone(root.find(".//c:effect[@id='dash_mat-effect']", ns))
 
     def test_texture_correction_material_preserves_source_stages(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2670,169 +2882,20 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertIn("dash_b.color_rhd.dds", materials["dash_mat_beamxp_tc"]["Stages"][0]["baseColorMap"])
             self.assertIn("console_b.color_rhd.dds", materials["dash_mat_beamxp_tc_2"]["Stages"][0]["baseColorMap"])
 
-    # The glass piece a split leaves behind, and the housing pieces beside it.
-    MIRROR_SPLIT = {
-        "carrier": "scintilla_interior_mirror__beamxp_mirrored_carrier",
-        "housing": "scintilla_interior_mirror__beamxp_rigid_001",
-        "glass": "scintilla_interior_mirror__beamxp_rigid_003",
-    }
-
-    def _split_dae(self, path: Path, housing_material: str = "scintilla_interior_beamxp_tc") -> None:
-        """A split mesh: two housing pieces, and one that carries the glass.
-
-        ``housing_material`` is what the housing pieces paint with. The default
-        is a corrected atlas; pass the plain source material for the far more
-        common case of a mirror the correction had no work to do on.
-        """
-        painted = {
-            self.MIRROR_SPLIT["carrier"]: [housing_material],
-            self.MIRROR_SPLIT["housing"]: [housing_material],
-            # the glass piece carries housing triangles of its own as well, the
-            # way a real split piece does
-            self.MIRROR_SPLIT["glass"]: ["mirror_F-material", housing_material],
-        }
-        pieces = "".join(
-            f'<geometry id="g_{name}"><mesh>'
-            + "".join(
-                f'<triangles material="{material}" count="0"/>' for material in materials
-            )
-            + "</mesh></geometry>"
-            for name, materials in painted.items()
-        )
-        nodes = "".join(
-            # every piece keeps the whole mesh's binding table, which is exactly
-            # why the node's bindings cannot tell the pieces apart
-            f'<node id="{name}" name="{name}">'
-            f'<instance_geometry url="#g_{name}"><bind_material><technique_common>'
-            f'<instance_material symbol="scintilla_interior_beamxp_tc" target="#a"/>'
-            f'<instance_material symbol="mirror_F" target="#b"/>'
-            f"</technique_common></bind_material></instance_geometry></node>"
-            for name in self.MIRROR_SPLIT.values()
-        )
-        path.write_text(
-            '<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema">'
-            f"<library_geometries>{pieces}</library_geometries>"
-            f"<library_visual_scenes><visual_scene>{nodes}</visual_scene>"
-            "</library_visual_scenes></COLLADA>",
-            encoding="utf-8",
-        )
-
-    def test_the_glass_piece_is_the_one_painting_with_a_mirror_material(self) -> None:
-        for label, housing in (
-            ("correction ran on the housing", "scintilla_interior_beamxp_tc"),
-            # The usual case, and the one that used to lose the row: a mirror
-            # is rarely worth correcting, so nothing on the mesh is renamed and
-            # asking which piece the correction skipped picks out all of them.
-            ("correction had nothing to do", "scintilla_interior-material"),
-        ):
-            with self.subTest(label):
-                with tempfile.TemporaryDirectory() as raw:
-                    dae = Path(raw) / "gen.dae"
-                    self._split_dae(dae, housing)
-                    pieces = list(self.MIRROR_SPLIT.values())
-                    materials = build_pipeline._node_material_symbols(dae, set(pieces))
-                    glass = build_pipeline._mirror_row_split_target(
-                        pieces, materials, {"mirror_f"}
-                    )
-
-                self.assertEqual(glass, self.MIRROR_SPLIT["glass"])
-
-    def test_a_split_with_no_single_glass_piece_leaves_the_row_alone(self) -> None:
-        """Better a mirror that does not reflect than a dashboard that does."""
-        with tempfile.TemporaryDirectory() as raw:
-            dae = Path(raw) / "gen.dae"
-            self._split_dae(dae)
-            pieces = list(self.MIRROR_SPLIT.values())
-            materials = build_pipeline._node_material_symbols(dae, set(pieces))
-            # no piece paints with a mirror material: nothing to point the row at
-            self.assertEqual(build_pipeline._mirror_row_split_target(pieces, materials, set()), "")
-            # a piece with no geometry at all is never a candidate
-            self.assertEqual(
-                build_pipeline._mirror_row_split_target(["absent"], materials, {"mirror_f"}), ""
-            )
-            # two pieces of glass is as unclear as none
-            shared = {piece: {"mirror_f"} for piece in pieces}
-            self.assertEqual(
-                build_pipeline._mirror_row_split_target(pieces, shared, {"mirror_f"}), ""
-            )
-
-    def test_a_mirror_material_is_recognised_by_how_it_reflects(self) -> None:
-        """The four the game defines, and nothing that merely looks shiny."""
-        mirror_f = {
-            "Stages": [
-                {
-                    "emissive": True,
-                    "metallicFactor": 1,
-                    "normalMap": "vehicles/common/mirror_n.normal.png",
-                    "roughnessFactor": 0,
-                }
-            ],
-            "dynamicCubemap": True,
-            "translucent": True,
-            "translucentBlendOp": "None",
-        }
-        self.assertTrue(build_pipeline._is_engine_mirror_material(mirror_f))
-
-        # chrome: a cubemap, but it composites opaquely
-        self.assertFalse(
-            build_pipeline._is_engine_mirror_material({**mirror_f, "translucent": False})
-        )
-        # glass: translucent and cubemapped, but it blends
-        self.assertFalse(
-            build_pipeline._is_engine_mirror_material(
-                {**mirror_f, "translucentBlendOp": "LerpAlpha"}
-            )
-        )
-        # anything with an image of its own is painted, not reflected
-        self.assertFalse(
-            build_pipeline._is_engine_mirror_material(
-                {**mirror_f, "Stages": [{**mirror_f["Stages"][0], "baseColorMap": "d.dds"}]}
-            )
-        )
-        self.assertFalse(build_pipeline._is_engine_mirror_material({"Stages": []}))
-
-    def test_a_mirrors_row_that_cannot_follow_its_split_is_reported(self) -> None:
-        """A dead reflection is silent in game: addMirror just returns -1."""
-        with tempfile.TemporaryDirectory() as raw:
-            vehicle_dir = Path(raw) / "vehicles/scintilla"
-            vehicle_dir.mkdir(parents=True)
-            (vehicle_dir / "car.jbeam").write_text(
-                """{
-"scintilla_interior_xp_rhd": {
-    "flexbodies": [
-        ["mesh", "[group]:"],
-        ["scintilla_interior_mirror_xp_rhd", ["scintilla_interior"]],
-    ],
-    "mirrors": [
-        ["mesh", "idRef:", "id1:", "id2:"],
-        ["scintilla_interior_mirror_xp_rhd","rf1","rf1rr","f6l",{}],
-    ],
-}
-}""",
-                encoding="utf-8",
-            )
-            result = build_pipeline._patch_texture_correction_jbeams(
-                vehicle_dir,
-                {"scintilla_interior_mirror_xp_rhd": list(self.MIRROR_SPLIT.values())},
-                # the split happened but no glass piece was identified
-                mirror_row_targets={},
-            )
-
-        self.assertEqual(
-            result["danglingMirrorRows"], ["scintilla_interior_mirror_xp_rhd"]
-        )
-
-    def test_a_mirrors_row_follows_its_mesh_into_the_split(self) -> None:
+    def test_a_mirrors_row_is_left_naming_the_mesh_it_always_named(self) -> None:
         """addMirror binds by mesh name, so a stale row reflects nothing.
 
-        The rename fix cured this once; splitting a mesh for texture correction
-        renames it again, later, and brought the same failure back.
+        A mirror is rarely worth correcting, but its mesh can be swept along
+        with the panel it shares an atlas with. While that split the mesh, the
+        row had to be repointed at whichever piece kept the glass -- guesswork
+        that gave up and shipped a dead reflection whenever no single piece
+        painted with a mirror material. Grouping leaves the mesh named as it
+        was, so there is nothing to repoint.
         """
         with tempfile.TemporaryDirectory() as raw:
             vehicle_dir = Path(raw) / "vehicles/scintilla"
             vehicle_dir.mkdir(parents=True)
-            (vehicle_dir / "car.jbeam").write_text(
-                """{
+            source = """{
 "scintilla_interior_xp_rhd": {
     "flexbodies": [
         ["mesh", "[group]:"],
@@ -2843,24 +2906,16 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         ["scintilla_interior_mirror_xp_rhd","rf1","rf1rr","f6l",{"refBaseTranslation":{"x":0.0,"y":0.0,"z":-0.09}}],
     ],
 }
-}""",
-                encoding="utf-8",
-            )
-            result = build_pipeline._patch_texture_correction_jbeams(
+}"""
+            (vehicle_dir / "car.jbeam").write_text(source, encoding="utf-8")
+
+            build_pipeline._patch_texture_correction_jbeams(
                 vehicle_dir,
-                {"scintilla_interior_mirror_xp_rhd": list(self.MIRROR_SPLIT.values())},
-                mirror_row_targets={
-                    "scintilla_interior_mirror_xp_rhd": self.MIRROR_SPLIT["glass"]
-                },
+                {"scintilla_interior_mirror_xp_rhd"},
             )
             updated = (vehicle_dir / "car.jbeam").read_text(encoding="utf-8")
 
-        self.assertEqual(result["mirrorRows"], 1)
-        self.assertIn(f'["{self.MIRROR_SPLIT["glass"]}","rf1"', updated)
-        self.assertNotIn('["scintilla_interior_mirror_xp_rhd","rf1"', updated)
-        # the flexbody rows still take every piece, glass included
-        for name in self.MIRROR_SPLIT.values():
-            self.assertIn(f'["{name}", ["scintilla_interior"]]', updated)
+        self.assertEqual(updated, source)
 
     @staticmethod
     def _skin_manifest_job(directory: Path) -> Path:
@@ -3108,10 +3163,11 @@ class WholeMeshMirrorCorrectionTests(unittest.TestCase):
     """A Mirror prop ships a whole-mesh reflection, so nothing about it is rigid.
 
     ``vehicleObj:addProp`` (lua/common/jbeam/sections/meshs.lua) spawns exactly
-    the mesh the row names, so a prop row cannot be swapped for the split a
-    flexbody row can carry. The Andronisk's signal stalk is the case: the sweep
-    called two of its triangles rigid, and their glyphs shipped unflipped under
-    geometry the exporter reflected anyway.
+    the mesh the row names and places it from that mesh's own frame, so a prop
+    keeps its whole-mesh copy rather than the grouped one a flexbody row is
+    moved onto. The Andronisk's signal stalk is the case: the sweep called two
+    of its triangles rigid, and their glyphs shipped unflipped under geometry
+    the exporter reflected anyway.
     """
 
     def test_a_mirror_prop_forces_its_whole_domain_mirrored(self) -> None:
@@ -3123,8 +3179,10 @@ class WholeMeshMirrorCorrectionTests(unittest.TestCase):
         )
         self.assertEqual(forced, {"signalstalk"})
 
-    def test_a_mesh_bound_as_both_keeps_the_split(self) -> None:
-        # A flexbody row can carry the split, so the sweep's answer still ships.
+    def test_a_mesh_bound_as_both_keeps_the_sweeps_answer(self) -> None:
+        # Its flexbody row moves onto a corrected copy of its own, beside the
+        # whole-mesh copy the prop goes on spawning, so the rigid regions still
+        # have somewhere to ride.
         forced = core.whole_mesh_mirror_correction_ids(
             {"handle": "mirror"},
             {},

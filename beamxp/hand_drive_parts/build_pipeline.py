@@ -1085,21 +1085,6 @@ def _bake_geometry_transform(geometry: ET.Element, matrix: list[list[float]]) ->
         array.text = _format_collada_floats(baked)
 
 
-def _set_identity_node_transform(node: ET.Element) -> None:
-    transform_tags = {
-        _collada_q("matrix"),
-        _collada_q("translate"),
-        _collada_q("rotate"),
-        _collada_q("scale"),
-    }
-    for child in list(node):
-        if child.tag in transform_tags:
-            node.remove(child)
-    matrix = ET.Element(_collada_q("matrix"))
-    matrix.text = "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
-    node.insert(0, matrix)
-
-
 def _normalise_material_alias(value: str) -> str:
     value = value.strip().lstrip("#").lower()
     for suffix in ("-material", "_material"):
@@ -2201,23 +2186,287 @@ def _ensure_retargeted_collada_materials(
             )
 
 
-def _append_texture_correction_dae(
+def _collada_source_layout(source: ET.Element) -> tuple[object, ...] | None:
+    accessor = source.find("c:technique_common/c:accessor", NS)
+    array = source.find("c:float_array", NS)
+    if accessor is None or array is None:
+        return None
+    return (
+        accessor.get("stride") or "1",
+        tuple(
+            (param.get("name") or "", param.get("type") or "")
+            for param in accessor.findall("c:param", NS)
+        ),
+    )
+
+
+def _collada_vertex_wiring(
+    mesh: ET.Element,
+) -> tuple[ET.Element, list[tuple[str, str, ET.Element]]] | None:
+    """The mesh's single ``<vertices>`` element and the sources it wires.
+
+    ``None`` when the mesh is not shaped the way a merge needs: a COLLADA mesh
+    carries exactly one ``<vertices>``, and every input of it has to resolve to
+    a float source this file also defines.
+    """
+    vertices = mesh.findall("c:vertices", NS)
+    if len(vertices) != 1:
+        return None
+    sources = {
+        source.get("id"): source
+        for source in mesh.findall("c:source", NS)
+        if source.get("id")
+    }
+    wired: list[tuple[str, str, ET.Element]] = []
+    for input_element in vertices[0].findall("c:input", NS):
+        semantic = input_element.get("semantic") or ""
+        source_id = (input_element.get("source") or "").lstrip("#")
+        source = sources.get(source_id)
+        if not semantic or source is None or _collada_source_layout(source) is None:
+            return None
+        wired.append((semantic, source_id, source))
+    if not wired:
+        return None
+    return vertices[0], wired
+
+
+def _collada_merge_signature(geometry: ET.Element) -> tuple[object, ...] | None:
+    """What two geometries must agree on before they can share one mesh."""
+    mesh = geometry.find("c:mesh", NS)
+    if mesh is None:
+        return None
+    wiring = _collada_vertex_wiring(mesh)
+    if wiring is None:
+        return None
+    for child in mesh:
+        name = child.tag.split("}")[-1]
+        if name not in {"source", "vertices", "triangles", "extra"}:
+            # polylist, tristrips and friends index differently; leave them be.
+            return None
+    return tuple(
+        (semantic, _collada_source_layout(source))
+        for semantic, _source_id, source in wiring[1]
+    )
+
+
+def _collada_vertex_count(wired: list[tuple[str, str, ET.Element]]) -> int | None:
+    """How many vertices the wired sources address, or ``None`` if they differ."""
+    counts = set()
+    for _semantic, _source_id, source in wired:
+        accessor = source.find("c:technique_common/c:accessor", NS)
+        if accessor is None:
+            return None
+        try:
+            counts.add(int(accessor.get("count") or 0))
+        except ValueError:
+            return None
+    if len(counts) != 1:
+        return None
+    return counts.pop()
+
+
+def _merge_collada_geometries(
+    geometries: list[ET.Element],
+    new_id: str,
+) -> ET.Element | None:
+    """One geometry carrying every given geometry's triangles.
+
+    The pieces keep their own materials -- a COLLADA mesh may hold a
+    ``<triangles>`` group per material, which is how the stock exports carry a
+    multi-material panel -- so nothing about what they paint with changes. Only
+    the vertex pool has to be shared, because a mesh has one ``<vertices>``
+    element, so the wired sources are concatenated and each piece's VERTEX
+    indices are shifted past the pieces already in.
+    """
+    wirings: list[tuple[ET.Element, ET.Element, list[tuple[str, str, ET.Element]]]] = []
+    signature = _collada_merge_signature(geometries[0])
+    if signature is None:
+        return None
+    for geometry in geometries:
+        if _collada_merge_signature(geometry) != signature:
+            return None
+        mesh = geometry.find("c:mesh", NS)
+        wiring = _collada_vertex_wiring(mesh) if mesh is not None else None
+        if mesh is None or wiring is None:
+            return None
+        wirings.append((mesh, wiring[0], wiring[1]))
+
+    merged = ET.Element(_collada_q("geometry"), {"id": new_id, "name": new_id})
+    # A COLLADA mesh wants every source before its <vertices>, and its
+    # primitives after both, so the parts are collected and appended in that
+    # order rather than as they are built.
+    merged_mesh = ET.Element(_collada_q("mesh"))
+
+    merged_sources: list[ET.Element] = []
+    for index, (semantic, _source_id, first_source) in enumerate(wirings[0][2]):
+        merged_source = copy.deepcopy(first_source)
+        source_id = f"{new_id}-{semantic.lower()}-{index}"
+        array = merged_source.find("c:float_array", NS)
+        accessor = merged_source.find("c:technique_common/c:accessor", NS)
+        if array is None or accessor is None:
+            return None
+        values: list[str] = []
+        elements = 0
+        for _mesh, _vertices, wired in wirings:
+            piece_source = wired[index][2]
+            piece_array = piece_source.find("c:float_array", NS)
+            piece_accessor = piece_source.find("c:technique_common/c:accessor", NS)
+            if piece_array is None or piece_accessor is None:
+                return None
+            values.extend((piece_array.text or "").split())
+            try:
+                elements += int(piece_accessor.get("count") or 0)
+            except ValueError:
+                return None
+        merged_source.set("id", source_id)
+        array.set("id", f"{source_id}-array")
+        array.set("count", str(len(values)))
+        array.text = " ".join(values)
+        accessor.set("source", f"#{source_id}-array")
+        accessor.set("count", str(elements))
+        merged_sources.append(merged_source)
+
+    merged_vertices_id = f"{new_id}-vertices"
+    merged_vertices = ET.Element(_collada_q("vertices"), {"id": merged_vertices_id})
+    for (semantic, _source_id, _source), merged_source in zip(wirings[0][2], merged_sources):
+        ET.SubElement(
+            merged_vertices,
+            _collada_q("input"),
+            {"semantic": semantic, "source": f"#{merged_source.get('id')}"},
+        )
+
+    vertex_base = 0
+    piece_sources: list[ET.Element] = []
+    pending_triangles: list[ET.Element] = []
+    for mesh, vertices, wired in wirings:
+        wired_sources = {
+            source_id: merged_sources[index].get("id") or ""
+            for index, (_semantic, source_id, _source) in enumerate(wired)
+        }
+        vertices_id = vertices.get("id") or ""
+        for source in mesh.findall("c:source", NS):
+            if source.get("id") not in wired_sources:
+                piece_sources.append(copy.deepcopy(source))
+        for triangles in mesh.findall("c:triangles", NS):
+            rebound = copy.deepcopy(triangles)
+            shifted_offsets: set[int] = set()
+            kept_offsets: set[int] = set()
+            stride = 1
+            for input_element in rebound.findall("c:input", NS):
+                try:
+                    offset = int(input_element.get("offset") or 0)
+                except ValueError:
+                    return None
+                stride = max(stride, offset + 1)
+                source_id = (input_element.get("source") or "").lstrip("#")
+                if input_element.get("semantic") == "VERTEX" and source_id == vertices_id:
+                    input_element.set("source", f"#{merged_vertices_id}")
+                    shifted_offsets.add(offset)
+                elif source_id in wired_sources:
+                    input_element.set("source", f"#{wired_sources[source_id]}")
+                    shifted_offsets.add(offset)
+                else:
+                    kept_offsets.add(offset)
+            if shifted_offsets & kept_offsets:
+                # One index column feeding both a concatenated source and an
+                # untouched one cannot be shifted for one without corrupting
+                # the other.
+                return None
+            if vertex_base and shifted_offsets:
+                p = rebound.find("c:p", NS)
+                if p is None:
+                    return None
+                try:
+                    indices = [int(value) for value in (p.text or "").split()]
+                except ValueError:
+                    return None
+                for offset in shifted_offsets:
+                    for position in range(offset, len(indices), stride):
+                        indices[position] += vertex_base
+                p.text = " ".join(str(value) for value in indices)
+            pending_triangles.append(rebound)
+        count = _collada_vertex_count(wired)
+        if count is None:
+            return None
+        vertex_base += count
+    for source in (*merged_sources, *piece_sources):
+        merged_mesh.append(source)
+    merged_mesh.append(merged_vertices)
+    for triangles in pending_triangles:
+        merged_mesh.append(triangles)
+    merged.append(merged_mesh)
+    for child in geometries[0]:
+        if child.tag != _collada_q("mesh"):
+            merged.append(copy.deepcopy(child))
+    return merged
+
+
+def _merged_bind_material(instances: list[ET.Element]) -> ET.Element | None:
+    """One binding table covering every symbol the merged pieces paint with."""
+    merged: ET.Element | None = None
+    technique: ET.Element | None = None
+    bound: set[str] = set()
+    for instance in instances:
+        bind = instance.find("c:bind_material", NS)
+        if bind is None:
+            continue
+        if merged is None:
+            merged = copy.deepcopy(bind)
+            technique = merged.find("c:technique_common", NS)
+            bound = {
+                str(entry.get("symbol") or "")
+                for entry in merged.findall("c:technique_common/c:instance_material", NS)
+            }
+            continue
+        if technique is None:
+            continue
+        for entry in bind.findall("c:technique_common/c:instance_material", NS):
+            symbol = str(entry.get("symbol") or "")
+            if symbol in bound:
+                continue
+            bound.add(symbol)
+            technique.append(copy.deepcopy(entry))
+    return merged
+
+
+def _unique_collada_id(base: str, used_ids: set[str]) -> str:
+    candidate = base
+    index = 1
+    while candidate in used_ids:
+        index += 1
+        candidate = f"{base}_{index:03d}"
+    used_ids.add(candidate)
+    return candidate
+
+
+def _group_texture_correction_dae(
     target_dae: Path,
     source_dae: Path,
     node_ids: set[str],
     alias_to_material: dict[str, str],
-    superseded_nodes: set[str] | None = None,
-) -> list[str]:
-    """Append the per-material split meshes, dropping what they replace.
+    grouped_node_names: list[str],
+) -> tuple[list[str], dict[str, set[str]]]:
+    """Put the sweep's pieces back into the mesh they were cut out of.
 
-    ``superseded_nodes`` names the whole-mesh copies whose flexbody rows the
-    caller is about to repoint at these splits. They are removed here, while
-    the tree is open and before it is written, rather than left for a later
-    pass -- a superseded node carries its geometry with it, and geometry is
-    where the bytes are.
+    The correction cuts a mesh into a mirrored carrier plus one rigidly moved
+    piece per symmetric region, each its own COLLADA node. Shipping them that
+    way meant a flexbody row naming the mesh had to become one row per piece,
+    and a row is not always a plain row: the ETK K-Series comments out
+    ``etkc_dash_race_lower`` in its stripped interior, and expanding that row
+    left the ``//`` on the first piece only, so the drift trim wore five
+    segments of a console it does not fit.
+
+    Grouping them back into one node under the name the mesh already had keeps
+    the mesh count the conversion ships equal to the one it started from, so
+    every row that named it -- live, commented, a ``mirrors`` row, a prop --
+    keeps naming exactly one mesh and needs no rewriting at all.
+
+    Returns the node names written and, per piece, the materials it paints
+    with; the caller still has to tell a mirrored piece's materials from a
+    rigid one's, which the merged mesh no longer says on its own.
     """
-    if not node_ids:
-        return []
+    if not node_ids or not grouped_node_names:
+        return [], {}
     target_tree = ET.parse(target_dae)
     target_root = target_tree.getroot()
     target_geometries = target_root.find(".//c:library_geometries", NS)
@@ -2236,60 +2485,105 @@ def _append_texture_correction_dae(
         if geometry.get("id")
     }
 
-    appended_nodes: list[ET.Element] = []
-    appended_geometries: list[ET.Element] = []
-    appended_geometry_ids: set[str] = set()
+    pieces: list[tuple[str, ET.Element, ET.Element]] = []
+    piece_materials: dict[str, set[str]] = {}
+    taken_geometry_ids: set[str] = set()
     for source_node in source_root.findall(".//c:node", NS):
         node_id = source_node.get("id") or ""
         if node_id not in node_ids:
             continue
         node_matrix = _collada_world_matrix(source_node, parents)
-        node = copy.deepcopy(source_node)
-        _set_identity_node_transform(node)
-        appended_nodes.append(node)
-
+        symbols: set[str] = set()
         for instance in source_node.findall(".//c:instance_geometry", NS):
             geometry_id = (instance.get("url") or "").lstrip("#")
-            if not geometry_id or geometry_id in appended_geometry_ids:
-                continue
             source_geometry = source_geometries.get(geometry_id)
-            if source_geometry is None:
+            if not geometry_id or source_geometry is None or geometry_id in taken_geometry_ids:
                 continue
+            taken_geometry_ids.add(geometry_id)
             geometry = copy.deepcopy(source_geometry)
             _bake_geometry_transform(geometry, node_matrix)
-            appended_geometries.append(geometry)
-            appended_geometry_ids.add(geometry_id)
+            pieces.append((node_id, geometry, instance))
+            symbols |= {
+                _normalise_material_alias(symbol)
+                for primitive in geometry.iter()
+                if (symbol := primitive.get("material"))
+            }
+        if symbols:
+            piece_materials[node_id] = symbols
+    if not pieces:
+        return [], {}
 
-    if not appended_nodes:
-        return []
+    # Pieces cut from one mesh share a vertex layout, so in practice they all
+    # land in one group; a part built from several source geometries keeps one
+    # group per layout rather than forcing an unmergeable pool.
+    groups: list[list[tuple[str, ET.Element, ET.Element]]] = []
+    signatures: list[object] = []
+    for piece in pieces:
+        signature = _collada_merge_signature(piece[1])
+        if signature is not None and signature in signatures:
+            groups[signatures.index(signature)].append(piece)
+            continue
+        signatures.append(signature if signature is not None else object())
+        groups.append([piece])
 
-    appended_node_ids = {node.get("id") for node in appended_nodes}
+    used_ids = {
+        str(element.get("id"))
+        for element in target_root.iter()
+        if element.get("id")
+    }
+    grouped: list[tuple[ET.Element, list[ET.Element]]] = []
+    for group in groups:
+        if len(group) == 1:
+            grouped.append((group[0][1], [group[0][2]]))
+            continue
+        merged = _merge_collada_geometries(
+            [geometry for _node_id, geometry, _instance in group],
+            _unique_collada_id(f"{grouped_node_names[0]}__beamxp_grouped", used_ids),
+        )
+        if merged is None:
+            grouped.extend((geometry, [instance]) for _node_id, geometry, instance in group)
+            continue
+        grouped.append((merged, [instance for _node_id, _geometry, instance in group]))
+
+    grouped_names = list(dict.fromkeys(grouped_node_names))
+    replaced_ids = set(grouped_names)
     for child in list(target_scene):
-        if child.get("id") in appended_node_ids:
+        if child.get("id") in replaced_ids or child.get("name") in replaced_ids:
             target_scene.remove(child)
+    grouped_geometry_ids = {str(geometry.get("id")) for geometry, _instances in grouped}
     for child in list(target_geometries):
-        if child.get("id") in appended_geometry_ids:
+        if child.get("id") in grouped_geometry_ids:
             target_geometries.remove(child)
-    for geometry in appended_geometries:
+    for geometry, _instances in grouped:
         target_geometries.append(geometry)
-    for node in appended_nodes:
+
+    for name in grouped_names:
+        node = ET.Element(_collada_q("node"), {"id": name, "name": name, "type": "NODE"})
+        matrix = ET.SubElement(node, _collada_q("matrix"))
+        matrix.text = "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
+        for geometry, instances in grouped:
+            instance = ET.SubElement(
+                node,
+                _collada_q("instance_geometry"),
+                {"url": f"#{geometry.get('id')}", "name": name},
+            )
+            bind = _merged_bind_material(instances)
+            if bind is not None:
+                instance.append(bind)
         target_scene.append(node)
 
-    if superseded_nodes:
-        for child in list(target_scene):
-            if child.get("id") in superseded_nodes or child.get("name") in superseded_nodes:
-                target_scene.remove(child)
-        # A geometry may be shared, so only drop the ones nothing instances now.
-        still_used = {
-            (instance.get("url") or "").lstrip("#")
-            for instance in target_scene.findall(".//c:instance_geometry", NS)
-        }
-        for child in list(target_geometries):
-            if child.get("id") not in still_used:
-                target_geometries.remove(child)
+    # The whole-mesh copies these replace carried their geometry with them, and
+    # geometry is where the bytes are.
+    still_used = {
+        (instance.get("url") or "").lstrip("#")
+        for instance in target_scene.findall(".//c:instance_geometry", NS)
+    }
+    for child in list(target_geometries):
+        if child.get("id") not in still_used:
+            target_geometries.remove(child)
 
     write_xml_tree(target_tree, target_dae)
-    return [str(node.get("id") or "") for node in appended_nodes]
+    return grouped_names, piece_materials
 
 
 def _node_material_symbols(dae_path: Path, node_ids: set[str]) -> dict[str, set[str]]:
@@ -2443,44 +2737,6 @@ def _retarget_runtime_screen_nodes(
     return sorted(node_id for node_id in retargeted_nodes if node_id)
 
 
-def _rigid_only_generated_materials(output_vehicle_dir: Path) -> set[str]:
-    """Materials the conversion carries only on pieces it never reflected.
-
-    ``_rigid_only_material_aliases`` over every generated piece in the folder,
-    rather than one split: a material is only safe to treat as unreflected when
-    no piece anywhere mirrored it, and the LC500 binds its cluster on both the
-    base interior and the facelift.
-    """
-    pieces: dict[str, set[str]] = {}
-    for dae_path in sorted(output_vehicle_dir.rglob("*.dae")):
-        try:
-            root = ET.parse(dae_path).getroot()
-        except (OSError, ET.ParseError):
-            continue
-        geometry_materials: dict[str, set[str]] = {}
-        for geometry in root.findall(".//c:geometry", NS):
-            geometry_id = geometry.get("id")
-            if not geometry_id:
-                continue
-            geometry_materials[geometry_id] = {
-                _normalise_material_alias(symbol)
-                for primitive in geometry.iter()
-                if (symbol := primitive.get("material"))
-            }
-        for node in root.findall(".//c:node", NS):
-            node_id = node.get("id") or ""
-            if "__beamxp_" not in node_id:
-                continue
-            symbols: set[str] = set()
-            for instance in node.findall(".//c:instance_geometry", NS):
-                symbols |= geometry_materials.get(
-                    (instance.get("url") or "").lstrip("#"), set()
-                )
-            if symbols:
-                pieces[f"{dae_path}:{node_id}"] = symbols
-    return _rigid_only_material_aliases(pieces)
-
-
 def _rigid_only_material_aliases(
     piece_materials: dict[str, set[str]],
 ) -> set[str]:
@@ -2502,114 +2758,6 @@ def _rigid_only_material_aliases(
         else:
             mirrored |= symbols
     return rigid - mirrored
-
-
-_MIRROR_COLOUR_MAP_KEYS = ("baseColorMap", "colorMap", "diffuseMap")
-
-
-def _is_engine_mirror_material(value: Mapping[str, object]) -> bool:
-    """Whether a ``*.materials.json`` entry is a mirror's reflective face.
-
-    Recognised by what makes it a reflection rather than by its name: it has no
-    colour map of its own (the image comes from the cubemap the engine renders),
-    it asks for that cubemap, and it composites as emissive translucency with no
-    blend over a normal map that gives the glass its slight waviness.
-
-    Across the fleet's material libraries this picks out the four the game
-    defines in ``vehicles/common/main.materials.json`` -- ``mirror``,
-    ``mirror_CE``, ``mirror_CX``, ``mirror_F`` -- and nothing else.
-    """
-    stages = [stage for stage in (value.get("Stages") or []) if isinstance(stage, dict)]
-    if not stages:
-        return False
-    if any(
-        isinstance(stage.get(key), str) and str(stage.get(key)).strip()
-        for stage in stages
-        for key in _MIRROR_COLOUR_MAP_KEYS
-    ):
-        return False
-    if value.get("dynamicCubemap") is not True or not value.get("translucent"):
-        return False
-    if str(value.get("translucentBlendOp") or "").strip().lower() != "none":
-        return False
-    if stages[0].get("emissive") is not True:
-        return False
-    return any(
-        isinstance(stage.get("normalMap"), str) and str(stage.get("normalMap")).strip()
-        for stage in stages
-    )
-
-
-def engine_mirror_materials(context: VehicleContext) -> set[str]:
-    """Every material this vehicle can paint a reflective surface with.
-
-    Read from the vehicle's own libraries and the game's common ones, the same
-    places the engine resolves a material name from. Cached on the context under
-    its own attribute, so a context unpickled from an older build recomputes it
-    rather than quietly answering with a set that predates this lookup.
-    """
-    cached = getattr(context, "_engine_mirror_materials", None)
-    if cached is not None:
-        return cached
-    found: set[str] = set()
-    for zip_path in [context.source_zip, *common_zip_candidates(context.source_zip)]:
-        try:
-            archive = zipfile.ZipFile(zip_path)
-        except (OSError, zipfile.BadZipFile):
-            continue
-        with archive:
-            for name in archive.namelist():
-                if not name.replace("\\", "/").endswith(".materials.json"):
-                    continue
-                try:
-                    data = parse_beamng_json(
-                        archive.read(name).decode("utf-8", errors="replace"), label=name
-                    )
-                except Exception:
-                    continue
-                for key, value in data.items():
-                    if not isinstance(value, dict) or not _is_engine_mirror_material(value):
-                        continue
-                    found.add(
-                        _normalise_material_alias(
-                            str(value.get("mapTo") or value.get("name") or key)
-                        )
-                    )
-    context._engine_mirror_materials = found
-    return found
-
-
-def _mirror_row_split_target(
-    pieces: Iterable[str],
-    piece_materials: dict[str, set[str]],
-    mirror_materials: set[str],
-) -> str:
-    """Which split piece a ``mirrors`` row should follow, or "" when unclear.
-
-    Splitting a mesh renames it, and ``addMirror`` binds by mesh name
-    (``lua/common/jbeam/sections/mirror.lua``, which gives up on the row
-    entirely when the name resolves to nothing), so a row left naming the whole
-    mesh stops reflecting -- the same failure the rename fix cured, arriving by
-    a later rename.
-
-    A row names one mesh, so it has to be the piece holding the reflective
-    surface rather than the housing. That piece is the one that paints with a
-    mirror material: asked positively, off the engine's own material
-    definitions. Asking it negatively -- the piece the texture correction left
-    alone -- said nothing whenever the correction had nothing to do on this mesh
-    in the first place, which is the usual case for a mirror and left every
-    piece looking equally untouched.
-
-    Where that does not pick out a single piece the row is left alone -- a
-    mirrors row aimed at a dashboard would turn the dashboard into a mirror,
-    which is worse than the reflection staying broken -- and the caller says so.
-    """
-    candidates = [
-        piece
-        for piece in pieces
-        if piece_materials.get(piece, set()) & mirror_materials
-    ]
-    return candidates[0] if len(candidates) == 1 else ""
 
 
 def _retarget_texture_correction_generated_nodes(
@@ -2648,19 +2796,16 @@ def _retarget_texture_correction_generated_nodes(
     return retargeted
 
 
-def _replace_first_flexbody_mesh(row: str, mesh: str) -> str:
-    return re.sub(
-        r'(\[\s*)"((?:[^"\\]|\\.)*)"',
-        rf'\1"{mesh}"',
-        row,
-        count=1,
-    )
-
-
-def _expand_texture_correction_flexbody_array(
+def _rename_texture_correction_flexbody_array(
     array_text: str,
-    replacements: dict[str, list[str]],
+    renames: dict[str, str],
 ) -> tuple[str, int]:
+    """Point a corrected mesh's flexbody rows at the copy carrying it.
+
+    One row in, one row out, and only its mesh token changes: everything else
+    the row says -- its node groups, its ``nonFlexMaterials``, its placement,
+    and whether it is commented out at all -- is left exactly where it was.
+    """
     spans: list[tuple[int, int, str]] = []
     idx = 1 if array_text.startswith("[") else 0
     while idx < len(array_text):
@@ -2678,11 +2823,16 @@ def _expand_texture_correction_flexbody_array(
     changed = 0
     for start, end, row in spans:
         out.append(array_text[cursor:start])
-        mesh = flexbody_row_mesh(row)
-        split_meshes = replacements.get(mesh or "")
-        if split_meshes:
-            line_joiner = ",\n" if "\n" in array_text else ", "
-            out.append(line_joiner.join(_replace_first_flexbody_mesh(row, split) for split in split_meshes))
+        renamed = renames.get(flexbody_row_mesh(row) or "")
+        if renamed:
+            out.append(
+                re.sub(
+                    r'(\[\s*)"((?:[^"\\]|\\.)*)"',
+                    lambda match: f'{match.group(1)}"{renamed}"',
+                    row,
+                    count=1,
+                )
+            )
             changed += 1
         else:
             out.append(row)
@@ -3162,20 +3312,28 @@ def _upsert_part_glowmap(
 
 def _patch_texture_correction_jbeams(
     output_vehicle_dir: Path,
-    replacements: dict[str, list[str]],
+    grouped_meshes: Iterable[str] = (),
     material_alias_sets: Iterable[dict[str, str]] = (),
     switch_base_aliases: Iterable[str] = (),
     source_jbeam_texts: Iterable[str] = (),
-    mirror_row_targets: dict[str, str] | None = None,
     switch_forks: Iterable[SwitchBaseFork] = (),
     generated_mesh_sources: dict[str, str] | None = None,
     rigid_only_aliases: Iterable[str] | None = None,
+    row_renames: dict[str, str] | None = None,
 ) -> dict[str, object]:
+    """Give the corrected meshes' parts the glowMap the correction implies.
+
+    A corrected mesh usually keeps the name it already had -- its pieces are
+    grouped back into one node under that name -- and then no row is touched.
+    ``row_renames`` covers the exception: a mesh a prop also binds keeps its
+    whole-mesh copy for the prop, so its flexbody and ``mirrors`` rows are
+    moved onto the corrected copy beside it. One name for one name, so a
+    commented row stays a commented row.
+    """
     patched_files: list[str] = []
-    replaced_rows = 0
-    mirror_rows = 0
-    dangling_mirror_rows: set[str] = set()
-    mirror_row_targets = mirror_row_targets or {}
+    renamed_rows = 0
+    grouped_meshes = set(grouped_meshes)
+    row_renames = row_renames or {}
     material_alias_sets = tuple(material_alias_sets)
     switch_base_aliases = set(switch_base_aliases)
     switch_forks = list(switch_forks)
@@ -3206,46 +3364,35 @@ def _patch_texture_correction_jbeams(
                 continue
             entries[fork.name] = value
         return entries
-    if not replacements and not material_alias_sets:
-        return {
-            "files": patched_files,
-            "replacedRows": replaced_rows,
-            "mirrorRows": mirror_rows,
-            "danglingMirrorRows": [],
-        }
+    if not grouped_meshes and not material_alias_sets:
+        return {"files": patched_files, "renamedRows": renamed_rows}
     for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
         original = path.read_text(encoding="utf-8")
-        file_replacements = 0
+        updated = original
+        if row_renames:
 
-        def replace_array(array_text: str) -> tuple[str, int]:
-            nonlocal file_replacements
-            new_text, changed = _expand_texture_correction_flexbody_array(array_text, replacements)
-            file_replacements += changed
-            return new_text, changed
+            def rename_flexbodies(array_text: str) -> tuple[str, int]:
+                nonlocal renamed_rows
+                new_text, changed = _rename_texture_correction_flexbody_array(
+                    array_text, row_renames
+                )
+                renamed_rows += changed
+                return new_text, changed
 
-        def replace_mirrors(array_text: str) -> tuple[str, int]:
-            nonlocal mirror_rows
-            for row in array_text.splitlines():
-                mesh = mirror_row_mesh(row)
-                # A mesh that was split no longer exists under its own name, so
-                # a row still naming it is one addMirror will refuse. Anything
-                # else in the row is none of this pass's business.
-                if mesh and mesh != "mesh" and mesh in replacements:
-                    if mesh not in mirror_row_targets:
-                        dangling_mirror_rows.add(mesh)
-            new_text = rewrite_mirror_rows(array_text, mirror_row_targets, {})
-            changed = 1 if new_text != array_text else 0
-            mirror_rows += changed
-            return new_text, changed
-
-        updated = _replace_all_jbeam_array_regions(original, "flexbodies", replace_array)
-        if replacements:
-            # The glass followed its mesh into the split; the row that binds it
-            # has to follow too, or addMirror finds nothing to reflect into.
-            # Run even with no targets resolved: that is exactly the case worth
-            # hearing about, and the rewrite is a no-op when there is nothing
-            # to repoint.
-            updated = _replace_all_jbeam_array_regions(updated, "mirrors", replace_mirrors)
+            updated = _replace_all_jbeam_array_regions(
+                updated, "flexbodies", rename_flexbodies
+            )
+            # The glass followed its mesh onto the corrected copy, and
+            # addMirror binds by mesh name, so the row that reflects it has to
+            # follow too or the reflection is simply dead.
+            updated = _replace_all_jbeam_array_regions(
+                updated,
+                "mirrors",
+                lambda array_text: (
+                    rewrite_mirror_rows(array_text, row_renames, {}),
+                    0,
+                ),
+            )
         if material_alias_sets:
             updated = _replace_all_jbeam_object_regions(
                 updated,
@@ -3259,13 +3406,11 @@ def _patch_texture_correction_jbeams(
                 ),
             )
         if corrected_source_glow_entries or fork_source_glow_entries:
-            # Every part carrying a corrected mesh, whether it was split into
-            # pieces or retargeted where it stood. The owner is read off the
-            # text as it arrived: a split mesh's row has already been replaced
-            # by its pieces by the time the glow pass runs.
+            # Every part carrying a corrected mesh, whether the correction was
+            # grouped back into it or retargeted where it stood.
             by_part: dict[str, dict[str, str]] = {}
-            for mesh_name in dict.fromkeys((*replacements, *generated_mesh_sources)):
-                entries = mesh_glow_entries(mesh_name, mesh_name in replacements)
+            for mesh_name in dict.fromkeys((*grouped_meshes, *generated_mesh_sources)):
+                entries = mesh_glow_entries(mesh_name, mesh_name in grouped_meshes)
                 if not entries:
                     continue
                 owner = _jbeam_part_carrying_mesh(original, mesh_name) or mesh_name
@@ -3280,13 +3425,7 @@ def _patch_texture_correction_jbeams(
             continue
         path.write_text(updated, encoding="utf-8")
         patched_files.append(str(path))
-        replaced_rows += file_replacements
-    return {
-        "files": patched_files,
-        "replacedRows": replaced_rows,
-        "mirrorRows": mirror_rows,
-        "danglingMirrorRows": sorted(dangling_mirror_rows),
-    }
+    return {"files": patched_files, "renamedRows": renamed_rows}
 
 
 def _replace_all_jbeam_array_regions(text: str, key: str, transform) -> str:
@@ -4155,8 +4294,9 @@ def isolate_converted_runtime_screens(
     source_meshes: Iterable[str],
     target_hands: Iterable[str],
     reflected_geometry: bool = True,
-    generated_mesh_replacements: Mapping[str, Iterable[str]] | None = None,
     generated_switch_forks: Iterable[Mapping[str, object]] = (),
+    rigid_only_materials: Iterable[str] = (),
+    generated_mesh_renames: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Give switched HTML screens a conversion-owned webview/material key.
 
@@ -4168,34 +4308,27 @@ def isolate_converted_runtime_screens(
     uv_flipped_sources = set(source_meshes)
     selected_sources = uv_flipped_sources.intersection(nav_scope)
     hands = set(target_hands)
-    replacements = generated_mesh_replacements or {}
+    renames = generated_mesh_renames or {}
     switch_forks = tuple(
         fork for fork in generated_switch_forks if isinstance(fork, Mapping)
     )
 
     def generated_targets_for(source_ids: Iterable[str]) -> set[str]:
-        """Generated/split mesh names carrying exactly ``source_ids``."""
+        """Generated mesh names carrying exactly ``source_ids``.
+
+        Runtime isolation runs after texture-correction integration, and a
+        corrected mesh usually comes out of it under the name it went in
+        with. One a prop also binds does not: its correction is carried by a
+        copy beside it, which is the one holding the screen.
+        """
         targets = {
             generated_mesh_name(source_mesh, hand)
             for source_mesh in source_ids
             for hand in hands
         }
-        # Runtime isolation runs after texture-correction integration.  A
-        # selected generated screen may therefore no longer appear literally
-        # in JBeam: its flexbody row can name the sweep's carrier/rigid pieces.
-        pending = list(targets)
-        while pending:
-            mesh = pending.pop()
-            values = replacements.get(mesh, ())
-            if isinstance(values, str):
-                values = (values,)
-            for replacement in values:
-                replacement = str(replacement).strip()
-                if not replacement or replacement in targets:
-                    continue
-                targets.add(replacement)
-                pending.append(replacement)
-        return targets
+        return targets | {
+            str(renames[mesh]) for mesh in targets if renames.get(mesh)
+        }
 
     controllers = _source_beam_navigator_objects(context)
     suffix = mod_id_for_context(context).lower()
@@ -4402,7 +4535,7 @@ def isolate_converted_runtime_screens(
     # both interiors, which is why it read backwards on every trim.
     rigid_only_materials = {
         _runtime_alias(alias)
-        for alias in _rigid_only_generated_materials(output_vehicle_dir)
+        for alias in rigid_only_materials
         if _runtime_alias(alias)
     }
     controller_specs, controller_materials, controller_lua, controller_pages = (
@@ -4660,12 +4793,12 @@ def integrate_texture_correction_artifacts(
         return {"enabled": False, "daePatches": [], "jbeamPatch": {"files": [], "replacedRows": 0}}
 
     dae_patches: list[dict[str, object]] = []
-    row_replacements: dict[str, list[str]] = {}
-    mirror_row_targets: dict[str, str] = {}
+    grouped_meshes: set[str] = set()
+    row_renames: dict[str, str] = {}
     glow_material_alias_sets: list[dict[str, str]] = []
     glow_switch_base_aliases: set[str] = set()
     glow_switch_forks: list[SwitchBaseFork] = []
-    glow_rigid_only_aliases: set[str] = set()
+    corrected_piece_materials: dict[str, set[str]] = {}
     generated_mesh_sources: dict[str, str] = {}
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
@@ -4732,13 +4865,15 @@ def integrate_texture_correction_artifacts(
                 for target_mesh in target_meshes
                 if structural_sources.get(target_mesh) == source_mesh
             ]
-            # A prop row names one mesh and the engine spawns exactly that one
-            # (``vehicleObj:addProp``, lua/common/jbeam/sections/meshs.lua), so
-            # it cannot be repointed at a split the way a flexbody row can. Its
-            # row already names a whole-mesh copy -- usually a per-row baked
-            # one -- so the correction rides on that copy's materials instead,
-            # the same way a structural mirror's does. A mesh bound as both
-            # keeps the split, which is the binding that can carry one.
+            # A prop row names one mesh and the engine spawns it from the node
+            # it finds under that name (``vehicleObj:addProp``,
+            # lua/common/jbeam/sections/meshs.lua), placing it from that node's
+            # own frame. Grouping rebuilds the node, baking the sweep's
+            # transforms into identity-placed geometry, which moves that frame
+            # under a prop that was counting on it. So a prop keeps its
+            # whole-mesh copy -- usually a per-row baked one -- and takes the
+            # correction through that copy's materials instead, the same way a
+            # structural mirror does.
             prop_target_meshes = [
                 target_mesh
                 for target_mesh in target_meshes
@@ -4752,43 +4887,48 @@ def integrate_texture_correction_artifacts(
                 if target_mesh not in structural_target_meshes
                 and target_mesh not in prop_target_meshes
             ]
-            appended: list[str] = []
-            if row_target_meshes:
-                appended = _append_texture_correction_dae(
+            # A mesh bound both ways needs both: the whole-mesh copy stays put
+            # under the name the prop spawns, and the grouped correction is
+            # added beside it under a name of its own for the flexbody row to
+            # follow. The Ardente's ``grp_shifter_knob_a`` is the case.
+            grouped_node_names: list[str] = []
+            job_renames: dict[str, str] = {}
+            for target_mesh in row_target_meshes:
+                for hand in hands:
+                    generated = generated_mesh_name(target_mesh, hand)
+                    if target_mesh in prop_meshes:
+                        node_name = f"{generated}__beamxp_corrected"
+                        job_renames[generated] = node_name
+                    else:
+                        node_name = generated
+                    grouped_node_names.append(node_name)
+            grouped: list[str] = []
+            if grouped_node_names:
+                grouped, piece_materials = _group_texture_correction_dae(
                     target_dae,
                     source_dae,
                     set(split_nodes),
                     collada_alias_to_material,
-                    superseded_nodes={
-                        generated_mesh_name(target_mesh, hand)
-                        for target_mesh in row_target_meshes
-                        for hand in hands
-                        # Dropping a node a prop still binds would leave the
-                        # engine with nothing to spawn; that mesh keeps its
-                        # whole-mesh copy and is retargeted below instead.
-                        if target_mesh not in prop_meshes
-                    },
+                    grouped_node_names,
                 )
-                if appended:
-                    # Read back off the DAE just written: the pieces carry the
-                    # retargeted material names, which is what has to be
-                    # compared against the ones the correction minted.
-                    piece_materials = _node_material_symbols(target_dae, set(appended))
-                    glow_rigid_only_aliases |= _rigid_only_material_aliases(
-                        piece_materials
-                    )
-                    glass = _mirror_row_split_target(
-                        appended,
-                        piece_materials,
-                        engine_mirror_materials(context),
-                    )
+                if grouped:
+                    # Pooled across every job before anything is decided from
+                    # them: a material is only unreflected when no piece
+                    # anywhere mirrored it, and the LC500 binds its cluster on
+                    # both the base interior and the facelift.
+                    for piece, symbols in piece_materials.items():
+                        corrected_piece_materials.setdefault(
+                            f"{target_dae}:{piece}", set()
+                        ).update(symbols)
+                    row_renames.update(job_renames)
+                    # Keyed on the generated name throughout: the glow pass
+                    # reads the part that carries a mesh off the JBeam as it
+                    # arrived, which is before any row was renamed.
                     for target_mesh in row_target_meshes:
                         for hand in hands:
-                            name = generated_mesh_name(target_mesh, hand)
-                            row_replacements[name] = appended
-                            generated_mesh_sources[name] = source_mesh
-                            if glass:
-                                mirror_row_targets[name] = glass
+                            generated = generated_mesh_name(target_mesh, hand)
+                            grouped_meshes.add(generated)
+                            generated_mesh_sources[generated] = source_mesh
             retargeted: list[str] = []
             retarget_target_meshes = structural_target_meshes + prop_target_meshes
             if retarget_target_meshes:
@@ -4823,7 +4963,7 @@ def integrate_texture_correction_artifacts(
                     "sourceMesh": source_mesh,
                     "sourceDae": str(source_dae),
                     "targetDae": str(target_dae),
-                    "appendedNodes": appended,
+                    "groupedNodes": grouped,
                     "retargetedNodes": retargeted,
                     "propTargetMeshes": prop_target_meshes,
                     "materialAliases": sorted(part_alias_to_material),
@@ -4836,29 +4976,35 @@ def integrate_texture_correction_artifacts(
     # states; nothing reflected them, so a corrected texture would read
     # backwards.  Never let one job's rigid piece speak for another job's
     # mirrored one, though: a material corrected anywhere is corrected.
-    glow_rigid_only_aliases -= {
+    rigid_only_piece_aliases = _rigid_only_material_aliases(corrected_piece_materials)
+    glow_rigid_only_aliases = rigid_only_piece_aliases - {
         _normalise_jbeam_material_alias(alias)
         for alias_set in glow_material_alias_sets
         for alias in alias_set
     }
     jbeam_patch = _patch_texture_correction_jbeams(
         output_vehicle_dir,
-        row_replacements,
+        grouped_meshes,
         glow_material_alias_sets,
         glow_switch_base_aliases,
         context.jbeam_texts.values(),
-        mirror_row_targets,
         glow_switch_forks,
         generated_mesh_sources,
         glow_rigid_only_aliases,
+        row_renames,
     )
     return {
         "enabled": True,
         "daePatches": dae_patches,
         "jbeamPatch": jbeam_patch,
-        "rowReplacements": row_replacements,
-        "mirrorRowTargets": mirror_row_targets,
+        "groupedMeshes": sorted(grouped_meshes),
+        "renamedMeshes": dict(row_renames),
         "rigidOnlyMaterials": sorted(glow_rigid_only_aliases),
+        # Before that subtraction: a page on a piece nothing reflected is
+        # already the right way round however the material was corrected
+        # elsewhere, which is a different question from which glow state to
+        # bind.
+        "rigidOnlyPieceMaterials": sorted(rigid_only_piece_aliases),
         "switchBaseForks": [
             {
                 "alias": fork.alias,
@@ -5126,21 +5272,6 @@ def build_batch(
             flexbody_meshes=flexbody_meshes,
             baked_mesh_copies=baked_mesh_copies_by_target(baked_shared_specs),
         )
-        # A mirrors row whose mesh was split and could not be repointed is a
-        # reflection that will be dead in game, and the engine says nothing
-        # about it: addMirror just returns -1 and the row is skipped. Say it
-        # here instead of letting it ship looking like a flat grey pane.
-        integration_result = texture_correction_report["integration"]
-        dangling = []
-        if isinstance(integration_result, dict):
-            patch = integration_result.get("jbeamPatch")
-            if isinstance(patch, dict):
-                dangling = list(patch.get("danglingMirrorRows") or [])
-        if dangling:
-            emit_progress(
-                f"WARNING: {len(dangling)} mirrors row(s) left unbound after the mesh "
-                f"was split, so these will not reflect: {', '.join(dangling)}"
-            )
         texture_correction_report["pruned"] = prune_unused_texture_correction_assets(
             output_root, output_vehicle_dir
         )
@@ -5155,11 +5286,6 @@ def build_batch(
         # row from the donor's jbeam, so a runtime rebind applied first is
         # handed straight back to the donor's material.
         integration = texture_correction_report.get("integration")
-        generated_mesh_replacements = (
-            integration.get("rowReplacements", {})
-            if isinstance(integration, dict)
-            else {}
-        )
         generated_switch_forks = (
             integration.get("switchBaseForks", [])
             if isinstance(integration, dict)
@@ -5174,15 +5300,20 @@ def build_batch(
                 mode in {MODE_MIRROR, MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}
                 for mode in object_modes.values()
             ),
-            generated_mesh_replacements=(
-                generated_mesh_replacements
-                if isinstance(generated_mesh_replacements, Mapping)
-                else {}
-            ),
             generated_switch_forks=(
                 generated_switch_forks
                 if isinstance(generated_switch_forks, list)
                 else []
+            ),
+            rigid_only_materials=(
+                integration.get("rigidOnlyPieceMaterials", [])
+                if isinstance(integration, dict)
+                else []
+            ),
+            generated_mesh_renames=(
+                integration.get("renamedMeshes", {})
+                if isinstance(integration, dict)
+                else {}
             ),
         )
     texture_correction_report["runtimeScreens"] = runtime_screen_patch
@@ -5293,4 +5424,4 @@ def build_batch(
         texture_correction=texture_correction_report,
     )
 
-__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'baked_mesh_copies_by_target', 'engine_mirror_materials', 'integrate_texture_correction_artifacts', 'build_batch']
+__all__ = ['generated_mesh_scope', 'relocation_meshes', 'MOD_AUTHOR', 'MOD_VERSION', 'package_stem_for_context', 'package_name_for_context', 'mod_id_for_context', 'showcase_preview_for_build', 'mod_description_bbcode', 'write_mod_info', 'selected_variant_targets', 'selected_output_plans', 'split_authored_hand_drive_targets', 'texture_correction_asset_archives', 'export_texture_correction_artifacts', 'prune_unused_texture_correction_assets', 'baked_mesh_copies_by_target', 'integrate_texture_correction_artifacts', 'build_batch']

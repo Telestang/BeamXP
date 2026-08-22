@@ -1928,20 +1928,24 @@ def whole_mesh_mirror_correction_ids(
 ) -> set[str]:
     """Source meshes a correction must treat as mirrored end to end.
 
-    A flexbody row can be swapped for the correction's split pieces, so a
-    Mirror flexbody ships the sweep's answer: a mirrored husk plus rotated
-    perimeter-symmetric candidates, and the candidates' texels are rightly
-    left alone. A prop cannot. ``vehicleObj:addProp`` in
+    A flexbody's mesh is rebuilt from the sweep's answer -- a mirrored husk
+    plus rotated perimeter-symmetric candidates, grouped into one mesh the row
+    is pointed at -- and the candidates' texels are rightly left alone. A
+    prop's is not. ``vehicleObj:addProp`` in
     ``lua/common/jbeam/sections/meshs.lua`` spawns exactly the one mesh the row
-    names, so a Mirror prop ships a whole-mesh reflection instead -- a per-row
+    names and places it from that mesh's own frame, which rebuilding would
+    move, so a Mirror prop ships a whole-mesh reflection instead -- a per-row
     baked copy for the usual case (``mesh_placement.add_baked_shared_mesh``,
     which bakes props unconditionally because their node triad is left-handed),
     otherwise the reflected ``_xp_rhd`` copy. Every texel it paints is
     therefore mirrored, and letting the sweep call some of them rigid leaves
     those glyphs unflipped under geometry that gets reflected anyway.
 
-    A mesh bound as both keeps the split, which is the binding that can carry
-    one.
+    A mesh bound as both keeps the sweep's answer: its flexbody row is moved
+    onto a corrected copy of its own, beside the whole-mesh copy the prop goes
+    on spawning. The Ardente's ``grp_shifter_knob_a`` is the case -- a race
+    shifter's flexbody and a sequential shifter's animated prop, in different
+    configs of the same conversion.
     """
     return {
         structural_sources.get(mesh, mesh)
