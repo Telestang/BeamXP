@@ -2,7 +2,7 @@
 
 **BeamXP (BeamNG Vehicle eXPort Services)** converts BeamNG.drive vehicles between left-hand drive and right-hand drive, with automatic correction of meshes, textures, controls, cameras, mirrors, lighting, configuration parts, and licence plates.
 
-**[Download BeamXP 0.3.4-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.4-alpha-windows.zip)** — extract it anywhere and run the exe. Keep `BeamXP.exe` in the extracted folder beside its `_internal` directory.
+**[Download BeamXP 0.3.5-alpha](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.5-alpha-windows.zip)** — extract it anywhere and run the exe. Keep `BeamXP.exe` in the extracted folder beside its `_internal` directory.
 
 > BeamXP was previously named **BeamHDC (BeamNG Hand Drive Converter)**.
 
@@ -28,7 +28,7 @@ The old **39 trims in 4 minutes 30 seconds** figure is no longer used as a bench
 
 ## Quick Start
 
-1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.4-alpha-windows.zip)**, extract it, and run the exe from the extracted folder (or run from source — see Requirements).
+1. **[Download the release zip](https://github.com/Telestang/BeamXP/raw/main/release/BeamXP-0.3.5-alpha-windows.zip)**, extract it, and run the exe from the extracted folder (or run from source — see Requirements).
 2. Open the app settings and configure:
    - your BeamNG vehicle-content folder;
    - your BeamNG mods folder.
@@ -52,6 +52,45 @@ Enjoying driving from the other side? Star the repo to help other people find it
 ## What's New in 0.3.x
 
 The 0.3 line is a major conversion-quality and workflow overhaul. It introduced automatic mesh and texture correction, then spent the releases since making that pipeline correct and affordable — much of it found while converting the Lexus LC500 and Civetta Scintilla.
+
+### Corrections that land on the right pixels, and parts that land on the right side
+
+0.3.5-alpha is the first release since the texture-correction pipeline went in
+to spend itself entirely on **being right** — most of it found by replaying the
+whole test fleet and reading the plans, rather than by adding anything new.
+
+**Texture correction.** A correction is now fitted as a parallelogram and
+mirrored about its own axis, so markings that sit at an angle — raked dial
+faces, slanted lettering, text following a curve — are corrected in their own
+frame instead of the atlas's. This is the angled-glyph gap 0.3.3-alpha carried
+forward. Alongside it: a region whose fitted outline leaves the atlas is flipped
+flat rather than smeared; a correction's pieces are grouped back into the mesh
+they came from; a mark is taken only where a transform actually reflected the
+mesh; and a display's atlas is no longer mirrored a second time when its UV
+island already mirrored it.
+
+**It is faster and smaller for it.** A texture shared by meshes that never meet
+on it is corrected once rather than once per mesh, one copy is staged per stage
+that reads it, and re-encoding touches only the blocks a correction actually
+reached instead of the whole image.
+
+**Parts.** Equivalent Parts rows were being pinned to whichever trim was on
+screen when they were drawn, which left single-seat trims converted with the
+wheel on the right and the seat still on the left — the hopper's Drag and Race,
+the bx's Drag and Powerglow. A row now reaches every trim, and a trim with a
+different seat on each side exchanges them instead of overwriting one. Mirrored
+props carry the mirrored rest orientation their row needs, converted mirrors are
+aimed the way the vehicle aims its own, and a converted trigger box is placed
+where the engine will read it.
+
+**Workflow.** First run asks for the game and mods folders instead of leaving
+them blank; a zip's own vehicle catalog is read rather than guessed from folder
+names; trims and vehicles are named the way the game names them; the trigger
+list shows a box the transform it will actually get; and the Texture Fix column
+asks its question only where it has one.
+
+Still not corrected: **digital gauge clusters**. Screen-style instrument panels
+remain missed by detection, so their readouts and legends can stay mirrored.
 
 ### The Windows build is now a folder, not a single exe
 

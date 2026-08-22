@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.3.4-alpha",
+    [string]$Version = "0.3.5-alpha",
     # Signs the MSIX with this certificate (Cert:\CurrentUser\My thumbprint).
     # Left empty the package is packed unsigned, which installs in developer
     # mode with: Add-AppxPackage -Path <msix> -AllowUnsigned
@@ -98,8 +98,8 @@ function Find-SdkTool {
     return $candidate
 }
 
-# MSIX identities take a strictly numeric four-part version, so "0.3.4-alpha"
-# packages as "0.3.4.0". The revision (fourth) part must be 0 for the Store.
+# MSIX identities take a strictly numeric four-part version, so "0.3.5-alpha"
+# packages as "0.3.5.0". The revision (fourth) part must be 0 for the Store.
 $MsixVersion = $null
 $VersionCore = ($Version -split '[-+]')[0]
 $VersionParts = @($VersionCore -split '\.')
