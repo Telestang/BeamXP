@@ -68,6 +68,11 @@ try {
 # --- MSIX package ---------------------------------------------------------
 # No-op unless the private manifest and Assets are both present.
 
+$MsixSourceDir = Join-Path $Root "packaging\msix"
+$MsixManifest = Join-Path $MsixSourceDir "AppxManifest.xml"
+$MsixAssets = Join-Path $MsixSourceDir "Assets"
+$MsixStageDir = Join-Path $Root "build\msix-stage"
+
 function Find-SdkTool {
     param([string]$Name)
 
