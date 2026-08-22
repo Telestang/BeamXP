@@ -902,6 +902,103 @@ class StructuralFlexbodyOutputTests(unittest.TestCase):
         self.assertEqual(generated_pc["parts"]["doorpanel_FL"], "doorpanel_FL_xp_rhd")
 
 
+class GeneratedJbeamIsLoadableTests(unittest.TestCase):
+    """A typo in one source part must not delete every generated part.
+
+    The Audi R8 mod writes ``{"x":91.5253, "y":-, "z":0}`` in its needle prop.
+    BeamNG's ``_parseFileIntoCache`` (``lua/common/jbeam/io.lua``) pcalls the
+    decode and returns nil for the *whole file*, so the mod itself loses its
+    dashboard. We clone parts as text and every clone shares one file, so the
+    typo rode in and took all 22 generated RHD parts down with it -- the
+    conversion shipped RHD configs with no RHD parts behind them.
+    """
+
+    def _panel(self, base_rotation_y: str) -> str:
+        return (
+            '"doorpanel_FL": {\n'
+            '"information": {"name": "Front Left Door Panel"},\n'
+            '"slotType": "doorpanel_FL",\n'
+            '"flexbodies": [\n'
+            '    ["mesh", "[group]:"],\n'
+            '    ["doorpanel_FL", ["door_FL"]]\n'
+            "],\n"
+            '"props": [\n'
+            '    ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation"],\n'
+            '    ["rpm", "needle", "a", "b", "c", '
+            f'{{"x":91.5253, "y":{base_rotation_y}, "z":0}}]\n'
+            "]\n"
+            "}"
+        )
+
+    def _generated_jbeam(self, panel_body: str) -> str:
+        car = part("car", "main", "Car", (("doorpanel_FL", "doorpanel_FL"),))
+        selected = {
+            "parts": {"car", "doorpanel_FL"},
+            "main_part": "car",
+            "part_instances": [
+                {
+                    "instance_id": "/car",
+                    "part_id": "car",
+                    "slot_id": "main",
+                    "slot_path": "/",
+                },
+                {
+                    "instance_id": "/doorpanel_FL/doorpanel_FL",
+                    "part_id": "doorpanel_FL",
+                    "slot_id": "doorpanel_FL",
+                    "slot_path": "/doorpanel_FL/",
+                    "parent_instance_id": "/car",
+                },
+            ],
+            "selected_by_slot": {"main": "car", "doorpanel_FL": "doorpanel_FL"},
+            "selected_by_path": {"/": "car", "/doorpanel_FL/": "doorpanel_FL"},
+        }
+        context = context_with_parts(
+            {"car": (car, "car.jbeam"), "doorpanel_FL": (panel_body, "panel.jbeam")},
+            selected,
+        )
+        context.objects = {
+            "doorpanel_FL": core.DaeObject(
+                "doorpanel_FL", "doorpanel_FL", "vehicles/acme/acme.dae", 1.0, 0.0, 0.0, ()
+            ),
+            "doorpanel_FR": core.DaeObject(
+                "doorpanel_FR", "doorpanel_FR", "vehicles/acme/acme.dae", -1.0, 0.0, 0.0, ()
+            ),
+        }
+        context.pc_cache["trim.pc"] = {"parts": {"doorpanel_FL": "doorpanel_FL"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            output_vehicle_dir = Path(tmp) / context.vehicle_path
+            write_structural_doorpanel_output(context, output_vehicle_dir)
+            return (
+                output_vehicle_dir / "jbeam" / "handdrive_visual_conversion.jbeam"
+            ).read_text(encoding="utf-8")
+
+    def test_a_malformed_source_number_still_yields_a_loadable_file(self) -> None:
+        generated = self._generated_jbeam(self._panel("-"))
+        parts = core.parse_beamng_json(generated, label="handdrive_visual_conversion.jbeam")
+        self.assertIn("doorpanel_FL_xp_rhd", parts)
+        row = parts["doorpanel_FL_xp_rhd"]["props"][1]
+        # 0, not null: meshs.lua guards `if prop.baseRotation then` and then
+        # calls math.rad(prop.baseRotation.y) on the raw table, so a nil
+        # component raises inside pushToPhysics and kills the rest of the prop
+        # loop for the vehicle -- a worse failure than the parse error.
+        self.assertEqual(row[5], {"x": 91.5253, "y": 0, "z": 0})
+        # jbeam rows are positional, so the repair must not change the arity.
+        self.assertEqual(len(row), 6)
+
+    def test_the_repair_is_recorded_against_the_part_it_came_from(self) -> None:
+        generated = self._generated_jbeam(self._panel("-"))
+        self.assertIn(
+            "// Repaired malformed number in source: doorpanel_FL_xp_rhd", generated
+        )
+
+    def test_a_clean_source_is_left_exactly_alone(self) -> None:
+        generated = self._generated_jbeam(self._panel("12.5"))
+        self.assertNotIn("Repaired malformed number", generated)
+        parts = core.parse_beamng_json(generated, label="handdrive_visual_conversion.jbeam")
+        self.assertEqual(parts["doorpanel_FL_xp_rhd"]["props"][1][5]["y"], 12.5)
+
+
 class GeneratedConfigMetadataTests(unittest.TestCase):
     def test_default_selector_flags_are_forced_off(self) -> None:
         data = {

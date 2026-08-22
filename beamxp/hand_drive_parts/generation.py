@@ -27,7 +27,7 @@ from beamxp.core.beam_json import (
     strip_json_comments,
     zip_json_by_name as _zip_json_by_name,
 )
-from beamxp.core.sjson import encode_beamng_json
+from beamxp.core.sjson import encode_beamng_json, repair_invalid_numbers
 from beamxp.core.constants import (
     ACTION_OPPOSITE,
     ACTION_SKIP,
@@ -1751,6 +1751,19 @@ def _generated_clone_plan(
     return generated_parts
 
 
+_CLONE_BODY_PART_ID_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:[\s,]*\{')
+
+
+def clone_body_part_id(body: str) -> str:
+    """Name the part a generated clone body declares, for diagnostics.
+
+    Bodies come from ``build_part_body_index``, which slices from the part id's
+    opening quote, so the id is always the first token.
+    """
+    match = _CLONE_BODY_PART_ID_RE.match(body.lstrip())
+    return match.group(1) if match else "<unknown part>"
+
+
 def write_generated_jbeam_and_configs(
     context: VehicleContext,
     output_vehicle_dir: Path,
@@ -2062,15 +2075,24 @@ def write_generated_jbeam_and_configs(
     if cloned_bodies:
         jbeam_dir = output_vehicle_dir / "jbeam"
         jbeam_dir.mkdir(parents=True, exist_ok=True)
-        contents = textwrap.dedent(
-            f"""\
-            {{
-            // Generated visual hand-drive conversion parts.
-            // Source: {context.source_zip.name}
-            {','.join(cloned_bodies)}
-            }}
-            """
-        )
+        # Cloning is textual, so a malformed number in the source part comes
+        # along for the ride -- and every generated part shares this one file,
+        # which BeamNG discards whole on a decode error (io.lua
+        # `_parseFileIntoCache`). Repairing per body keeps the note pinned to
+        # the part it came from. See `repair_invalid_numbers` for why 0.
+        repaired_bodies: list[str] = []
+        repair_notes: list[str] = []
+        for body in cloned_bodies:
+            body, notes = repair_invalid_numbers(body)
+            repaired_bodies.append(body)
+            repair_notes.extend(f"{clone_body_part_id(body)} {note}" for note in notes)
+        header = [
+            "{",
+            "// Generated visual hand-drive conversion parts.",
+            f"// Source: {context.source_zip.name}",
+            *(f"// Repaired malformed number in source: {note}" for note in repair_notes),
+        ]
+        contents = "\n".join(header) + "\n" + ",".join(repaired_bodies) + "\n}\n"
         write_text_file(jbeam_dir / "handdrive_visual_conversion.jbeam", contents, encoding="utf-8")
     return generated_configs
 

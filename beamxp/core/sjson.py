@@ -69,11 +69,14 @@ class SJSONError(ValueError):
 
 
 class _Reader:
-    __slots__ = ("s", "n")
+    __slots__ = ("s", "n", "repairs")
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, repairs: list[tuple[int, int, str]] | None = None) -> None:
         self.s = text
         self.n = len(text)
+        # When this is a list, a malformed *number* is recorded here and read as
+        # 0 instead of raising -- see :func:`repair_invalid_numbers`.
+        self.repairs = repairs
 
     def fail(self, message: str, index: int) -> None:
         index = max(0, min(index, self.n))
@@ -182,13 +185,22 @@ class _Reader:
             while i < n and s[i] in _DIGITS:
                 i += 1
         if i == digits_start:
-            self.fail(f"Invalid number {s[start : start + 12]!r}", start)
+            # A sign with no digits behind it, e.g. `"y":-,`. i is always at
+            # least start + 1 here (read_value only dispatches to a number on a
+            # digit or a sign, and a digit would have advanced digits_start), so
+            # repairing consumes input and the walk cannot stall.
+            return self._bad_number(start, i, s[start : start + 12])
         text = s[start:i]
         try:
             return (float(text) if is_float else int(text)), i
         except ValueError:
+            return self._bad_number(start, i, text)
+
+    def _bad_number(self, start: int, i: int, text: str) -> tuple[int, int]:
+        if self.repairs is None:
             self.fail(f"Invalid number {text!r}", start)
-            return 0, i
+        self.repairs.append((start, i, self.s[start:i]))
+        return 0, i
 
     def read_key(self, i: int) -> tuple[str, int]:
         s = self.s
@@ -267,7 +279,11 @@ class _Reader:
 
 def decode(text: str) -> object:
     """Decode SJSON text to Python values, as BeamNG's parser would read it."""
-    reader = _Reader(text.lstrip("﻿"))
+    return _decode_with(text, None)
+
+
+def _decode_with(text: str, repairs: list[tuple[int, int, str]] | None) -> object:
+    reader = _Reader(text.lstrip("﻿"), repairs)
     i = reader.skip_space(0)
     if i >= reader.n:
         return {}
@@ -293,6 +309,52 @@ def decode(text: str) -> object:
     return out
 
 
+def repair_invalid_numbers(text: str) -> tuple[str, list[str]]:
+    """Rewrite malformed numbers as ``0`` so the engine can read the document.
+
+    A mod can ship a number that is not one -- the Audi R8's needle prop carries
+    ``{"x":91.5253, "y":-, "z":0}``. BeamNG's ``_parseFileIntoCache``
+    (``lua/common/jbeam/io.lua``) ``pcall``s the decode and returns ``nil`` for
+    the *whole file* on any error, so one stray ``-`` deletes every part the
+    file declares. We clone parts as text, so the typo rides into our generated
+    jbeam -- where the blast radius is worse, because every generated part
+    shares one file.
+
+    ``0`` rather than ``null``: null is Lua ``nil``, and nil is not inert here.
+    ``lua/common/jbeam/sections/meshs.lua`` guards ``if prop.baseRotation then``
+    and then calls ``math.rad(prop.baseRotation.y)`` on the raw table, so a
+    missing component raises inside ``pushToPhysics`` and takes out the rest of
+    the prop loop for the vehicle. That would trade a parse error for a worse
+    spawn-time one. ``0`` also keeps a jbeam row's arity, which matters because
+    rows are positional.
+
+    Only malformed numbers are repaired. Any other syntax error stops the walk;
+    whatever was fixed before it is still applied, and the caller gets the
+    partially repaired text rather than an exception -- this never makes output
+    less loadable than leaving it alone.
+
+    Returns the repaired text and one human-readable note per repair.
+    """
+    prefix = len(text) - len(text.lstrip("﻿"))
+    body = text[prefix:]
+    repairs: list[tuple[int, int, str]] = []
+    try:
+        _decode_with(body, repairs)
+    except SJSONError:
+        pass  # documented above: keep the repairs made before the other error
+    if not repairs:
+        return text, []
+    notes: list[str] = []
+    out = body
+    for start, end, token in reversed(repairs):
+        out = out[:start] + "0" + out[end:]
+    for start, _end, token in repairs:
+        line = body.count("\n", 0, start) + 1
+        column = start - (body.rfind("\n", 0, start) + 1) + 1
+        notes.append(f"line {line} column {column}: {token!r} -> 0")
+    return text[:prefix] + out, notes
+
+
 def encode_beamng_json(data: object, *, indent: int | None = None) -> str:
     """Serialise a document the way the reader above will read it back.
 
@@ -310,4 +372,9 @@ def encode_beamng_json(data: object, *, indent: int | None = None) -> str:
     return json.dumps(data, indent=indent, ensure_ascii=False)
 
 
-__all__ = ["SJSONError", "decode", "encode_beamng_json"]
+__all__ = [
+    "SJSONError",
+    "decode",
+    "encode_beamng_json",
+    "repair_invalid_numbers",
+]

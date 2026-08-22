@@ -173,5 +173,61 @@ class EncodeTests(unittest.TestCase):
         self.assertEqual(parse_beamng_json(text, label="info.json"), payload)
 
 
+class RepairInvalidNumbersTests(unittest.TestCase):
+    # The Audi R8 mod ships `{"x":91.5253, "y":-, "z":0}` in its tachometer
+    # needle prop. BeamNG's io.lua pcalls the decode and drops the WHOLE file,
+    # so the source loses its dash/steering/shifter parts -- and our generated
+    # jbeam, which carries every clone, loses all of them.
+
+    def test_a_sign_with_no_digits_becomes_zero(self) -> None:
+        text, notes = sjson.repair_invalid_numbers('{"x":91.5253, "y":-, "z":0}')
+        self.assertEqual(sjson.decode(text), {"x": 91.5253, "y": 0, "z": 0})
+        self.assertEqual(len(notes), 1)
+        self.assertIn("'-' -> 0", notes[0])
+
+    def test_zero_not_null_so_the_key_survives(self) -> None:
+        # null is Lua nil, and meshs.lua calls math.rad(prop.baseRotation.y) on
+        # the raw table behind an `if prop.baseRotation then` guard -- a missing
+        # component raises inside pushToPhysics and kills the rest of the prop
+        # loop. A parse error would become a worse spawn-time error.
+        text, _ = sjson.repair_invalid_numbers('{"y":-}')
+        self.assertNotIn("null", text)
+        self.assertEqual(sjson.decode(text), {"y": 0})
+
+    def test_row_arity_is_preserved(self) -> None:
+        # jbeam rows are positional, so a dropped value would shift every
+        # later column onto the wrong header name.
+        text, _ = sjson.repair_invalid_numbers('["rpm", -, 7000]')
+        self.assertEqual(sjson.decode(text), ["rpm", 0, 7000])
+
+    def test_clean_text_is_returned_untouched(self) -> None:
+        original = '{"a":1, "b":[2, -3.5, 1e4, Infinity]}'
+        text, notes = sjson.repair_invalid_numbers(original)
+        self.assertEqual(text, original)
+        self.assertEqual(notes, [])
+
+    def test_every_bad_number_is_repaired_in_one_pass(self) -> None:
+        text, notes = sjson.repair_invalid_numbers('{"a":-, "b":+, "c":3}')
+        self.assertEqual(sjson.decode(text), {"a": 0, "b": 0, "c": 3})
+        self.assertEqual(len(notes), 2)
+
+    def test_notes_carry_the_line_and_column(self) -> None:
+        text, notes = sjson.repair_invalid_numbers('{\n  "a":1,\n  "b":-\n}')
+        self.assertEqual(sjson.decode(text), {"a": 1, "b": 0})
+        self.assertIn("line 3 column 7", notes[0])
+
+    def test_an_unrelated_syntax_error_keeps_the_repairs_made_so_far(self) -> None:
+        # Never raise: partially repaired output is no less loadable than the
+        # untouched text, which BeamNG would reject either way.
+        text, notes = sjson.repair_invalid_numbers('{"a":-, "b":')
+        self.assertEqual(text, '{"a":0, "b":')
+        self.assertEqual(len(notes), 1)
+
+    def test_a_leading_bom_is_preserved(self) -> None:
+        text, _ = sjson.repair_invalid_numbers('﻿{"y":-}')
+        self.assertTrue(text.startswith("﻿"))
+        self.assertEqual(sjson.decode(text), {"y": 0})
+
+
 if __name__ == "__main__":
     unittest.main()
