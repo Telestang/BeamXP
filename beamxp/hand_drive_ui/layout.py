@@ -204,12 +204,14 @@ class LayoutMixin:
         frame.grid(row=1, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        columns = ("build", "config", "display", "stock_hand", "plate", "front_plate", "rear_plate")
+        # One column for the trim, holding the name the game shows. The raw
+        # config name it is filed under is the row's identity, not something
+        # the user picks a trim by, so it no longer takes a column of its own.
+        columns = ("build", "config", "stock_hand", "plate", "front_plate", "rear_plate")
         self.variant_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8, selectmode="browse")
         headings = {
             "build": "Build",
             "config": "Config",
-            "display": "Display Name",
             "stock_hand": "Stock drive side",
             "plate": "Plates",
             "front_plate": "Front plate",
@@ -217,8 +219,7 @@ class LayoutMixin:
         }
         widths = {
             "build": 88,
-            "config": 130,
-            "display": 260,
+            "config": 260,
             "stock_hand": 110,
             "plate": 120,
             "front_plate": 94,
@@ -234,7 +235,7 @@ class LayoutMixin:
                 col,
                 width=widths[col],
                 minwidth=48,
-                stretch=col == "display",
+                stretch=col == "config",
                 anchor="w",
             )
         self._register_tree_headings(self.variant_tree, headings)

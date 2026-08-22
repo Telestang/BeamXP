@@ -44,8 +44,7 @@ class VariantWorkflowMixin:
                 tags=self._row_tags(row_index),
                 values=(
                     BUILD_LABELS[build_mode],
-                    config_name,
-                    variant.display_name,
+                    variant.display_name or config_name,
                     stock_hand,
                     self._variant_plate_label(config_name, settings),
                     plate_generator.plate_part_label_for_config(
@@ -146,9 +145,19 @@ class VariantWorkflowMixin:
             outputs.append(core.original_plate_output_name(config_name))
         return ", ".join(outputs)
 
-    @staticmethod
-    def _preview_config_label(output_name: str) -> str:
-        return re.sub(r"_(?:rhd|lhd)$", "", output_name, flags=re.IGNORECASE)
+    def _preview_config_label(self, config_name: str) -> str:
+        """The trim name the Config dropdown shows for a source config.
+
+        The same name the variants table shows, so the two agree: a trim is
+        picked here by the name it goes by in game rather than by the config
+        it is filed under. Only the bare-config fallback keeps the old
+        hand suffix trim -- a real trim name may legitimately end in "LHD".
+        """
+        variant = self.context.variants.get(config_name) if self.context is not None else None
+        display = variant.display_name if variant is not None else ""
+        if display:
+            return display
+        return re.sub(r"_(?:rhd|lhd)$", "", config_name, flags=re.IGNORECASE)
 
     def _output_config_sources_for_ui(self) -> tuple[dict[str, str], dict[str, str]]:
         if self.context is None:

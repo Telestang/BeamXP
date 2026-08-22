@@ -62,10 +62,18 @@ class VehicleWorkflowMixin:
         ]
         core.save_app_settings(self.settings)
 
-    @staticmethod
-    def _model_history_label(zip_path: Path, vehicle_id: str, taken: dict[str, object]) -> str:
-        label = f"{vehicle_id}  ({zip_path.stem})"
-        base = label
+    def _model_history_label(self, vehicle_id: str, taken: dict[str, object]) -> str:
+        """The dropdown label for a vehicle in the zip currently open by hand.
+
+        Follows VehicleListing.label(): the display name the folder scan would
+        have shown ("Lexus LC", not "lc500"), then a bracketed tag for where it
+        came from, then a number if that much is already taken. [imported]
+        stands beside [mod] as the third origin a row can have -- neither
+        configured folder listed this one, the user opened it themselves.
+        """
+        name = self.vehicle_display_names.get(vehicle_id) or vehicle_id
+        base = f"{name} [imported]"
+        label = base
         suffix = 2
         while label in taken:
             label = f"{base} #{suffix}"
@@ -74,13 +82,29 @@ class VehicleWorkflowMixin:
 
     def _load_source_zip(self, source_zip: Path, vehicle_id: str | None = None) -> None:
         try:
-            vehicle_ids = core.vehicle_ids_in_zip(source_zip)
+            # The full entries, not just the ids: a zip opened by hand is not
+            # in any folder scan, so this is the only place its display names
+            # are read.
+            catalog = core.vehicle_catalog_entries_in_zip(source_zip)
+            vehicle_ids = [entry.vehicle_id for entry in catalog]
             if not vehicle_ids:
-                raise RuntimeError("No vehicles/<model>/ content with DAE/PC/JBeam files was found")
+                # Reached both by a zip holding no vehicle content at all and
+                # by one holding only shared parts, so the message names what
+                # a convertible vehicle needs rather than what was missing.
+                raise RuntimeError(
+                    "No convertible vehicle was found in this zip.\n\n"
+                    "BeamXP needs a vehicles/<model>/ folder holding a mesh and at "
+                    "least one config (.pc) file. Shared parts such as "
+                    "vehicles/common, and add-ons that only supply parts for "
+                    "another vehicle, cannot be converted on their own."
+                )
             self.source_zip = source_zip
             self.settings["lastVehicleZipFolder"] = str(source_zip.parent)
             core.save_app_settings(self.settings)
             self.vehicle_ids = vehicle_ids
+            self.vehicle_display_names = {
+                entry.vehicle_id: entry.display_name for entry in catalog if entry.display_name
+            }
             self.source_var.set(str(source_zip))
             selected_vehicle = vehicle_id if vehicle_id in vehicle_ids else vehicle_ids[0]
             self._rebuild_model_combo()
@@ -159,23 +183,64 @@ class VehicleWorkflowMixin:
         except Exception as exc:
             self.worker_queue.put(("vehicle_load_error", (seq, exc)))
 
+    # Every control that acts on the vehicle currently on screen. None of them
+    # can mean anything before one is loaded, so they grey out together rather
+    # than each answering an empty window its own way -- which is how the same
+    # click came to raise a popup on one button and do nothing at all on the
+    # next. Add a new vehicle-scoped button here and it inherits the rule.
+    VEHICLE_BUTTONS = (
+        "refresh_button",
+        "recommend_button",
+        "convert_all_button",
+        "clear_builds_button",
+        "save_config_button",
+        "import_config_button",
+        "new_side_pair_button",
+        "remove_side_pair_button",
+        "clear_slot_pairs_button",
+        "reset_trigger_button",
+        "clear_triggers_button",
+        "toggle_triggers_button",
+        "show_all_parts_button",
+        "hide_all_parts_button",
+        "active_only_parts_button",
+        "clear_solo_parts_button",
+        "install_button",
+        "blender_button",
+    )
+
+    def _vehicle_controls_enabled(self) -> bool:
+        """Whether a vehicle is loaded and not mid-load or mid-build."""
+        return self.context is not None and not self.model_load_busy and not self.worker_running
+
+    def _refresh_vehicle_control_state(self) -> None:
+        """Restate every vehicle-scoped control from the current context."""
+        state = "normal" if self._vehicle_controls_enabled() else "disabled"
+        for name in self.VEHICLE_BUTTONS:
+            button = getattr(self, name, None)
+            if button is not None:
+                button.configure(state=state)
+        self._refresh_plate_control_state()
+
+    def _refresh_plate_control_state(self) -> None:
+        """The plate row, which needs a vehicle *and* a plate chosen for it.
+
+        Kept apart from the buttons above because it is restated whenever the
+        plate choice changes, not only when a vehicle comes and goes.
+        """
+        if not hasattr(self, "plate_choice_combo"):
+            return  # _set_busy can run before the layout is built
+        enabled = self._vehicle_controls_enabled()
+        self.plate_choice_combo.configure(state="readonly" if enabled else "disabled")
+        chosen = enabled and self.plate_choice_var.get() != "Off"
+        self.plate_configure_button.configure(state="normal" if chosen else "disabled")
+
     def _set_load_busy(self, busy: bool) -> None:
-        state = "disabled" if busy else "normal"
-        self.open_button.configure(state=state)
-        self.refresh_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.recommend_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.new_side_pair_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.remove_side_pair_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.clear_slot_pairs_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.reset_trigger_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.clear_triggers_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.toggle_triggers_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.show_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.hide_all_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.active_only_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
-        self.clear_solo_parts_button.configure(state="disabled" if busy or self.context is None else "normal")
+        self.open_button.configure(state="disabled" if busy else "normal")
         self.model_load_busy = busy
         self._update_model_combo_state()
+        # A vehicle load drives the same progress bar a build does, so it goes
+        # through _set_busy, which restates the buttons on its way out.
         self._set_busy(busy)
 
     def _handle_vehicle_load_success(self, payload: object) -> None:
@@ -229,6 +294,11 @@ class VehicleWorkflowMixin:
         if seq != self.vehicle_load_seq:
             return
         self._set_load_busy(False)
+        if self.context is None:
+            # The zip path went up the moment it was picked, so a failed load
+            # would otherwise leave the window naming a vehicle it does not
+            # have while every control sits greyed out.
+            self.source_var.set(NO_VEHICLE_LOADED)
         self._show_error("Load vehicle failed", str(exc))
         self.status_var.set("Load vehicle failed")
 
@@ -327,7 +397,7 @@ class VehicleWorkflowMixin:
         else:
             selected = "Off"
         self.plate_choice_var.set(selected)
-        self.plate_configure_button.configure(state="disabled" if selected == "Off" else "normal")
+        self._refresh_plate_control_state()
 
     def _main_plate_choice_changed(self) -> None:
         label = self.plate_choice_var.get()

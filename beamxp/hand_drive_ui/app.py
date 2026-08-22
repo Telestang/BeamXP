@@ -51,6 +51,9 @@ class HandDriveToolApp(
         self.conversion: dict[str, object] = {}
         self.source_zip: Path | None = None
         self.vehicle_ids: list[str] = []
+        # Display names for the vehicles in the zip on screen, so a zip
+        # opened by hand is labelled the way a scanned one is.
+        self.vehicle_display_names: dict[str, str] = {}
         # Model dropdown: combo label -> (zip path, vehicle id)
         self.model_entries: dict[str, tuple[Path, str]] = {}
         self.model_load_busy = False
