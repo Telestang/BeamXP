@@ -220,7 +220,25 @@ class RhdTextureConfig:
     # A flip only exchanges a texel when its opposite number is also inside
     # the chosen stencil.  If the mirrored domain alone would tear the glyph,
     # pass 3 tries the full material domain before leaving the region unchanged.
-    min_region_exchangeable: float = 0.98
+    #
+    # What this is for is rejecting a detection that straddles the edge of a UV
+    # island, where half the mark has no partner and flipping shreds it.  Those
+    # score around a half -- the Audi R8 dash declined two at 49% and 51%.  It
+    # does not need to be near 1.0 to catch them, and at 0.98 it was also
+    # catching marks that are entirely exchangeable bar a sliver: pass 3 flips
+    # about the region box's centre, so a box sitting a couple of pixels off the
+    # island's own mirror line loses its outermost columns and understates a
+    # symmetric glyph.  (Pass 2 searches for that line -- see
+    # island_axis_search_ratio -- pass 3 does not.)  The R8's MMI BACK and MENU
+    # scored 0.98 that way, were dropped whole, and shipped reading backwards,
+    # as the ETK K-series console controller did at 0.970 before it.
+    #
+    # Calibrated between the two real cases on record: above the LC500 shifter
+    # gate's overhanging outline at 0.890, which genuinely tore the R and must
+    # stay rejected (OutlinePartnerShareTests guards it), and below the 0.970
+    # that has to be admitted.  Shared with the outline partner test at
+    # `outline_partner_share`.
+    min_region_exchangeable: float = 0.95
     # Some atlas marks are skewed in texture space but become upright only when
     # mapped onto the mesh.  Skewing and mirroring do not commute, and the flat
     # texture often lacks enough detail to repair honestly, so materially
