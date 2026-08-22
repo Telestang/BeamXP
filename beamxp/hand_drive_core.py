@@ -91,6 +91,7 @@ from beamxp.core.files import (
     read_json_file,
     safe_id,
     safe_project_segment,
+    vehicle_catalog_entries_in_zip,
     vehicle_ids_in_zip,
     vehicle_prefix,
     write_bytes_file,

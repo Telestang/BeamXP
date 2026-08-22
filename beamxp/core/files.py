@@ -29,6 +29,29 @@ class VehicleCatalogEntry:
     config_count: int = 0
 
 
+# Folder names under vehicles/ that the engine reserves for shared content
+# rather than a vehicle. vehicles/common is where a mod files wheels, tyres and
+# other parts it wants every vehicle to be able to slot -- the Lexus LC500 mod
+# ships five wheel sets there, each with its own DAE and jbeam.
+RESERVED_VEHICLE_IDS = frozenset({"common"})
+
+
+def is_convertible_vehicle(entry: VehicleCatalogEntry) -> bool:
+    """Whether a catalog entry is a vehicle this tool can actually convert.
+
+    Having a mesh and a jbeam beside it is not enough: that describes any
+    shared parts namespace. A vehicle is a folder the game will spawn, which
+    means it is not one of the reserved namespaces and it ships at least one
+    config of its own. Nothing here judges the *kind* of vehicle -- filtering
+    to cars and trucks, or hiding this tool's own output, is the vehicle
+    dropdown's business and does not belong on a zip the user opened by hand.
+    """
+    if entry.source_vehicle_id.lower() in RESERVED_VEHICLE_IDS:
+        return False
+    # No .pc means no trim to build, whatever else the folder holds.
+    return entry.config_count > 0
+
+
 def _direct_zip_files(names: list[str], vehicle_id: str, suffix: str) -> list[str]:
     prefix = f"vehicles/{vehicle_id}/"
     wanted = suffix.lower()
@@ -343,7 +366,10 @@ def vehicle_catalog_entries_in_zip(source_zip: Path) -> list[VehicleCatalogEntry
                         config_count=len(config_names),
                     )
                 )
-        return sorted(entries, key=lambda entry: (entry.vehicle_id.lower(), entry.source_vehicle_id.lower()))
+        return sorted(
+            (entry for entry in entries if is_convertible_vehicle(entry)),
+            key=lambda entry: (entry.vehicle_id.lower(), entry.source_vehicle_id.lower()),
+        )
 
 
 def vehicle_catalog_entry_for_id(source_zip: Path, vehicle_id: str) -> VehicleCatalogEntry | None:

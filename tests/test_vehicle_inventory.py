@@ -6,6 +6,7 @@ import zipfile
 from pathlib import Path
 
 from beamxp.core.inventory import (
+    read_preview_bytes_for_vehicle,
     read_preview_image_bytes,
     scan_vehicle_inventory,
 )
@@ -152,6 +153,29 @@ class VehicleInventoryTests(unittest.TestCase):
         items = scan_vehicle_inventory(self.game, self.root / "nope")
         self.assertEqual([item.label() for item in items], ["Acme Hauler", "Acme Rocket"])
 
+    def test_game_folder_is_scanned_no_deeper_than_its_own_zips(self) -> None:
+        # The game's vehicles folder is flat; anything filed below it belongs
+        # to something else and is not ours to open.
+        nested = self.game / "extra"
+        nested.mkdir()
+        vehicle_zip(nested, "buried.zip", "buried", '{"Name":"Buried","Type":"Car"}')
+        items = scan_vehicle_inventory(self.game, None)
+        self.assertNotIn("buried", [item.vehicle_id for item in items])
+        self.assertIn("acme", [item.vehicle_id for item in items])
+
+    def test_mods_are_found_one_folder_down(self) -> None:
+        # mods/repo/zippy.zip, which is where the in-game repo files downloads.
+        items = scan_vehicle_inventory(None, self.mods)
+        self.assertIn("zippy", [item.vehicle_id for item in items])
+
+    def test_mods_are_not_found_two_folders_down(self) -> None:
+        deep = self.mods / "repo" / "archive"
+        deep.mkdir()
+        vehicle_zip(deep, "deep.zip", "deep", '{"Name":"Deep","Type":"Car"}')
+        items = scan_vehicle_inventory(None, self.mods)
+        self.assertNotIn("deep", [item.vehicle_id for item in items])
+        self.assertIn("zippy", [item.vehicle_id for item in items])
+
     def test_preview_bytes_are_readable(self) -> None:
         items = scan_vehicle_inventory(self.game, self.mods)
         rocket = next(item for item in items if item.vehicle_id == "acme")
@@ -162,6 +186,25 @@ class VehicleInventoryTests(unittest.TestCase):
         items = scan_vehicle_inventory(self.game, self.mods)
         bare = next(item for item in items if item.vehicle_id == "bare")
         self.assertIsNone(read_preview_image_bytes(bare))
+
+    # Load Zip opens vehicles that no folder scan covered, so they have no
+    # listing to hang a preview on and the thumbnail used to sit empty.
+    def test_a_preview_is_readable_without_a_folder_scan(self) -> None:
+        loose = self.root / "elsewhere"
+        loose.mkdir()
+        vehicle_zip(loose, "hand.zip", "hand", '{"Name":"Hand Picked","Type":"Car"}')
+        self.assertEqual(read_preview_bytes_for_vehicle(loose / "hand.zip", "hand"), PNG_1PX)
+
+    def test_a_vehicle_not_in_the_zip_has_no_preview(self) -> None:
+        self.assertIsNone(read_preview_bytes_for_vehicle(self.game / "acme.zip", "nosuch"))
+
+    def test_a_zip_shipping_no_preview_reads_none(self) -> None:
+        vehicle_zip(self.game, "bare2.zip", "bare2", '{"Name":"Bare","Type":"Car"}', preview=False)
+        self.assertIsNone(read_preview_bytes_for_vehicle(self.game / "bare2.zip", "bare2"))
+
+    def test_an_unreadable_zip_has_no_preview(self) -> None:
+        (self.root / "broken2.zip").write_bytes(b"not a zip")
+        self.assertIsNone(read_preview_bytes_for_vehicle(self.root / "broken2.zip", "acme"))
 
     def test_display_name_falls_back_to_the_vehicle_id(self) -> None:
         # A mod with no model info.json at all still has to appear.

@@ -190,6 +190,62 @@ class VehicleCatalogTests(unittest.TestCase):
         self.assertEqual(entry.source_vehicle_id, "acme")
         self.assertEqual(entry.config_names, ())
 
+    # What separates a vehicle from a shared parts namespace: both hold a mesh
+    # and a jbeam, so only the presence of a config of its own tells them
+    # apart. The Lexus LC500 mod files five wheel sets under vehicles/common,
+    # which used to show up in the Model dropdown as a vehicle called "common".
+    def test_the_shared_parts_namespace_is_not_a_vehicle(self) -> None:
+        zip_path = self._zip_path(
+            {
+                "vehicles/lc500/lc500.dae": "",
+                "vehicles/lc500/lc500.jbeam": "",
+                "vehicles/lc500/base.pc": "{}",
+                "vehicles/common/21in_tires/21in_tires.dae": "",
+                "vehicles/common/21in_tires/tires_F_21x9.jbeam": "",
+                "vehicles/common/wheels.dae": "",
+                "vehicles/common/wheels.jbeam": "",
+            }
+        )
+
+        self.assertEqual(vehicle_ids_in_zip(zip_path), ["lc500"])
+        self.assertIsNone(vehicle_catalog_entry_for_id(zip_path, "common"))
+
+    def test_a_shared_namespace_with_configs_is_still_not_a_vehicle(self) -> None:
+        # vehicles/common is reserved by name, so a stray .pc does not promote
+        # it. It is a slot for parts every vehicle can borrow, not a car.
+        zip_path = self._zip_path(
+            {
+                "vehicles/common/wheels.dae": "",
+                "vehicles/common/wheels.jbeam": "",
+                "vehicles/common/base.pc": "{}",
+            }
+        )
+
+        self.assertEqual(vehicle_ids_in_zip(zip_path), [])
+
+    def test_a_parts_only_add_on_is_not_a_vehicle(self) -> None:
+        # A bodykit or wheel pack for someone else's car: meshes and jbeams,
+        # but no trim of its own to build.
+        zip_path = self._zip_path(
+            {
+                "vehicles/etk800/bodykit.dae": "",
+                "vehicles/etk800/bodykit.jbeam": "",
+            }
+        )
+
+        self.assertEqual(vehicle_ids_in_zip(zip_path), [])
+
+    def test_a_vehicle_with_one_config_is_a_vehicle(self) -> None:
+        zip_path = self._zip_path(
+            {
+                "vehicles/etk800/etk800.dae": "",
+                "vehicles/etk800/etk800.jbeam": "",
+                "vehicles/etk800/base.pc": "{}",
+            }
+        )
+
+        self.assertEqual(vehicle_ids_in_zip(zip_path), ["etk800"])
+
     # A config's authored Configuration is a locale key that the engine puts
     # through _tr before the selector shows it (core/vehicles.lua), so the
     # string in the locale table is the name the player reads. Prettifying the

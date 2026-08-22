@@ -18,7 +18,12 @@ import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from beamxp.core.files import VehicleCatalogEntry, vehicle_catalog_entries_in_zip
+from beamxp.core.files import (
+    RESERVED_VEHICLE_IDS,
+    VehicleCatalogEntry,
+    vehicle_catalog_entries_in_zip,
+    vehicle_catalog_entry_for_id,
+)
 
 # lua/ge/extensions/ui/vehicleSelector/tileGrouping.lua maps the model's Type
 # onto a selector section. Car and Truck are the "Cars and Trucks" section.
@@ -30,9 +35,6 @@ AUTOMATION_TYPES = frozenset({"Automation"})
 # build_batch writes this into every mod it produces. Our own output must never
 # be offered as a conversion source: it is already converted.
 TOOL_BUILD_MARKER = "handedness_conversion/conversion.json"
-
-# vehicles/common holds shared parts, not a vehicle.
-RESERVED_VEHICLE_IDS = frozenset({"common"})
 
 
 @dataclass(frozen=True)
@@ -67,14 +69,28 @@ class VehicleListing:
         return text
 
 
-def _iter_zips(folder: Path) -> list[Path]:
+# How far below each configured folder a vehicle zip is looked for. The game's
+# vehicles folder is flat, so nothing below it is ours to read. Mods sit either
+# loose in the mods folder or one level down (mods/repo/, mods/unpacked/), so
+# that is as deep as the mods scan goes. Both are capped rather than walked to
+# the bottom: a user is free to point either setting at a large folder, and an
+# unbounded walk there would stall the scan on files that cannot be vehicles.
+GAME_SCAN_DEPTH = 0
+MODS_SCAN_DEPTH = 1
+
+
+def _iter_zips(folder: Path, depth: int) -> list[Path]:
+    """Zips in `folder`, plus `depth` levels of subfolders beneath it."""
     if not folder or not folder.is_dir():
         return []
-    try:
-        # Mods can sit in subfolders (mods/repo/, mods/unpacked/ siblings).
-        return sorted(folder.rglob("*.zip"))
-    except OSError:
-        return []
+    found: list[Path] = []
+    for level in range(max(depth, 0) + 1):
+        pattern = "*/" * level + "*.zip"
+        try:
+            found.extend(path for path in folder.glob(pattern) if path.is_file())
+        except OSError:
+            continue
+    return sorted(found)
 
 
 def _is_tool_build(source_zip: Path) -> bool:
@@ -87,24 +103,23 @@ def _is_tool_build(source_zip: Path) -> bool:
         return False
 
 
-def scan_folder(folder: Path, *, is_mod: bool) -> list[tuple[Path, VehicleCatalogEntry]]:
+def scan_folder(
+    folder: Path, *, is_mod: bool, depth: int | None = None
+) -> list[tuple[Path, VehicleCatalogEntry]]:
     """Every (zip, catalog entry) pair in the folder that could be converted."""
+    if depth is None:
+        depth = MODS_SCAN_DEPTH if is_mod else GAME_SCAN_DEPTH
     found: list[tuple[Path, VehicleCatalogEntry]] = []
-    for source_zip in _iter_zips(folder):
+    for source_zip in _iter_zips(folder, depth):
         if is_mod and _is_tool_build(source_zip):
             continue
         try:
             entries = vehicle_catalog_entries_in_zip(source_zip)
         except (OSError, zipfile.BadZipFile):
             continue  # an unreadable or partially-downloaded mod must not stop the scan
-        for entry in entries:
-            if entry.source_vehicle_id.lower() in RESERVED_VEHICLE_IDS:
-                continue
-            # A zip that ships parts for a vehicle but no trim of its own (a
-            # plate or livery overlay) has nothing to convert.
-            if entry.config_count == 0:
-                continue
-            found.append((source_zip, entry))
+        # Shared-parts namespaces and parts-only overlays never reach here:
+        # vehicle_catalog_entries_in_zip only yields convertible vehicles.
+        found.extend((source_zip, entry) for entry in entries)
     return found
 
 
@@ -212,23 +227,46 @@ def _disambiguate_labels(listings: list[VehicleListing]) -> list[VehicleListing]
     ]
 
 
+def _read_member(source_zip: Path, member: str) -> bytes | None:
+    try:
+        with zipfile.ZipFile(source_zip) as archive:
+            return archive.read(member)
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+
+
 def read_preview_image_bytes(listing: VehicleListing) -> bytes | None:
     """The tile's preview image, or None when no usable preview was found."""
     if not listing.preview_member:
         return None
+    return _read_member(listing.preview_zip, listing.preview_member)
+
+
+def read_preview_bytes_for_vehicle(source_zip: Path, vehicle_id: str) -> bytes | None:
+    """The tile preview for one vehicle of a zip no folder scan covered.
+
+    Load Zip reaches vehicles outside both configured folders, which have no
+    VehicleListing behind them -- so the preview is resolved from the zip's own
+    catalog entry, by the same rules the scan would have applied.
+    """
     try:
-        with zipfile.ZipFile(listing.preview_zip) as archive:
-            return archive.read(listing.preview_member)
-    except (OSError, KeyError, zipfile.BadZipFile):
+        entry = vehicle_catalog_entry_for_id(source_zip, vehicle_id)
+    except (OSError, zipfile.BadZipFile):
         return None
+    if entry is None or not entry.preview_member:
+        return None
+    return _read_member(source_zip, entry.preview_member)
 
 
 __all__ = [
     "AUTOMATION_TYPES",
     "CAR_TRUCK_TYPES",
+    "GAME_SCAN_DEPTH",
+    "MODS_SCAN_DEPTH",
     "RESERVED_VEHICLE_IDS",
     "TOOL_BUILD_MARKER",
     "VehicleListing",
+    "read_preview_bytes_for_vehicle",
     "read_preview_image_bytes",
     "scan_folder",
     "scan_vehicle_inventory",
