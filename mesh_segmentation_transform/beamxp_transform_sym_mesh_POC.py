@@ -214,6 +214,11 @@ class VehicleArchive:
     archive_paths: tuple[Path, ...] = ()
     runtime_material_aliases: tuple[str, ...] = ()
     material_errors: tuple[str, ...] = ()
+    # Texture references no member could be found for, collected as they are
+    # met rather than at scan time -- resolution needs the material that names
+    # them. Drained into the export's textureFailures so an unreadable texture
+    # is reported instead of being skipped in silence.
+    unresolved_texture_references: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -948,7 +953,35 @@ def extract_archive_member(archive: VehicleArchive, member: str) -> Path:
     return target
 
 
+# DDS first, then the order this has always used: a cooked texture wins over
+# the source it was cooked from. `.bmp` is new here and last, because BeamNG
+# accepts it and we did not.
+_TEXTURE_EXTENSIONS = (".dds", ".png", ".tga", ".jpg", ".jpeg", ".bmp")
+# BeamNG's texture cooker names a map `<stem>.color.png` / `.normal.` / `.data.`
+# and a material may point at the bare stem.
+_TEXTURE_COOKER_INFIXES = (".color", ".normal", ".data")
+
+
 def _texture_reference_candidates(reference: str, materials_member: str) -> tuple[str, ...]:
+    """Every archive member a BeamNG texture reference could mean.
+
+    A material may name a texture with no extension at all -- the Audi R8's
+    `r8_intsym` points at `/vehicles/r8/aud_r8v10plus_16_symbols_001_diff` and
+    the engine renders the `.png` sitting beside it. BeamNG probes for the
+    extension; the candidate set it treats as variants of one stem is listed in
+    `lua/ge/extensions/editor/resourceChecker/resourceUtil.lua`.
+
+    We used to expand extensions only when the reference already carried one,
+    so a bare stem produced a single candidate that matched no member,
+    `resolve_archive_texture_member` returned None and the caller skipped the
+    layer without a word. On the R8 that silently passed over all 31
+    extensionless references, including both interior symbol atlases -- the
+    console lettering shipped mirrored.
+
+    Candidates are tried in order and the first hit wins, so everything that
+    resolved before still resolves to the same member: the new forms are only
+    ever appended behind the old ones.
+    """
     reference = reference.replace("\\", "/").strip()
     if not reference or reference.startswith("@"):
         return ()
@@ -972,10 +1005,18 @@ def _texture_reference_candidates(reference: str, materials_member: str) -> tupl
     for candidate in expanded:
         path = PurePosixPath(candidate)
         suffix = path.suffix.lower()
-        if suffix in {".png", ".dds", ".tga", ".jpg", ".jpeg"}:
+        if suffix in _TEXTURE_EXTENSIONS:
             stem = candidate[: -len(path.suffix)]
-            for replacement in (".dds", ".png", ".tga", ".jpg", ".jpeg"):
+            for replacement in _TEXTURE_EXTENSIONS:
                 add(stem + replacement)
+            continue
+        # No extension, or one that is not an image (a stem like `foo.v2`).
+        # Nothing has been named yet, so the whole reference is the stem.
+        for replacement in _TEXTURE_EXTENSIONS:
+            add(candidate + replacement)
+        for infix in _TEXTURE_COOKER_INFIXES:
+            for replacement in _TEXTURE_EXTENSIONS:
+                add(candidate + infix + replacement)
     return tuple(candidates)
 
 
@@ -1006,6 +1047,12 @@ def resolve_archive_texture_member(
                 )
             )
             return matches[0]
+    # An empty candidate set means the reference never named a file: a runtime
+    # `@alias` is painted by the game, not shipped, so it is not a failure.
+    # getattr: the texture suite drives this with SimpleNamespace archives.
+    unresolved = getattr(archive, "unresolved_texture_references", None)
+    if candidates and unresolved is not None:
+        unresolved.add(reference)
     return None
 
 

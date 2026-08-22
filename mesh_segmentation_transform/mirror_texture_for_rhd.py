@@ -8893,7 +8893,16 @@ def export_parts_preview(
     results: list[RhdTextureResult] = []
     detection_attempted_members: set[str] = set()
     detection_skips: list[dict[str, str]] = []
-    texture_failures: list[dict[str, str]] = []
+    # A material map we could not find a file for is a texture we cannot read,
+    # so it belongs here with the ones that failed to decode. Collecting the
+    # bindings above is what populates this; before it was reported, the layer
+    # was simply skipped and the mesh shipped on the uncorrected atlas.
+    texture_failures: list[dict[str, str]] = [
+        {"texture": reference, "reason": "no file found for this texture reference"}
+        for reference in sorted(getattr(archive, "unresolved_texture_references", ()) or ())
+    ]
+    for failure in texture_failures:
+        log(f"  ! unresolved texture reference: {failure['texture']}")
     # Every correction is planned before any is run, so the pass can be spread
     # over processes.  A texture's heading and mask coverage are written during
     # planning but belong above that texture's corrections, which no longer

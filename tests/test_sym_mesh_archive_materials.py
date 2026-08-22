@@ -19,6 +19,7 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
     _blend_archive_preview_texture,
     archive_texture_choices_for_part,
     extract_archive_member,
+    resolve_archive_texture_member,
     scan_vehicle_archive,
 )
 
@@ -834,6 +835,102 @@ class SymMeshArchiveMaterialTests(unittest.TestCase):
             [choice.material_key for choice in choices],
             ["bolide_interior", "bolide_interior.skin_interior.cream"],
         )
+
+
+
+class ExtensionlessTextureReferenceTests(unittest.TestCase):
+    """A material may name a texture without naming its file type.
+
+    The Audi R8's `r8_intsym` points at
+    `/vehicles/r8/aud_r8v10plus_16_symbols_001_diff` and the engine renders the
+    `.png` beside it -- `resourceChecker/resourceUtil.lua` lists the extensions
+    it treats as variants of one stem. We used to expand extensions only when
+    the reference already carried one, so a bare stem resolved to nothing and
+    the caller skipped the layer silently: 31 references on the R8, including
+    both interior symbol atlases, so the console lettering shipped mirrored.
+    """
+
+    def _archive(self, members, root):
+        archive_path = root / "textures.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("vehicles/car/car.dae", "<COLLADA/>")
+            for member in members:
+                archive.writestr(member, b"x")
+        return scan_vehicle_archive(archive_path, root / "scan")
+
+    def _resolve(self, members, reference):
+        with TemporaryDirectory() as temporary:
+            scanned = self._archive(members, Path(temporary))
+            resolved = resolve_archive_texture_member(
+                scanned, reference, "vehicles/car/main.materials.json"
+            )
+            return resolved, sorted(scanned.unresolved_texture_references)
+
+    def test_a_bare_stem_finds_the_png_beside_it(self) -> None:
+        resolved, unresolved = self._resolve(
+            ["vehicles/car/symbols_001_diff.png"], "/vehicles/car/symbols_001_diff"
+        )
+        self.assertEqual(resolved, "vehicles/car/symbols_001_diff.png")
+        self.assertEqual(unresolved, [])
+
+    def test_a_cooked_dds_still_wins_over_its_source(self) -> None:
+        # Unchanged precedence: .dds has always been tried first.
+        resolved, _ = self._resolve(
+            ["vehicles/car/symbols.png", "vehicles/car/symbols.dds"],
+            "/vehicles/car/symbols",
+        )
+        self.assertEqual(resolved, "vehicles/car/symbols.dds")
+
+    def test_an_explicit_extension_is_honoured_before_any_expansion(self) -> None:
+        # The reference itself is candidate one, so naming .png gets the .png
+        # even though .dds leads the expanded alternatives.
+        resolved, _ = self._resolve(
+            ["vehicles/car/paint.dds", "vehicles/car/paint.png"],
+            "/vehicles/car/paint.png",
+        )
+        self.assertEqual(resolved, "vehicles/car/paint.png")
+
+    def test_an_explicit_extension_still_falls_back_to_the_cooked_file(self) -> None:
+        # The png-to-dds alias, unchanged: new candidates are only ever
+        # appended behind the ones that already resolved.
+        resolved, _ = self._resolve(
+            ["vehicles/car/paint.dds"], "/vehicles/car/paint.png"
+        )
+        self.assertEqual(resolved, "vehicles/car/paint.dds")
+
+    def test_bmp_is_accepted(self) -> None:
+        resolved, _ = self._resolve(
+            ["vehicles/car/decal.bmp"], "/vehicles/car/decal"
+        )
+        self.assertEqual(resolved, "vehicles/car/decal.bmp")
+
+    def test_a_bare_stem_finds_a_texture_cooker_name(self) -> None:
+        resolved, _ = self._resolve(
+            ["vehicles/car/badge.color.png"], "/vehicles/car/badge"
+        )
+        self.assertEqual(resolved, "vehicles/car/badge.color.png")
+
+    def test_a_non_image_suffix_is_treated_as_part_of_the_stem(self) -> None:
+        resolved, _ = self._resolve(
+            ["vehicles/car/atlas.v2.png"], "/vehicles/car/atlas.v2"
+        )
+        self.assertEqual(resolved, "vehicles/car/atlas.v2.png")
+
+    def test_a_reference_with_no_file_is_recorded_not_swallowed(self) -> None:
+        resolved, unresolved = self._resolve(
+            ["vehicles/car/other.png"], "/vehicles/car/missing"
+        )
+        self.assertIsNone(resolved)
+        self.assertEqual(unresolved, ["/vehicles/car/missing"])
+
+    def test_a_runtime_alias_is_not_a_failure(self) -> None:
+        # `@name` is painted by the game at runtime and ships no file.
+        resolved, unresolved = self._resolve(
+            ["vehicles/car/other.png"], "@car_screen_canvas"
+        )
+        self.assertIsNone(resolved)
+        self.assertEqual(unresolved, [])
+
 
 
 if __name__ == "__main__":
