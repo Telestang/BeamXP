@@ -62,3 +62,8 @@ rhd_textures/
 
 # Local reveal GIF scratch/output assets
 reveal_gif_work/
+
+# MSIX packaging inputs — kept local only (private signing identity + store art).
+# build_windows.ps1 no-ops the MSIX step when they are absent.
+packaging/msix/AppxManifest.xml
+packaging/msix/Assets/
