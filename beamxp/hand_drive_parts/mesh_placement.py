@@ -194,18 +194,19 @@ def baked_dae_matrix(
             # Position handled in jbeam (flexbody pos / prop baseTranslationGlobal);
             # the DAE copy stays identical to the source.
             return source_node_matrix
-        if spec.is_prop:
-            # Prop mirror: jbeam keeps the node-frame anchoring (baseTranslationGlobal moves
-            # the anchor to the mirrored position) so the reflection must be baked into the
-            # mesh in prop-model space. With world = T(A)*R*(M*g) and the mirrored anchor
-            # T(S*A), we need M' = (R^T*S*R)*M*S paired with locally mirrored geometry S*g:
-            # T(S*A)*R*M'*(S*g) = S*(T(A)*R*M*g).
-            rotation = rotation_transpose_matrix4(spec.placement_matrix)
-            reflection = multiply_matrix(
-                multiply_matrix(rotation, mirror),
-                matrix4_with_rotation_translation(matrix3_from_matrix4(spec.placement_matrix), (0.0, 0.0, 0.0)),
-            )
-            return multiply_matrix(multiply_matrix(reflection, source_node_matrix), mirror)
+        # Prop mirror: nothing frame-aligned can be baked here, because the
+        # engine throws a prop mesh's node ROTATION away at load -- the rest
+        # orientation comes from the row, authored baseRotationGlobal or the
+        # node triad, and only the node's translation and scale survive (see
+        # mesh_data.prop_rest_rotation_override, and bx_steer, whose node
+        # carries Rx(-73.5) that the game plainly does not apply on top of the
+        # brg it derives). A reflection written into that rotation is simply
+        # discarded, and the mesh is then drawn mirrored under the UNmirrored
+        # rest: the etkc's hydraulic handbrake shipped yawed by twice its
+        # triad's 19.47deg yaw. rewrite_prop_meshes_with_globals writes the
+        # mirrored rest into the row instead, which leaves the copy needing
+        # exactly what a flexbody copy needs.
+        #
         # Flexbody mirror with the pos/rot mirrored in the jbeam row (P' = S*P*S):
         # the DAE copy must supply the world-mirrored mesh in DAE space, i.e.
         # node matrix S*M*S with locally mirrored geometry S*g, so that

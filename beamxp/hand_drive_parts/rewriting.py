@@ -441,10 +441,9 @@ def rewrite_prop_meshes_with_globals(
             if re.search(pattern, content) is not None:
                 matched_old_mesh = old_mesh
                 if shared_bake is not None:
-                    # Mirror bakes reflect across the frame's x-axis via
-                    # D = R^T*S*R, so R must be the ENGINE's rest rotation:
-                    # authored baseRotationGlobal, or the analytic engine
-                    # model for rows without authored brg.
+                    # R must be the ENGINE's rest rotation: authored
+                    # baseRotationGlobal, or the analytic engine model for rows
+                    # without authored brg.
                     rest_rotation, _source = prop_rest_rotation_override(content, node_positions)
                     placement_matrix = prop_row_source_matrix(
                         content, node_positions, inherited_options, rest_rotation
@@ -482,12 +481,19 @@ def rewrite_prop_meshes_with_globals(
             if target_position is not None:
                 jbeam_position = pos_before_node_transforms(content, target_position, inherited_options)
                 content = replace_or_append_prop_translation_global(content, jbeam_position)
-                if action == "mirror" and baked_mesh is None:
-                    # Vehicle-local prop meshes carry the mirrored orientation via
-                    # baseRotationGlobal. Baked shared copies instead have the frame-aligned
-                    # reflection baked into the DAE (see baked_dae_matrix), so their rows
-                    # must keep the original rotation fields untouched.
-                    mirrored_rotation = mirrored_prop_global_rotation(content, node_positions)
+                if action == "mirror":
+                    # Mirroring a prop is three things -- the pivot above, the
+                    # geometry in the mesh copy, and the rest orientation here.
+                    # Only the row can carry the third: the engine discards a
+                    # prop mesh's DAE node rotation, so a reflection written
+                    # there is thrown away and the mesh is drawn mirrored under
+                    # the rest its unmirrored node triad implies. Baked shared
+                    # copies used to be left to that route, which is how the
+                    # etkc's pedal-box and handbrake rods shipped a full 180
+                    # degrees out of their mirror.
+                    mirrored_rotation = mirrored_prop_rest_rotation(content, node_positions)
+                    if mirrored_rotation is None:
+                        mirrored_rotation = mirrored_prop_global_rotation(content, node_positions)
                     if mirrored_rotation is not None:
                         _jbeam_position, jbeam_rotation = pos_rot_before_node_transforms(
                             content,

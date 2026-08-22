@@ -505,4 +505,41 @@ def prop_engine_rest_rotation(
         rotation_transpose_matrix3(prop_base_rotation_matrix3(base)),
     )
 
-__all__ = ['DaeObject', 'parse_dae', 'dae_unit_scale', 'dae_objects_from_tree', 'dae_node_aliases', 'find_dae_node', 'list_dae_objects_for_file', 'list_dae_objects_for_path', 'common_dae_paths', 'DAE_ALIAS_ATTR_RE', 'dae_alias_candidates', 'geometry_position_points', 'preview_data_for_file', 'preview_data_from_tree', 'surface_triangles_from_tree', 'load_common_dae_objects', 'referenced_mesh_names', 'dae_source_index', 'full_surface_triangles_for_ids', 'full_vertex_clouds_for_ids', 'vertex_cloud_for_resolved_placement', 'surface_triangles_for_resolved_placement', 'prop_rest_rotation_override', 'prop_engine_rest_rotation']
+
+def mirrored_prop_rest_rotation(
+    row: str,
+    node_positions: dict[str, tuple[float, float, float]],
+) -> tuple[float, float, float] | None:
+    """A prop's rest orientation reflected across the vehicle's centre plane.
+
+    Mirroring a prop is three things -- the pivot, the geometry and the rest
+    orientation -- and only the row can carry the third. The engine discards a
+    prop mesh's DAE node rotation (see :func:`prop_rest_rotation_override`), so
+    a reflection written into the mesh copy's node is thrown away and the mesh
+    is drawn mirrored under the rest its unmirrored node triad implies. In the
+    etkc that left the pedal-box and handbrake rods a full 180 degrees out and
+    the hydraulic handbrake yawed by 38.9, twice its triad's yaw.
+
+    Read off the engine-exact rest, not ``prop_row_global_rotation_matrix``:
+    the latter is only right for rows that author their own
+    ``baseRotationGlobal``, and for a derived row it disagrees. It would stand
+    the etkc handbrake lever on its side, pointing rearward, instead of
+    upright.
+
+    Transposed on the way out because the two brg conventions in this codebase
+    are not the same one. A rest rotation is held the way
+    :func:`beamxp.core.geometry.brg_rotation_matrix3` reads the engine's field
+    -- transposed against ``Ry*Rz*Rx`` -- while
+    :func:`beamxp.core.geometry.euler_yzx_from_matrix3` decomposes ``Ry*Rz*Rx``
+    itself. Emitting one through the other hands the game the transpose of the
+    rotation meant.
+    """
+    rest = prop_rest_rotation_override(row, node_positions)[0]
+    if rest is None:
+        return None
+    return euler_yzx_from_matrix3(
+        rotation_transpose_matrix3(mirror_rotation_matrix_x(rest))
+    )
+
+
+__all__ = ['DaeObject', 'parse_dae', 'dae_unit_scale', 'dae_objects_from_tree', 'dae_node_aliases', 'find_dae_node', 'list_dae_objects_for_file', 'list_dae_objects_for_path', 'common_dae_paths', 'DAE_ALIAS_ATTR_RE', 'dae_alias_candidates', 'geometry_position_points', 'preview_data_for_file', 'preview_data_from_tree', 'surface_triangles_from_tree', 'load_common_dae_objects', 'referenced_mesh_names', 'dae_source_index', 'full_surface_triangles_for_ids', 'full_vertex_clouds_for_ids', 'vertex_cloud_for_resolved_placement', 'surface_triangles_for_resolved_placement', 'prop_rest_rotation_override', 'prop_engine_rest_rotation', 'mirrored_prop_rest_rotation']

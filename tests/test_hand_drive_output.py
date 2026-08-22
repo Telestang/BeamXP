@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -1192,6 +1193,99 @@ class HandAuthoredGroupTests(unittest.TestCase):
             core.HAND_RHD,
         )
         self.assertEqual(pc["parts"]["dashboard_xp_rhd"], "dash_rhd")
+
+
+class MirroredPropRestRotationTests(unittest.TestCase):
+    """A Mirror prop has to be mirrored in orientation too, and only the row can say so.
+
+    The etkc's hydraulic handbrake, whose triad ``hb_m1r/hb_m1l/hb_m2`` sits
+    across the tunnel at a 19.47 degree yaw. The reflection used to be written
+    into the baked mesh copy's DAE node, which the engine discards for props
+    (mesh_data.prop_rest_rotation_override), so the game drew mirrored geometry
+    under the unmirrored rest: the assembly came out yawed by twice that, and
+    the pedal-box and handbrake rods -- whose triads face the other way -- by a
+    full 180 degrees.
+    """
+
+    NODES = {
+        "hb_m1r": (-0.073, -0.196, 0.465),
+        "hb_m1l": (-0.0433, -0.2065, 0.465),
+        "hb_m2": (-0.062, -0.157, 0.465),
+    }
+    ROW = (
+        '["parkingbrake", "grp_hb_lever_a", "hb_m1r","hb_m1l","hb_m2", '
+        '{"x":90, "y":0, "z":0}, {"x":-20, "y":0, "z":0}, {"x":0, "y":0.0, "z":0}, '
+        '0, 1, 0, 1, {"baseTranslation":{"x":0.004, "y":0.065, "z":-0.045}}]'
+    )
+    ARRAY = (
+        "[\n"
+        '  ["func", "mesh", "idRef:", "idX:", "idY:"],\n'
+        "  " + ROW + ",\n"
+        "]"
+    )
+
+    def _rewrite(self) -> str:
+        return core.rewrite_prop_meshes_with_globals(
+            self.ARRAY,
+            {"grp_hb_lever_a": "grp_hb_lever_a_xp_rhd"},
+            {},
+            {"grp_hb_lever_a": ("mirror", 0.0)},
+            self.NODES,
+        )
+
+    def test_the_row_carries_the_mirrored_rest_orientation(self) -> None:
+        rewritten = self._rewrite()
+        self.assertIn('"baseRotationGlobal"', rewritten)
+        # The frame yaws +19.47; its reflection yaws the other way.
+        self.assertIn('"baseRotationGlobal":{"x":0,"y":0,"z":-19.470302}', rewritten)
+
+    def test_the_engine_reads_it_back_as_the_reflected_rest(self) -> None:
+        """Round-tripped through the game's own field, not just any euler.
+
+        ``brg_rotation_matrix3`` is how an authored baseRotationGlobal is read,
+        and it is transposed against ``euler_yzx_from_matrix3``. Emitting one
+        through the other hands the game the transpose of the rotation meant.
+        """
+        rest = core.prop_rest_rotation_override(self.ROW, self.NODES)[0]
+        brg = core.mirrored_prop_rest_rotation(self.ROW, self.NODES)
+        engine_reads = core.brg_rotation_matrix3([math.radians(v) for v in brg])
+        expected = core.mirror_rotation_matrix_x(rest)
+        for got_row, want_row in zip(engine_reads, expected):
+            for got, want in zip(got_row, want_row):
+                self.assertAlmostEqual(got, want, places=12)
+
+    def test_a_mirrored_vertex_lands_where_the_reflection_puts_it(self) -> None:
+        rest = core.prop_rest_rotation_override(self.ROW, self.NODES)[0]
+        brg = core.mirrored_prop_rest_rotation(self.ROW, self.NODES)
+        engine_reads = core.brg_rotation_matrix3([math.radians(v) for v in brg])
+
+        def apply(matrix, vector):
+            return tuple(
+                sum(matrix[i][j] * vector[j] for j in range(3)) for i in range(3)
+            )
+
+        for vertex in ((0.1, 0.2, 0.3), (-0.4, 0.05, 0.9), (0.0, -0.3, 0.15)):
+            # what the game draws: reflected rest over the mesh copy's
+            # reflected geometry
+            drawn = apply(engine_reads, (-vertex[0], vertex[1], vertex[2]))
+            placed = apply(rest, vertex)
+            reflected = (-placed[0], placed[1], placed[2])
+            for got, want in zip(drawn, reflected):
+                self.assertAlmostEqual(got, want, places=12)
+
+    def test_an_authored_rest_keeps_the_answer_it_always_gave(self) -> None:
+        # A row that authors its own brg was already handled correctly, and
+        # still is: the engine-exact model returns the authored field verbatim.
+        row = (
+            '["dummy", "m", "hb_m1r","hb_m1l","hb_m2", '
+            '{"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, {"x":0, "y":0, "z":0}, '
+            '0, 1, 0, 1, {"baseRotationGlobal":{"x":6,"y":0,"z":19}}]'
+        )
+        self.assertEqual(
+            [round(v, 6) for v in core.mirrored_prop_rest_rotation(row, self.NODES)],
+            [6.0, 0.0, -19.0],
+        )
+
 
 
 if __name__ == "__main__":
