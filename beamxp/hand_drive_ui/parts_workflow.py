@@ -815,7 +815,7 @@ class PartsWorkflowMixin:
                 and query not in source_display.lower()
                 and query not in (
                     "texture fix"
-                    if settings.get(core.PART_TEXTURE_CORRECTION_KEY)
+                    if self._texture_correction_display(mode, settings, child_override) == "Y"
                     else ""
                 )
                 and query not in str(row.get("slot_path") or "").lower()
@@ -835,7 +835,7 @@ class PartsWorkflowMixin:
                     yn_label(settings.get("viewerSolo")),
                     yn_label(object_id in active_ids),
                     mode_display,
-                    yn_label(settings.get(core.PART_TEXTURE_CORRECTION_KEY)),
+                    self._texture_correction_display(mode, settings, child_override),
                     source_display,
                     self._part_override_children_label(child_override)
                     if child_override
@@ -925,6 +925,11 @@ class PartsWorkflowMixin:
                     self._part_override_children_label(child_override)
                     if child_override
                     else self._part_children_label(object_id, settings),
+                )
+                self.part_tree.set(
+                    row_id,
+                    "textureCorrection",
+                    self._texture_correction_display(mode, settings, child_override),
                 )
                 self.part_tree.set(
                     row_id,
@@ -1225,7 +1230,7 @@ class PartsWorkflowMixin:
                     texture_note = (
                         ", texture correction"
                         if isinstance(settings, dict)
-                        and settings.get(core.PART_TEXTURE_CORRECTION_KEY)
+                        and self._texture_correction_display(mode, settings, child_override) == "Y"
                         else ""
                     )
                     ref_note = ""

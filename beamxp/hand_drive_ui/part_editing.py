@@ -57,7 +57,7 @@ class PartEditingMixin:
             )
             return "break"
         if name == "textureCorrection":
-            self._toggle_texture_correction(object_id)
+            self._toggle_texture_correction(object_id, item)
             return "break"
         if name == "source":
             mode = self._get_part_setting(object_id, "mode", core.MODE_SKIP)
@@ -440,6 +440,33 @@ class PartEditingMixin:
                 self.part_tree.set(row_id, "visible", yn_label(settings.get("viewerVisible", True)))
                 self.part_tree.set(row_id, "solo", yn_label(settings.get("viewerSolo")))
 
+    @staticmethod
+    def _texture_correction_display(
+        mode: str,
+        settings: object,
+        child_override: object = None,
+    ) -> str:
+        """The Texture Fix cell: Y/N where it can apply, "N/A" where it cannot.
+
+        Only Mirror and Swap Mesh reflect a mesh, so only those can leave a
+        texture running the wrong way. Everything else reads "N/A" for the
+        same reason Move X does -- the column has no question to put. The
+        stored answer is left untouched underneath, so putting the mesh back on
+        a reflecting transform brings the tick back with it.
+        """
+        if child_override is not None:
+            return "N/A"
+        if not core.texture_correction_applies(mode):
+            return "N/A"
+        enabled = bool(settings.get(core.PART_TEXTURE_CORRECTION_KEY)) if isinstance(settings, dict) else False
+        return yn_label(enabled)
+
+    def _texture_correction_editable(self, object_id: str, row_id: object = None) -> bool:
+        settings = self.conversion.get("parts", {}).get(self._part_row_mesh_id(object_id), {})
+        mode = str(settings.get("mode", core.MODE_SKIP)) if isinstance(settings, dict) else core.MODE_SKIP
+        override = self._part_child_override(row_id) if row_id is not None else None
+        return self._texture_correction_display(mode, settings, override) != "N/A"
+
     def _refresh_part_texture_correction_cells(
         self,
         object_ids: list[str] | tuple[str, ...] | set[str],
@@ -455,9 +482,15 @@ class PartEditingMixin:
                 if row_id == object_id or self._part_row_mesh_id(row_id) == mesh_id
             ]
             settings = parts.get(mesh_id)
-            enabled = bool(settings.get(core.PART_TEXTURE_CORRECTION_KEY)) if isinstance(settings, dict) else False
+            mode = str(settings.get("mode", core.MODE_SKIP)) if isinstance(settings, dict) else core.MODE_SKIP
             for row_id in row_ids:
-                self.part_tree.set(row_id, "textureCorrection", yn_label(enabled))
+                self.part_tree.set(
+                    row_id,
+                    "textureCorrection",
+                    self._texture_correction_display(
+                        mode, settings, self._part_child_override(row_id)
+                    ),
+                )
 
     def _toggle_part_bool(self, object_id: str, key: str, *, default: bool = False) -> None:
         object_id = self._part_row_mesh_id(object_id)
@@ -476,7 +509,13 @@ class PartEditingMixin:
         self._refresh_delta_label()
         self._update_detail()
 
-    def _toggle_texture_correction(self, object_id: str) -> None:
+    def _toggle_texture_correction(self, object_id: str, row_id: object = None) -> None:
+        if not self._texture_correction_editable(object_id, row_id):
+            self.status_var.set(
+                "Texture Fix applies only to a mesh set to Mirror or Swap Mesh -- "
+                "those are the transforms that reflect it"
+            )
+            return
         object_id = self._part_row_mesh_id(object_id)
         settings = self._part_settings(object_id)
         enabled = not bool(settings.get(core.PART_TEXTURE_CORRECTION_KEY))
