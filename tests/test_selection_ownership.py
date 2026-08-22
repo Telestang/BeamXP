@@ -114,7 +114,7 @@ class Harness(TriggersWorkflowMixin):
         return str(row["label"])
 
     def _trigger_mode_label(self, row):
-        return "(auto: unattributed)"
+        return "Skip"
 
     def _trigger_offset_display(self, row):
         return "N/A"

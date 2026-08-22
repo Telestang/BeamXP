@@ -124,29 +124,23 @@ class TriggersWorkflowMixin:
         return boxes
 
     def _auto_action(self, box: dict[str, object], node_transforms) -> str:
-        """The action the build would give this box if left unanswered.
+        """The transform the build will give this box if left unanswered.
 
         This has to agree with the build, not merely with the attribution
         ladder: a twinned pair is left alone before attribution is consulted
         at all, so reporting the ladder's verdict for one would promise a
-        mirror the build never performs. An empty string means the ladder
-        found no owner, which is not the same as deciding to skip.
+        mirror the build never performs.
+
+        A box the ladder finds no owner for is reported as Skip, because that
+        is what the build does with it -- ``part_has_relocatable_trigger``
+        finds no transforming owner and leaves the box exactly where it was.
+        Naming that outcome after the reason for it said nothing the user
+        could act on and named a transform that does not exist.
         """
         if box.get("twinned"):
-            return "skip"
+            return core.MODE_SKIP
         hit = node_transforms.get(str(box.get("ref") or ""))
-        return str(hit[0]) if hit is not None else ""
-
-    @staticmethod
-    def _auto_label(action: str, twinned: bool) -> str:
-        if twinned:
-            return "Skip, twinned pair"
-        return {
-            "translate": "Move",
-            "mirror": "Mirror",
-            "mirrorPosition": "Mirror Move",
-            "skip": "Skip",
-        }.get(action, "unattributed")
+        return str(hit[0]) if hit is not None else core.MODE_SKIP
 
     def _trigger_rows(self) -> list[dict[str, object]]:
         """The boxes with the user's answer and the automatic verdict attached.
@@ -163,15 +157,25 @@ class TriggersWorkflowMixin:
         node_transforms = owners[1] if owners else {}
         rows: list[dict[str, object]] = []
         for box in boxes:
-            action = self._auto_action(box, node_transforms)
             rows.append({
                 **box,
                 "mode": chosen.get(box["key"]),
                 "offset": offsets.get(box["key"]),
-                "auto_action": action,
-                "auto": self._auto_label(action, bool(box.get("twinned"))),
+                "auto_action": self._auto_action(box, node_transforms),
             })
         return rows
+
+    @staticmethod
+    def _effective_trigger_mode(row: dict[str, object]) -> str:
+        """The transform this box will receive: the user's, or the prediction.
+
+        The ladder reports its verdict using the same names the modes carry,
+        so an unanswered row needs no translation -- and, since a prediction
+        is only ever Skip, Move, Mirror or Mirror Move, the result is always a
+        real transform rather than a placeholder for "no answer yet".
+        """
+        mode = row.get("mode")
+        return str(mode) if mode is not None else str(row.get("auto_action") or core.MODE_SKIP)
 
     def _trigger_actions(self) -> dict[tuple, str]:
         """(trigger id, position) -> the action each box will receive.
@@ -206,20 +210,26 @@ class TriggersWorkflowMixin:
         return str(row["label"])
 
     def _trigger_mode_label(self, row: dict[str, object]) -> str:
-        mode = row.get("mode")
-        if mode is None:
-            return f"(auto: {row.get('auto') or 'unattributed'})"
-        return TRIGGER_MODE_LABELS.get(str(mode), "Skip")
+        """The Transform cell: what the box will do, chosen or predicted.
+
+        A row the user has not answered reads as the plain transform it will
+        get, not as an announcement that nobody has answered it. The table's
+        job is to state what the build will do; disagreeing with it is what
+        picking a transform is for.
+        """
+        return mode_label(self._effective_trigger_mode(row))
 
     def _trigger_offset_display(self, row: dict[str, object]) -> str:
         """The box's Move X cell.
 
         Open on the transforms that move the box -- the whole distance for a
-        Move, a nudge over the reflection for a Mirror. An auto row is left as
-        "N/A" even where the ladder resolved one of those, because what it
-        travels is the owning mesh's, and overriding it here would quietly
-        detach the box from the mesh it was attributed to; choose the transform
-        outright and the column opens up.
+        Move, a nudge over the reflection for a Mirror. A row left on the
+        prediction reads "N/A" even where that prediction is one of those,
+        because the distance it travels is the owning mesh's: this box has no
+        Move X of its own to show, and writing one here would quietly detach it
+        from the mesh it was matched to. Choose the transform outright -- which
+        is what tells the build to stop following that mesh -- and the column
+        opens up.
         """
         mode = str(row.get("mode") or "")
         return offset_display(
@@ -404,7 +414,9 @@ class TriggersWorkflowMixin:
         if item not in self.trigger_tree.selection():
             self.trigger_tree.selection_set([item])
         if name == "mode":
-            current = TRIGGER_MODE_LABELS.get(str(row.get("mode") or ""), "")
+            # Opens on what the cell shows, prediction included, so the list
+            # starts from the transform in force rather than from blank.
+            current = TRIGGER_MODE_LABELS.get(self._effective_trigger_mode(row), "")
 
             def commit(value: str) -> None:
                 self._set_trigger_mode(row, TRIGGER_MODE_BY_LABEL.get(value, core.MODE_SKIP))
@@ -414,7 +426,12 @@ class TriggersWorkflowMixin:
             )
         elif name == "offset":
             if str(row.get("mode") or "") not in core.TRIGGER_OFFSET_MODES:
-                self.status_var.set("Move X only applies to a box set to Move or Mirror")
+                self.status_var.set(
+                    "This box travels with the mesh it was matched to. Pick its transform "
+                    "yourself to give it a Move X of its own."
+                    if row.get("mode") is None
+                    else "Move X only applies to a box set to Move or Mirror"
+                )
                 return "break"
             self._edit_tree_entry(
                 self.trigger_tree,
@@ -437,9 +454,10 @@ class TriggersWorkflowMixin:
         """Set one Move X on everything selected, in both tables at once.
 
         Rows whose transform has no distance to take -- a Skip, or a box left
-        on the automatic attribution -- are passed over rather than being
-        quietly given a mode they were never set to, and counted in the
-        message so a silent no-op cannot look like a change.
+        on the prediction, which travels with the mesh it was matched to --
+        are passed over rather than being quietly given a mode they were never
+        set to, and counted in the message so a silent no-op cannot look like
+        a change.
         """
         cleaned = value.strip()
         if cleaned:
