@@ -1315,6 +1315,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             context = minimal_context(Path(raw))
             saved = core.base_conversion_config(context)
+            saved["parts"]["scintilla_dashboard"]["mode"] = core.MODE_MIRROR
             saved["parts"]["scintilla_dashboard"][core.PART_TEXTURE_CORRECTION_KEY] = True
 
             merged = core.merge_with_current_inventory(context, saved)
@@ -1328,6 +1329,68 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertEqual(counts["partImported"], 2)
             self.assertEqual(
                 core.active_texture_correction_mesh_ids(imported),
+                {"scintilla_dashboard"},
+            )
+
+    def test_a_mark_survives_a_transform_that_cannot_use_it(self) -> None:
+        """The Move X rule: the setting is kept, not cleared, so it comes back.
+
+        Marking a dashboard, trying it on Move, then going back to Mirror must
+        not silently lose the mark -- the table shows N/A in between, and the
+        stored answer is what N/A is standing in front of.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            context = minimal_context(Path(raw))
+            conversion = core.base_conversion_config(context)
+            settings = conversion["parts"]["scintilla_dashboard"]
+            settings["mode"] = core.MODE_MIRROR
+            settings[core.PART_TEXTURE_CORRECTION_KEY] = True
+
+            settings["mode"] = core.MODE_TRANSLATE
+            self.assertEqual(core.active_texture_correction_mesh_ids(conversion), set())
+            self.assertTrue(settings[core.PART_TEXTURE_CORRECTION_KEY])
+
+            settings["mode"] = core.MODE_MIRROR_STRUCTURAL
+            self.assertEqual(
+                core.active_texture_correction_mesh_ids(conversion), {"scintilla_dashboard"}
+            )
+
+    def test_only_the_reflecting_transforms_take_a_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            context = minimal_context(Path(raw))
+            conversion = core.base_conversion_config(context)
+            settings = conversion["parts"]["scintilla_dashboard"]
+            settings[core.PART_TEXTURE_CORRECTION_KEY] = True
+            for mode in (core.MODE_MIRROR, core.MODE_MIRROR_STRUCTURAL):
+                settings["mode"] = mode
+                self.assertEqual(
+                    core.active_texture_correction_mesh_ids(conversion),
+                    {"scintilla_dashboard"},
+                    mode,
+                )
+            for mode in (
+                core.MODE_SKIP,
+                core.MODE_TRANSLATE,
+                core.MODE_MIRROR_POSITION,
+                core.MODE_REPLACE_SOURCE,
+            ):
+                settings["mode"] = mode
+                self.assertEqual(core.active_texture_correction_mesh_ids(conversion), set(), mode)
+
+    def test_a_replace_source_that_falls_back_to_mirror_still_corrects(self) -> None:
+        # The build resolves modes before asking, because a Replace Source with
+        # no usable source becomes a Mirror, and that really does reflect.
+        with tempfile.TemporaryDirectory() as raw:
+            context = minimal_context(Path(raw))
+            conversion = core.base_conversion_config(context)
+            settings = conversion["parts"]["scintilla_dashboard"]
+            settings["mode"] = core.MODE_REPLACE_SOURCE
+            settings[core.PART_TEXTURE_CORRECTION_KEY] = True
+            self.assertEqual(core.active_texture_correction_mesh_ids(conversion), set())
+            self.assertEqual(
+                core.active_texture_correction_mesh_ids(
+                    conversion, object_modes={"scintilla_dashboard": core.MODE_MIRROR}
+                ),
                 {"scintilla_dashboard"},
             )
 

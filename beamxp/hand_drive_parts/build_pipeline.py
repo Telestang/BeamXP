@@ -5103,9 +5103,6 @@ def build_batch(
         )
         if mesh_scope:
             object_modes = {mesh: mode for mesh, mode in object_modes.items() if mesh in mesh_scope}
-            texture_correction_ids = active_texture_correction_mesh_ids(conversion) & mesh_scope
-        else:
-            texture_correction_ids = active_texture_correction_mesh_ids(conversion)
         for mesh in relocation_meshes(context, slot_pair_plans):
             object_modes[mesh] = MODE_MIRROR
         if not object_modes and not swap_driven:
@@ -5119,6 +5116,12 @@ def build_batch(
             conversion,
             object_modes,
             selected_configs=selected_configs,
+        )
+        # Read once the modes are final: the correction only applies to a mesh
+        # some transform reflected, and both the mesh scope and the Replace
+        # Source fallback to Mirror have had their say by here.
+        texture_correction_ids = active_texture_correction_mesh_ids(
+            conversion, object_modes=object_modes
         )
         structural_sources = structural_mirror_sources(context, conversion, object_modes)
         for mesh in sorted(texture_correction_ids):

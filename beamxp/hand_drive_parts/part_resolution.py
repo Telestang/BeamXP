@@ -1860,27 +1860,55 @@ def active_part_modes(conversion: dict[str, object]) -> dict[str, str]:
     return modes
 
 
+# The transforms that actually reflect a mesh's geometry, and so can leave its
+# texture running the wrong way. Mirror reflects the mesh itself; Swap Mesh
+# hands it the opposite side's authored mesh. Nothing else does: Move and
+# Mirror Move relocate a mesh without reflecting it, and Replace Source fits a
+# different part that already carries its own texture.
+TEXTURE_CORRECTION_MODES = frozenset({MODE_MIRROR, MODE_MIRROR_STRUCTURAL})
+
+
+def texture_correction_applies(mode: object) -> bool:
+    """Whether a texture correction can mean anything for this transform."""
+    return str(mode or MODE_SKIP) in TEXTURE_CORRECTION_MODES
+
+
 def active_texture_correction_mesh_ids(
     conversion: dict[str, object],
     *,
     object_modes: dict[str, str] | None = None,
 ) -> set[str]:
-    """Meshes the user explicitly marked for the expensive atlas correction.
+    """Meshes marked for the expensive atlas correction that can use one.
 
-    This is independent of transform mode: the column is an extra opt-in for
-    dashboard/console-style texture work, not another transform state.
+    The mark is an opt-in rather than a transform state, but it only bites on
+    a mesh some transform has reflected -- correcting a mesh that was merely
+    moved would rewrite a texture that never went the wrong way. A mark on a
+    mesh whose transform cannot use it is kept, not cleared, so setting the
+    transform back to Mirror or Swap Mesh brings the correction back with it.
+
+    ``object_modes`` supplies the *effective* modes where the caller has them,
+    which is not always what the conversion stores: a Replace Source with no
+    resolvable source falls back to Mirror, and that fallback genuinely does
+    reflect the mesh. Without it the stored mode is used, which is what the
+    parts table shows.
     """
     parts = conversion.get("parts", {})
     if not isinstance(parts, dict):
         return set()
-    scope = set(object_modes) if object_modes is not None else None
-    return {
-        str(object_id)
-        for object_id, settings in parts.items()
-        if isinstance(settings, dict)
-        and settings.get(PART_TEXTURE_CORRECTION_KEY)
-        and (scope is None or str(object_id) in scope)
-    }
+    found: set[str] = set()
+    for object_id, settings in parts.items():
+        if not isinstance(settings, dict) or not settings.get(PART_TEXTURE_CORRECTION_KEY):
+            continue
+        key = str(object_id)
+        if object_modes is not None:
+            if key not in object_modes:
+                continue
+            mode = object_modes[key]
+        else:
+            mode = settings.get("mode", MODE_SKIP)
+        if texture_correction_applies(mode):
+            found.add(key)
+    return found
 
 
 def texture_correction_atlas_dependencies(
@@ -2057,4 +2085,4 @@ def auto_delta_source_refs(context: VehicleContext, conversion: dict[str, object
 
 STEERING_PROP_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
-__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'mesh_owner_parts', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'active_texture_correction_mesh_ids', 'texture_correction_atlas_dependencies', 'whole_mesh_mirror_correction_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
+__all__ = ['find_part_body', 'part_body_for_context', 'part_named_array_for_context', 'part_mesh_names_for_context', 'authored_mirror_rows', 'mesh_owner_parts', 'part_slot_defs_for_context', 'parts_fitting_slot', 'load_context_pc', 'load_context_info', 'vehicle_namespace_main_part', 'resolve_selected_parts', 'selected_parts_for_config', 'find_hand_authored_opposite_group', 'resolve_slot_pair_plan', 'resolve_side_pair_plan', 'slot_pair_plans_for_variants', 'slot_pair_plan_relocations', 'authored_group_source_parts', 'authored_group_meshes', 'part_variable_scope', '_NODE_ROW_RE', 'selected_part_instances', 'part_instance_options', 'part_instance_variable_scope', 'iter_node_rows', 'jbeam_group_names', 'iter_jbeam_table_rows', 'node_group_names', 'vehicle_node_group_names', 'wheel_group_names', 'flexbody_row_groups', 'populated_node_groups', 'node_groups_for_selection', 'flexbody_row_is_bound', 'selected_parts_in_merge_order', 'selected_node_positions_for_config', 'selected_node_positions_for_parts', 'prop_row_mesh', 'prop_row_nodes_present', 'selected_prop_mesh_positions', 'mesh_roles_for_config', 'selected_mesh_roles', 'active_part_modes', 'TEXTURE_CORRECTION_MODES', 'texture_correction_applies', 'active_texture_correction_mesh_ids', 'texture_correction_atlas_dependencies', 'whole_mesh_mirror_correction_ids', 'texture_flip_mesh_ids', 'structural_mirror_source_for_settings', 'structural_mirror_sources', 'fallback_structural_part_modes', 'selected_steering_refs', 'auto_delta_source_refs', 'STEERING_PROP_STR_RE']
