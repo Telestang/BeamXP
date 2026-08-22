@@ -602,6 +602,56 @@ def apply_replace_source_slot_updates(
     pc["parts"] = parts
 
 
+def renamed_child_slots(cloned_bodies: Iterable[str], suffix: str) -> set[str]:
+    """Child slot types the generated clones renamed for this hand.
+
+    ``rewrite_child_slot_defaults`` suffixes a child slot whenever it also
+    clones the part that slot defaults to, so the clone asks about
+    ``etkc_doorpanel_L_xp_rhd`` where the stock door asked about
+    ``etkc_doorpanel_L``. The config still answers under the old name, so the
+    renamed slot needs finding before its answer can be carried across.
+    """
+    found: set[str] = set()
+    for body in cloned_bodies:
+        for slot in extract_slot_defs(body):
+            if slot.slot_type.endswith(suffix):
+                found.add(slot.slot_type)
+    return found
+
+
+def carry_answers_to_renamed_slots(
+    parts: dict[str, object],
+    cloned_bodies: Iterable[str],
+    suffix: str,
+    slot_updates: dict[str, str],
+) -> dict[str, object]:
+    """Re-answer the child slots the clones renamed, using this config's answer.
+
+    A clone renames the child slots whose default part it also cloned, so the
+    answer the config gave under the original slot name no longer reaches the
+    renamed slot and the slot falls back to its own default part. That is how a
+    drift trim with both door card slots deliberately empty came out of a build
+    wearing door cards: the config still said ``etkc_doorpanel_L: ""`` while the
+    cloned door asked about ``etkc_doorpanel_L_xp_rhd``, which defaults to the
+    cloned card.
+
+    Every answer is carried across, empty ones included -- an explicit "" is the
+    config saying "leave this slot empty", and that is precisely the answer a
+    default overrules. It is not only about empty slots: a trim that fitted a
+    race card lost that choice the same way, and got the base card the renamed
+    slot defaults to.
+
+    Slots whose own part was cloned are answered by ``slot_updates``, which the
+    caller applies afterwards and which keeps the last word.
+    """
+    carried = dict(parts)
+    for renamed in renamed_child_slots(cloned_bodies, suffix):
+        original = renamed[: -len(suffix)]
+        if renamed not in slot_updates and original in carried:
+            carried.setdefault(renamed, carried[original])
+    return carried
+
+
 def apply_authored_group_suffixed_slot_updates(
     pc: dict[str, object],
     authored_group: dict[str, object] | None,
@@ -1998,6 +2048,9 @@ def write_generated_jbeam_and_configs(
         if main_update:
             pc["mainPartName"] = main_update
         parts = dict(pc.get("parts", {}))
+        parts = carry_answers_to_renamed_slots(
+            parts, cloned_bodies, suffix, slot_updates
+        )
         parts.update(slot_updates)
         pc["parts"] = parts
         apply_authored_group_suffixed_slot_updates(pc, authored_group, target_hand)
