@@ -62,10 +62,16 @@ class LayoutMixin:
             row=0, column=5, sticky="w", padx=(12, 0)
         )
 
-        ttk.Button(top, text="Save Config", command=self._save_config).grid(row=0, column=5, sticky="e")
-        ttk.Button(top, text="Import Config", command=self._import_config_dialog).grid(
-            row=0, column=6, sticky="e", padx=(6, 0)
+        # Both act on the loaded vehicle's conversion, so like every other
+        # vehicle button they start disabled and _set_load_busy turns them on.
+        self.save_config_button = ttk.Button(
+            top, text="Save Config", command=self._save_config, state="disabled"
         )
+        self.save_config_button.grid(row=0, column=5, sticky="e")
+        self.import_config_button = ttk.Button(
+            top, text="Import Config", command=self._import_config_dialog, state="disabled"
+        )
+        self.import_config_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
 
         # Row 1 -- which vehicle, directly under the source buttons.  The
         # thumbnail beside it follows the dropdown highlight, so scrolling the
@@ -185,13 +191,20 @@ class LayoutMixin:
         header = ttk.Frame(parent)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         ttk.Label(header, text="Variants").pack(side="left")
-        ttk.Button(header, text="Clear Builds", command=lambda: self._set_all_variants_selected(False)).pack(
-            side="right"
+        self.clear_builds_button = ttk.Button(
+            header,
+            text="Clear Builds",
+            command=lambda: self._set_all_variants_selected(False),
+            state="disabled",
         )
-        ttk.Button(header, text="Convert All", command=lambda: self._set_all_variants_selected(True)).pack(
-            side="right",
-            padx=(0, 6),
+        self.clear_builds_button.pack(side="right")
+        self.convert_all_button = ttk.Button(
+            header,
+            text="Convert All",
+            command=lambda: self._set_all_variants_selected(True),
+            state="disabled",
         )
+        self.convert_all_button.pack(side="right", padx=(0, 6))
         self.recommend_button = ttk.Button(
             header,
             text="Recommend Transforms",
@@ -590,14 +603,18 @@ class LayoutMixin:
         plate_row = ttk.Frame(controls)
         plate_row.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(6, 0))
         plate_row.columnconfigure(0, weight=1)
+        # Picking a plate writes into the loaded vehicle's conversion, so the
+        # dropdown is gated on a vehicle exactly as its Configure button is.
         self.plate_choice_combo = ttk.Combobox(
             plate_row,
             textvariable=self.plate_choice_var,
-            state="readonly",
+            state="disabled",
         )
         self.plate_choice_combo.grid(row=0, column=0, sticky="ew")
         self.plate_choice_combo.bind("<<ComboboxSelected>>", lambda _event: self._main_plate_choice_changed())
-        self.plate_configure_button = ttk.Button(plate_row, text="Configure...", command=lambda: self._open_plate_editor(None))
+        self.plate_configure_button = ttk.Button(
+            plate_row, text="Configure...", command=lambda: self._open_plate_editor(None), state="disabled"
+        )
         self.plate_configure_button.grid(row=0, column=1, sticky="e", padx=(6, 0))
         ttk.Button(plate_row, text="Library...", command=self._open_plate_library).grid(
             row=0, column=2, sticky="e", padx=(6, 0)
@@ -643,9 +660,13 @@ class LayoutMixin:
         buttons = ttk.Frame(parent)
         buttons.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         buttons.columnconfigure((0, 1), weight=1)
-        self.install_button = ttk.Button(buttons, text="Build + Install", command=lambda: self._start_build(install=True))
+        self.install_button = ttk.Button(
+            buttons, text="Build + Install", command=lambda: self._start_build(install=True), state="disabled"
+        )
         self.install_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.blender_button = ttk.Button(buttons, text="Blender Preview", command=self._start_blender_preview)
+        self.blender_button = ttk.Button(
+            buttons, text="Blender Preview", command=self._start_blender_preview, state="disabled"
+        )
         self.blender_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.busy_progress = ttk.Progressbar(buttons, mode="indeterminate")
         self.busy_progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))

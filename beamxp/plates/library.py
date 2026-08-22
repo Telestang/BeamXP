@@ -168,7 +168,11 @@ class PlateLibraryDialog(tk.Toplevel):
         for index, record in enumerate(records):
             names.insert("end", str(record["name"]))
             names.selection_set(index)
-        install_var = tk.BooleanVar(value=bool(self.app.mods_folder_var.get().strip()))
+        # Only pre-tick the install when there is a real folder to install
+        # into: the mods setting carries BeamNG's standard path whether or not
+        # the game is installed.
+        mods_configured = self.app._folder_is_usable(self.app._mods_folder())
+        install_var = tk.BooleanVar(value=mods_configured)
         ttk.Checkbutton(dialog, text="Install into the configured BeamNG mods folder", variable=install_var).grid(
             row=2, column=0, sticky="w", padx=10, pady=(8, 0)
         )
@@ -183,10 +187,9 @@ class PlateLibraryDialog(tk.Toplevel):
                 result = plate_generator.export_plate_sets(selected, target)
                 installed: Path | None = None
                 if install_var.get():
-                    mods_value = self.app.mods_folder_var.get().strip()
-                    if not mods_value:
+                    mods = self.app._mods_folder()
+                    if mods is None:
                         raise RuntimeError("Configure the BeamNG mods folder before installing")
-                    mods = Path(mods_value)
                     mods.mkdir(parents=True, exist_ok=True)
                     installed = mods / target.name
                     shutil.copy2(target, installed)

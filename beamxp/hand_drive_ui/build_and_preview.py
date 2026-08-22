@@ -85,9 +85,9 @@ class BuildAndPreviewMixin:
 
     def _set_busy(self, busy: bool) -> None:
         self.worker_running = busy
-        state = "disabled" if busy else "normal"
-        self.install_button.configure(state=state)
-        self.blender_button.configure(state=state)
+        # Build + Install and Blender Preview are vehicle-scoped like the rest,
+        # so finishing a build must not re-enable them over an empty window.
+        self._refresh_vehicle_control_state()
         if hasattr(self, "busy_progress"):
             if busy:
                 self.busy_progress.grid()
@@ -101,12 +101,50 @@ class BuildAndPreviewMixin:
             else:
                 self.preview_output_combo.configure(state="readonly")
 
+    def _prompt_for_install_location(self) -> bool:
+        """Ask where an install with no mods folder configured should land.
+
+        The build itself is ready to run, so this asks for a save location
+        rather than refusing: whatever folder is chosen becomes the mods
+        folder from here on, which is where every later install goes too.
+        """
+        if not messagebox.askokcancel(
+            "Choose a save location",
+            "No BeamNG mods folder is set, so there is nowhere to install to.\n\n"
+            "Choose a folder to save the built mod into. BeamXP will use it as "
+            "the mods folder from now on, and you can change it later with the "
+            "Mods button at the top of the window.",
+            parent=self,
+        ):
+            return False
+        initial = existing_initial_dir(
+            self.settings.get("lastModsFolder") or self.mods_folder_var.get(),
+            core.WORKSPACE_DIR,
+        )
+        path = self._ask_directory(
+            title="Select a folder to save installed mods into",
+            initialdir=initial,
+            mustexist=True,
+        )
+        if not path:
+            return False
+        self.mods_folder_var.set(path)
+        self.settings["lastModsFolder"] = path
+        self._save_app_settings_from_ui()
+        self._refresh_folder_buttons()
+        self._start_inventory_scan()
+        return True
+
     def _start_build(self, *, install: bool) -> None:
         if self.context is None:
             self._show_error("No source", "Open a vehicle zip first.")
             return
-        if install and not self.mods_folder_var.get().strip():
-            self._show_error("No mods folder", "Set a BeamNG mods folder before installing.")
+        if (
+            install
+            and not self._folder_is_usable(self._mods_folder())
+            and not self._prompt_for_install_location()
+        ):
+            self.status_var.set("Install cancelled: no save location chosen")
             return
         self._commit_delta_from_ui()
         self._save_app_settings_from_ui()
@@ -303,10 +341,10 @@ class BuildAndPreviewMixin:
             except Exception as exc:
                 if should_apply and self.viewer is not None:
                     self.viewer.set_message(f"preview failed: {exc}")
-                self._schedule_pending_mesh_scene()
+                self._discard_mesh_scene_build()
                 return
             if not should_apply:
-                self._schedule_pending_mesh_scene()
+                self._discard_mesh_scene_build()
                 return
             assert self.viewer is not None
             reset_view = self.mesh_scene_reset_pending
@@ -319,6 +357,28 @@ class BuildAndPreviewMixin:
             self._refresh_preview_dependent_part_cells()
             self._refresh_viewer(reset=reset_view)
             self._schedule_pending_mesh_scene()
+
+    def _discard_mesh_scene_build(self) -> None:
+        """Forget a build that never reached the screen, and try again.
+
+        ``mesh_scene_hash`` is written when a build is *dispatched*, so that a
+        second edit arriving while the first is resolving does not queue an
+        identical rebuild. When the result is then dropped -- the window moved
+        on while the worker ran, or the build raised -- that hash is left
+        claiming the screen shows a state it never showed, and every later
+        request for that same state is skipped as a no-op.
+
+        Nothing recovers from that on its own: the pending flag is only set by
+        a request that arrived while a build was running, and the snapshot
+        covers the part selection as well as the conversion, so it can move
+        away and back without one. An Equivalent Parts row set at the wrong
+        moment therefore stayed out of the preview until the app was
+        restarted and the hash started empty again.
+        """
+        self.mesh_scene_hash = None
+        self.mesh_scene_pending = False
+        if self.viewer is not None and self.viewer_supports_scene:
+            self._schedule_mesh_scene(immediate=True)
 
     def _schedule_pending_mesh_scene(self) -> None:
         if not self.mesh_scene_pending:
