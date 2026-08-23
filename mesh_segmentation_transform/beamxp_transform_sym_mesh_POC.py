@@ -4744,22 +4744,10 @@ def _wire_blender_base_colours(
             f"{symbol}: {unresolved_reasons.get(symbol, 'unresolved')}"
             for symbol in sorted(set(unresolved_symbols))
         ) or "no used material symbols"
-        # Not fatal. This wires base colours for the Blender preview only, and
-        # a build turns the inspection PNGs off (`write_preview_png=False`), so
-        # the alias map holds only whichever textures happened to fall back to
-        # PNG encoding -- on the R8, 21 paint_*/chrome_* files against 12 DDS.
-        # A part whose materials miss that arbitrary set matched nothing and
-        # raised, and the raise took the whole DAE export with it: no
-        # `__beamxp_grouped` mesh, so the retarget had nothing to rebind and the
-        # part shipped the plain reflection on its original materials.
-        # r8_shifter_A, r8_signal and r8_interior_mirror lost every corrected
-        # glyph that way, while r8_dash -- same atlases, wider material set --
-        # kept them. An empty alias map already returned rather than raising;
-        # a non-matching one now agrees with it.
-        return {
-            "enabled": False,
-            "reason": f"no material symbol matched a resolved texture ({details})",
-        }
+        raise ValueError(
+            "A materials-JSON texture was selected, but it could not be bound to "
+            f"the exported COLLADA material ({details})."
+        )
     return {
         "enabled": True,
         "mode": "vehicle ZIP automatic material resolution",
