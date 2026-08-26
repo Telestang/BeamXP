@@ -5240,8 +5240,31 @@ def _candidate_transform_metres(candidate: AcceptedCandidate) -> np.ndarray:
     return _global_x_reflection() @ local
 
 
+def mesh_segmentation_disabled() -> bool:
+    """Whether ``BEAMXP_DISABLE_MESH_SEGMENTATION`` is asking for a whole-mesh mirror.
+
+    2026-08-26: a diagnostic switch, not a shipping mode. Setting it makes the
+    sweep's accepted perimeter-symmetric candidates invisible to everything
+    downstream, so a marked mesh becomes one mirrored husk with no rigidly moved
+    pieces and the atlas pass sees its whole UV footprint as mirrored. Read at
+    call time rather than import time because the texture pass runs in a process
+    pool, and the workers are spawned by re-importing this module.
+    """
+    return os.environ.get("BEAMXP_DISABLE_MESH_SEGMENTATION", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
+
+
 def _candidate_ids_by_face(result: SymmetrySweepResult) -> np.ndarray:
     labels = np.full(len(result.topology.triangles), -1, dtype=np.int64)
+    if mesh_segmentation_disabled():
+        # Every face reads as residual, so the exporter emits no
+        # ``__beamxp_rigid_`` node and ``split_mirrored_and_rigid`` reports an
+        # empty rigid domain. The sweep still runs; only its answer is dropped.
+        return labels
     for candidate in result.candidates:
         labels[list(candidate.faces)] = candidate.candidate_id
     return labels
