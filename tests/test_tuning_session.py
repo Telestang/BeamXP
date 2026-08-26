@@ -252,7 +252,11 @@ class SourceDefaultTests(unittest.TestCase):
         # Promoted 2026-08-16 from the colour+relief-edge session, along with
         # min_region_uv_coverage below.
         self.assertEqual(DEFAULT_CONFIG.feature_extension_min_ratio, 0.03)
-        self.assertEqual(DEFAULT_CONFIG.min_region_uv_coverage, 0.98)
+        # Promoted 2026-08-26: the coverage gate relaxed to 0.9, and the
+        # parallelogram fit turned off -- false shears were costing more than
+        # the true ones earned, so a region is described by its box again.
+        self.assertEqual(DEFAULT_CONFIG.min_region_uv_coverage, 0.9)
+        self.assertFalse(DEFAULT_CONFIG.enable_parallelogram_bounds)
 
     def test_colour_and_normal_detection_defaults_are_separate(self) -> None:
         self.assertEqual(DEFAULT_CONFIG.box_source, "foreground")
@@ -263,6 +267,9 @@ class SourceDefaultTests(unittest.TestCase):
         # axis directly, so it is no longer estimated from the hull.
         self.assertFalse(DEFAULT_RELIEF_DETECTION_CONFIG.enable_symmetry_rotation)
         self.assertFalse(DEFAULT_CONFIG.enable_symmetry_rotation)
+        # Both presets dropped the parallelogram fit on 2026-08-26, so neither
+        # states an axis at all now: every region keeps its axis-aligned box.
+        self.assertFalse(DEFAULT_RELIEF_DETECTION_CONFIG.enable_parallelogram_bounds)
         self.assertNotEqual(
             DEFAULT_RELIEF_DETECTION_CONFIG.min_rotated_fill,
             DEFAULT_CONFIG.min_rotated_fill,

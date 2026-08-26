@@ -755,7 +755,11 @@ DEFAULT_COLOUR_CONFIG = replace(
     # puts the colour layer on contrast_gpu with relief-edge grouping, so that
     # pipeline's tuning is what these defaults are for.
     feature_extension_min_ratio=0.03,
-    min_region_uv_coverage=0.98,
+    min_region_uv_coverage=0.9,
+    # Promoted 2026-08-26 from the tuning harness.
+    enable_parallelogram_bounds=False,
+    parallelogram_max_area_ratio=0.97,
+    parallelogram_min_fill=0.9,
 )
 # One preset for every relief front end.  Its rotation, flatness and ring
 # values were measured on the GPU edge response and promoted 2026-08-16 from
@@ -823,6 +827,8 @@ DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     feature_extension_min_ratio=0.25,
     # Promoted 2026-08-20 from the tuning harness.
     final_region_padding_px=4,
+    # Promoted 2026-08-26 from the tuning harness.
+    enable_parallelogram_bounds=False,
 )
 DEFAULT_CONFIG = DEFAULT_COLOUR_CONFIG
 
@@ -838,7 +844,7 @@ class UvIslandSymmetryConfig:
     enable_uv_island_symmetry: bool = True
     # Promoted 2026-08-16 from the harness's shared session value.  Shared, not
     # per pipeline: this is read off the UV mask and no detector touches it.
-    min_uv_island_symmetry: float = 0.95
+    min_uv_island_symmetry: float = 0.98
     blue_colour: tuple[int, int, int] = (255, 0, 0)  # BGR
     blue_thickness: int = 1
 

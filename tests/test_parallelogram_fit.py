@@ -15,9 +15,12 @@ import unittest
 import cv2
 import numpy as np
 
+from dataclasses import replace
+
 from mesh_segmentation_transform.annotate_texture_regions import (
     DEFAULT_CONFIG,
     FeatureShape,
+    MserConfig,
     inscribed_circle_radius,
     sheared_outline,
 )
@@ -32,6 +35,21 @@ from mesh_segmentation_transform.parallelogram_fit import (
 RECTANGLE = [(0, 0), (100, 0), (100, 40), (0, 40)]
 # A switch legend, square enough to fail any elongation test.
 LOCK = [(0, 3), (3, 0), (17, 0), (20, 3), (20, 22), (0, 22)]
+
+# 2026-08-26: the shipped presets turn the parallelogram fit off, so asking
+# DEFAULT_CONFIG about a shape now answers "disabled" before any of the ladder
+# below runs -- which would leave every ``assertIsNone`` here passing for the
+# wrong reason.  The ladder is still in the tree and still reachable, so it is
+# tested on its own terms: the preset's other fields, with the three
+# parallelogram knobs at the values the dataclass declares rather than the ones
+# a preset happens to promote.
+_LADDER_DEFAULTS = MserConfig()
+LADDER_CONFIG = replace(
+    DEFAULT_CONFIG,
+    enable_parallelogram_bounds=True,
+    parallelogram_min_fill=_LADDER_DEFAULTS.parallelogram_min_fill,
+    parallelogram_max_area_ratio=_LADDER_DEFAULTS.parallelogram_max_area_ratio,
+)
 
 
 def rotated(polygon, degrees: float):
@@ -114,7 +132,7 @@ class ShapeLadderTests(unittest.TestCase):
 
     def assert_shape(self, polygon, expect_shear: bool, message: str) -> None:
         shape = feature_of(polygon)
-        outline = sheared_outline(shape, DEFAULT_CONFIG)
+        outline = sheared_outline(shape, LADDER_CONFIG)
         self.assertEqual(outline is not None, expect_shear, message)
         if outline is not None:
             self.assertEqual(len(outline), 4)
@@ -168,12 +186,12 @@ class ShapeLadderTests(unittest.TestCase):
         for text in ("AUTO", "AVA", "W4"):
             with self.subTest(text=text):
                 self.assertIsNone(
-                    sheared_outline(shape_of(word(text)), DEFAULT_CONFIG)
+                    sheared_outline(shape_of(word(text)), LADDER_CONFIG)
                 )
 
     def test_rotated_text_claims_no_shear(self) -> None:
         self.assertIsNone(
-            sheared_outline(shape_of(word(degrees=20)), DEFAULT_CONFIG)
+            sheared_outline(shape_of(word(degrees=20)), LADDER_CONFIG)
         )
 
     def test_a_word_presents_one_direction_and_so_claims_no_shear(self) -> None:
@@ -201,7 +219,7 @@ class ShapeLadderTests(unittest.TestCase):
         ]
         self.assertLess(abs(weak[0] - weak[1]), 0.15)
         for shape in (upright, leaning):
-            self.assertIsNone(sheared_outline(shape, DEFAULT_CONFIG))
+            self.assertIsNone(sheared_outline(shape, LADDER_CONFIG))
 
     def test_evidence_is_read_per_direction_not_per_side(self) -> None:
         """One ragged edge must not erase a direction the other side carries.
@@ -218,7 +236,7 @@ class ShapeLadderTests(unittest.TestCase):
         self.assertLess(min(fit.side_evidence), min(fit.direction_evidence))
         self.assertGreaterEqual(
             min(fit.direction_evidence),
-            DEFAULT_CONFIG.parallelogram_min_direction_evidence,
+            LADDER_CONFIG.parallelogram_min_direction_evidence,
         )
 
 
@@ -251,7 +269,7 @@ class HullChordTests(unittest.TestCase):
         )
 
     def test_a_stack_of_upright_rows_is_not_a_sheared_mark(self) -> None:
-        self.assertIsNone(sheared_outline(self._stack(), DEFAULT_CONFIG))
+        self.assertIsNone(sheared_outline(self._stack(), LADDER_CONFIG))
 
     def test_the_bridging_chord_is_not_believed(self) -> None:
         """Judged against the hull the chord scores perfectly, by construction.

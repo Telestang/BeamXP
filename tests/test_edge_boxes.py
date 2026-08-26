@@ -2572,7 +2572,16 @@ class FeatureShapeTests(unittest.TestCase):
         # The fit decides the shape now, so its own fill is the lever: a
         # boundary wrapping mostly empty space describes the mark badly, which
         # is a statement about the boundary and not about the mark.
-        base = replace(MARKS_CONFIG, enable_symmetry_rotation=False)
+        # 2026-08-26: ``parallelogram_min_fill`` is the lever this test pulls,
+        # and it is inert while the fit is off -- both runs then fall through to
+        # the filter's own minimum-area rectangle and report the same rotations.
+        # The shipped presets disable the fit; this test is about the fill gate,
+        # so it turns it back on.
+        base = replace(
+            MARKS_CONFIG,
+            enable_symmetry_rotation=False,
+            enable_parallelogram_bounds=True,
+        )
         loose = run_detection(
             separated_marks(), None, replace(base, parallelogram_min_fill=0.0),
         )
