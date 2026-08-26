@@ -4108,8 +4108,28 @@ def apply_flip_plan(
         correct_normals = kind == "normal" and in_place and correct_normal_background
         if step.island_label is None:
             if step.stencil == STENCIL_REGION:
+                # 2026-08-26: the component's own bounds, not the whole atlas.
+                # The flat path takes those bounds as an argument and reads the
+                # stencil only inside them, so an all-true mask was harmless
+                # there -- but ``apply_masked_rotated_flip`` has no bounds
+                # parameter and writes ``inside & stencil``, so an all-true mask
+                # let a fitted outline turn over its entire rotated rectangle.
+                # A rectangle fitted to a component is not contained in that
+                # component's box: the Ardente console's leather opacity mask
+                # had a 196x266 component whose outline was 329x306 at ~31
+                # degrees, and half of the 101k texels it wrote landed outside
+                # the box, smearing the mask diagonally across the trim islands
+                # beside it.
                 if region_stencil is None:
-                    region_stencil = np.ones(mirror_mask.shape, dtype=bool)
+                    region_stencil = np.zeros(mirror_mask.shape, dtype=bool)
+                else:
+                    region_stencil[:] = False
+                bx, by, bw, bh = step.bounds
+                bx0, by0 = max(int(bx), 0), max(int(by), 0)
+                bx1 = min(int(bx) + int(bw), region_stencil.shape[1])
+                by1 = min(int(by) + int(bh), region_stencil.shape[0])
+                if bx1 > bx0 and by1 > by0:
+                    region_stencil[by0:by1, bx0:bx1] = True
                 stencil = region_stencil
             elif step.stencil == STENCIL_DOMAIN and domain_mask is not None:
                 stencil = domain_mask
