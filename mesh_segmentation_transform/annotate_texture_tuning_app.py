@@ -138,6 +138,13 @@ APP_NAME = "BeamXP Texture Annotation Tuning Harness"
 VIEWER_BACKGROUND = "#1b1b1b"
 KEPT_COLOUR = (60, 255, 60)
 REJECTED_COLOUR = (255, 70, 70)
+# The texels the front end actually fired on.  Amber so it reads under both
+# the green and the red box outlines rather than competing with either.
+DETECTOR_TEXEL_COLOUR = (255, 176, 32)
+# A 4k atlas at "Fit" is about 1/8 scale, so a single-texel stroke covers an
+# eighth of a screen pixel and averages to alpha 32.  Lift it until it is
+# visible without letting a dense area saturate past opaque.
+TEXEL_ALPHA_LIFT = 4.0
 
 # UV island overlay.  Everything outside the UV domain is painted out solidly
 # rather than tinted: those pixels carry no geometry, so they must read as
@@ -629,6 +636,11 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
         None,
     ),
     (
+        "5. Overlap grouping",
+        ("enable_hollow_container_filter", "hollow_container_min_regions"),
+        None,
+    ),
+    (
         "5. Initial grouping",
         (
             "merge_distance_px",
@@ -693,6 +705,11 @@ PARAMETER_SECTIONS: tuple[tuple[str, tuple[str, ...], str | tuple[str, ...] | No
             "parallelogram_min_fill",
             "parallelogram_max_area_ratio",
         ),
+        None,
+    ),
+    (
+        "9. Domain coverage",
+        ("enable_fitted_region_domain_filter", "min_fitted_region_uv_coverage"),
         None,
     ),
     (
@@ -919,6 +936,91 @@ def _offset_stage(stage: DetectionStage, x_offset: int, y_offset: int) -> Detect
     )
 
 
+def texel_overlay(
+    texels: np.ndarray | None,
+    visible_rect: tuple[float, float, float, float],
+    origin_x: float,
+    origin_y: float,
+    scale: float,
+) -> tuple[Image.Image, Image.Image, tuple[int, int]] | None:
+    """Build the amber wash for the visible part of the detector mask.
+
+    Pure, and separate from the viewer, because the first version of this
+    sliced a numpy array with the viewer's *float* rectangle -- valid for
+    PIL's resize box and an IndexError for numpy -- which threw out of the
+    render and left the canvas blank.  The maths was checked in isolation and
+    the code path was not; this is the seam that makes them the same thing.
+
+    The rectangle is snapped outwards to whole texels, since numpy cannot
+    slice between them, and the paste position is derived from the snapped
+    edge so the wash still lands on the texture grid.
+    """
+    if texels is None or scale <= 0.0:
+        return None
+    vx0, vy0, vx1, vy1 = visible_rect
+    height, width = texels.shape[:2]
+    x0 = max(int(np.floor(vx0)), 0)
+    y0 = max(int(np.floor(vy0)), 0)
+    x1 = min(int(np.ceil(vx1)), width)
+    y1 = min(int(np.ceil(vy1)), height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    patch = texels[y0:y1, x0:x1]
+    if not patch.any():
+        return None
+    target_w = max(round((x1 - x0) * scale), 1)
+    target_h = max(round((y1 - y0) * scale), 1)
+    # Area-averaged rather than sampled: a one-texel loop vanishes under
+    # NEAREST the moment the view zooms out, and a loop that only exists at
+    # 1:1 is not a diagnostic.  The average is then lifted so a sparse cell
+    # still reads.
+    alpha = Image.fromarray(
+        np.ascontiguousarray(patch).astype(np.uint8) * 255
+    ).resize((target_w, target_h), Image.BOX)
+    if scale < 1.0:
+        alpha = alpha.point(lambda value: min(int(value * TEXEL_ALPHA_LIFT), 255))
+    tint = Image.new("RGB", (target_w, target_h), DETECTOR_TEXEL_COLOUR)
+    at = (
+        round((x0 - origin_x) * scale),
+        round((y0 - origin_y) * scale),
+    )
+    return tint, alpha, at
+
+
+def _composite_detector_texels(
+    shape: tuple[int, int],
+    valid: list[tuple[int, int, np.ndarray]],
+    contrast_by_island: list[object | None],
+    edge_masks_by_island: list[np.ndarray | None],
+) -> np.ndarray | None:
+    """Paste every island's thresholded detector response into one atlas mask.
+
+    This is the front end's own answer before anything consolidates it -- the
+    contrast response over its threshold, or the thresholded edge response
+    ahead of the close -- which is the picture a component's bounding box
+    cannot show.  A glyph draws a loop here and a rectangle there.
+    """
+    texels: np.ndarray | None = None
+    for index, (x0, y0, crop_mask) in enumerate(valid):
+        detection = (
+            contrast_by_island[index] if index < len(contrast_by_island) else None
+        )
+        edges = (
+            edge_masks_by_island[index] if index < len(edge_masks_by_island) else None
+        )
+        if detection is not None:
+            patch = (detection.response >= detection.threshold) & crop_mask
+        elif edges is not None:
+            patch = edges.astype(bool) & crop_mask
+        else:
+            continue
+        if texels is None:
+            texels = np.zeros(shape, dtype=bool)
+        height, width = crop_mask.shape[:2]
+        texels[y0:y0 + height, x0:x0 + width] |= patch
+    return texels
+
+
 def run_detection_by_uv_island(
     image: np.ndarray,
     uv_islands: tuple[UvIslandCrop | np.ndarray, ...],
@@ -993,6 +1095,9 @@ def run_detection_by_uv_island(
     pipeline_seconds = 0.0
     empty_islands = 0
     raw_boxes_by_island: list[np.ndarray | None] = [None] * len(valid)
+    # What each front end detected before it consolidated anything, so the
+    # pipeline can report the two as separate stages.
+    component_boxes_by_island: list[np.ndarray | None] = [None] * len(valid)
     contrast_by_island: list[object | None] = [None] * len(valid)
     edge_masks_by_island: list[np.ndarray | None] = [None] * len(valid)
     unique_foregrounds = 0
@@ -1032,15 +1137,15 @@ def run_detection_by_uv_island(
 
         def edge_boxes_for_entry(
             entry: tuple[int, int, np.ndarray, list[int]],
-        ) -> tuple[np.ndarray, np.ndarray]:
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             x0, y0, crop_mask, _indices = entry
             height, width = crop_mask.shape[:2]
             response = relief_bridge_response[y0:y0 + height, x0:x0 + width]
             edge_mask, _response = edge_mask_from_response(response, crop_mask, config)
-            boxes, _response = detect_edge_boxes_from_response(
+            boxes, _response, components = detect_edge_boxes_from_response(
                 edge_mask, response, config,
             )
-            return boxes, edge_mask
+            return boxes, edge_mask, components
 
         edge_started = time.perf_counter()
         workers = min(FOREGROUND_PREFLIGHT_WORKERS, len(edge_entries))
@@ -1050,10 +1155,11 @@ def run_detection_by_uv_island(
         else:
             edge_detections = [edge_boxes_for_entry(entry) for entry in edge_entries]
         preflight_seconds += time.perf_counter() - edge_started
-        for entry, (boxes, edge_mask) in zip(edge_entries, edge_detections):
+        for entry, (boxes, edge_mask, components) in zip(edge_entries, edge_detections):
             for island_index in entry[3]:
                 raw_boxes_by_island[island_index] = boxes
                 edge_masks_by_island[island_index] = edge_mask
+                component_boxes_by_island[island_index] = components
     if foreground_preflight:
         # Identical UV placements appear in separate DAE primitives.  Detect
         # each unique crop once, then retain its boxes for every original
@@ -1103,11 +1209,13 @@ def run_detection_by_uv_island(
             ]
         preflight_seconds = time.perf_counter() - preflight_started
         for entry, detection in zip(entries, boxes_by_unique):
-            boxes = detection.boxes if config.box_source in {"contrast", "contrast_gpu"} else detection
+            is_contrast = config.box_source in {"contrast", "contrast_gpu"}
+            boxes = detection.boxes if is_contrast else detection
             for island_index in entry[2]:
                 raw_boxes_by_island[island_index] = boxes
-                if config.box_source in {"contrast", "contrast_gpu"}:
+                if is_contrast:
                     contrast_by_island[island_index] = detection
+                    component_boxes_by_island[island_index] = detection.components
 
     # One atlas-wide recurrence index for every island.  Whether a texture
     # repeats is a property of the material, not of the island consuming it,
@@ -1151,6 +1259,7 @@ def run_detection_by_uv_island(
                 empty_template = run_detection(
                     crop, crop_mask, config,
                     previous=previous, initial_boxes=raw_boxes,
+                    initial_component_boxes=component_boxes_by_island[island_index],
                     initial_contrast_response=(
                         contrast.response if contrast is not None else None
                     ),
@@ -1168,6 +1277,7 @@ def run_detection_by_uv_island(
             run = run_detection(
                 crop, crop_mask, config,
                 previous=previous, initial_boxes=raw_boxes,
+                initial_component_boxes=component_boxes_by_island[island_index],
                 initial_contrast_response=(
                     contrast.response if contrast is not None else None
                 ),
@@ -1184,6 +1294,9 @@ def run_detection_by_uv_island(
 
     aggregate_started = time.perf_counter()
     stages: list[DetectionStage] = []
+    # The detector stage's component count, so the stage that reports the join
+    # can quote atlas totals rather than one island's share of them.
+    detected_components = 0
     stage_count = len(per_island[0][2].stages)
     for index in range(stage_count):
         members = [
@@ -1221,14 +1334,51 @@ def run_detection_by_uv_island(
                 f"{adjusted} nested/overlapping box"
                 f"{'es' if adjusted != 1 else ''} absorbed"
             )
-        elif first.key == "overlap_group":
+        elif first.key == "mser":
+            # Counts in these two lines are the whole point of the stage, so
+            # they are recomputed over the atlas instead of taken from the one
+            # island the rest of the detail is quoted from.
+            detected_components = len(kept)
+            head = detail.split(";")[0]
             detail = (
-                f"forced {adjusted} cardinal/cross fragment"
-                f"{'s' if adjusted != 1 else ''} into UV-valid inscribed circles; "
-                "ordinary rectangle proximity is not retried"
+                f"{head}; {detected_components} component"
+                f"{'s' if detected_components != 1 else ''} detected"
+            )
+        elif first.key == "front_end_boxes":
+            head = detail.split(";")[0] if ";" in detail else ""
+            joined = len(kept)
+            detail = (
+                (f"{head}; " if head else "")
+                + f"{detected_components} component"
+                + f"{'s' if detected_components != 1 else ''} became {joined} box"
+                + f"{'es' if joined != 1 else ''}"
+                # Per-island `adjusted` only counts shrinkage, which says
+                # nothing useful once the atlas total has grown: closing a
+                # thresholded edge mask fuses sub-threshold fragments into
+                # components that then pass, so the count goes up.
+                + (
+                    f", {detected_components - joined} absorbed"
+                    if joined < detected_components
+                    else f", {joined - detected_components} more than were "
+                         "detected -- the morphology fused sub-threshold "
+                         "fragments into components that then pass"
+                    if joined > detected_components
+                    else ", nothing joined"
+                )
+            )
+        elif first.key == "overlap_group":
+            # ``adjusted`` sums the circle merge and the forced overlap merge
+            # that follows it, and the per-island counts are gone by here, so
+            # the aggregate line names both rather than guessing a split.
+            detail = (
+                f"forced {adjusted} region{'s' if adjusted != 1 else ''} "
+                "together: cardinal/cross fragments into UV-valid inscribed "
+                "circles, then anything still overlapping; ordinary rectangle "
+                "proximity is not retried"
                 if adjusted
-                else "no UV-valid circular cardinal/cross cluster found; "
-                "ordinary rectangle proximity is not retried"
+                else "no UV-valid circular cardinal/cross cluster found and "
+                "nothing left overlapping; ordinary rectangle proximity is "
+                "not retried"
             )
         stages.append(replace(
             first,
@@ -1263,6 +1413,13 @@ def run_detection_by_uv_island(
             else min(FOREGROUND_PREFLIGHT_WORKERS, unique_foregrounds)
         ),
         "gpu_warm_state": gpu_warm_state,
+        # Popped out by the caller, not a statistic: the texels every front end
+        # fired on, composited back to atlas coordinates.  Built here because
+        # the per-island responses are already in hand; recomputing it would
+        # mean running the whole detector a second time.
+        "detector_texels": _composite_detector_texels(
+            image.shape[:2], valid, contrast_by_island, edge_masks_by_island,
+        ),
         "pipeline_seconds": round(pipeline_seconds, 6),
         "aggregate_seconds": round(time.perf_counter() - aggregate_started, 6),
         "total_seconds": round(time.perf_counter() - started, 6),
@@ -1333,6 +1490,7 @@ class RunResult:
     # each island at the first affected stage.
     island_runs: tuple[DetectionRun, ...] = ()
     timings: dict[str, object] = field(default_factory=dict)
+    detector_texels: np.ndarray | None = None
 
     @property
     def stages(self) -> list[DetectionStage]:
@@ -1601,13 +1759,21 @@ class StageCanvas:
                 min(vy1 * base_scale, base.height),
             )
             patch = base.resize((target_w, target_h), resample=resample, box=box)
-            visible.paste(
-                patch,
-                (
-                    int(round((vx0 - view.origin_x) * view.scale)),
-                    int(round((vy0 - view.origin_y) * view.scale)),
-                ),
+            at = (
+                int(round((vx0 - view.origin_x) * view.scale)),
+                int(round((vy0 - view.origin_y) * view.scale)),
             )
+            visible.paste(patch, at)
+
+            if self.app.show_detector_texels.get():
+                wash = texel_overlay(
+                    self.app.detector_texels(),
+                    (vx0, vy0, vx1, vy1),
+                    view.origin_x, view.origin_y, view.scale,
+                )
+                if wash is not None:
+                    tint, alpha, texel_at = wash
+                    visible.paste(tint, texel_at, alpha)
 
         stage = self.app.stage_by_key(self.stage_key)
         if stage is not None:
@@ -1784,6 +1950,7 @@ class TuningApp(tk.Tk):
         self.cursor_var = tk.StringVar(value="")
         self.zoom_var = tk.StringVar(value="")
         self.show_kept = tk.BooleanVar(value=True)
+        self.show_detector_texels = tk.BooleanVar(value=False)
         self.show_rejected = tk.BooleanVar(value=True)
         self.show_uv_domain = tk.BooleanVar(value=SHOW_UV_DOMAIN_BY_DEFAULT)
         self.show_uv_symmetry = tk.BooleanVar(value=True)
@@ -1931,6 +2098,12 @@ class TuningApp(tk.Tk):
             variable=self.show_uv_domain,
             command=self._redraw,
         ).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(
+            overlay_bar,
+            text="Detector texels (amber)",
+            variable=self.show_detector_texels,
+            command=self._redraw,
+        ).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(
             overlay_bar,
             text="Symmetric UV islands (blue)",
@@ -3157,6 +3330,7 @@ class TuningApp(tk.Tk):
                 )
                 source.uv_symmetry_cache[symmetry_config] = symmetric_uv_islands
             symmetry_seconds = time.perf_counter() - symmetry_started
+            detector_texels = island_timings.pop("detector_texels", None)
             timings: dict[str, object] = {
                 "source_seconds": round(source_seconds, 6),
                 "source_cached": reuse,
@@ -3177,6 +3351,7 @@ class TuningApp(tk.Tk):
                 relief_config=relief_config if relief_image_source else None,
                 island_runs=island_runs,
                 timings=timings,
+                detector_texels=detector_texels,
             )
 
         self._start_worker(job)
@@ -3361,6 +3536,10 @@ class TuningApp(tk.Tk):
         self.detail_var.set(detail)
 
     # -- view ------------------------------------------------------------
+    def detector_texels(self) -> np.ndarray | None:
+        """The current run's detector mask, in atlas coordinates."""
+        return self.result.detector_texels if self.result is not None else None
+
     def _build_pyramid(self, image: np.ndarray, uv_mask: np.ndarray) -> None:
         """Cache full and reduced levels so panning a 4k atlas stays responsive.
 

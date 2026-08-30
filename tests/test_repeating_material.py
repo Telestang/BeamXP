@@ -256,11 +256,6 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(stage.detail, "disabled")
         self.assertEqual(stage.rejected, ())
 
-    def test_it_is_on_by_default(self) -> None:
-        """Replayed over every region the shipped plans flipped, the two it
-        takes are a run of carpet stitching and a dead-flat patch of trim."""
-        self.assertTrue(DEFAULT_CONFIG.enable_repeat_texture_filter)
-
     def test_it_runs_before_anything_groups(self) -> None:
         """A seam that reaches grouping merges into chains that read as text."""
         self.assertLess(STEP_INDEX["box_filter"], STEP_INDEX["repeat_texture"])

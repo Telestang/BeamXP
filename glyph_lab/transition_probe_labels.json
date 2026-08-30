@@ -1,0 +1,29 @@
+{
+  "default": "keep",
+  "notes": [
+    "2026-08-30: labels parsed from the full exact-colour transition-probe annotation.",
+    "Display candidate 233 is excluded from this stage and stored as indifferent."
+  ],
+  "labels": [
+    {"stage": "7 clear material transitions", "texture": "etk800_dash", "domain": 42, "bounds": [2697, 2112, 852, 94], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "etk800_dash", "domain": 80, "bounds": [2142, 2019, 198, 92], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "etk800_dash", "domain": 86, "bounds": [2379, 2017, 195, 93], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "etk800_dash", "domain": 98, "bounds": [2767, 1556, 120, 128], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "etk800_dash", "domain": 26, "bounds": [3213, 526, 34, 9], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_interior", "domain": 21, "bounds": [404, 3055, 48, 10], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_interior", "domain": 29, "bounds": [3619, 1747, 91, 67], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_interior", "domain": 117, "bounds": [1802, 3928, 11, 94], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_interior", "domain": 117, "bounds": [2796, 3932, 10, 58], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_interior", "domain": 117, "bounds": [2796, 3991, 10, 29], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_interior", "domain": 132, "bounds": [3245, 3389, 84, 84], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_badges", "domain": 1, "bounds": [65, 38, 202, 68], "decision": "indifferent"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_badges", "domain": 1, "bounds": [37, 55, 260, 106], "decision": "indifferent"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_badges", "domain": 1, "bounds": [195, 77, 35, 31], "decision": "indifferent"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_badges", "domain": 1, "bounds": [105, 79, 36, 29], "decision": "indifferent"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_badges", "domain": 1, "bounds": [340, 322, 68, 11], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_badges", "domain": 1, "bounds": [307, 389, 56, 54], "decision": "indifferent"},
+    {"stage": "7 clear material transitions", "texture": "scintilla_badges", "domain": 1, "bounds": [406, 406, 37, 35], "decision": "indifferent"},
+    {"stage": "7 clear material transitions", "texture": "ardente_dash", "domain": 53, "bounds": [3051, 2831, 151, 248], "decision": "discard"},
+    {"stage": "7 clear material transitions", "texture": "ardente_dash", "domain": 397, "bounds": [3556, 636, 71, 81], "decision": "indifferent"}
+  ]
+}

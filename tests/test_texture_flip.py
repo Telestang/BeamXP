@@ -248,6 +248,64 @@ class IslandMirrorLineTests(unittest.TestCase):
         self.assertEqual(flips, [])
 
 
+class SimpleUvDomainFallbackTests(unittest.TestCase):
+    """Whole-chart correction for uncomplicated dashboard UV atlases."""
+
+    @staticmethod
+    def components(polygons: tuple[np.ndarray, ...]) -> tuple[np.ndarray, tuple]:
+        mask = np.zeros((128, 160), dtype=np.uint8)
+        for polygon in polygons:
+            cv2.fillPoly(mask, [np.rint(polygon).astype(np.int32)], 1)
+        count, labels, stats, _centres = cv2.connectedComponentsWithStats(mask, 8)
+        return mask.astype(bool), (count, labels, stats)
+
+    def test_a_source_uv_parallelogram_gets_an_oblique_whole_chart_flip(self) -> None:
+        chart = np.asarray(((20.0, 20.0), (90.0, 20.0), (110.0, 70.0), (40.0, 70.0)))
+        mask, components = self.components((chart,))
+        config = replace(
+            rhd.DEFAULT_RHD_CONFIG,
+            simple_uv_min_area_share=0.95,
+            simple_uv_max_boundary_error_px=1.5,
+        )
+
+        flips = rhd.simple_uv_domain_flips(
+            mask, config, None, components, {1: chart},
+        )
+
+        self.assertEqual(len(flips), 1)
+        self.assertIsNotNone(flips[0].rotated_corners)
+        self.assertIsNotNone(flips[0].rotated_axis)
+
+    def test_a_symmetric_triangle_needs_no_parallelogram_fit(self) -> None:
+        triangle = np.asarray(((64.0, 15.0), (25.0, 95.0), (103.0, 95.0)))
+        mask, components = self.components((triangle,))
+        axis_map = np.full(mask.shape, rhd.AXIS_HORIZONTAL, dtype=np.uint8)
+
+        flips = rhd.simple_uv_domain_flips(
+            mask, rhd.DEFAULT_RHD_CONFIG, axis_map, components, {},
+        )
+
+        self.assertEqual(len(flips), 1)
+        self.assertIsNone(flips[0].rotated_corners)
+
+    def test_a_non_parallelogram_source_boundary_vetoes_the_whole_shortcut(self) -> None:
+        # Its convex hull is rectangular, but the notch is an authored UV
+        # boundary corner.  A raster-hull fit would miss it; source corners do
+        # not, and prevent a destructive whole-chart shear.
+        l_shape = np.asarray(
+            ((20.0, 20.0), (110.0, 20.0), (110.0, 45.0), (55.0, 45.0),
+             (55.0, 95.0), (20.0, 95.0))
+        )
+        mask, components = self.components((l_shape,))
+        config = replace(rhd.DEFAULT_RHD_CONFIG, simple_uv_min_area_share=0.95)
+
+        flips = rhd.simple_uv_domain_flips(
+            mask, config, None, components, {1: l_shape},
+        )
+
+        self.assertEqual(flips, [])
+
+
 class IslandLabellingTests(unittest.TestCase):
     """What pass 2 counts as one island.
 
@@ -336,6 +394,41 @@ class IslandLabellingTests(unittest.TestCase):
         first = rhd.domain_island_labels(masks)[1]
 
         self.assertIs(rhd.domain_island_labels(masks)[1], first)
+
+    def test_source_corners_follow_the_same_topological_label_as_the_chart(self) -> None:
+        # Two source triangles make one sheared quad.  The fallback must receive
+        # the four DAE corners, not a contour reconstructed from its raster.
+        uv = np.asarray(
+            [[(0.15, 0.8), (0.65, 0.8), (0.8, 0.35)],
+             [(0.15, 0.8), (0.8, 0.35), (0.3, 0.35)]],
+            dtype=float,
+        )
+        xyz = np.asarray(
+            [[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)],
+             [(0.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]],
+            dtype=float,
+        )
+        mirror = rhd.rasterise_uv_triangles(list(uv), 128, 128)
+        masks = rhd.DomainMasks(
+            mirror=mirror,
+            rigid=~mirror,
+            conflict_coverage=0.0,
+            mirrored_triangles=2,
+            rigid_triangles=0,
+            parts_analysed=1,
+            mirrored_uv=(uv[0], uv[1]),
+            mirrored_xyz=(xyz[0], xyz[1]),
+        )
+
+        components = rhd.domain_island_labels(masks)
+        corners = rhd.source_uv_island_corners(masks, components)
+        flips = rhd.simple_uv_domain_flips(
+            mirror, rhd.DEFAULT_RHD_CONFIG, None, components, corners,
+        )
+
+        self.assertEqual(set(corners), {1})
+        self.assertEqual(len(flips), 1)
+        self.assertIsNotNone(flips[0].rotated_corners)
 
 
 class ForegroundMaskDetectorTests(unittest.TestCase):

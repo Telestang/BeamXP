@@ -3,6 +3,7 @@ __pycache__/
 
 # Machine-local settings
 hand_drive_tool_settings.json
+glyph_lab_params.json
 
 # Full-resolution screenshot originals (README uses the .jpg versions)
 Screenshots/sunburst2_lhd.png
@@ -54,11 +55,22 @@ examples/converted_mods/*.zip
 .idea/
 .vscode/
 
-# Working docs / handover notes — kept local only.
+# Agent instructions, working docs and handover notes — kept local only.
+# CLAUDE/AGENTS.md's pointer table references docs/, so the two stay untracked together.
+CLAUDE.md
+AGENTS.md
 docs/
 
 # Generated RHD texture outputs (large binaries)
 rhd_textures/
+
+# glyph_lab's extracted texture corpus: derived from the game's own zips, and
+# tens of MB per 4k atlas.  Rebuild it with scripts/build_glyph_corpus.py.
+# The selection alongside it is the recipe that built it, and names zips by
+# absolute path on this machine.
+glyph_corpus/
+glyph_corpus_selection.json
+glyph_doorcards_selection.json
 
 # Local reveal GIF scratch/output assets
 reveal_gif_work/

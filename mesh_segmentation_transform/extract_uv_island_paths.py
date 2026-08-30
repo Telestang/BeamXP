@@ -96,6 +96,33 @@ def _uv_at(values: list[float], stride: int, index: int) -> tuple[float, float]:
 # grid.  It matches ``mirror_texture_for_rhd.SURFACE_WELD_KEYS_PER_METRE`` so the
 # harness previews the islands the exporter will actually work on.
 SURFACE_WELD_KEYS_PER_UNIT = 100_000
+# The same idea for the texture coordinate.  Far finer than the surface grid
+# because UVs are authored in 0..1 and two charts can be packed a texel apart:
+# at 1e8 keys per unit a 4096 atlas gets ~24000 keys per texel, so nothing welds
+# that was not meant to, while float noise in the DAE still lands together.
+UV_WELD_KEYS_PER_UNIT = 100_000_000
+
+
+def _corner_key(
+    u: float, v: float, point: tuple[int, int, int] | None
+) -> tuple[int, ...]:
+    """One triangle corner's identity: where it is in the atlas *and* in space.
+
+    Both halves are needed, for different reasons.  Without the UV a chart
+    would weld to whatever it adjoins in 3D across a seam -- which is exactly
+    the cut the seam exists to make.  Without the surface point, two charts
+    packed so their corners coincide would weld although the mesh never joins
+    them; the Lexus LC500 does this.
+
+    A corner whose POSITION could not be resolved keys on the UV alone.  That
+    is the weaker test, and it errs towards welding, so it under-reports
+    discontinuities rather than inventing any.
+    """
+    key = (
+        int(round(u * UV_WELD_KEYS_PER_UNIT)),
+        int(round(v * UV_WELD_KEYS_PER_UNIT)),
+    )
+    return key + point if point is not None else key
 
 
 def _position_source(
@@ -190,6 +217,7 @@ def _uv_polygon_to_pixels(
 def _triangles_for_material(
     root: ET.Element,
     material: str,
+    geometry_ids: frozenset[str] | None = None,
 ) -> tuple[
     list[list[tuple[float, float]]],
     list[list[tuple[int, int, int] | None]],
@@ -210,6 +238,8 @@ def _triangles_for_material(
     uv_max = [float("-inf"), float("-inf")]
 
     for geometry in geometries:
+        if geometry_ids is not None and geometry.get("id") not in geometry_ids:
+            continue
         mesh = _child(geometry, "mesh", ns)
         if mesh is None:
             continue
@@ -584,6 +614,7 @@ def uv_island_masks(
     root: ET.Element,
     material: str,
     size: tuple[int, int],
+    geometry_ids: frozenset[str] | None = None,
 ) -> tuple[tuple[UvIslandCrop, ...], dict[str, object]]:
     """Rasterise each topological UV island into its own tight crop.
 
@@ -596,7 +627,9 @@ def uv_island_masks(
     islands.
     """
     width, height = size
-    triangles, surfaces, stats = _triangles_for_material(root, material)
+    triangles, surfaces, stats = _triangles_for_material(
+        root, material, geometry_ids,
+    )
     parents = list(range(len(triangles)))
 
     def find(index: int) -> int:
@@ -614,10 +647,9 @@ def uv_island_masks(
     for index, triangle in enumerate(triangles):
         surface = surfaces[index] if index < len(surfaces) else ()
         for corner, (u, v) in enumerate(triangle):
-            key = (int(round(u * 100_000_000)), int(round(v * 100_000_000)))
-            point = surface[corner] if corner < len(surface) else None
-            if point is not None:
-                key += point
+            key = _corner_key(
+                u, v, surface[corner] if corner < len(surface) else None
+            )
             previous = owner.get(key)
             if previous is None:
                 owner[key] = index
@@ -633,6 +665,324 @@ def uv_island_masks(
         if crop is not None:
             crops.append(crop)
     return tuple(crops), {**stats, "uv_islands": len(crops)}
+
+
+def _clip_segment_to_unit_tile(
+    a: tuple[float, float], b: tuple[float, float]
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Liang-Barsky: the part of a segment inside 0..1, or None if none is.
+
+    The polygon clipper above cannot do this job.  Sutherland-Hodgman treats
+    its input as a closed ring, so handing it two points describes a degenerate
+    triangle and it returns the segment traversed both ways -- harmless for a
+    filled polygon, wrong for a line.
+    """
+    (ax, ay), (bx, by) = a, b
+    dx, dy = bx - ax, by - ay
+    lower, upper = 0.0, 1.0
+    for delta, room in (
+        (-dx, ax), (dx, 1.0 - ax), (-dy, ay), (dy, 1.0 - ay),
+    ):
+        if delta == 0.0:
+            if room < 0.0:  # parallel to this edge and outside it
+                return None
+            continue
+        distance = room / delta
+        if delta < 0.0:
+            if distance > upper:
+                return None
+            lower = max(lower, distance)
+        else:
+            if distance < lower:
+                return None
+            upper = min(upper, distance)
+    if upper < lower:
+        return None
+    return (
+        (ax + dx * lower, ay + dy * lower),
+        (ax + dx * upper, ay + dy * upper),
+    )
+
+
+def _island_extent_px(
+    triangles: list[list[tuple[float, float]]], width: int, height: int
+) -> float:
+    """One island's atlas footprint: sqrt(w*h) of its pixel bounding box.
+
+    The same measure ``glyph_lab.suppress.island_extent`` takes of a domain,
+    computed from the polygons instead of from a raster so that sizing 800
+    islands does not mean allocating 800 masks.
+    """
+    x0 = y0 = float("inf")
+    x1 = y1 = float("-inf")
+    for triangle in triangles:
+        for shift_u in range(
+            math.floor(min(u for u, _ in triangle)),
+            math.floor(max(u for u, _ in triangle)) + 1,
+        ):
+            for shift_v in range(
+                math.floor(min(v for _, v in triangle)),
+                math.floor(max(v for _, v in triangle)) + 1,
+            ):
+                clipped = _clip_to_unit_tile(
+                    [(u - shift_u, v - shift_v) for u, v in triangle]
+                )
+                if len(clipped) < 3:
+                    continue
+                points = _uv_polygon_to_pixels(clipped, width, height)
+                x0, y0 = min(x0, points[:, 0].min()), min(y0, points[:, 1].min())
+                x1, y1 = max(x1, points[:, 0].max()), max(y1, points[:, 1].max())
+    if x1 < x0:
+        return 0.0
+    return float(math.sqrt((x1 - x0 + 1) * (y1 - y0 + 1)))
+
+
+def discontinuous_edge_extents(
+    root: ET.Element,
+    material: str,
+    size: tuple[int, int],
+    collect_regions: bool = False,
+    geometry_ids: frozenset[str] | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Every edge the mesh does not carry through, tagged with its chart's size.
+
+    ``size`` is (width, height).  The result is uint16 in the same atlas frame
+    as ``uv_island_mask``: 0 where no discontinuity runs, and otherwise the
+    atlas footprint (sqrt(w*h), as ``glyph_lab.suppress.island_extent`` measures
+    a domain) of the chart the edge bounds.
+
+    2026-08-27: the extent is here because a bare mask is not enough to use one
+    of these safely.  A margin has to scale with texel density, and the only
+    proxy for that is an atlas footprint -- but the footprint that matters at a
+    seam is the *chart's*, not that of whatever domain it was coalesced into.
+    Those diverge: scintilla_interior packs 739 charts with a median of 1,004
+    texels, a 32x32 patch, into 245 domains measuring hundreds of texels
+    across.  ``glyph_lab.suppress.mesh_seam_texels`` has what that is worth
+    once measured -- less than it sounds, and not the thing that fixed
+    scintilla.
+
+    Where two charts' edges land on the same texel the smaller chart's extent
+    wins -- the band should be sized for the more delicate of the two features
+    it separates.
+
+    Coincident triangles are dropped first, and *this* is what fixed
+    scintilla.  A vehicle DAE holds every body variant at once, and two
+    variants of the same panel are authored as separate ``<geometry>``
+    elements over the same vertex positions and the same UVs -- scintilla has
+    ``scintilla_dashboard`` against ``scintilla_dashboard_race`` (4,831
+    triangles), and its hardtop and spider sunvisors on each side (325 and
+    320), 11% of the material between them.  Only one of each pair is ever
+    fitted, but the file carries both.
+
+    That breaks the count in both directions: an interior edge shared by two
+    variants is carried *four* times -- two triangles from each -- and so fails
+    "exactly two" and reads as open, while their common border is carried twice
+    and reads as closed.  Measured, 7,277 of scintilla's 73,924 edges had four
+    carriers; dropping the copies took its seam lines from 329,851 texels to
+    232,049 and its seam-band coverage from 25.5% of the UV area to 16.3%.  It
+    costs nothing on a mesh without variants, which is the other three.
+
+    Note the corner key is in *local* coordinates, so two variants collapse
+    even when their nodes place them apart -- the sunvisor pairs sit 6 cm from
+    each other.  That is wanted here rather than tolerated: the question this
+    answers is about the atlas, and variants sharing a chart sample the very
+    same texels, so continuity across one of those texels is one fact however
+    many parts read it.
+    """
+    width, height = size
+    triangles, surfaces, stats = _triangles_for_material(
+        root, material, geometry_ids,
+    )
+
+    keyed: list[tuple[tuple[int, ...], ...]] = []
+    for index, triangle in enumerate(triangles):
+        surface = surfaces[index] if index < len(surfaces) else ()
+        keyed.append(tuple(
+            _corner_key(u, v, surface[corner] if corner < len(surface) else None)
+            for corner, (u, v) in enumerate(triangle)
+        ))
+    # One representative per distinct triangle, by corner set so that a copy
+    # wound the other way is still recognised as the same triangle.
+    representative: dict[tuple, int] = {}
+    for index, keys in enumerate(keyed):
+        representative.setdefault(tuple(sorted(keys)), index)
+    kept = sorted(representative.values())
+
+    # Islands, welded on shared corners -- deliberately the rule
+    # ``uv_island_masks`` uses, so the charts sized here are the charts it
+    # rasterises.
+    parents = list(range(len(triangles)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parents[right] = left
+
+    owner: dict[tuple[int, ...], int] = {}
+    for index in kept:
+        for key in keyed[index]:
+            previous = owner.setdefault(key, index)
+            if previous != index:
+                union(index, previous)
+
+    islands: dict[int, list[int]] = {}
+    for index in kept:
+        islands.setdefault(find(index), []).append(index)
+
+    # Per island: its open edges, and the footprint to tag them with.
+    sized: list[tuple[float, list[tuple[tuple[float, float], tuple[float, float]]]]] = []
+    open_total = 0
+    edge_total = 0
+    for members in islands.values():
+        carriers: dict[tuple, int] = {}
+        placement: dict[tuple, tuple[tuple[float, float], tuple[float, float]]] = {}
+        for index in members:
+            keys = keyed[index]
+            for corner in range(3):
+                follows = (corner + 1) % 3
+                first, second = keys[corner], keys[follows]
+                edge = (first, second) if first <= second else (second, first)
+                carriers[edge] = carriers.get(edge, 0) + 1
+                if edge not in placement:
+                    placement[edge] = (
+                        triangles[index][corner], triangles[index][follows]
+                    )
+        segments = [
+            placement[edge] for edge, count in carriers.items() if count < 2
+        ]
+        edge_total += len(carriers)
+        open_total += len(segments)
+        if segments:
+            sized.append((
+                _island_extent_px([triangles[i] for i in members], width, height),
+                segments,
+            ))
+
+    # Largest first, so a smaller chart's edges overwrite where they coincide.
+    sized.sort(key=lambda item: -item[0])
+    canvas = Image.new("I", (width, height), 0)
+    pen = ImageDraw.Draw(canvas)
+    region_masks: list[np.ndarray] = []
+    region_wraps: list[bool] = []
+    drawn = 0
+    for extent, segments in sized:
+        # At least 1, so a chart too small to round up to a texel still marks
+        # its edges rather than reading as "no seam here".
+        value = max(min(round(extent), 65_535), 1)
+        region_canvas = Image.new("1", (width, height), 0) if collect_regions else None
+        region_pen = ImageDraw.Draw(region_canvas) if region_canvas is not None else None
+        for a, b in segments:
+            for shift_u in range(
+                math.floor(min(a[0], b[0])), math.floor(max(a[0], b[0])) + 1
+            ):
+                for shift_v in range(
+                    math.floor(min(a[1], b[1])), math.floor(max(a[1], b[1])) + 1
+                ):
+                    clipped = _clip_segment_to_unit_tile(
+                        (a[0] - shift_u, a[1] - shift_v),
+                        (b[0] - shift_u, b[1] - shift_v),
+                    )
+                    if clipped is None:
+                        continue
+                    points = _uv_polygon_to_pixels(list(clipped), width, height)
+                    pen.line(
+                        [
+                            (int(points[0][0]), int(points[0][1])),
+                            (int(points[1][0]), int(points[1][1])),
+                        ],
+                        fill=value,
+                        width=1,
+                    )
+                    if region_pen is not None:
+                        region_pen.line(
+                            [
+                                (int(points[0][0]), int(points[0][1])),
+                                (int(points[1][0]), int(points[1][1])),
+                            ],
+                            fill=1,
+                            width=1,
+                        )
+                    drawn += 1
+        if region_canvas is not None:
+            region_masks.append(np.asarray(region_canvas, dtype=bool))
+            region_wraps.append(any(
+                min(a[axis], b[axis]) < 0.0 or max(a[axis], b[axis]) > 1.0
+                for a, b in segments for axis in (0, 1)
+            ))
+
+    extents = np.asarray(canvas).astype(np.uint16)
+    return extents, {
+        **stats,
+        "unique_triangles": len(kept),
+        "charts": len(islands),
+        "edges": edge_total,
+        "discontinuous_edges": open_total,
+        "drawn_segments": drawn,
+        "seam_texels": int(np.count_nonzero(extents)),
+        **({
+            "seam_region_masks": tuple(region_masks),
+            "seam_region_wraps": tuple(region_wraps),
+            "seam_region_segments": tuple(
+                tuple(segments) for _extent, segments in sized
+            ),
+        } if collect_regions else {}),
+    }
+
+
+def discontinuous_edge_mask(
+    root: ET.Element,
+    material: str,
+    size: tuple[int, int],
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Rasterise every edge across which the mesh does not carry on.
+
+    ``size`` is (width, height).  True marks texels a discontinuous edge runs
+    through, in the same atlas frame as ``uv_island_mask``.  The sizes those
+    edges carry are in ``discontinuous_edge_extents``, which this wraps.
+
+    The test is topological and exact, not a guess at the picture.  An edge is
+    a pair of corner keys (``_corner_key``: atlas position plus surface point),
+    and the mesh carries through it as soon as *two* triangles hold that same
+    pair.  Only an edge with a single carrier is a discontinuity: an open
+    border of the mesh, or one lip of a UV seam whose partner holds the same
+    surface points at a different place in the atlas and so keys differently.
+    A pair matching in UV but not in space, or the reverse, cannot share a key
+    at all and shows up as two single-carrier edges -- one per lip, which is
+    what is wanted, since each lip is a border in the atlas.
+
+    2026-08-27: two *or more*, not exactly two.  Requiring exactly two called
+    every non-manifold edge a seam, and on scintilla that was 758 of 20,893
+    open edges -- 3.6% -- drawn as lines cutting across surfaces that are
+    plainly continuous.  Where three faces meet an edge, two of them do carry
+    the surface through and the third is a fin butting into it; the texture
+    either side of that line is continuous, so there is nothing to filter.
+    Reading it as "at least two" also stops the count depending on how many
+    body variants happen to share a panel, which the deduplication below can
+    only partly protect it from.
+
+    This is deliberately the same key ``uv_island_masks`` welds islands on, so
+    the two answers cannot drift apart: the edges returned here are precisely
+    the outlines of the topological islands returned there.  What makes it
+    worth having separately is that those outlines survive here.  Islands get
+    coalesced downstream whenever their rasters overlap -- ``scintilla_badges``
+    is 8 islands packed into 1 domain, ``ardente_interior`` 805 into 426 -- and
+    a seam inside a coalesced domain is invisible to anything that reads the
+    raster, while remaining every bit as much a place where the texture stops
+    being one continuous surface.
+
+    Drawn with PIL rather than ``cv2.polylines``: CLAUDE.md/AGENTS.md bars new cv2 call
+    sites, ``ImageDraw`` is already imported here, and Bresenham is the same
+    8-connected family as the ``LINE_8`` fill the triangles get -- close enough
+    that a texel of disagreement disappears under any margin worth applying.
+    """
+    extents, stats = discontinuous_edge_extents(root, material, size)
+    return extents > 0, stats
 
 
 def extract(config: ExtractionConfig, root: ET.Element) -> dict[str, object]:

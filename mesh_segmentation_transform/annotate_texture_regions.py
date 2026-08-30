@@ -714,6 +714,38 @@ class MserConfig:
     enable_final_aspect_filter:            bool  = True  # default: True
     final_max_aspect:                      float = 12.0  # default: 12.0 (long side / short)
 
+    # A front end that responds to outlines reports a panel border, a bezel or
+    # a chrome trim strip as one long thin component, and its *rectangle*
+    # encloses every unrelated mark on the panel.  Overlap grouping then
+    # collapses all of them into that rectangle, which is why the etk800 dash
+    # shipped one box for the radio instead of eighteen.  A box that overlaps
+    # this many marks its own texels never touch is such a container, and is
+    # dropped so the marks inside it survive; the container itself is a
+    # surround, and a correction rectangle spanning the whole panel is not
+    # something a later stage can rescue.
+    # 2026-08-26: OFF by default, and the reason is worth recording, because
+    # the filter does what it says -- it is the question that has no answer.  A
+    # box whose rectangle overlaps marks made of texels that are none of its
+    # own is either a panel border swallowing a legend or a logo outline
+    # holding its own counterforms, and nothing measured tells those apart.
+    # Across etk800's dash, scintilla's badge sheet and scintilla's dashboard
+    # relief pass -- three atlases where the intended answer is known and
+    # differs -- the two classes overlap on every signal tried: fill
+    # (0.033-0.135 against 0.092-0.135), UV coverage (both reach 1.000), domain
+    # fraction, the contents' occupancy, spread and dispersion, single-linkage
+    # cluster count at four link distances, the number of holes the outline
+    # closes, the share of the box it encloses, whether the contents sit inside
+    # that loop (a badge scores 1.00 -- so does a panel that must be dropped),
+    # and how much of the box perimeter the outline rings, which inverts: the
+    # panel that most needs dropping scores highest at 0.95.
+    #
+    # Enabled it costs etk800 nothing and rescues its radio, HVAC and door
+    # card, which produce no regions at all without it; enabled on a badge
+    # sheet it deletes the badges.  So it is a switch to throw per vehicle in
+    # the harness, not a default.
+    enable_hollow_container_filter:        bool  = False  # default: False
+    hollow_container_min_regions:          int   = 6  # default: 6
+
     # Two-pass shaped-domain recovery.  Grouping uses min_box_uv_coverage as a
     # loose rectangular gate so a circular candidate can form before its shape
     # is known.  This pass then applies the stricter shaped-domain test by
@@ -721,6 +753,17 @@ class MserConfig:
     # and regrouping survivors, with one half-distance retry.
     enable_region_domain_filter:           bool  = True  # default: True
     min_region_uv_coverage:                float = 1.0  # default: 0.98
+
+    # The same question again once the region is final, and terminal this
+    # time.  Domain recovery runs before the shape fit and before the forced
+    # merge, so what it measured is not what ships: a fit can rotate or grow a
+    # region, and a merge can union two valid ones into a rectangle that is
+    # not.  This pass measures whatever shape the region ended up with --
+    # rotated outline, inscribed disc, or plain rectangle -- and rejects it.
+    # There is no recovery here on purpose: by this point a region has already
+    # had its one chance to be split and rebuilt.
+    enable_fitted_region_domain_filter:    bool  = True  # default: True
+    min_fitted_region_uv_coverage:         float = 1.0  # default: 1.0
 
     # Terminal output shaping.  Applied only after every detection/filter stage,
     # so padding cannot cause a region to fail an earlier size, colour, or domain
@@ -760,6 +803,9 @@ DEFAULT_COLOUR_CONFIG = replace(
     enable_parallelogram_bounds=False,
     parallelogram_max_area_ratio=0.97,
     parallelogram_min_fill=0.9,
+    # Promoted 2026-08-26 from the tuning harness.
+    enable_repeat_texture_filter=False,
+    min_fitted_region_uv_coverage=0.97,
 )
 # One preset for every relief front end.  Its rotation, flatness and ring
 # values were measured on the GPU edge response and promoted 2026-08-16 from
@@ -823,12 +869,16 @@ DEFAULT_RELIEF_DETECTION_CONFIG = replace(
     # ``feature_extension_min_ratio`` is inert while
     # ``enable_feature_extension_filter`` is off above, but a pin that only
     # holds while a neighbouring switch stays off is not a pin.
-    min_region_uv_coverage=1.0,
+    min_region_uv_coverage=0.95,
     feature_extension_min_ratio=0.25,
     # Promoted 2026-08-20 from the tuning harness.
     final_region_padding_px=4,
     # Promoted 2026-08-26 from the tuning harness.
     enable_parallelogram_bounds=False,
+    # Promoted 2026-08-26 from the tuning harness.
+    min_fitted_region_uv_coverage=0.97,
+    parallelogram_max_area_ratio=0.93,
+    parallelogram_min_fill=0.35,
 )
 DEFAULT_CONFIG = DEFAULT_COLOUR_CONFIG
 
@@ -1230,19 +1280,23 @@ def detect_edge_boxes_with_response(
     boundary, without computing the Laplacian a second time.
     """
     mask, response = edge_mask(grey, uv_mask, config)
-    return detect_edge_boxes_from_response(mask, response, config)
+    boxes, response, _components = detect_edge_boxes_from_response(
+        mask, response, config
+    )
+    return boxes, response
 
 
-def detect_edge_boxes_from_response(
-    mask: np.ndarray,
-    response: np.ndarray,
-    config: MserConfig,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fit edge components from a thresholded response already in memory."""
+def closed_edge_mask(mask: np.ndarray, config: MserConfig) -> np.ndarray:
+    """Close and dilate a thresholded edge mask into its component field.
+
+    Kept separate from ``detect_edge_boxes_from_response`` because two callers
+    need to agree on it exactly.  The thresholded mask and this one are not
+    the same picture: at ``edge_close_px`` 5 a glyph that arrives as a dozen
+    broken strokes becomes one component here, and anything reasoning about
+    which component a *box* came from has to be looking at this field, not at
+    the fragments underneath it.
+    """
     edges = mask.astype(np.uint8)
-    if not bool(edges.any()):
-        return np.empty((0, 4), dtype=np.int32), response
-
     if config.edge_close_px > 0:
         size = max(int(config.edge_close_px), 1)
         edges = cv2.morphologyEx(
@@ -1254,27 +1308,165 @@ def detect_edge_boxes_from_response(
         edges = cv2.dilate(
             edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
         )
+    return edges
 
+
+def detect_edge_boxes_from_response(
+    mask: np.ndarray,
+    response: np.ndarray,
+    config: MserConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit edge components from a thresholded response already in memory.
+
+    Returns the fitted boxes, the response, and the components as they stood
+    *before* the close/dilate joined them.  Those two are not a small
+    refinement of each other: on scintilla's dashboard 5170 thresholded
+    components clear ``edge_min_component_px`` on their own, and 24095 do once
+    ``edge_close_px`` 5 has fused the sub-threshold noise between them into
+    components that then pass.  The close does not only weld glyph strokes
+    back together, it manufactures regions, and that is invisible unless both
+    pictures are kept.
+    """
+    edges = mask.astype(np.uint8)
+    empty = np.empty((0, 4), dtype=np.int32)
+    if not bool(edges.any()):
+        return empty, response, empty
+
+    def admissible(stats_table: np.ndarray, count: int) -> list[int]:
+        labels_kept: list[int] = []
+        for label in range(1, count):
+            if int(stats_table[label, cv2.CC_STAT_AREA]) < max(
+                config.edge_min_component_px, 1
+            ):
+                continue
+            w = int(stats_table[label, cv2.CC_STAT_WIDTH])
+            h = int(stats_table[label, cv2.CC_STAT_HEIGHT])
+            aspect = max(w, h) / max(min(w, h), 1)
+            if config.enable_aspect_ratio_filter and (
+                aspect < config.min_aspect or aspect > config.max_aspect
+            ):
+                continue
+            labels_kept.append(label)
+        return labels_kept
+
+    closed = closed_edge_mask(edges, config)
     count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
-        edges, connectivity=8
+        closed, connectivity=8
     )
-    boxes: list[tuple[int, int, int, int]] = []
-    for label in range(1, count):
-        if int(stats[label, cv2.CC_STAT_AREA]) < max(config.edge_min_component_px, 1):
+    kept = admissible(stats, count)
+    boxes = _component_boxes(stats, kept)
+
+    if config.edge_close_px > 0 or config.edge_dilate_px > 0:
+        bare_count, _bl, bare_stats, _bc = cv2.connectedComponentsWithStats(
+            edges, connectivity=8
+        )
+        components = _component_boxes(bare_stats, admissible(bare_stats, bare_count))
+    else:
+        components = boxes
+    return boxes, response, components
+
+
+def _component_boxes(stats: np.ndarray, labels: list[int]) -> np.ndarray:
+    """Bounding boxes for a set of connected-component labels."""
+    if not labels:
+        return np.empty((0, 4), dtype=np.int32)
+    return np.asarray(
+        [
+            (int(stats[label, cv2.CC_STAT_LEFT]),
+             int(stats[label, cv2.CC_STAT_TOP]),
+             int(stats[label, cv2.CC_STAT_WIDTH]),
+             int(stats[label, cv2.CC_STAT_HEIGHT]))
+            for label in labels
+        ],
+        dtype=np.int32,
+    )
+
+
+def _merge_components_by_pixel_gap(
+    labels: np.ndarray,
+    kept: list[int],
+    stats: np.ndarray,
+    gap: int,
+    charts: list[int | None] | None = None,
+) -> list[tuple[int, int, int, int]]:
+    """Merge components whose *pixels* come within ``gap``, not their boxes.
+
+    2026-08-26: ``_merge_foreground_boxes`` measures the Chebyshev gap between
+    bounding rectangles, which is not the same question.  A local-contrast
+    response draws outlines, so a panel's border arrives as one long thin
+    component whose rectangle encloses the whole panel -- and every glyph
+    inside it is then "within gap 0" of that rectangle and unioned away.  The
+    etk800 dash lost the radio (28 components), the HVAC panel (17) and a door
+    card's window switches (7) to exactly one box each this way.
+
+    Measuring between the components themselves makes ``gap`` mean what its
+    name says: at 0 nothing merges, because 8-connected components are already
+    maximal.  Each component is grown once on its own crop rather than every
+    pair being compared, so the cost follows total foreground area instead of
+    the square of the component count.
+    """
+    boxes = [
+        (int(stats[label, cv2.CC_STAT_LEFT]),
+         int(stats[label, cv2.CC_STAT_TOP]),
+         int(stats[label, cv2.CC_STAT_WIDTH]),
+         int(stats[label, cv2.CC_STAT_HEIGHT]))
+        for label in kept
+    ]
+    gap = max(int(gap), 0)
+    count = len(kept)
+    if gap == 0 or count < 2:
+        return boxes
+
+    slot_by_label: dict[int, int] = {label: slot for slot, label in enumerate(kept)}
+    parent = list(range(count))
+
+    def find(slot: int) -> int:
+        while parent[slot] != slot:
+            parent[slot] = parent[parent[slot]]
+            slot = parent[slot]
+        return slot
+
+    height, width = labels.shape[:2]
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (2 * gap + 1, 2 * gap + 1)
+    )
+    for slot, label in enumerate(kept):
+        x, y, box_width, box_height = boxes[slot]
+        x0, y0 = max(x - gap, 0), max(y - gap, 0)
+        x1, y1 = min(x + box_width + gap, width), min(y + box_height + gap, height)
+        window = labels[y0:y1, x0:x1]
+        grown = cv2.dilate((window == label).astype(np.uint8), kernel).astype(bool)
+        for other in np.unique(window[grown]):
+            other = int(other)
+            neighbour = slot_by_label.get(other)
+            if other == label or neighbour is None:
+                continue
+            if charts is not None:
+                own, theirs = charts[slot], charts[neighbour]
+                if own is not None and theirs is not None and own != theirs:
+                    continue
+            root, other_root = find(slot), find(neighbour)
+            if root != other_root:
+                parent[max(root, other_root)] = min(root, other_root)
+
+    # A group is represented by its lowest member, matching the order the
+    # bounding-box merge leaves its survivors in.
+    merged: dict[int, tuple[int, int, int, int]] = {}
+    for slot in range(count):
+        root = find(slot)
+        x, y, box_width, box_height = boxes[slot]
+        if root not in merged:
+            merged[root] = (x, y, x + box_width, y + box_height)
             continue
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
-        w = int(stats[label, cv2.CC_STAT_WIDTH])
-        h = int(stats[label, cv2.CC_STAT_HEIGHT])
-        aspect = max(w, h) / max(min(w, h), 1)
-        if config.enable_aspect_ratio_filter and (
-            aspect < config.min_aspect or aspect > config.max_aspect
-        ):
-            continue
-        boxes.append((x, y, w, h))
-    if not boxes:
-        return np.empty((0, 4), dtype=np.int32), response
-    return np.asarray(boxes, dtype=np.int32), response
+        left, top, right, bottom = merged[root]
+        merged[root] = (
+            min(left, x), min(top, y),
+            max(right, x + box_width), max(bottom, y + box_height),
+        )
+    return [
+        (left, top, right - left, bottom - top)
+        for _root, (left, top, right, bottom) in sorted(merged.items())
+    ]
 
 
 def _merge_foreground_boxes(
@@ -1758,6 +1950,50 @@ class LocalContrastDetection:
     boxes: np.ndarray
     response: np.ndarray
     threshold: float
+    # 2026-08-26: one box per thresholded component, before the open/close and
+    # the pixel-gap merge consolidate them.  Carried so the harness can show
+    # what was detected separately from what was joined up; with all three of
+    # those parameters at 0 it is the same list as ``boxes``, which is itself
+    # the answer to "what is this stage grouping".
+    components: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 4), dtype=np.int32)
+    )
+    # Components the size/coverage gates threw out, counted rather than kept:
+    # a 4k atlas produces a quarter of a million of them and no viewer wants
+    # the boxes.
+    discarded: int = 0
+
+
+def shaped_contrast_mask(
+    above_threshold: np.ndarray,
+    domain: np.ndarray | None,
+    config: MserConfig,
+) -> np.ndarray:
+    """Open/close a thresholded contrast response into its component field.
+
+    The counterpart of ``closed_edge_mask``, and separate for the same reason:
+    whatever this returns is what the front end labelled, so it is the only
+    field a later stage can ask which component a box came from.
+    """
+    work = above_threshold
+    if domain is not None:
+        work = work & domain
+    work = work.astype(np.uint8)
+    if config.contrast_open_px > 0:
+        size = max(int(config.contrast_open_px) * 2 + 1, 1)
+        work = cv2.morphologyEx(
+            work, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+    if config.contrast_close_px > 0:
+        size = max(int(config.contrast_close_px) * 2 + 1, 1)
+        work = cv2.morphologyEx(
+            work, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+    if domain is not None:
+        work &= domain.astype(np.uint8)
+    return work
 
 
 def local_contrast_detection_from_response(
@@ -1777,41 +2013,62 @@ def local_contrast_detection_from_response(
         float(config.contrast_min_response),
         float(np.percentile(island_response, percentile)),
     )
-    work = ((response >= threshold) & domain).astype(np.uint8)
-    if config.contrast_open_px > 0:
-        size = max(int(config.contrast_open_px) * 2 + 1, 1)
-        work = cv2.morphologyEx(
-            work, cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
-        )
-    if config.contrast_close_px > 0:
-        size = max(int(config.contrast_close_px) * 2 + 1, 1)
-        work = cv2.morphologyEx(
-            work, cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
-        )
-    work &= domain.astype(np.uint8)
-    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(work, 8)
+    above = response >= threshold
+    work = shaped_contrast_mask(above, domain, config)
     min_area = max(int(config.contrast_min_component_px), 1)
-    boxes: list[tuple[int, int, int, int]] = []
     domain_area = max(int(domain.sum()), 1)
-    for label in range(1, count):
-        x, y, box_width, box_height, area = (int(value) for value in stats[label])
-        if area < min_area or box_width <= 0 or box_height <= 0:
-            continue
-        coverage = area / max(box_width * box_height, 1)
-        if (
-            coverage > float(config.contrast_max_coverage)
-            and area / domain_area > float(config.contrast_max_coverage)
-        ):
-            continue
-        boxes.append((x, y, box_width, box_height))
-    boxes = _merge_foreground_boxes(boxes, config.contrast_merge_gap_px)
+
+    def surviving(stats_table: np.ndarray, count: int) -> list[int]:
+        labels_kept: list[int] = []
+        for label in range(1, count):
+            _x, _y, box_width, box_height, area = (
+                int(value) for value in stats_table[label]
+            )
+            if area < min_area or box_width <= 0 or box_height <= 0:
+                continue
+            coverage = area / max(box_width * box_height, 1)
+            if (
+                coverage > float(config.contrast_max_coverage)
+                and area / domain_area > float(config.contrast_max_coverage)
+            ):
+                continue
+            labels_kept.append(label)
+        return labels_kept
+
+    # The components as detected, before morphology joins any of them.  When
+    # neither open nor close is set the two masks are identical, so the second
+    # labelling is skipped rather than repeated for a picture already in hand.
+    if config.contrast_open_px > 0 or config.contrast_close_px > 0:
+        bare = (above & domain).astype(np.uint8)
+        bare_count, _bare_labels, bare_stats, _bc = cv2.connectedComponentsWithStats(
+            bare, 8
+        )
+        bare_kept = surviving(bare_stats, bare_count)
+        components = _component_boxes(bare_stats, bare_kept)
+        discarded = max(bare_count - 1 - len(bare_kept), 0)
+    else:
+        components = None
+        discarded = None
+
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(work, 8)
+    kept = surviving(stats, count)
+    if components is None:
+        components = _component_boxes(stats, kept)
+        discarded = max(count - 1 - len(kept), 0)
+    # 2026-08-26: components, not their rectangles.  The other front ends still
+    # merge by bounding box: their gaps (6 and 10 texels) were tuned against
+    # that looser measure, and a contrast response is the one that draws the
+    # long thin panel outlines this distinction exists for.
+    boxes = _merge_components_by_pixel_gap(
+        labels, kept, stats, config.contrast_merge_gap_px,
+    )
     return LocalContrastDetection(
         np.asarray(boxes, dtype=np.int32)
         if boxes else np.empty((0, 4), dtype=np.int32),
         response.astype(np.float32, copy=False),
         threshold,
+        components=components,
+        discarded=int(discarded or 0),
     )
 
 
@@ -2887,6 +3144,10 @@ def channel_colour_mask(
     dark trim carrying +/-20 of compression dither reads as 75% flat under the
     Euclidean test and 100% under this one.
     """
+    # 2026-08-26: an unsigned max-minus-min was tried here to avoid promoting
+    # the crop, and measured slower -- three broadcasts over a box-sized crop
+    # cost more than the int16 pass they save.  The crops are small; it is the
+    # per-box call overhead that dominates, not the memory.
     delta = np.abs(crop.astype(np.int16) - colour.astype(np.int16))
     return (delta.max(axis=2) <= max(tolerance, 0)) & domain_mask
 
@@ -2926,6 +3187,11 @@ def box_feature_blob_px(
     config: MserConfig,
 ) -> int | None:
     """Return the area of a box's largest connected non-background run.
+
+    Below ``box_min_feature_px`` it returns the total feature area instead,
+    which is an upper bound on that largest run and cheaper to reach.  The one
+    caller only ever compares the result against that floor, so the two agree
+    wherever the answer is used; see the note at the return.
 
     Speckle noise on blank trim breaks into tiny fragments, while a glyph
     stroke stays whole, so this one number separates the two.  The share of the
@@ -2974,8 +3240,18 @@ def box_feature_blob_px(
         return None
 
     feature = domain & ~channel_colour_mask(crop, domain, dominant, tolerance)
-    if not bool(feature.any()):
+    total = int(feature.sum())
+    if total == 0:
         return 0
+    # 2026-08-26: a connected component cannot be larger than the whole
+    # foreground it is drawn from, so a box with fewer feature texels than the
+    # caller's floor cannot pass however they are joined up, and labelling it
+    # only to discover that is work with a known answer.  Exact, not an
+    # estimate: the count returned here is only ever compared against that
+    # floor.  On etk800's dash it skips the labelling for most of the 8400
+    # boxes this stage rejects.
+    if total < max(config.box_min_feature_px, 1):
+        return total
     count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
         feature.astype(np.uint8), connectivity=8
     )
@@ -3871,6 +4147,60 @@ def circle_uv_coverage(
             uv_mask.astype(np.uint8), connectivity=8
         )
     within = labels[y0:y1, x0:x1][disc]
+    within = within[within > 0]
+    if within.size == 0:
+        return 0.0
+    return float(np.bincount(within).max()) / float(area)
+
+
+def outline_uv_coverage(
+    uv_mask: np.ndarray | None,
+    points: Sequence[tuple[float, float]],
+    domain: UvDomainIndex | None = None,
+) -> float:
+    """Return the share of a convex outline covered by one UV island.
+
+    The polygon counterpart of ``circle_uv_coverage``, answering the same
+    question with the same "largest single island" rule: a shape spanning two
+    charts is not covered, however little of it falls on bare atlas.  Filled
+    by half-plane tests at full resolution rather than through
+    ``rasterise_convex_hull``, which decimates for speed -- here the answer is
+    a pass/fail on a threshold near 1.0, so a decimated edge is the whole
+    measurement.
+    """
+    if uv_mask is None:
+        return 1.0
+    polygon = np.asarray(points, dtype=np.float64)
+    if polygon.shape[0] < 3:
+        return 0.0
+    height, width = uv_mask.shape[:2]
+    x0 = max(int(np.floor(polygon[:, 0].min())), 0)
+    y0 = max(int(np.floor(polygon[:, 1].min())), 0)
+    x1 = min(int(np.ceil(polygon[:, 0].max())) + 1, width)
+    y1 = min(int(np.ceil(polygon[:, 1].max())) + 1, height)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    grid_x = np.arange(x0, x1, dtype=np.float64)[None, :] + 0.5
+    grid_y = np.arange(y0, y1, dtype=np.float64)[:, None] + 0.5
+    shifted = np.roll(polygon, -1, axis=0)
+    twice_area = float(
+        (polygon[:, 0] * shifted[:, 1] - shifted[:, 0] * polygon[:, 1]).sum()
+    )
+    sign = 1.0 if twice_area >= 0.0 else -1.0
+    inside = np.ones((y1 - y0, x1 - x0), dtype=bool)
+    for (ax, ay), (bx, by) in zip(polygon, shifted):
+        cross = (bx - ax) * (grid_y - ay) - (by - ay) * (grid_x - ax)
+        inside &= (cross * sign) >= -1e-9
+    area = int(inside.sum())
+    if area == 0:
+        return 0.0
+    if domain is not None:
+        labels = domain.island_labels
+    else:
+        _count, labels = cv2.connectedComponents(
+            uv_mask.astype(np.uint8), connectivity=8
+        )
+    within = labels[y0:y1, x0:x1][inside]
     within = within[within > 0]
     if within.size == 0:
         return 0.0
@@ -4846,13 +5176,20 @@ def clamp_group(
     return (x0, y0, x1 - x0, y1 - y0)
 
 
+def quantized_bgr_codes(quantized: np.ndarray, levels: int) -> np.ndarray:
+    """Pack quantized BGR triples into one integer per pixel."""
+    return (
+        quantized[:, 0].astype(np.int32) * levels + quantized[:, 1]
+    ) * levels + quantized[:, 2]
+
+
 def dominant_quantized_bin(quantized: np.ndarray, levels: int) -> np.ndarray:
     """Return the most populated quantized BGR bin, given quantized pixels."""
     if levels**3 > 1_000_000:
         bins, counts = np.unique(quantized.reshape(-1, 3), axis=0, return_counts=True)
         return bins[int(np.argmax(counts))]
 
-    codes = (quantized[:, 0] * levels + quantized[:, 1]) * levels + quantized[:, 2]
+    codes = quantized_bgr_codes(quantized, levels)
     dominant_code = int(np.bincount(codes).argmax())
     b = dominant_code // (levels * levels)
     remainder = dominant_code % (levels * levels)
@@ -4875,11 +5212,22 @@ def estimate_background_colour(
         return None
 
     quant_step = max(colour_thresh, 1)
-    quantized = (domain_pixels // quant_step).astype(np.int32)
+    quantized = domain_pixels // quant_step
     levels = (255 // quant_step) + 1
-    dominant_matches = np.all(
-        quantized == dominant_quantized_bin(quantized, levels), axis=1
-    )
+    if levels**3 > 1_000_000:
+        # Too many bins to count directly; the unique-rows path owns this.
+        dominant_matches = np.all(
+            quantized == dominant_quantized_bin(quantized, levels), axis=1
+        )
+    else:
+        # 2026-08-26: the packed codes decide the winner, so keep them and
+        # test against the code.  Unpacking to a BGR triple and re-comparing
+        # all three channels rebuilt, per box, an answer already in hand --
+        # an (N,3) int32 copy, three comparisons and an all-reduce, where one
+        # (N,) equality does it.  Packing is a bijection below `levels`, so
+        # the two select exactly the same pixels.
+        codes = quantized_bgr_codes(quantized, levels)
+        dominant_matches = codes == int(np.bincount(codes).argmax())
     if not bool(dominant_matches.any()):
         return None
 
@@ -5009,6 +5357,9 @@ class DetectionState:
     # that per-island mask beside its response so later filters do not repeat
     # percentile/local-threshold and morphology work merely to inspect it.
     relief_edge_mask: np.ndarray | None = None
+    # What the front end detected before it consolidated anything.  Set by the
+    # detector stage and read by the one after it, which reports the join.
+    component_boxes: np.ndarray | None = None
     # The decimated high-passed atlas the repeating-material stage correlates
     # against, kept so a resumed run does not rebuild it.  Read-only apart from
     # its own match cache, and so safe to share by reference.
@@ -5033,6 +5384,7 @@ class DetectionState:
             relief_bridge_response=self.relief_bridge_response,
             island_bits=self.island_bits,
             relief_edge_mask=self.relief_edge_mask,
+            component_boxes=self.component_boxes,
             repeat_texture=self.repeat_texture,
             circle_radii=self.circle_radii,
         )
@@ -5061,7 +5413,7 @@ def _step_mser(
         edge_mask_cache, _response = edge_mask_from_response(
             edge_bridge_response, uv_mask, config,
         )
-        boxes, edge_bridge_response = detect_edge_boxes_from_response(
+        boxes, edge_bridge_response, component_boxes = detect_edge_boxes_from_response(
             edge_mask_cache, edge_bridge_response, config,
         )
         detail = (
@@ -5111,8 +5463,18 @@ def _step_mser(
         boxes = detect_mser_boxes(grey, config)
         detail = f"delta={config.delta}, area {config.min_area}-{config.max_area} px"
         title = "MSER boxes"
+    if config.box_source in {"contrast", "contrast_gpu"}:
+        component_boxes = contrast.components
+        discarded = contrast.discarded
+    elif config.box_source not in {"edge", "edge_gpu"}:
+        # No front end but these two separates detection from consolidation,
+        # so the rest report the same list twice rather than inventing a split.
+        component_boxes, discarded = boxes, 0
+    else:
+        discarded = 0
     return DetectionState(
         boxes, [],
+        component_boxes=component_boxes,
         contrast_response=(contrast.response if config.box_source in {"contrast", "contrast_gpu"} else None),
         contrast_threshold=(contrast.threshold if config.box_source in {"contrast", "contrast_gpu"} else None),
         # Relief-edge grouping needs the same barrier evidence as the colour
@@ -5123,10 +5485,114 @@ def _step_mser(
         relief_edge_mask=edge_mask_cache,
     ), DetectionStage(
         key="mser",
-        title=title,
-        kept=tuple(tuple(int(v) for v in box) for box in boxes),  # type: ignore[misc]
-        detail=detail,
+        title=f"{title.removesuffix(' boxes')} components",
+        kept=tuple(tuple(int(v) for v in box) for box in component_boxes),  # type: ignore[misc]
+        detail=(
+            detail
+            + f"; {len(component_boxes)} component"
+            + f"{'s' if len(component_boxes) != 1 else ''} detected"
+            + (
+                f", {discarded} below the size/coverage gates"
+                if discarded else ""
+            )
+        ),
     )
+
+
+def _step_front_end_boxes(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Report what the front end joined its own components into.
+
+    2026-08-26: split out of the detector stage so the join is visible.  It
+    recomputes nothing -- the detector already produced both lists -- and it
+    filters nothing, so a box here is a box there.  What it shows is the
+    difference, which is the whole point: a contrast front end with open,
+    close and merge_gap all at 0 consolidates nothing and the two stages are
+    identical, while ``edge_close_px`` 5 turned scintilla's 5170 thresholded
+    components into 24095 by fusing the noise between them.
+    """
+    detected = (
+        len(state.component_boxes) if state.component_boxes is not None
+        else len(state.boxes)
+    )
+    joined = len(state.boxes)
+    if config.box_source in {"edge", "edge_gpu"}:
+        how = (
+            f"closed by {config.edge_close_px} px and dilated by "
+            f"{config.edge_dilate_px} px before components were taken"
+        )
+    elif config.box_source in {"contrast", "contrast_gpu"}:
+        how = (
+            f"opened {config.contrast_open_px} px, closed "
+            f"{config.contrast_close_px} px, then components within "
+            f"{config.contrast_merge_gap_px} px of each other merged"
+        )
+    else:
+        how = "this front end has no consolidation step"
+    return state, DetectionStage(
+        key="front_end_boxes",
+        title=state_front_end_title(config),
+        kept=tuple(tuple(int(v) for v in box) for box in state.boxes),
+        adjusted=max(detected - joined, 0),
+        detail=(
+            f"{how}; {detected} component"
+            f"{'s' if detected != 1 else ''} became {joined} box"
+            f"{'es' if joined != 1 else ''}"
+        ),
+    )
+
+
+def front_end_detail(config: MserConfig) -> str:
+    """What the front end did to produce its components, from the config.
+
+    2026-08-26: shared with the preflight path, which used to say only
+    "precomputed ... boxes".  The scale a component was found at is the first
+    thing to know about it -- on the colour path ``contrast_kernel_px`` *is*
+    the grouping, since the response is a pixel's distance from the mean of
+    that neighbourhood, so two marks closer together than the kernel can
+    answer as one component before anything else runs.  A stage that will not
+    say which kernel drew it cannot be tuned by eye.
+    """
+    if config.box_source in {"edge", "edge_gpu"}:
+        return (
+            f"{config.edge_operator} gradient over {config.edge_kernel_px}px "
+            f"after a {config.edge_blur_sigma:g} sigma blur, threshold at the "
+            f"{config.edge_threshold_percentile:g}th percentile inside the UV "
+            f"domain (floor {config.edge_threshold_floor:g})"
+        )
+    if config.box_source in {"contrast", "contrast_gpu"}:
+        return (
+            f"masked {config.contrast_kernel_px}px local-colour contrast, "
+            f"max({config.contrast_min_response:g}, "
+            f"{config.contrast_percentile:g}th island percentile)"
+        )
+    if config.box_source == "foreground":
+        return (
+            "dominant-background foreground mask, distance "
+            f"{config.foreground_background_distance:g}"
+        )
+    if config.box_source == "opacity_mask":
+        return (
+            "authored opacity-mask foreground, threshold "
+            f"{config.opacity_mask_threshold}"
+        )
+    return f"delta={config.delta}, area {config.min_area}-{config.max_area} px"
+
+
+def state_front_end_title(config: MserConfig) -> str:
+    """The title the consolidated front-end stage carries, by source."""
+    return {
+        "edge": "Edge boxes",
+        "edge_gpu": "Edge GPU boxes",
+        "foreground": "Foreground-mask boxes",
+        "opacity_mask": "Opacity-mask boxes",
+        "contrast": "Local-contrast CPU boxes",
+        "contrast_gpu": "Local-contrast GPU boxes",
+    }.get(config.box_source, "MSER boxes")
 
 
 def _step_stroke_width(
@@ -5280,6 +5746,157 @@ def _step_repeat_texture(
     )
 
 
+def box_structure_owners(
+    feature_mask: np.ndarray,
+    labels: np.ndarray,
+    stats: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> frozenset[int]:
+    """Which foreground components this box is the bounds *of*.
+
+    A front-end box is the bounds of its own component, or of a set of them
+    merged across a pixel gap, so every member runs out to one of its edges.
+    A mark that merely sits inside a frame's rectangle reaches none of them.
+    That distinction is what separates "these two boxes describe one mark"
+    from "this rectangle happens to enclose that one".
+    """
+    height, width = feature_mask.shape[:2]
+    x0, y0 = max(box[0], 0), max(box[1], 0)
+    x1, y1 = min(box[0] + box[2], width), min(box[1] + box[3], height)
+    if x1 <= x0 or y1 <= y0:
+        return frozenset()
+    window = labels[y0:y1, x0:x1]
+    owners: set[int] = set()
+    for label in np.unique(window[window > 0]):
+        label = int(label)
+        left = int(stats[label, cv2.CC_STAT_LEFT])
+        top = int(stats[label, cv2.CC_STAT_TOP])
+        right = left + int(stats[label, cv2.CC_STAT_WIDTH])
+        bottom = top + int(stats[label, cv2.CC_STAT_HEIGHT])
+        if left < x0 or top < y0 or right > x1 or bottom > y1:
+            continue
+        # One texel of slack: the box came from these bounds, so an edge it
+        # was clamped or padded to still counts as reached.
+        if left <= x0 + 1 or top <= y0 + 1 or right >= x1 - 1 or bottom >= y1 - 1:
+            owners.add(label)
+    return frozenset(owners)
+
+
+def front_end_component_mask(
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> np.ndarray | None:
+    """The exact field the front end ran connected components on, or None.
+
+    2026-08-26: not ``region_feature_mask``.  That deliberately returns the
+    *thresholded* mask, because a shape should be fitted to the texels the
+    detector responded to rather than to a morphological approximation of
+    them.  Asking which component a box came from is the opposite question,
+    and answering it from the thresholded mask was wrong in a way that only
+    showed on the relief path: at ``edge_close_px`` 5 a box's real component
+    does not exist there, only the fragments the close welded together, so
+    scintilla's owl emblem "owned" four scraps totalling 43 texels of its own
+    92x52 box and read every part of itself as a stranger.
+
+    None where the field cannot be reconstructed, which leaves the surround
+    filter a no-op rather than a filter working off the wrong picture.
+    """
+    domain = (
+        uv_mask.astype(bool)
+        if uv_mask is not None and uv_mask.shape[:2] == state_shape(state, uv_mask)
+        else None
+    )
+    if config.box_source in ("edge", "edge_gpu"):
+        base = state.relief_edge_mask
+        if base is None and state.relief_bridge_response is not None:
+            base, _response = edge_mask_from_response(
+                state.relief_bridge_response, uv_mask, config,
+            )
+        if base is None:
+            return None
+        return closed_edge_mask(base, config).astype(bool)
+    if config.box_source in ("contrast", "contrast_gpu"):
+        if state.contrast_response is None or state.contrast_threshold is None:
+            return None
+        return shaped_contrast_mask(
+            state.contrast_response >= state.contrast_threshold, domain, config,
+        ).astype(bool)
+    return None
+
+
+def state_shape(state: DetectionState, uv_mask: np.ndarray) -> tuple[int, int]:
+    """The detector field's shape, for confirming a UV mask lines up with it."""
+    for candidate in (
+        state.contrast_response, state.relief_edge_mask, state.relief_bridge_response,
+    ):
+        if candidate is not None:
+            return candidate.shape[:2]
+    return uv_mask.shape[:2]
+
+
+def drop_hollow_containers(
+    boxes: np.ndarray,
+    feature_mask: np.ndarray | None,
+    config: MserConfig,
+) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+    """Split the boxes into marks and the surrounds that would swallow them.
+
+    2026-08-26: a candidate is a box overlapping other boxes whose texels are
+    none of its own.  That test finds surrounds reliably; what it cannot do is
+    tell a surround from a mark, because a logo outline holds its counterforms
+    on precisely the same terms.  See ``enable_hollow_container_filter`` for
+    what was measured and why this is off by default.
+
+    ``hollow_container_min_regions`` is the only lever, and it is a fitted one:
+    six is where the two classes happen to part on the atlases to hand -- a
+    logo holds a handful of internal details (the Cinetta owl 3, its wordmark
+    3, the dashboard owl emblem 2) while a panel holds a legend (etk800's
+    radio 10, its HVAC 8, its door trim 6, scintilla's perforated panel 11 and
+    12).  A logo with seven details would still be destroyed by it.  Read it
+    as "this vehicle's panels hold at least this many marks", not as a
+    property of surrounds.
+    """
+    kept = [tuple(int(value) for value in box) for box in boxes]
+    if (
+        not config.enable_hollow_container_filter
+        or feature_mask is None
+        or len(kept) < 2
+    ):
+        return kept, []
+    _count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        feature_mask.astype(np.uint8), connectivity=8
+    )
+    owners = {
+        box: box_structure_owners(feature_mask, labels, stats, box) for box in kept
+    }
+    minimum = max(int(config.hollow_container_min_regions), 1)
+    dropped: list[tuple[int, int, int, int]] = []
+    for box in kept:
+        # Both sides have to be made of something visible before their texels
+        # can be said to be different texels.  Boxes handed to the pipeline
+        # directly, or fitted to a mark this front end cannot see, carry no
+        # such evidence, and absence of it is not evidence of a surround.
+        if not owners[box]:
+            continue
+        strangers = 0
+        for other in kept:
+            if other == box or box[2] * box[3] <= other[2] * other[3]:
+                continue
+            if not owners[other] or intersection_area(box, other) <= 0:
+                continue
+            if owners[box] & owners[other]:
+                continue
+            strangers += 1
+            if strangers >= minimum:
+                dropped.append(box)
+                break
+    if not dropped:
+        return kept, []
+    removed = set(dropped)
+    return [box for box in kept if box not in removed], dropped
+
+
 def _step_overlap_box_group(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
@@ -5288,14 +5905,24 @@ def _step_overlap_box_group(
 ) -> tuple[DetectionState, DetectionStage]:
     """Collapse all intersecting boxes before proximity grouping."""
     domain = state.domain or build_uv_domain_index(uv_mask)
+    # Drop the surrounds first: collapsing every overlap is right for two
+    # detections of one mark and wrong for a border's rectangle, and once the
+    # collapse has happened there is no way back to the marks inside it.
+    boxes, containers = drop_hollow_containers(
+        state.boxes, front_end_component_mask(uv_mask, config, state), config,
+    )
+    kept_boxes = (
+        np.asarray(boxes, dtype=np.int32) if boxes
+        else np.empty((0, 4), dtype=np.int32)
+    )
     candidates = overlap_region_group_candidates(
-        state.boxes, image, config, uv_mask, domain,
+        kept_boxes, image, config, uv_mask, domain,
         defer_domain_validation=True,
     )
     groups = [candidate.bounds for candidate in candidates]
     absorbed = sum(max(len(candidate.members) - 1, 0) for candidate in candidates)
     return DetectionState(
-        state.boxes, groups, candidates, domain,
+        kept_boxes, groups, candidates, domain,
         contrast_response=state.contrast_response,
         contrast_threshold=state.contrast_threshold,
         relief_bridge_response=state.relief_bridge_response,
@@ -5305,10 +5932,14 @@ def _step_overlap_box_group(
         key="overlap_box_group",
         title="Overlap grouping",
         kept=tuple(groups),
+        rejected=tuple(containers),
         adjusted=absorbed,
         detail=(
-            "every positive-area overlap, including one-texel raster "
-            "containment, is collapsed first; "
+            f"{len(containers)} surround"
+            f"{'s' if len(containers) != 1 else ''} dropped, each overlapping "
+            f"{max(int(config.hollow_container_min_regions), 1)} or more marks "
+            "of texels not its own; then every positive-area "
+            "overlap, including one-texel raster containment, is collapsed; "
             f"{absorbed} nested/overlapping box"
             f"{'es' if absorbed != 1 else ''} absorbed"
         ),
@@ -5362,6 +5993,74 @@ def _step_grouped(
             f"and centres within {config.group_axis_center_tolerance:g}x the smaller shared axis "
             "are accepted only across colour- and relief-clear bridges, then rechecked as groups grow; diagonal and weak-overlap "
             "joins are left as smaller groups. Domain recovery validates completed groups and splits invalid ones."
+        ),
+    )
+
+
+def _step_fitted_region_domain(
+    image: np.ndarray,
+    uv_mask: np.ndarray | None,
+    config: MserConfig,
+    state: DetectionState,
+) -> tuple[DetectionState, DetectionStage]:
+    """Reject a fitted region that leaves its UV island.  No recovery."""
+    groups = list(state.groups)
+    rotations = list(state.rotations)
+    domain = state.domain or build_uv_domain_index(uv_mask)
+    if not config.enable_fitted_region_domain_filter or uv_mask is None:
+        return state, DetectionStage(
+            key="fitted_region_domain",
+            title="Domain coverage",
+            kept=tuple(groups),
+            rotations=tuple(rotations),
+            detail="disabled" if uv_mask is not None else "no UV mask",
+        )
+
+    minimum = float(config.min_fitted_region_uv_coverage)
+    kept: list[tuple[int, int, int, int]] = []
+    rejected: list[tuple[int, int, int, int]] = []
+    measured_outline = 0
+    measured_circle = 0
+    worst_kept = 1.0
+    for index, group in enumerate(groups):
+        outline = rotations[index] if index < len(rotations) else None
+        if outline:
+            coverage = outline_uv_coverage(uv_mask, outline, domain)
+            measured_outline += 1
+        else:
+            radius = cached_inscribed_circle_radius(
+                image, uv_mask, group, config, state.circle_radii, domain,
+                state.boxes,
+            )
+            coverage = _shaped_region_uv_coverage(
+                image, uv_mask, group, radius, domain,
+            )
+            measured_circle += radius is not None
+        if coverage < minimum:
+            rejected.append(group)
+            continue
+        kept.append(group)
+        worst_kept = min(worst_kept, coverage)
+
+    return DetectionState(
+        state.boxes, kept, domain=domain,
+        rotations=_rotations_for_subset(rotations, groups, kept),
+        relief_bridge_response=state.relief_bridge_response,
+        island_bits=state.island_bits,
+        relief_edge_mask=state.relief_edge_mask,
+        circle_radii=state.circle_radii,
+    ), DetectionStage(
+        key="fitted_region_domain",
+        title="Domain coverage",
+        kept=tuple(kept),
+        rejected=tuple(rejected),
+        rotations=tuple(_rotations_for_subset(rotations, groups, kept)),
+        detail=(
+            f"keep >= {minimum:.0%} of the fitted shape on one UV island, with "
+            f"no recovery; measured {measured_outline} rotated outline"
+            f"{'s' if measured_outline != 1 else ''} and {measured_circle} "
+            f"inscribed disc{'s' if measured_circle != 1 else ''}, the rest as "
+            f"rectangles; worst kept {worst_kept:.1%}"
         ),
     )
 
@@ -6706,6 +7405,40 @@ def _shaped_region_uv_coverage(
     return box_uv_coverage(uv_mask, group, image.shape, domain)
 
 
+def force_overlapping_groups(
+    groups: list[tuple[int, int, int, int]],
+) -> tuple[list[tuple[int, int, int, int]], int]:
+    """Union every pair of regions whose rectangles share interior area.
+
+    2026-08-26: two output regions that overlap would correct the same texels
+    twice, so by this point overlap has to be gone.  Overlap grouping settles
+    it among the raw boxes, but Domain recovery splits and regroups, and the
+    shape fit moves bounds again, so groups can overlap once more by the time
+    they are final.  Merging is transitive -- a union can reach a third region
+    the halves did not -- so this runs to a fixed point.
+    """
+    merged = list(groups)
+    absorbed = 0
+    changed = True
+    while changed:
+        changed = False
+        for left in range(len(merged)):
+            for right in range(len(merged) - 1, left, -1):
+                if intersection_area(merged[left], merged[right]) <= 0:
+                    continue
+                ax, ay, aw, ah = merged[left]
+                bx, by, bw, bh = merged.pop(right)
+                x0, y0 = min(ax, bx), min(ay, by)
+                x1 = max(ax + aw, bx + bw)
+                y1 = max(ay + ah, by + bh)
+                merged[left] = (x0, y0, x1 - x0, y1 - y0)
+                absorbed += 1
+                changed = True
+            if changed:
+                break
+    return merged, absorbed
+
+
 def _step_overlap_group(
     image: np.ndarray,
     uv_mask: np.ndarray | None,
@@ -6726,20 +7459,27 @@ def _step_overlap_group(
     domain = state.domain or build_uv_domain_index(uv_mask)
 
     if not config.enable_circular_groups or len(groups) < 2:
+        groups, forced = force_overlapping_groups(groups)
+        groups.sort(key=lambda group: (group[1], group[0]))
         return DetectionState(
             state.boxes, groups, domain=domain,
             relief_bridge_response=state.relief_bridge_response,
-        island_bits=state.island_bits,
+            island_bits=state.island_bits,
             relief_edge_mask=state.relief_edge_mask,
             circle_radii=state.circle_radii,
         ), DetectionStage(
             key="overlap_group",
             title="Post-circle forced merge",
             kept=tuple(groups),
+            adjusted=forced,
             detail=(
-                "circular groups disabled"
-                if not config.enable_circular_groups
-                else "fewer than two recovered groups; nothing to circle-merge"
+                (
+                    "circular groups disabled"
+                    if not config.enable_circular_groups
+                    else "fewer than two recovered groups; nothing to circle-merge"
+                )
+                + f"; {forced} overlapping region"
+                + f"{'s' if forced != 1 else ''} force-merged"
             ),
         )
 
@@ -6863,6 +7603,10 @@ def _step_overlap_group(
         merged.append(bounds)
         absorbed += len(indices) - 1
     merged.extend(group for index, group in enumerate(groups) if index not in consumed)
+    # The circle merge is selective by design -- it only reconnects a control
+    # whose cardinal arms earned a UV-valid inscribed circle.  Whatever it
+    # leaves behind still has to come out of this stage non-overlapping.
+    merged, forced = force_overlapping_groups(merged)
     merged.sort(key=lambda group: (group[1], group[0]))
 
     return DetectionState(
@@ -6877,9 +7621,11 @@ def _step_overlap_group(
         kept=tuple(merged),
         detail=(
             f"forced {absorbed} cardinal fragment{'s' if absorbed != 1 else ''} "
-            "into UV-valid inscribed circles; ordinary rectangle proximity is not retried"
+            "into UV-valid inscribed circles; ordinary rectangle proximity is "
+            f"not retried; {forced} still-overlapping region"
+            f"{'s' if forced != 1 else ''} then force-merged"
         ),
-        adjusted=absorbed,
+        adjusted=absorbed + forced,
     )
 
 def _step_final_padding(
@@ -7149,6 +7895,7 @@ GROUP_STAGE_KEYS = frozenset(
         "overlap_group",
         "pattern_group",
         "rotated_bounds",
+        "fitted_region_domain",
         "blob_shape",
         "ring_smoothness",
         "size",
@@ -7158,6 +7905,7 @@ GROUP_STAGE_KEYS = frozenset(
 
 PIPELINE_STEPS = (
     _step_mser,
+    _step_front_end_boxes,
     _step_stroke_width,
     _step_box_filter,
     _step_repeat_texture,
@@ -7166,6 +7914,7 @@ PIPELINE_STEPS = (
     _step_region_domain,
     _step_overlap_group,
     _step_rotated_bounds,
+    _step_fitted_region_domain,
     _step_pattern_group,
     _step_region_flatness,
     _step_relief_glyph_structure,
@@ -7187,6 +7936,7 @@ STEP_INDEX = {
     for index, name in enumerate(
         (
             "boxes",
+            "front_end_boxes",
             "stroke_width",
             "box_filter",
             "repeat_texture",
@@ -7195,6 +7945,7 @@ STEP_INDEX = {
             "region_domain",
             "overlap_group",
             "rotated_bounds",
+            "fitted_region_domain",
             "pattern_group",
             "region_flatness",
             "relief_glyph_structure",
@@ -7256,7 +8007,7 @@ PARAMETER_STEP = {
     "contrast_open_px": STEP_INDEX["boxes"],
     "contrast_close_px": STEP_INDEX["boxes"],
     "contrast_min_component_px": STEP_INDEX["boxes"],
-    "contrast_merge_gap_px": STEP_INDEX["boxes"],
+    "contrast_merge_gap_px": STEP_INDEX["boxes"],  # both stages, via the detector
     "contrast_max_coverage": STEP_INDEX["boxes"],
     "enable_contrast_continuity_grouping": STEP_INDEX["grouped"],
     "contrast_bridge_min_response": STEP_INDEX["grouped"],
@@ -7305,8 +8056,12 @@ PARAMETER_STEP = {
     "circular_group_colour_tolerance": STEP_INDEX["grouped"],
     "circular_group_max_corner_content": STEP_INDEX["grouped"],
     "circular_group_min_regions": STEP_INDEX["grouped"],
+    "enable_hollow_container_filter": STEP_INDEX["overlap_box_group"],
+    "hollow_container_min_regions": STEP_INDEX["overlap_box_group"],
     "enable_region_domain_filter": STEP_INDEX["grouped"],
     "min_region_uv_coverage": STEP_INDEX["region_domain"],
+    "enable_fitted_region_domain_filter": STEP_INDEX["fitted_region_domain"],
+    "min_fitted_region_uv_coverage": STEP_INDEX["fitted_region_domain"],
     "enable_pattern_group_filter": STEP_INDEX["pattern_group"],
     "max_pattern_autocorrelation": STEP_INDEX["pattern_group"],
     "pattern_window_scale": STEP_INDEX["pattern_group"],
@@ -7423,6 +8178,7 @@ def run_detection(
     config: MserConfig | None = None,
     previous: DetectionRun | None = None,
     initial_boxes: np.ndarray | None = None,
+    initial_component_boxes: np.ndarray | None = None,
     initial_contrast_response: np.ndarray | None = None,
     initial_contrast_threshold: float | None = None,
     initial_relief_bridge_response: np.ndarray | None = None,
@@ -7443,23 +8199,41 @@ def run_detection(
         boxes = np.asarray(initial_boxes, dtype=np.int32).reshape(-1, 4)
         if config.box_source == "foreground":
             title = "Foreground-mask boxes"
-            detail = "precomputed dominant-background foreground mask"
+            detail = front_end_detail(config)
         elif config.box_source == "opacity_mask":
             title = "Opacity-mask boxes"
-            detail = "precomputed authored opacity-mask foreground"
+            detail = front_end_detail(config)
         elif config.box_source in {"contrast", "contrast_gpu"}:
             title = "Local-contrast GPU boxes" if config.box_source == "contrast_gpu" else "Local-contrast CPU boxes"
-            detail = "precomputed masked local-contrast boxes and bridge response"
+            detail = front_end_detail(config)
         elif config.box_source in {"edge", "edge_gpu"}:
             title = "Edge GPU boxes" if config.box_source == "edge_gpu" else "Edge boxes"
-            detail = "precomputed edge boxes"
+            detail = front_end_detail(config)
         else:
             title = "MSER boxes"
-            detail = "precomputed MSER boxes"
+            detail = front_end_detail(config)
+        components = (
+            np.asarray(initial_component_boxes, dtype=np.int32).reshape(-1, 4)
+            if initial_component_boxes is not None
+            else boxes
+        )
         raw_stage = DetectionStage(
-            key="mser", title=title,
+            key="mser", title=f"{title.removesuffix(' boxes')} components",
+            kept=tuple(tuple(int(value) for value in box) for box in components),
+            detail=(
+                f"{detail}; {len(components)} component"
+                f"{'s' if len(components) != 1 else ''} detected"
+            ),
+        )
+        joined_stage = DetectionStage(
+            key="front_end_boxes", title=title,
             kept=tuple(tuple(int(value) for value in box) for box in boxes),
-            detail=detail,
+            adjusted=max(len(components) - len(boxes), 0),
+            detail=(
+                f"{len(components)} component"
+                f"{'s' if len(components) != 1 else ''} became {len(boxes)} box"
+                f"{'es' if len(boxes) != 1 else ''}"
+            ),
         )
         if previous is not None and len(previous.entry_states) == len(PIPELINE_STEPS):
             start = first_changed_step(previous.config, config)
@@ -7470,15 +8244,19 @@ def run_detection(
                     entry_states=previous.entry_states,
                     resumed_from=start,
                 )
-            if start > 0:
+            if start > 1:
                 stages = list(previous.stages[:start])
                 entry_states = list(previous.entry_states[:start])
                 state = previous.entry_states[start].copy()
             else:
-                stages = [raw_stage]
-                entry_states = [DetectionState(np.empty((0, 4), dtype=np.int32), [])]
+                stages = [raw_stage, joined_stage]
+                entry_states = [
+                    DetectionState(np.empty((0, 4), dtype=np.int32), []),
+                    DetectionState(np.empty((0, 4), dtype=np.int32), []),
+                ]
                 state = DetectionState(
                     boxes.copy(), [],
+                    component_boxes=components,
                     contrast_response=initial_contrast_response,
                     contrast_threshold=initial_contrast_threshold,
                     relief_bridge_response=initial_relief_bridge_response,
@@ -7486,12 +8264,16 @@ def run_detection(
                     relief_edge_mask=initial_relief_edge_mask,
                     repeat_texture=initial_repeat_texture,
                 )
-                start = 1
+                start = 2
         else:
-            stages = [raw_stage]
-            entry_states = [DetectionState(np.empty((0, 4), dtype=np.int32), [])]
+            stages = [raw_stage, joined_stage]
+            entry_states = [
+                DetectionState(np.empty((0, 4), dtype=np.int32), []),
+                DetectionState(np.empty((0, 4), dtype=np.int32), []),
+            ]
             state = DetectionState(
                 boxes.copy(), [],
+                component_boxes=components,
                 contrast_response=initial_contrast_response,
                 contrast_threshold=initial_contrast_threshold,
                 relief_bridge_response=initial_relief_bridge_response,
@@ -7499,7 +8281,7 @@ def run_detection(
                 relief_edge_mask=initial_relief_edge_mask,
                 repeat_texture=initial_repeat_texture,
             )
-            start = 1
+            start = 2
     else:
         start = 0
     if initial_boxes is None and previous is not None and len(previous.entry_states) == len(PIPELINE_STEPS):
@@ -7545,6 +8327,8 @@ def run_detection(
         # filter constructor to remember to thread it through.
         if state.relief_edge_mask is None:
             state.relief_edge_mask = entry_states[-1].relief_edge_mask
+        if state.component_boxes is None:
+            state.component_boxes = entry_states[-1].component_boxes
         if not state.circle_radii:
             state.circle_radii = entry_states[-1].circle_radii
         if state.repeat_texture is None:

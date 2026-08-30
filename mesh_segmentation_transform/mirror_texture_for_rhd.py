@@ -13,8 +13,9 @@ The correction happens in three passes, each narrower than the last:
 1.  Rasterise every husk triangle's UVs into a mirror mask, unioned over all
     parts sharing the material.  A texel any part rigid-transforms is excluded:
     flipping it would fix one part and break another.
-2.  Flip whole UV islands that carry glyphs and are reflection-symmetric, so
-    the flipped content lands back inside the same silhouette.
+2.  Flip whole UV islands that carry glyphs and are reflection-symmetric.  On
+    an overwhelmingly simple-chart atlas, source UV geometry can instead
+    authorise symmetric triangles/rectangles and fitted parallelograms directly.
 3.  Flip anything still backwards in place, within its own detected bounds.  A
     region overrunning its UV island cannot come out perfect, and is flipped
     anyway and reported rather than left reliably backwards.
@@ -119,6 +120,7 @@ from mesh_segmentation_transform.production_texture_detection import (  # noqa: 
 )
 from mesh_segmentation_transform.parallelogram_fit import (  # noqa: E402
     enclosing_parallelogram,
+    fit_parallelogram,
 )
 from mesh_segmentation_transform.extract_uv_island_paths import (  # noqa: E402
     merge_overlapping_mask_crops,
@@ -207,6 +209,18 @@ class RhdTextureConfig:
     # meant to recover the island's own axis, not to hunt for a better-looking
     # one somewhere else in the box.
     island_axis_search_ratio: float = 0.02
+    # 2026-08-30: a texture atlas built almost entirely from simple UV charts
+    # does not need a glyph detection to grant a chart its own reflection.
+    # This is deliberately an area share over *mirrorable* charts: one large
+    # irregular chart is enough to retain the established glyph-led plan, while
+    # harmless raster specks cannot veto a dashboard made of regular controls.
+    enable_simple_uv_domain_fallback: bool = True
+    simple_uv_min_area_px: int = 64
+    simple_uv_min_area_share: float = 0.95
+    # A fitted frame has to explain every source UV boundary corner.  A
+    # trapezoid can be enclosed by a parallelogram but must never be sheared
+    # into one.
+    simple_uv_max_boundary_error_px: float = 1.5
     # Share of a detected region that must sit inside the mirror mask before
     # the region counts as ours to fix.
     min_region_mirror_overlap: float = 0.5
@@ -488,6 +502,10 @@ class IslandFlip:
     # Whole texels the applied mirror line sits away from twice the bounding
     # box centre, so a plan says which line it turned the island over about.
     axis_shift: int = 0
+    # The fitted chart frame used for an oblique reflection.  ``None`` keeps
+    # the ordinary island-centred flat reflection.
+    rotated_corners: tuple[tuple[float, float], ...] | None = None
+    rotated_axis: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2292,6 +2310,7 @@ class DomainMasks:
     axis_map: np.ndarray | None = None
     mirrored_uv: tuple[np.ndarray, ...] = ()
     mirrored_xyz: tuple[np.ndarray, ...] = ()
+    island_triangle_groups: tuple[tuple[np.ndarray, ...], ...] | None = None
     foreground_islands: tuple[UvIslandCrop, ...] | None = None
     foreground_island_padding_px: int = -1
     island_label_count: int = 0
@@ -2313,11 +2332,16 @@ def domain_uv_islands(
         and masks.foreground_island_padding_px == padding_px
     ):
         return masks.foreground_islands
+    if masks.island_triangle_groups is None:
+        masks.island_triangle_groups = uv_island_triangle_groups(
+            masks.mirrored_uv, masks.mirrored_xyz,
+        )
     islands = mirrored_uv_island_crops(
         masks.mirrored_uv,
         masks.mirror,
         padding_px,
         masks.mirrored_xyz,
+        masks.island_triangle_groups,
     )
     masks.foreground_islands = islands
     masks.foreground_island_padding_px = padding_px
@@ -2407,29 +2431,19 @@ def domain_skew_frames(
     return masks.skew_frames
 
 
-def mirrored_uv_island_crops(
+def uv_island_triangle_groups(
     triangles: tuple[np.ndarray, ...],
-    mirror_mask: np.ndarray,
-    padding_px: int = 0,
     surfaces: tuple[np.ndarray, ...] = (),
-) -> tuple[UvIslandCrop, ...]:
-    """Rasterise topological islands once and retain only their padded crops.
+) -> tuple[tuple[np.ndarray, ...], ...]:
+    """Group source UV triangles by the same chart topology as pass two.
 
-    ``surfaces`` carries the same triangles' world-metre corners, index for
-    index and corner for corner.  When it is supplied, two triangles only join
-    across a UV corner if their meshes meet there too: an atlas can pack the
-    charts of two separate surfaces so that they share a UV vertex, and the
-    Lexus LC500 does exactly that, which without the surface test hands the
-    detector one island covering two unrelated pieces of geometry.
+    2026-08-30: retain the source groups as well as their raster masks.  A UV
+    chart's authored corners are the exact, cheap input for the simple-chart
+    fallback; recovering them from a raster contour only reintroduces sampling
+    error and repeats work the DAE loader already did.
     """
-    height, width = mirror_mask.shape[:2]
-    padding = max(int(padding_px), 0)
     if not triangles:
-        bounds = _mask_crop_bounds(mirror_mask, padding)
-        if bounds is None:
-            return ()
-        x0, y0, x1, y1 = bounds
-        return (UvIslandCrop(bounds, mirror_mask[y0:y1, x0:x1].copy()),)
+        return ()
 
     parents = list(range(len(triangles)))
 
@@ -2473,11 +2487,38 @@ def mirrored_uv_island_crops(
     groups: dict[int, list[np.ndarray]] = {}
     for index, triangle in enumerate(triangles):
         groups.setdefault(find(index), []).append(triangle)
+    return tuple(tuple(group) for group in groups.values())
+
+
+def mirrored_uv_island_crops(
+    triangles: tuple[np.ndarray, ...],
+    mirror_mask: np.ndarray,
+    padding_px: int = 0,
+    surfaces: tuple[np.ndarray, ...] = (),
+    groups: tuple[tuple[np.ndarray, ...], ...] | None = None,
+) -> tuple[UvIslandCrop, ...]:
+    """Rasterise topological islands once and retain only their padded crops.
+
+    ``surfaces`` carries the same triangles' world-metre corners, index for
+    index and corner for corner.  When it is supplied, two triangles only join
+    across a UV corner if their meshes meet there too: an atlas can pack the
+    charts of two separate surfaces so that they share a UV vertex, and the
+    Lexus LC500 does exactly that, which without the surface test hands the
+    detector one island covering two unrelated pieces of geometry.
+    """
+    height, width = mirror_mask.shape[:2]
+    padding = max(int(padding_px), 0)
+    if not triangles:
+        bounds = _mask_crop_bounds(mirror_mask, padding)
+        if bounds is None:
+            return ()
+        x0, y0, x1, y1 = bounds
+        return (UvIslandCrop(bounds, mirror_mask[y0:y1, x0:x1].copy()),)
 
     crops: list[UvIslandCrop] = []
     seen: set[tuple[tuple[int, int, int, int], bytes]] = set()
-    for group in groups.values():
-        island = rasterise_uv_triangles_crop(group, mirror_mask, padding)
+    for group in groups or uv_island_triangle_groups(triangles, surfaces):
+        island = rasterise_uv_triangles_crop(list(group), mirror_mask, padding)
         if island is None:
             continue
         signature = (island.bounds, island.mask.tobytes())
@@ -3122,6 +3163,206 @@ def _bounds_about_shifted_axis(
         if moved[1] < 0 or moved[1] + moved[3] > height:
             return None
     return moved
+
+
+def _island_surface_axis(
+    component: np.ndarray,
+    axis_map: np.ndarray | None,
+    bounds: tuple[int, int, int, int],
+    symmetry_threshold: float,
+) -> str:
+    """The one texture direction the surface permits this chart to reverse."""
+    x, y, w, h = bounds
+    if axis_map is not None:
+        values = axis_map[y : y + h, x : x + w][component]
+        return (
+            "horizontal"
+            if int((values == AXIS_HORIZONTAL).sum()) >= int((values == AXIS_VERTICAL).sum())
+            else "vertical"
+        )
+    horizontal = _reflection_similarity(component, np.fliplr(component))
+    return "horizontal" if horizontal >= symmetry_threshold else "vertical"
+
+
+def _source_uv_boundary_points(
+    triangles: tuple[np.ndarray, ...],
+    width: int,
+    height: int,
+) -> np.ndarray | None:
+    """The authored outer UV corners of one unwrapped triangle group."""
+    # A chart crossing the UV tile edge is split by rasterisation.  Its source
+    # corners no longer describe one in-atlas parallelogram, so leave it to
+    # the established symmetry/in-place paths rather than manufacture one.
+    if any(
+        float(triangle.min()) < 0.0 or float(triangle.max()) > 1.0
+        for triangle in triangles
+    ):
+        return None
+    points: dict[tuple[int, int], tuple[float, float]] = {}
+    edges: dict[tuple[tuple[int, int], tuple[int, int]], int] = {}
+    for triangle in triangles:
+        pixel = np.asarray(triangle, dtype=np.float64).reshape(-1, 2).copy()
+        pixel[:, 0] *= max(width - 1, 1)
+        pixel[:, 1] = (1.0 - pixel[:, 1]) * max(height - 1, 1)
+        keys = [
+            (int(round(float(px) * 100_000)), int(round(float(py) * 100_000)))
+            for px, py in pixel
+        ]
+        points.update({key: tuple(point) for key, point in zip(keys, pixel)})
+        for start, end in zip(keys, keys[1:] + keys[:1]):
+            edge = tuple(sorted((start, end)))
+            edges[edge] = edges.get(edge, 0) + 1
+    boundary_keys = {
+        point for edge, uses in edges.items() if uses == 1 for point in edge
+    }
+    if len(boundary_keys) < 4:
+        return None
+    return np.asarray([points[key] for key in boundary_keys], dtype=np.float64)
+
+
+def source_uv_island_corners(
+    masks: DomainMasks,
+    components: tuple[int, np.ndarray, np.ndarray],
+) -> dict[int, np.ndarray]:
+    """Map each labelled chart to its authored boundary corners in pixels."""
+    if masks.island_triangle_groups is None:
+        masks.island_triangle_groups = uv_island_triangle_groups(
+            masks.mirrored_uv, masks.mirrored_xyz,
+        )
+    _count, labels, _stats = components
+    height, width = labels.shape
+    corners: dict[int, list[np.ndarray]] = {}
+    for group in masks.island_triangle_groups:
+        crop = rasterise_uv_triangles_crop(list(group), masks.mirror)
+        if crop is None:
+            continue
+        x0, y0, x1, y1 = crop.bounds
+        owners = labels[y0:y1, x0:x1][crop.mask]
+        owners = owners[owners > 0]
+        if not len(owners):
+            continue
+        label, claimed = np.unique(owners, return_counts=True)
+        index = int(np.argmax(claimed))
+        # A source group straddling labels is not a single chart in the plan.
+        if int(claimed[index]) != int(crop.mask.sum()):
+            continue
+        source = _source_uv_boundary_points(tuple(group), width, height)
+        if source is not None:
+            corners.setdefault(int(label[index]), []).append(source)
+    return {
+        label: np.concatenate(points, axis=0)
+        for label, points in corners.items()
+    }
+
+
+def _parallelogram_chart_outline(
+    boundary: np.ndarray | None,
+    max_error_px: float,
+) -> tuple[tuple[float, float], ...] | None:
+    """Fit a parallelogram directly to the authored UV boundary corners."""
+    if boundary is None or len(boundary) < 4:
+        return None
+    hull = cv2.convexHull(boundary.astype(np.float32)).reshape(-1, 2)
+    fit = fit_parallelogram(hull, boundary)
+    if fit is None:
+        return None
+    corners = np.asarray(fit.corners, dtype=np.float64)
+    starts = corners
+    ends = np.roll(corners, -1, axis=0)
+    edges = ends - starts
+    length = np.linalg.norm(edges, axis=1)
+    if bool((length <= 1e-6).any()):
+        return None
+    relative = boundary[:, None, :] - starts[None, :, :]
+    cross = np.abs(relative[:, :, 0] * edges[None, :, 1] - relative[:, :, 1] * edges[None, :, 0])
+    distance = cross / length[None, :]
+    if float(distance.min(axis=1).max()) > max(float(max_error_px), 0.0):
+        return None
+    return fit.corners
+
+
+def simple_uv_domain_flips(
+    mirror_mask: np.ndarray,
+    config: RhdTextureConfig,
+    axis_map: np.ndarray | None,
+    components: tuple[int, np.ndarray, np.ndarray],
+    source_corners: dict[int, np.ndarray] | None = None,
+) -> list[IslandFlip]:
+    """Plan every simple chart only when they dominate this mirrorable atlas.
+
+    Symmetric triangles and rectangles retain the established flat reflection.
+    A non-rectangular quadrilateral gets the same oblique reflection used for a
+    fitted glyph region, which is the one-pass form of deskew, mirror, reskew.
+    A sizeable irregular chart makes the whole shortcut decline, preserving the
+    old glyph-led path for mixed atlases.
+    """
+    if not config.enable_simple_uv_domain_fallback:
+        return []
+    count, labels, stats = components
+    threshold = min(max(float(config.min_island_symmetry), 0.0), 1.0)
+    min_area = max(int(config.simple_uv_min_area_px), 1)
+    simple_area = total_area = 0
+    planned: list[IslandFlip] = []
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        component = labels[y : y + h, x : x + w] == label
+        if not bool(component.any()):
+            continue
+        total_area += area
+        bounds = (x, y, w, h)
+        axis = _island_surface_axis(component, axis_map, bounds, threshold)
+        horizontal = _reflection_similarity(component, np.fliplr(component))
+        vertical = _reflection_similarity(component, np.flipud(component))
+        extent = w if axis == "horizontal" else h
+        similarity, shift = _shifted_reflection_similarity(
+            component,
+            axis,
+            int(round(extent * max(config.island_axis_search_ratio, 0.0))),
+        )
+        shifted_bounds = _bounds_about_shifted_axis(
+            bounds, axis, shift, mirror_mask.shape[:2]
+        )
+        if similarity >= threshold and shifted_bounds is not None:
+            simple_area += area
+            if axis == "horizontal":
+                horizontal = similarity
+            else:
+                vertical = similarity
+            planned.append(
+                IslandFlip(
+                    label, shifted_bounds, area, axis, horizontal, vertical, 0,
+                    shift,
+                )
+            )
+            continue
+        corners = _parallelogram_chart_outline(
+            None if source_corners is None else source_corners.get(label),
+            config.simple_uv_max_boundary_error_px,
+        )
+        rotated_axis = (
+            rotated_axis_for_surface_axis(corners, axis)
+            if corners is not None
+            else None
+        )
+        if corners is None or rotated_axis is None:
+            continue
+        simple_area += area
+        planned.append(
+            IslandFlip(
+                label, bounds, area, axis, horizontal, vertical, 0,
+                rotated_corners=corners, rotated_axis=rotated_axis,
+            )
+        )
+    required = min(max(float(config.simple_uv_min_area_share), 0.0), 1.0)
+    if total_area == 0 or simple_area / total_area < required:
+        return []
+    return planned
 
 
 def plan_island_flips(
@@ -7328,16 +7569,38 @@ def build_rhd_texture(
         texture=texture_member,
     )
     components = domain_island_labels(masks, config.detection_crop_padding_px)
-    flips, flipped_islands = plan_island_flips(
-        mirror_mask, mirrored_regions, config, masks.axis_map, components
+    source_corners = source_uv_island_corners(masks, components)
+    # 2026-08-30: this gate is deliberately outside `plan_island_flips`.
+    # Geometry-complete charts do not need glyph evidence, while the original
+    # glyph-led planner remains callable unchanged for every mixed atlas.
+    flips = (
+        simple_uv_domain_flips(
+            mirror_mask, config, masks.axis_map, components, source_corners,
+        )
+        if masks.mirrored_uv
+        else []
     )
+    if flips:
+        flipped_islands = np.zeros_like(mirror_mask)
+        labels = components[1]
+        for flip in flips:
+            flipped_islands |= labels == flip.label
+    else:
+        flips, flipped_islands = plan_island_flips(
+            mirror_mask, mirrored_regions, config, masks.axis_map, components,
+        )
     label_image = components[1] if flips else None
     # The plan is recorded as it is applied, so every other map of the material
     # can be turned over by exactly the same steps in exactly the same order.
     steps: list[FlipStep] = []
     for flip in flips:
-        steps.append(FlipStep(flip.bounds, flip.axis, flip.label))
-    log(f"  pass 2: flipped {len(flips)} symmetric island(s) "
+        steps.append(
+            FlipStep(
+                flip.bounds, flip.axis, flip.label,
+                flip.rotated_corners, flip.rotated_axis,
+            )
+        )
+    log(f"  pass 2: flipped {len(flips)} whole island(s) "
         f"({sum(1 for f in flips if f.axis == 'horizontal')} horizontal, "
         f"{sum(1 for f in flips if f.axis == 'vertical')} vertical)")
 

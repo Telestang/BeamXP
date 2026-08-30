@@ -216,8 +216,11 @@ class PipelineIntegrationTests(unittest.TestCase):
         run = run_detection(image, domain, config)
 
         self.assertEqual(boxes.tolist(), [[10, 8, 12, 16]])
-        self.assertEqual(run.stages[0].title, "Opacity-mask boxes")
-        self.assertEqual(run.stages[0].kept, ((10, 8, 12, 16),))
+        joined = run.stages[STEP_INDEX["front_end_boxes"]]
+        self.assertEqual(run.stages[STEP_INDEX["boxes"]].title,
+                         "Opacity-mask components")
+        self.assertEqual(joined.title, "Opacity-mask boxes")
+        self.assertEqual(joined.kept, ((10, 8, 12, 16),))
 
     def test_the_colour_path_uses_the_foreground_front_end_by_default(self) -> None:
         # Authored UI/emissive atlases are now detected from their foreground
@@ -225,15 +228,21 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG.box_source, "foreground")
         image = embossed_text()
         run = run_detection(image, None, DEFAULT_CONFIG)
-        self.assertEqual(run.stages[0].title, "Foreground-mask boxes")
+        joined = run.stages[STEP_INDEX["front_end_boxes"]]
+        self.assertEqual(run.stages[STEP_INDEX["boxes"]].title,
+                         "Foreground-mask components")
+        self.assertEqual(joined.title, "Foreground-mask boxes")
         self.assertEqual(
-            len(run.stages[0].kept), len(detect_foreground_boxes(image, None, DEFAULT_CONFIG))
+            len(joined.kept), len(detect_foreground_boxes(image, None, DEFAULT_CONFIG))
         )
 
-    def test_the_edge_source_renames_the_first_stage(self) -> None:
+    def test_the_edge_source_renames_the_first_stages(self) -> None:
         run = run_detection(embossed_text(), None, EDGE_CONFIG)
-        self.assertEqual(run.stages[0].title, "Edge boxes")
-        self.assertIn("gradient", run.stages[0].detail)
+        self.assertEqual(run.stages[STEP_INDEX["boxes"]].title, "Edge components")
+        self.assertIn("gradient", run.stages[STEP_INDEX["boxes"]].detail)
+        self.assertEqual(
+            run.stages[STEP_INDEX["front_end_boxes"]].title, "Edge boxes"
+        )
 
     def test_changing_an_edge_parameter_reruns_from_the_first_step(self) -> None:
         # Otherwise the harness would show stale boxes while it is being tuned.
@@ -1079,7 +1088,10 @@ class StrokeWidthTests(unittest.TestCase):
         stage = next(s for s in run.stages if s.key == "stroke_width")
         self.assertEqual(stage.detail, "disabled")
         self.assertEqual(len(stage.rejected), 0)
-        self.assertEqual(len(stage.kept), len(run.stages[0].kept))
+        # The boxes the front end consolidated, not the components underneath.
+        self.assertEqual(
+            len(stage.kept), len(run.stages[STEP_INDEX["front_end_boxes"]].kept)
+        )
 
     def test_every_parameter_maps_to_a_pipeline_step(self) -> None:
         # A parameter left out of the table resumes from the wrong step and
@@ -2001,8 +2013,10 @@ class RotatedBoundsTests(unittest.TestCase):
         called the answer the region's.
         """
         from mesh_segmentation_transform.annotate_texture_regions import STEP_INDEX
-        self.assertEqual(
-            STEP_INDEX["rotated_bounds"] + 1, STEP_INDEX["pattern_group"]
+        # Ordering, not adjacency: 2026-08-26 put the terminal domain check
+        # between the two, which reads the fitted shape without scoring it.
+        self.assertLess(
+            STEP_INDEX["rotated_bounds"], STEP_INDEX["pattern_group"]
         )
         self.assertLess(
             STEP_INDEX["pattern_group"], STEP_INDEX["region_flatness"]
