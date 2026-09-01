@@ -57,7 +57,7 @@ class MaterialTransitionProbeTests(unittest.TestCase):
         loop_mask[5:25, 5:25] = False
         loop = self.candidate((100, 0, 30, 30), loop_mask)
         classify_material_transition_candidates(
-            [trace, loop], 100, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3,
+            [trace, loop], 100, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3, 2.0, 3,
         )
         self.assertTrue(trace.discarded)
         self.assertTrue(loop.discarded)
@@ -65,9 +65,62 @@ class MaterialTransitionProbeTests(unittest.TestCase):
     def test_short_dense_trace_is_discarded_below_the_broad_gate(self) -> None:
         trace = self.candidate((0, 0, 34, 9), np.ones((9, 34), dtype=bool))
         classify_material_transition_candidates(
-            [trace], 512, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3,
+            [trace], 512, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3, 2.0, 3,
         )
         self.assertTrue(trace.discarded)
+
+    def test_compact_shallow_body_is_a_material_transition(self) -> None:
+        mask = np.zeros((97, 53), dtype=bool)
+        mask[:5] = True
+        mask[:, :5] = True
+        mask[:, -5:] = True
+        transition = self.candidate(
+            (0, 0, 53, 97), mask, detail=3.0,
+        )
+        transition.body_void_share = 0.80
+        classify_material_transition_candidates(
+            [transition], 512, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3, 2.0, 3,
+        )
+        self.assertTrue(transition.discarded)
+
+    def test_compact_rim_fragment_is_a_material_transition(self) -> None:
+        mask = np.zeros((42, 39), dtype=bool)
+        mask[:4] = True
+        mask[:, :4] = True
+        mask[:, -4:] = True
+        transition = self.candidate(
+            (0, 0, 39, 42), mask, detail=8.0,
+        )
+        transition.inside_rim = True
+        classify_material_transition_candidates(
+            [transition], 512, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3, 2.0, 3,
+        )
+        self.assertTrue(transition.discarded)
+
+    def test_a_loop_with_several_interior_holes_is_kept_as_glyph_detail(self) -> None:
+        mask = np.ones((30, 30), dtype=bool)
+        for row, column in ((4, 4), (4, 18), (18, 4), (18, 18)):
+            mask[row:row + 6, column:column + 6] = False
+        glyph = self.candidate((0, 0, 30, 30), mask, detail=3.0)
+
+        classify_material_transition_candidates(
+            [glyph], 10, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3, 2.0, 3,
+        )
+
+        self.assertEqual(glyph.region.holes, 4)
+        self.assertFalse(glyph.discarded)
+
+    def test_a_quiet_multi_hole_loop_remains_a_material_transition(self) -> None:
+        mask = np.ones((30, 30), dtype=bool)
+        for row, column in ((4, 4), (4, 18), (18, 4), (18, 18)):
+            mask[row:row + 6, column:column + 6] = False
+        transition = self.candidate((0, 0, 30, 30), mask, detail=0.5)
+
+        classify_material_transition_candidates(
+            [transition], 10, 0.03, 6.0, 4.5, 10, 3.5, 6_000, 3, 2.0, 3,
+        )
+
+        self.assertTrue(transition.discarded)
 
     def test_context_uses_mark_gap_not_the_overlapping_bounds(self) -> None:
         frame_mask = np.zeros((20, 20), dtype=bool)

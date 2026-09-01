@@ -33,8 +33,12 @@ def tiny_corpus(directory: Path, count: int = 3) -> Path:
         colour[12:20, 8:size - 8] = 220        # something to fire on
         domains = np.zeros((size, size), dtype=np.uint16)
         domains[4:size - 4, 4:size - 4] = 1
+        normal = None
+        if index == 0:
+            normal = np.full((size, size, 3), (128, 128, 255), dtype=np.uint8)
+            normal[12:20, 8:size - 8, 0] = 220
         records.append(
-            write_texture(directory, f"tiny_{index}", colour, domains, None)
+            write_texture(directory, f"tiny_{index}", colour, domains, normal)
         )
     (directory / MANIFEST_NAME).write_text(json.dumps({"textures": records}))
     return directory
@@ -158,7 +162,7 @@ class GlyphLabWindowTests(unittest.TestCase):
 
     @staticmethod
     def settle(app, timeout: float = 10.0) -> None:
-        """Wait out the detection so destroy does not race a live worker.
+        """Wait out detection and raster workers before the window goes away.
 
         Releasing the Tk variables and the poll timer used to happen here, by
         name.  It belongs in ``GlyphLab.destroy``, which now does it by type --
@@ -166,7 +170,7 @@ class GlyphLabWindowTests(unittest.TestCase):
         missed off it surfaced as a crash in some later, unrelated test.
         """
         deadline = time.monotonic() + timeout
-        while app._busy and time.monotonic() < deadline:
+        while (app._busy or app._render_busy) and time.monotonic() < deadline:
             app.update()
             app.after(10)
         app.update()
@@ -176,6 +180,92 @@ class GlyphLabWindowTests(unittest.TestCase):
         """`configure` alone was enough to break this once."""
         app = self.build()
         self.assertEqual(len(app.textures), 3)
+
+    def test_the_cursor_marks_background_work(self) -> None:
+        app = self.build()
+        app._busy = True
+        app._refresh_busy_cursor()
+        self.assertEqual(app.canvas.cget("cursor"), "wait")
+        app._busy = False
+        app._refresh_busy_cursor()
+        self.assertEqual(app.canvas.cget("cursor"), "")
+
+    def test_normal_source_uses_only_textures_with_normal_maps(self) -> None:
+        from glyph_lab.app import SOURCE_NORMAL_EDGE_STEEPNESS
+
+        app = self.build()
+        app.source_var.set(SOURCE_NORMAL_EDGE_STEEPNESS)
+        app._on_source_change()
+        self.settle(app)
+        self.assertEqual([texture.name for texture in app.textures], ["tiny_0"])
+
+    def test_source_switch_shows_only_its_detector_parameters(self) -> None:
+        from glyph_lab.app import (
+            SOURCE_COLOUR,
+            SOURCE_NORMAL_EDGE_STEEPNESS,
+        )
+
+        app = self.build()
+        self.assertEqual(
+            list(app._source_box.cget("values")),
+            [SOURCE_COLOUR, SOURCE_NORMAL_EDGE_STEEPNESS],
+        )
+        self.assertTrue(any(
+            row.winfo_ismapped() for row in app._config_rows.values()
+        ))
+        self.assertFalse(any(
+            row.winfo_ismapped() for row in app._normal_config_rows.values()
+        ))
+
+        app.source_var.set(SOURCE_NORMAL_EDGE_STEEPNESS)
+        app._on_source_change()
+        self.settle(app)
+        self.assertFalse(any(
+            row.winfo_ismapped() for row in app._config_rows.values()
+        ))
+        self.assertTrue(any(
+            row.winfo_ismapped() for row in app._normal_config_rows.values()
+        ))
+
+
+    def test_normal_edge_source_measures_normal_direction_changes(self) -> None:
+        from glyph_lab.app import SOURCE_NORMAL_EDGE_STEEPNESS
+
+        app = self.build()
+        app.source_var.set(SOURCE_NORMAL_EDGE_STEEPNESS)
+        app._on_source_change()
+        self.settle(app)
+        self.assertEqual([texture.name for texture in app.textures], ["tiny_0"])
+        image = app.textures[0].colour
+        self.assertGreater(int(image.max()), 0, "the normal change made no edge")
+        np.testing.assert_array_equal(image[:, :, 0], image[:, :, 1])
+        np.testing.assert_array_equal(image[:, :, 1], image[:, :, 2])
+
+    def test_normal_parameters_are_separate_from_colour_and_their_cache(self) -> None:
+        from glyph_lab import app as app_module
+
+        app = self.build()
+        colour_kernel = app.current_config().contrast.kernel_px
+        app.normal_config_vars["slope_threshold"].set("19")
+        app._on_normal_config_change()
+        self.assertEqual(app.current_config().contrast.kernel_px, colour_kernel)
+        self.assertEqual(app.current_normal_config().slope_threshold, 19)
+        app.remember()
+        saved = app_module.load_settings()
+        self.assertEqual(saved["normal_slope_threshold"], 19)
+        self.assertEqual(saved["kernel_px"], colour_kernel)
+
+    def test_normal_source_has_its_own_stage_picker(self) -> None:
+        from glyph_lab.app import NO_STAGE, SOURCE_NORMAL_EDGE_STEEPNESS
+        from glyph_lab.normal_detect import NORMAL_STAGES
+
+        app = self.build()
+        app.source_var.set(SOURCE_NORMAL_EDGE_STEEPNESS)
+        app._on_source_change()
+        self.settle(app)
+        self.assertEqual(
+            list(app._stage_box.cget("values")), [NO_STAGE, *NORMAL_STAGES],
+        )
 
     def test_the_contact_sheet_draws_a_tile_per_texture(self) -> None:
         app = self.build()
@@ -473,6 +563,19 @@ class GlyphLabWindowTests(unittest.TestCase):
         app.update_idletasks()
         self.assertEqual(shell.yview(), settled, "it scrolled a panel that fits")
 
+    def test_the_wheel_ignores_a_native_combobox_popup(self) -> None:
+        app = self.build()
+
+        class Turn:
+            delta = -120
+            x_root = y_root = 0
+
+        def native_popup(_x, _y):
+            raise KeyError("popdown")
+
+        app.winfo_containing = native_popup
+        app._on_panel_wheel(Turn())
+
     def test_the_stage_picker_offers_every_stage(self) -> None:
         """A stage missing from the picker is a stage nobody can look at."""
         from glyph_lab.app import NO_STAGE
@@ -504,10 +607,11 @@ class GlyphLabWindowTests(unittest.TestCase):
         # too clean to have a dropout in it.  What is actually true is that
         # the seed is drawn from the threshold mask, and that the last texel
         # stage is `fired` itself.
-        from glyph_lab.detect import OFF_BOUNDARY
+        from glyph_lab.detect import NEARBY_CONTRAST, OFF_BOUNDARY
 
         seeded = found.stage_mask(OFF_BOUNDARY)
-        self.assertEqual(int((seeded & ~layer).sum()), 0)
+        recovered = found.stage_mask(NEARBY_CONTRAST)
+        self.assertEqual(int((seeded & ~recovered).sum()), 0)
         np.testing.assert_array_equal(found.stage_mask(STAGES[-1]), found.fired)
 
     def test_switching_between_captured_stages_needs_no_rerun(self) -> None:
@@ -585,6 +689,18 @@ class GlyphLabWindowTests(unittest.TestCase):
                 app_module.load_settings()["stop_after_stage"], value
             )
 
+    def test_a_stale_normal_stop_runs_the_new_normal_stage(self) -> None:
+        """A normal pipeline extension must not arrive silently disabled."""
+        from glyph_lab import app as app_module
+        from glyph_lab.normal_detect import NORMAL_STAGES
+
+        app_module.SETTINGS_PATH.write_text(
+            json.dumps({"normal_stop_after_stage": len(NORMAL_STAGES) - 1})
+        )
+        self.assertEqual(
+            app_module.load_settings()["normal_stop_after_stage"], 0
+        )
+
     def test_a_stage_that_does_not_run_is_off_the_panel(self) -> None:
         """Half a job otherwise: the pipeline stops but the knobs remain.
 
@@ -594,7 +710,7 @@ class GlyphLabWindowTests(unittest.TestCase):
         offer a blank picture with nothing to say why it is blank.
         """
         from glyph_lab.app import NO_STAGE
-        from glyph_lab.detect import STAGE_OF, STAGES, UNTRANSITIONED
+        from glyph_lab.detect import CONVEX_HULLED, STAGE_OF, STAGES
 
         app = self.build()
         stop = app.stage_stop()
@@ -610,10 +726,10 @@ class GlyphLabWindowTests(unittest.TestCase):
         self.assertEqual(
             list(app._stage_box.cget("values")), [NO_STAGE, *STAGES[:stop]]
         )
-        self.assertEqual(STAGES[stop - 1], UNTRANSITIONED)
+        self.assertEqual(STAGES[stop - 1], CONVEX_HULLED)
         # ...and the stage's own heading goes with its knobs, so the panel
         # does not end on a run of empty titles.
-        for heading, names in app._section_rows:
+        for heading, names in app._colour_section_rows:
             shown = bool(heading.winfo_ismapped())
             reached = any(STAGE_OF[name] <= stop for name in names)
             self.assertEqual(

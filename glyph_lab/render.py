@@ -38,15 +38,15 @@ BACKGROUND = (18, 18, 18)
 
 @dataclass(frozen=True, slots=True)
 class ViewOptions:
-    show_texels: bool = True
+    show_texels: bool = False
     show_regions: bool = True
     dim_outside_uv: bool = True
     show_uv_edges: bool = False
-    show_mesh_seams: bool = False
-    show_uv_geometry: bool = False
+    show_mesh_seams: bool = True
+    show_uv_geometry: bool = True
     show_sparse: bool = False
     # How far the texture is knocked back outside any UV island.
-    outside_uv_dim: float = OUTSIDE_UV_DIM
+    outside_uv_dim: float = 1.0
     # A 4k atlas in a contact-sheet cell is around 1/16 scale, where a
     # one-texel loop covers a sixteenth of a screen pixel.  Area-averaging
     # keeps it from vanishing; this lifts what is left until it reads.
@@ -73,6 +73,39 @@ def snap_rect(
     if x1 <= x0 or y1 <= y0:
         return None
     return x0, y0, x1, y1
+
+
+def draw_uv_geometry(
+    image: Image.Image,
+    rect: tuple[float, float, float, float],
+    uv_geometry: tuple[UvDomainGeometry, ...],
+) -> None:
+    """Draw the small vector-guide layer over an already composed image."""
+    if not uv_geometry:
+        return
+    left, top, right, bottom = rect
+    span_x, span_y = right - left, bottom - top
+    if span_x <= 0 or span_y <= 0:
+        return
+    scale_x, scale_y = image.width / span_x, image.height / span_y
+    draw = ImageDraw.Draw(image)
+
+    def project(point: tuple[float, float]) -> tuple[float, float]:
+        return ((point[0] - left) * scale_x, (point[1] - top) * scale_y)
+
+    # 2026-09-01: output coordinates follow the same floating crop used for
+    # pan and zoom, instead of snapping geometry to source texels.
+    for item in uv_geometry:
+        if item.kind == "symmetric" and item.axis is not None:
+            draw.line([project(point) for point in item.axis], fill=UV_SYMMETRY_COLOUR,
+                      width=2)
+        elif item.kind == "parallelogram" and len(item.corners) == 4:
+            points = [project(point) for point in item.corners]
+            draw.line([*points, points[0]], fill=PARALLELOGRAM_COLOUR, width=2)
+        elif item.kind == "parallelogram" and item.segments:
+            for segment in item.segments:
+                draw.line([project(point) for point in segment],
+                          fill=PARALLELOGRAM_COLOUR, width=2)
 
 
 def compose_view(
@@ -121,15 +154,34 @@ def compose_view(
         at = (round((x0 - left) * scale_x), round((y0 - top) * scale_y))
 
         patch = colour[y0:y1, x0:x1]
+        patch_image = Image.fromarray(np.ascontiguousarray(patch))
         if options.dim_outside_uv:
-            outside = domains[y0:y1, x0:x1] == 0
-            patch = patch.copy()
-            patch[outside] = (
-                patch[outside] * options.outside_uv_dim
-            ).astype(np.uint8)
+            # 2026-08-31: contact-sheet cells are smaller than the 4k atlases
+            # they display.  Boolean-indexing the RGB source to dim its bare
+            # texels made an intermediate containing every outside pixel and
+            # took 2.20 s across the shipped corpus before resizing began.
+            # Pillow can apply the same black wash in native code before the
+            # existing resize, preserving the source-space compositing result.
+            # The mask's opacity is the complement of the requested brightness
+            # (0 = untouched, 255 = black).
+            darkness = round((1.0 - options.outside_uv_dim) * 255)
+            if 0 < darkness <= 255:
+                outside = np.ascontiguousarray(
+                    domains[y0:y1, x0:x1] == 0, dtype=np.uint8
+                ) * darkness
+                patch_image.paste((0, 0, 0), mask=Image.fromarray(outside))
+            elif darkness > 255 or darkness < 0:
+                # Keep hand-entered values outside the dimmer's normal
+                # 0..1 range compatible with the previous array operation.
+                outside = domains[y0:y1, x0:x1] == 0
+                patch = patch.copy()
+                patch[outside] = (
+                    patch[outside] * options.outside_uv_dim
+                ).astype(np.uint8)
+                patch_image = Image.fromarray(np.ascontiguousarray(patch))
 
         shrinking = target_w < (x1 - x0)
-        patch_image = Image.fromarray(np.ascontiguousarray(patch)).resize(
+        patch_image = patch_image.resize(
             (target_w, target_h), Image.BOX if shrinking else Image.NEAREST
         )
 
@@ -172,25 +224,8 @@ def compose_view(
             )
         canvas.paste(patch_image, at)
 
-    if options.show_uv_geometry and uv_geometry:
-        draw = ImageDraw.Draw(canvas)
-
-        def project(point: tuple[float, float]) -> tuple[float, float]:
-            return ((point[0] - left) * scale_x, (point[1] - top) * scale_y)
-
-        # 2026-08-30: output coordinates follow the same floating crop used
-        # for pan and zoom, instead of snapping geometry to source texels.
-        for item in uv_geometry:
-            if item.kind == "symmetric" and item.axis is not None:
-                draw.line([project(point) for point in item.axis], fill=UV_SYMMETRY_COLOUR,
-                          width=2)
-            elif item.kind == "parallelogram" and len(item.corners) == 4:
-                points = [project(point) for point in item.corners]
-                draw.line([*points, points[0]], fill=PARALLELOGRAM_COLOUR, width=2)
-            elif item.kind == "parallelogram" and item.segments:
-                for segment in item.segments:
-                    draw.line([project(point) for point in segment],
-                              fill=PARALLELOGRAM_COLOUR, width=2)
+    if options.show_uv_geometry:
+        draw_uv_geometry(canvas, rect, uv_geometry)
 
     return canvas
 

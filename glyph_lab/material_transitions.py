@@ -38,6 +38,10 @@ class MaterialTransitionCandidate:
     enclosed_texels: int | None = None
     rule_eligible: bool = False
     loop_eligible: bool = False
+    # 2026-09-01: set from the existing rim pass.  Keeping this evidence here lets the
+    # material stage recognise compact boundary transitions without another
+    # whole-domain distance or morphology pass.
+    inside_rim: bool = False
     discarded: bool = False
 
 
@@ -45,6 +49,9 @@ def material_transition_candidates(
     regions: list[Region], colour: np.ndarray, min_span: int, max_fill: float,
     close_gap: int, offset: tuple[int, int] = (0, 0),
     include_all: bool = False, measure_all: bool = False,
+    rim_regions: set[int] | None = None,
+    compact_min_span: int = 36, compact_max_span: int = 128,
+    compact_max_fill: float = 0.40, compact_max_holes: int = 3,
 ) -> list[MaterialTransitionCandidate]:
     """Measure all transition-shaped regions, without deciding them yet.
 
@@ -59,9 +66,18 @@ def material_transition_candidates(
         if not include_all and not eligible:
             continue
         minor = min(region.width, region.height)
+        major = max(region.width, region.height)
         loop_eligible = minor >= max(int(min_span), 0)
-        needs_body = eligible or measure_all
-        needs_loop = loop_eligible or measure_all
+        compact_possible = (
+            max(int(compact_min_span), 0) <= major <= int(compact_max_span)
+            and region.fill <= float(compact_max_fill)
+            and region.holes <= int(compact_max_holes)
+        )
+        # 2026-09-01: compact candidates need the same body and interior evidence in an
+        # ordinary run as they do in a probe.  Without this, opening a probe
+        # would change the classifier's verdict.
+        needs_body = eligible or measure_all or compact_possible
+        needs_loop = loop_eligible or measure_all or compact_possible
         body_void_texels: int | None = None
         body_void_share: float | None = None
         if needs_body:
@@ -93,6 +109,7 @@ def material_transition_candidates(
             enclosed_texels=enclosed_texels,
             rule_eligible=eligible,
             loop_eligible=loop_eligible,
+            inside_rim=id(region) in (rim_regions or set()),
         ))
     return candidates
 
@@ -101,7 +118,12 @@ def classify_material_transition_candidates(
     candidates: list[MaterialTransitionCandidate], min_enclosed_texels: int,
     min_body_void_share: float, max_interior_detail: float,
     min_long_aspect: float, max_thin_trace_span: int,
-    min_thin_trace_aspect: float, max_flat_loop_texels: int, context_gap: int,
+    min_thin_trace_aspect: float, max_flat_loop_texels: int,
+    max_flat_loop_holes: int, min_glyph_loop_detail: float, context_gap: int,
+    compact_min_span: int = 36, compact_max_span: int = 128,
+    compact_max_fill: float = 0.40, compact_max_holes: int = 3,
+    compact_min_body_void_share: float = 0.50,
+    compact_max_enclosure: float = 0.10, compact_rim_max_span: int = 48,
 ) -> None:
     """Discard empty loops, long traces, and their attached fragments."""
     for candidate in candidates:
@@ -111,7 +133,15 @@ def classify_material_transition_candidates(
             candidate.loop_eligible
             and (candidate.enclosed_texels or 0) >= max(int(min_enclosed_texels), 0)
         )
-        empty_loop = actual_loop and (candidate.interior_detail or 0.0) <= max_interior_detail
+        detailed_multi_hole_loop = (
+            region.holes > max(int(max_flat_loop_holes), 0)
+            and (candidate.interior_detail or 0.0) >= min_glyph_loop_detail
+        )
+        empty_loop = (
+            actual_loop
+            and not detailed_multi_hole_loop
+            and (candidate.interior_detail or 0.0) <= max_interior_detail
+        )
         unclosed_trace = (
             candidate.rule_eligible and not actual_loop
             and (candidate.body_void_share or 0.0) <= min_body_void_share
@@ -120,6 +150,26 @@ def classify_material_transition_candidates(
             min(region.width, region.height) <= max(int(max_thin_trace_span), 0)
             and aspect >= min_thin_trace_aspect
         )
+        major = max(region.width, region.height)
+        compact = (
+            max(int(compact_min_span), 0) <= major <= int(compact_max_span)
+            and region.fill <= float(compact_max_fill)
+            and region.holes <= int(compact_max_holes)
+        )
+        compact_body = (
+            compact
+            and (candidate.body_void_share or 0.0) >= compact_min_body_void_share
+            and candidate.interior_detail is not None
+            and candidate.interior_detail <= max_interior_detail
+        )
+        # 2026-09-01: the rim pass has already established that the whole component sits
+        # in the UV edge band.  Its very small true enclosure distinguishes a
+        # compact material join from the dial and display loops nearby.
+        compact_rim = (
+            compact and candidate.inside_rim
+            and major <= int(compact_rim_max_span)
+            and region.enclosure <= compact_max_enclosure
+        )
         # 2026-08-30: the original broad/sparse gate stays conservative.  The
         # two extensions come from the full-region annotation: an extremely
         # long thin trace is itself sufficient evidence, while an empty loop
@@ -127,7 +177,7 @@ def classify_material_transition_candidates(
         # simple badge is not caught merely for having a quiet interior.
         candidate.discarded = (
             candidate.rule_eligible and (empty_loop or unclosed_trace)
-        ) or aspect >= min_long_aspect or thin_trace or (
+        ) or aspect >= min_long_aspect or thin_trace or compact_body or compact_rim or (
             empty_loop and region.texels <= max_flat_loop_texels
         )
     gap = max(int(context_gap), 0)
@@ -178,18 +228,31 @@ def clear_of_material_transitions(
     close_gap: int, min_enclosed_texels: int, min_body_void_share: float,
     max_interior_detail: float, min_long_aspect: float,
     max_thin_trace_span: int, min_thin_trace_aspect: float,
-    max_flat_loop_texels: int, context_gap: int,
+    max_flat_loop_texels: int, max_flat_loop_holes: int,
+    min_glyph_loop_detail: float, context_gap: int,
     measurements: list[MaterialTransitionCandidate] | None = None,
     offset: tuple[int, int] = (0, 0),
+    rim_regions: set[int] | None = None,
+    compact_min_span: int = 36, compact_max_span: int = 128,
+    compact_max_fill: float = 0.40, compact_max_holes: int = 3,
+    compact_min_body_void_share: float = 0.50,
+    compact_max_enclosure: float = 0.10, compact_rim_max_span: int = 48,
 ) -> list[Region]:
     """Remove the measured material-transition artefacts from a region list."""
     candidates = measurements if measurements is not None else material_transition_candidates(
         regions, colour, min_span, max_fill, close_gap, offset, include_all=True,
+        rim_regions=rim_regions, compact_min_span=compact_min_span,
+        compact_max_span=compact_max_span, compact_max_fill=compact_max_fill,
+        compact_max_holes=compact_max_holes,
     )
     classify_material_transition_candidates(
         candidates, min_enclosed_texels, min_body_void_share, max_interior_detail,
         min_long_aspect, max_thin_trace_span, min_thin_trace_aspect,
-        max_flat_loop_texels, context_gap,
+        max_flat_loop_texels, max_flat_loop_holes, min_glyph_loop_detail,
+        context_gap,
+        compact_min_span, compact_max_span,
+        compact_max_fill, compact_max_holes, compact_min_body_void_share,
+        compact_max_enclosure, compact_rim_max_span,
     )
     discarded = {id(candidate.region) for candidate in candidates if candidate.discarded}
     return [region for region in regions if id(region) not in discarded]
@@ -224,4 +287,5 @@ def material_transition_features(
         "body_void_share": candidate.body_void_share,
         "interior_detail": candidate.interior_detail,
         "rule_eligible": candidate.rule_eligible,
+        "inside_rim": candidate.inside_rim,
     }

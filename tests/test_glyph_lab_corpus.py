@@ -21,16 +21,25 @@ from glyph_lab.uv_geometry import (
     DEFAULT_SIMPLE_UV_GEOMETRY_CONFIG,
     fit_domain_seam_parallelogram,
     fit_seam_parallelogram,
+    fit_source_seam_parallelogram,
     seam_region_axes,
     seam_region_axis_candidates,
     seam_region_parallelograms,
     source_seam_axis_candidates,
     source_seam_axis_measurements,
     source_seam_guides,
+    wrapped_axis_copies,
 )
 
 
 class GeometrySidecarTests(unittest.TestCase):
+    def test_an_unwrapped_axis_returns_to_its_visible_atlas_copy(self) -> None:
+        copies = wrapped_axis_copies(
+            ((7_287.5, 100.0), (7_287.5, 300.0)), (4_096, 4_096),
+        )
+
+        self.assertEqual(copies, (((3_191.5, 100.0), (3_191.5, 300.0)),))
+
     def test_mesh_seams_supply_a_sheared_parallelogram_frame(self) -> None:
         image = Image.new("1", (100, 80))
         corners = ((20, 20), (70, 25), (60, 60), (10, 55))
@@ -48,6 +57,22 @@ class GeometrySidecarTests(unittest.TestCase):
 
         self.assertIsNone(fit_seam_parallelogram(np.asarray(image, dtype=bool)))
 
+    def test_mesh_seams_reject_an_axis_aligned_parallelogram(self) -> None:
+        image = Image.new("1", (100, 80))
+        corners = ((20, 20), (70, 20), (70, 60), (20, 60))
+        ImageDraw.Draw(image).line([*corners, corners[0]], fill=1)
+
+        self.assertIsNone(fit_seam_parallelogram(np.asarray(image, dtype=bool)))
+
+    def test_source_seams_reject_an_axis_aligned_parallelogram(self) -> None:
+        corners = ((0.2, 0.2), (0.7, 0.2), (0.7, 0.6), (0.2, 0.6))
+        segments = tuple(
+            (first, second)
+            for first, second in zip(corners, (*corners[1:], corners[0]), strict=True)
+        )
+
+        self.assertIsNone(fit_source_seam_parallelogram(segments, (100, 100)))
+
     def test_domain_fit_uses_nonzero_even_seam_extents(self) -> None:
         """Extent magnitudes are data, not a bit mask for the domain label."""
         outline = Image.new("1", (100, 80))
@@ -64,8 +89,8 @@ class GeometrySidecarTests(unittest.TestCase):
 
     def test_disconnected_seam_regions_never_share_a_frame(self) -> None:
         image = Image.new("1", (140, 80))
-        left = ((10, 15), (50, 15), (50, 50), (10, 50))
-        right = ((85, 20), (125, 20), (125, 55), (85, 55))
+        left = ((10, 15), (50, 20), (45, 50), (5, 45))
+        right = ((85, 20), (125, 25), (120, 55), (80, 50))
         draw = ImageDraw.Draw(image)
         draw.line([*left, left[0]], fill=1)
         draw.line([*right, right[0]], fill=1)
@@ -116,7 +141,7 @@ class GeometrySidecarTests(unittest.TestCase):
         self.assertTrue(all(score == 1.0 for score, _axis in candidates))
 
     def test_source_frame_rejects_extra_boundary_that_a_hull_would_hide(self) -> None:
-        corners = ((0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8))
+        corners = ((0.2, 0.2), (0.8, 0.25), (0.75, 0.8), (0.15, 0.75))
         boundary = tuple(
             (first, second)
             for first, second in zip(corners, (*corners[1:], corners[0]), strict=True)

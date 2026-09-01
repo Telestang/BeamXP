@@ -18,9 +18,12 @@ from glyph_lab.corpus import CorpusTexture
 from glyph_lab.detect import (
     AT_THRESHOLD,
     BRIDGED,
+    CONVEX_HULLED,
     DENSE_SEED,
+    FLAT_GROUPED,
     LAST_STOP,
     MARKED,
+    NEARBY_CONTRAST,
     OFF_BOUNDARY,
     PATTERNED,
     SEEDED,
@@ -53,6 +56,7 @@ from glyph_lab.detect import (
     paint_holes,
     past_the_size_floor,
     pattern_candidates,
+    recover_nearby_contrast,
     regions_from_holes,
     regions_from_marks,
     repeat_scores,
@@ -62,6 +66,7 @@ from glyph_lab.detect import (
     sampling_mask,
     seed_density,
     sparse_field,
+    sparse_field_with_mesh_cuts,
     structure_map,
     structure_seed,
 )
@@ -255,6 +260,9 @@ class SeedDensityInThePipelineTests(unittest.TestCase):
         """
         texture = one_texture(self.speckled())
         base = whole_pipeline()
+        base = replace(
+            base, contrast=replace(base.contrast, nearby_contrast_radius_px=0),
+        )
         bar = np.zeros((96, 96), dtype=bool)
         bar[18:28, 8:88] = True                          # the mark and its rim
         for level in (0.05, 0.1, 0.15, 0.2, 0.3):
@@ -385,13 +393,13 @@ class StageOrderTests(unittest.TestCase):
             ),
         )
         found = detect(one_texture(colour), config, capture=True)
-        first = found.stage_mask(AT_THRESHOLD)
+        first = found.stage_mask(NEARBY_CONTRAST)
         for name in (OFF_BOUNDARY, SEEDED, DENSE_SEED, PATTERNED):
             mask = found.stage_mask(name)
             self.assertIsNotNone(mask, name)
             self.assertEqual(
                 int((mask & ~first).sum()), 0,
-                f"{name} holds texels that were never over the threshold",
+                f"{name} holds texels outside the recovered threshold",
             )
         # The gate can only remove from the seed it is given.
         np.testing.assert_array_equal(
@@ -512,6 +520,58 @@ class BoundaryContrastTests(unittest.TestCase):
         self.assertGreater(float(response[domain].max()), 0.0)
 
 
+class NearbyContrastRecoveryTests(unittest.TestCase):
+    def test_only_the_neighbourhood_of_the_first_pass_is_recovered(self) -> None:
+        response = np.zeros((15, 15), dtype=np.float32)
+        first_pass = np.zeros((15, 15), dtype=bool)
+        first_pass[7, 7] = True
+        response[7, 10] = 30.0
+        response[1, 1] = 90.0
+
+        recovered = recover_nearby_contrast(
+            response, first_pass, np.ones_like(first_pass), 3, 24.0,
+        )
+
+        self.assertTrue(recovered[7, 7])
+        self.assertTrue(recovered[7, 10])
+        self.assertFalse(recovered[1, 1])
+
+    def test_a_non_positive_setting_disables_recovery(self) -> None:
+        response = np.full((7, 7), 99.0, dtype=np.float32)
+        first_pass = np.zeros((7, 7), dtype=bool)
+        first_pass[3, 3] = True
+
+        for radius, threshold in ((0, 24.0), (3, 0.0)):
+            np.testing.assert_array_equal(
+                recover_nearby_contrast(
+                    response, first_pass, np.ones_like(first_pass), radius, threshold,
+                ),
+                first_pass,
+            )
+
+    def test_the_recovery_is_captured_as_its_own_stage(self) -> None:
+        response = np.zeros((15, 15), dtype=np.float32)
+        response[7, 7] = 100.0
+        response[7, 10] = response[1, 1] = 25.0
+        colour = np.zeros((15, 15, 3), dtype=np.uint8)
+        base = LabConfig()
+        config = replace(
+            base,
+            contrast=replace(
+                base.contrast, local_floor_multiple=0.0, min_response=50.0,
+                nearby_contrast_radius_px=3, nearby_contrast_min_response=24.0,
+                stop_after_stage=2,
+            ),
+        )
+        with patch("glyph_lab.detect.contrast_response", return_value=response):
+            found = detect(one_texture(colour), config, capture=True)
+
+        self.assertTrue(found.stage_mask(AT_THRESHOLD)[7, 7])
+        self.assertFalse(found.stage_mask(AT_THRESHOLD)[7, 10])
+        self.assertTrue(found.stage_mask(NEARBY_CONTRAST)[7, 10])
+        self.assertFalse(found.stage_mask(NEARBY_CONTRAST)[1, 1])
+
+
 class BoundaryReachTests(unittest.TestCase):
     """Touching the island edge is not held against a mark; only hugging it is."""
 
@@ -583,13 +643,16 @@ class BoundaryReachTests(unittest.TestCase):
         The sparse field sits between, and reads the threshold rather than
         filtering it, so the boundary stage still gets `lit` untouched.
         """
-        self.assertEqual(STAGES[STAGES.index(AT_THRESHOLD) + 1], SPARSE)
+        self.assertEqual(STAGES[STAGES.index(AT_THRESHOLD) + 1], NEARBY_CONTRAST)
+        self.assertEqual(STAGES[STAGES.index(NEARBY_CONTRAST) + 1], SPARSE)
         self.assertEqual(STAGES[STAGES.index(SPARSE) + 1], UNCROWDED)
         self.assertEqual(STAGES[STAGES.index(UNCROWDED) + 1], SIZED)
         self.assertEqual(STAGES[STAGES.index(SIZED) + 1], UNREPEATED)
         self.assertEqual(STAGES[STAGES.index(UNREPEATED) + 1], UNRIMMED)
         self.assertEqual(STAGES[STAGES.index(UNRIMMED) + 1], UNTRANSITIONED)
-        self.assertEqual(STAGES[STAGES.index(UNTRANSITIONED) + 1], OFF_BOUNDARY)
+        self.assertEqual(STAGES[STAGES.index(UNTRANSITIONED) + 1], FLAT_GROUPED)
+        self.assertEqual(STAGES[STAGES.index(FLAT_GROUPED) + 1], CONVEX_HULLED)
+        self.assertEqual(STAGES[STAGES.index(CONVEX_HULLED) + 1], OFF_BOUNDARY)
         self.assertEqual(STAGES[STAGES.index(OFF_BOUNDARY) + 1], SEEDED)
 
     def test_the_stage_only_ever_removes(self) -> None:
@@ -601,7 +664,7 @@ class BoundaryReachTests(unittest.TestCase):
             domains=(self.island()).astype(np.uint16), normal=None, source={},
         )
         found = detect(texture, whole_pipeline(), capture=True)
-        before = found.stage_mask(AT_THRESHOLD)
+        before = found.stage_mask(NEARBY_CONTRAST)
         after = found.stage_mask(OFF_BOUNDARY)
         self.assertEqual(int((after & ~before).sum()), 0)
 
@@ -1413,6 +1476,21 @@ class SparseFieldTests(unittest.TestCase):
         lit = np.zeros((20, 20), dtype=bool)
         self.assertEqual(int(sparse_field(lit, sample, 0, 1).sum()), 0)
 
+    def test_a_mesh_seam_is_removed_from_the_sparse_fields_ground(self) -> None:
+        sample = np.ones((21, 21), dtype=bool)
+        mesh_regions = np.zeros((21, 21), dtype=np.uint32)
+        mesh_regions[:, :10] = 1
+        mesh_regions[:, 11:] = 2
+        lit = np.zeros((21, 21), dtype=bool)
+        lit[10, 8] = lit[10, 12] = True
+
+        blank, field_sample = sparse_field_with_mesh_cuts(
+            lit, sample, mesh_regions, 9, 0,
+        )
+
+        self.assertFalse(field_sample[:, 10].any())
+        self.assertFalse((field_sample & ~blank)[:, 10].any())
+
     def test_the_stage_lets_the_threshold_past_untouched(self) -> None:
         """A marker, not a filter -- the boundary stage sees the whole of it."""
         colour = np.full((96, 96, 3), 40, dtype=np.uint8)
@@ -1423,7 +1501,7 @@ class SparseFieldTests(unittest.TestCase):
             replace(base, contrast=replace(base.contrast, stop_after_stage=0)),
             capture=True,
         )
-        lit = found.stage_mask(AT_THRESHOLD)
+        lit = found.stage_mask(NEARBY_CONTRAST)
         boundary = found.stage_mask(OFF_BOUNDARY)
         self.assertEqual(int((boundary & ~lit).sum()), 0)
         # The stage answers with the inverse of what it computes: `sparse` is
@@ -1536,7 +1614,7 @@ class RegionsFromHolesTests(unittest.TestCase):
             sum(int(region.texels) for region in found.regions),
             int(found.fired.sum()),
         )
-        self.assertEqual(int((found.fired & found.sparse).sum()), 0)
+        self.assertGreater(int((found.fired & found.sparse).sum()), 0)
 
 
 class ClearOfACrowdTests(unittest.TestCase):
@@ -2060,17 +2138,17 @@ class StopAfterStageTests(unittest.TestCase):
         """
         found = detect(self.probe(), LabConfig(), capture=True)
         self.assertEqual(
-            STAGES[LabConfig().contrast.stop_after_stage - 1], UNTRANSITIONED
+            STAGES[LabConfig().contrast.stop_after_stage - 1], CONVEX_HULLED
         )
-        np.testing.assert_array_equal(found.stage_mask(UNTRANSITIONED), found.fired)
+        np.testing.assert_array_equal(found.stage_mask(CONVEX_HULLED), found.fired)
         self.assertNotEqual(found.regions, [])
         self.assertGreater(int(found.outlines.sum()), 0)
 
     def test_the_stages_past_the_stop_never_happen(self) -> None:
         found = detect(self.probe(), LabConfig(), capture=True)
-        for name in STAGES[:STAGES.index(UNTRANSITIONED) + 1]:
+        for name in STAGES[:STAGES.index(CONVEX_HULLED) + 1]:
             self.assertIsNotNone(found.stage_mask(name), name)
-        for name in STAGES[STAGES.index(UNTRANSITIONED) + 1:]:
+        for name in STAGES[STAGES.index(CONVEX_HULLED) + 1:]:
             self.assertIsNone(found.stage_mask(name), f"{name} still ran")
 
     def test_zero_puts_the_whole_pipeline_back(self) -> None:
@@ -2154,7 +2232,8 @@ class StopAfterStageTests(unittest.TestCase):
             # the end of the front end this replaces.
             if STAGES[number - 1] in (
                     SPARSE, SIZED, UNCROWDED, UNREPEATED, UNRIMMED,
-                    UNTRANSITIONED, MARKED):
+                    UNTRANSITIONED, PATTERNED, MARKED, FLAT_GROUPED,
+                    CONVEX_HULLED):
                 self.assertNotEqual(found.regions, [], f"stop {number}")
             else:
                 self.assertEqual(
@@ -2260,13 +2339,9 @@ class StageCostTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_the_gate_is_off_by_default(self) -> None:
-        """Measured over the corpus it does not pay for itself -- see the field.
-
-        Pinned so that turning it on is a decision somebody makes, with the
-        numbers in front of them, rather than something a default does quietly.
-        """
-        self.assertEqual(ContrastConfig().min_seed_density, 0.0)
+    def test_the_tuned_seed_density_is_the_default(self) -> None:
+        """The current corpus setting must be what a fresh session starts with."""
+        self.assertEqual(ContrastConfig().min_seed_density, 0.02)
 
 
 if __name__ == "__main__":

@@ -40,11 +40,17 @@ from glyph_lab.material_transitions import (
     material_transition_features,
 )
 from glyph_lab.probe import RegionObservation, RegionProbe
+from glyph_lab.region_grouping import (
+    GroupingConfig,
+    group_regions_across_flat_ground,
+    mesh_region_labels,
+)
+from glyph_lab.region_hulls import convex_region_hulls
 from glyph_lab.regions import NEIGHBOURHOOD, Region, closed_body
 
 # The last stage `stop_after_stage` can name, which is the last stage there
-# is: the pipeline ends on the marks and answers with them.
-LAST_STOP = 14
+# is: explicit diagnostic runs can still reach the legacy marks stage.
+LAST_STOP = 17
 
 # Every point in the pipeline worth looking at, in the order it happens.  The
 # viewer lists these and draws whichever is picked in place of the response, so
@@ -60,28 +66,34 @@ LAST_STOP = 14
 # stage's contents into its neighbour's name.  The number stays in the label
 # because the picker is a flat list and reads better ordered.
 AT_THRESHOLD = "1 over threshold"
-SPARSE = "2 the sparse field"
-UNCROWDED = "3 clear of a crowd"
-SIZED = "4 past the size floor"
-UNREPEATED = "5 clear of a repeat"
-UNRIMMED = "6 clear of the rim"
-UNTRANSITIONED = "7 clear material transitions"
-OFF_BOUNDARY = "8 clear of the boundary"
-SEEDED = "9 structure seed"
-DENSE_SEED = "10 seed over density"
-PATTERNED = "11 pattern candidates"
-TRANSFORMED = "12 past the transform"
-BRIDGED = "13 bridged across the gaps"
-MARKED = "14 grouped into marks"
+NEARBY_CONTRAST = "2 recovered nearby contrast"
+SPARSE = "3 the sparse field"
+UNCROWDED = "4 clear of a crowd"
+SIZED = "5 past the size floor"
+UNREPEATED = "6 clear of a repeat"
+UNRIMMED = "7 clear of the rim"
+UNTRANSITIONED = "8 clear material transitions"
+FLAT_GROUPED = "9 grouped across flat ground"
+CONVEX_HULLED = "10 convex region hull"
+OFF_BOUNDARY = "11 clear of the boundary"
+SEEDED = "12 structure seed"
+DENSE_SEED = "13 seed over density"
+PATTERNED = "14 pattern candidates"
+TRANSFORMED = "15 past the transform"
+BRIDGED = "16 bridged across the gaps"
+MARKED = "17 grouped into marks"
 
 STAGES: tuple[str, ...] = (
     AT_THRESHOLD,
+    NEARBY_CONTRAST,
     SPARSE,
     UNCROWDED,
     SIZED,
     UNREPEATED,
     UNRIMMED,
     UNTRANSITIONED,
+    FLAT_GROUPED,
+    CONVEX_HULLED,
     OFF_BOUNDARY,
     SEEDED,
     DENSE_SEED,
@@ -111,92 +123,104 @@ STAGE_OF: dict[str, int] = {
     "percentile": 1,
     "local_floor_multiple": 1,
     "local_floor_px": 1,
-    # 2 the sparse field
-    "sparse_kernel_px": 2,
-    "max_sparse_texels": 2,
+    # 2 recovered nearby contrast
+    "nearby_contrast_radius_px": 2,
+    "nearby_contrast_min_response": 2,
+    # 3 the sparse field
+    "sparse_kernel_px": 3,
+    "max_sparse_texels": 3,
     # ...and the paths drawn round the holes it leaves.
-    "min_void_texels": 2,
-    "outline_px": 2,
-    # 3 clear of a crowd
-    "crowd_radius_px": 3,
-    "max_neighbours": 3,
-    "crowd_large_region_area_px": 3,
-    # 4 past the size floor
-    "min_width_px": 4,
-    "min_height_px": 4,
-    "min_area_px": 4,
-    # 5 clear of a repeat
-    "enable_repeat_texture_filter": 5,
-    "repeat_texture_decimation": 5,
-    "repeat_texture_highpass_px": 5,
-    "repeat_texture_tile_px": 5,
-    "repeat_texture_search_scale": 5,
-    "repeat_texture_min_search_px": 5,
-    "repeat_texture_max_search_px": 5,
-    "repeat_texture_match_threshold": 5,
-    "repeat_texture_min_tile_contrast": 5,
-    "repeat_texture_min_region_span_px": 5,
-    "repeat_texture_min_region_area_px": 5,
-    "repeat_texture_min_repeats": 5,
-    "repeat_texture_context_repeats": 5,
-    "repeat_texture_context_directions": 5,
-    "repeat_texture_context_margin_px": 5,
-    "repeat_texture_fallback_tile_px": 5,
-    "repeat_texture_fallback_max_fill": 5,
-    "repeat_texture_fallback_min_energy": 5,
-    "repeat_texture_fallback_min_overlap": 5,
-    "repeat_texture_fallback_min_dip": 5,
-    # 6 clear of the rim
-    "min_rim_margin_px": 6,
-    "max_rim_margin_px": 6,
-    "rim_margin_share": 6,
-    "min_rim_contact": 6,
-    "rim_artifact_max_span_px": 6,
-    "rim_artifact_min_perimeter_contact": 6,
-    "rim_artifact_large_max_fill": 6,
-    # 7 clear material transitions
-    "transition_min_span_px": 7,
-    "transition_max_fill": 7,
-    "transition_close_gap_px": 7,
-    "transition_min_enclosed_texels": 7,
-    "transition_min_body_void_share": 7,
-    "transition_max_interior_detail": 7,
-    "transition_min_long_aspect": 7,
-    "transition_max_thin_trace_span_px": 7,
-    "transition_min_thin_trace_aspect": 7,
-    "transition_max_flat_loop_texels": 7,
-    "transition_context_gap_px": 7,
-    # 8 clear of the boundary
-    "min_boundary_reach_px": 8,
-    # 9 structure seed
-    "structure_px": 9,
-    "structure_inner_px": 9,
-    "min_structure": 9,
-    # 10 seed over density
-    "seed_density_px": 10,
-    "min_seed_density": 10,
-    # 11 pattern candidates
-    "pattern_gap_px": 11,
-    "min_pattern_texels": 11,
-    "min_pattern_fill": 11,
-    "min_pattern_area": 11,
-    "min_pattern_coverage": 11,
-    # 12 past the transform
-    "repeat_skip_px": 12,
-    "repeat_longest_px": 12,
-    "min_repeat_energy": 12,
-    "min_repeat_overlap": 12,
-    "min_repeat_dip": 12,
-    # 13 bridged across the gaps
-    "bridge_clear_px": 13,
-    "bridge_void_px": 13,
-    "min_bridge_void": 13,
-    "bridge_span_px": 13,
-    "min_bridge_response": 13,
-    "max_bridge_share": 13,
-    # 14 grouped into marks
-    "mark_gap_px": 14,
-    "min_stroke_texels": 14,
+    "min_void_texels": 3,
+    "outline_px": 3,
+    # 4 clear of a crowd
+    "crowd_radius_px": 4,
+    "max_neighbours": 4,
+    "crowd_large_region_area_px": 4,
+    # 5 past the size floor
+    "min_width_px": 5,
+    "min_height_px": 5,
+    "min_area_px": 5,
+    # 6 clear of a repeat
+    "enable_repeat_texture_filter": 6,
+    "repeat_texture_decimation": 6,
+    "repeat_texture_highpass_px": 6,
+    "repeat_texture_tile_px": 6,
+    "repeat_texture_search_scale": 6,
+    "repeat_texture_min_search_px": 6,
+    "repeat_texture_max_search_px": 6,
+    "repeat_texture_match_threshold": 6,
+    "repeat_texture_min_tile_contrast": 6,
+    "repeat_texture_min_region_span_px": 6,
+    "repeat_texture_min_region_area_px": 6,
+    "repeat_texture_min_repeats": 6,
+    "repeat_texture_context_repeats": 6,
+    "repeat_texture_context_directions": 6,
+    "repeat_texture_context_margin_px": 6,
+    "repeat_texture_fallback_tile_px": 6,
+    "repeat_texture_fallback_max_fill": 6,
+    "repeat_texture_fallback_min_energy": 6,
+    "repeat_texture_fallback_min_overlap": 6,
+    "repeat_texture_fallback_min_dip": 6,
+    # 7 clear of the rim
+    "min_rim_margin_px": 7,
+    "max_rim_margin_px": 7,
+    "rim_margin_share": 7,
+    "min_rim_contact": 7,
+    "rim_artifact_max_span_px": 7,
+    "rim_artifact_min_perimeter_contact": 7,
+    "rim_artifact_large_max_fill": 7,
+    # 8 clear material transitions
+    "transition_min_span_px": 8,
+    "transition_max_fill": 8,
+    "transition_close_gap_px": 8,
+    "transition_min_enclosed_texels": 8,
+    "transition_min_body_void_share": 8,
+    "transition_max_interior_detail": 8,
+    "transition_min_long_aspect": 8,
+    "transition_max_thin_trace_span_px": 8,
+    "transition_min_thin_trace_aspect": 8,
+    "transition_max_flat_loop_texels": 8,
+    "transition_max_flat_loop_holes": 8,
+    "transition_min_glyph_loop_detail": 8,
+    "transition_context_gap_px": 8,
+    "transition_compact_min_span_px": 8,
+    "transition_compact_max_span_px": 8,
+    "transition_compact_max_fill": 8,
+    "transition_compact_max_holes": 8,
+    "transition_compact_min_body_void_share": 8,
+    "transition_compact_max_enclosure": 8,
+    "transition_compact_rim_max_span_px": 8,
+    # 11 clear of the boundary
+    "min_boundary_reach_px": 11,
+    # 12 structure seed
+    "structure_px": 12,
+    "structure_inner_px": 12,
+    "min_structure": 12,
+    # 13 seed over density
+    "seed_density_px": 13,
+    "min_seed_density": 13,
+    # 14 pattern candidates
+    "pattern_gap_px": 14,
+    "min_pattern_texels": 14,
+    "min_pattern_fill": 14,
+    "min_pattern_area": 14,
+    "min_pattern_coverage": 14,
+    # 15 past the transform
+    "repeat_skip_px": 15,
+    "repeat_longest_px": 15,
+    "min_repeat_energy": 15,
+    "min_repeat_overlap": 15,
+    "min_repeat_dip": 15,
+    # 16 bridged across the gaps
+    "bridge_clear_px": 16,
+    "bridge_void_px": 16,
+    "min_bridge_void": 16,
+    "bridge_span_px": 16,
+    "min_bridge_response": 16,
+    "max_bridge_share": 16,
+    # 17 grouped into marks
+    "mark_gap_px": 17,
+    "min_stroke_texels": 17,
 }
 
 
@@ -219,7 +243,7 @@ class ContrastConfig:
     """What the front end reads.  One knob per decision, and no more."""
 
     # 2026-08-27: where the pipeline ends, as a stage number.  0 runs the lot,
-    # and so does 7, which is the last stage there is.
+    # and so does 10, the colour interactive endpoint.
     #
     # 2026-08-28: a debugging tool now rather than a way of holding the old
     # tail back -- there is no tail.  Set it to an earlier stage and that
@@ -230,7 +254,7 @@ class ContrastConfig:
     #
     # The panel hides the parameters of every stage past the stop, so it also
     # narrows the window down to the step being worked on.
-    stop_after_stage: int = 7
+    stop_after_stage: int = 10
 
     # 2026-08-27: how far in from an island's rim a texel has to be before its
     # colour is treated as a measurement of the surface.
@@ -291,10 +315,10 @@ class ContrastConfig:
     # the field from the inside while a drawn stroke -- solid, so far above any
     # small count -- is untouched.
     #
-    # 9 and 1 to start, which is the plain reading of "blank".  Both are here
-    # to be turned rather than trusted.  0 on either paints nothing.
-    sparse_kernel_px: int = 9
-    max_sparse_texels: int = 1
+    # 2026-09-01: 11 and 7 are the corpus-tuned reading of "blank".  0 on
+    # either paints nothing.
+    sparse_kernel_px: int = 11
+    max_sparse_texels: int = 7
     # 2026-08-28: and how small a hole may be and still be worth keeping.
     #
     # Width and height are the hole's bounding box; the area is the hole
@@ -307,12 +331,11 @@ class ContrastConfig:
     # the whole of the sorting, which is why the three of them are their own
     # stage rather than a clause in the one above.
     #
-    # 4, 4 and 36 to start, and deliberately loose -- this is the stage the
-    # rebuild has just reached, so the numbers are here to be turned rather
-    # than trusted.
-    min_width_px: int = 4
-    min_height_px: int = 4
-    min_area_px: int = 36
+    # 2026-09-01: 8, 8 and 128 suppress the remaining tiny holes without
+    # trimming the resolved glyph marks.
+    min_width_px: int = 8
+    min_height_px: int = 8
+    min_area_px: int = 128
     # 2026-08-29: and how much company a mark may keep.
     #
     # A region is refused when more than `max_neighbours` holes have their
@@ -338,7 +361,7 @@ class ContrastConfig:
     # even the right one.  What is distinctive is not the shape of any one of
     # them but that there are hundreds.
     #
-    # 120 and 40, swept at 8, 20, 40 and 80 against the whole-hole count.  The
+    # 2026-09-01: 240 and 40, swept at 8, 20, 40 and 80 against the whole-hole count.  The
     # bar is what decides how much is lost elsewhere rather than how much of
     # the panel is caught -- the panel is refused at every setting swept.  At 8
     # etk800 loses its 5.0 badge and two faceplate icons; at 40 it keeps all
@@ -356,7 +379,7 @@ class ContrastConfig:
     # `crowd_radius_px` at 0 switches the stage off.  `max_neighbours` at 0
     # does not -- it means a mark may keep no company at all, which is a
     # setting worth having and not the same statement.
-    crowd_radius_px: int = 120
+    crowd_radius_px: int = 240
     max_neighbours: int = 40
     # 2026-08-29: birdshot can surround a real, substantial mark.  The crowd
     # rule is evidence about the small fragments, not a reason to discard the
@@ -443,18 +466,17 @@ class ContrastConfig:
     # everywhere; the ceiling stops a large panel condemning anything within
     # so many texels of its border.
     #
-    # 3, 16 and 0.08.  The share halved when the size measure changed from the
-    # island's reach, which is a half-thickness, to the mean of its bounds,
-    # which is roughly twice that -- the same margin, read off a box that costs
-    # nothing instead of a distance transform that cost the whole stage.
+    # 2026-09-01: 0, 30 and 0.20 keep the margin proportional, while allowing
+    # small charts to use their actual edge evidence rather than a forced
+    # three-texel floor.
     #
     # `min_rim_margin_px` at 0 with no share switches the stage off, and
     # `min_rim_contact` at 0 drops the second condition so the margin decides
     # alone.
-    min_rim_margin_px: int = 3
-    max_rim_margin_px: int = 16
-    rim_margin_share: float = 0.08
-    min_rim_contact: float = 0.40
+    min_rim_margin_px: int = 0
+    max_rim_margin_px: int = 30
+    rim_margin_share: float = 0.20
+    min_rim_contact: float = 0.20
     # 2026-08-29: an edge artefact has a bounded minor axis.  That includes a
     # continuous band and the separate, low-fill pieces of edge stitching.
     # Short pieces are only removed as a locally straight run along the rim;
@@ -490,7 +512,24 @@ class ContrastConfig:
     transition_max_thin_trace_span_px: int = 10
     transition_min_thin_trace_aspect: float = 3.5
     transition_max_flat_loop_texels: int = 6_000
+    # 2026-09-01: several enclosed holes are glyph detail, not an empty
+    # material loop, even when their total luminance variation stays modest.
+    transition_max_flat_loop_holes: int = 3
+    # 2026-09-01: several holes only veto an empty-loop decision when there
+    # is real variation inside them.  This retains AUTO (detail 4.00) while
+    # keeping the quiet Scintilla material loop (detail 0.69) removable.
+    transition_min_glyph_loop_detail: float = 2.0
     transition_context_gap_px: int = 3
+    # 2026-09-01: compact, closed fragments can be material joins rather than glyphs.
+    # These knobs use the rim evidence already produced by stage 6, rather
+    # than adding another full-domain image operation at stage 7.
+    transition_compact_min_span_px: int = 36
+    transition_compact_max_span_px: int = 128
+    transition_compact_max_fill: float = 0.40
+    transition_compact_max_holes: int = 3
+    transition_compact_min_body_void_share: float = 0.50
+    transition_compact_max_enclosure: float = 0.10
+    transition_compact_rim_max_span_px: int = 48
     # 2026-08-27: how far a response that touches an island's edge has to
     # reach inward before it is believed.
     #
@@ -561,6 +600,13 @@ class ContrastConfig:
     # blurring destroys -- 8.6% -> 8.5%, which is to say untouched.
     local_floor_multiple: float = 2.5
     local_floor_px: int = 31
+    # 2026-09-01: the local floor deliberately rejects parts of a glyph that
+    # lie on busy material.  Once the first pass has established that a mark
+    # is nearby, a fixed response floor may recover those missed texels without
+    # becoming a permissive whole-atlas detector.  A non-positive radius or
+    # response disables this recovery pass.
+    nearby_contrast_radius_px: int = 8
+    nearby_contrast_min_response: float = 48.0
     # 2026-08-27: is there a *step* here, or only fluctuation?
     #
     # Derived from fifty 7x7 crops sampled at random from fired texels across
@@ -650,8 +696,8 @@ class ContrastConfig:
     # holds every region on three textures and takes 87 to 2,398 seed texels.
     #
     # 0 disables the test.
-    seed_density_px: int = 15
-    min_seed_density: float = 0.0
+    seed_density_px: int = 24
+    min_seed_density: float = 0.02
     # 2026-08-27: how far apart two seed texels can be and still be the same
     # mark.
     #
@@ -737,11 +783,11 @@ class ContrastConfig:
     # two scintilla pads come in at 1,526 and 997 texels -- and opening it
     # further changes almost nothing, since by then everything that belongs
     # together has already met.
-    pattern_gap_px: int = 6
-    # 500, from the smaller of those two pads at 997.  Generous on purpose: an
+    pattern_gap_px: int = 16
+    # 2026-09-01: 250, below the smaller of those two pads at 997.  Generous on purpose: an
     # area that turns out not to repeat costs one transform that says no.
     # Across the corpus it offers 19, 19, 2 and 21 groups.
-    min_pattern_texels: int = 500
+    min_pattern_texels: int = 250
     # Moderately dense: the group's seed over the part of its bounding
     # rectangle that lies inside the UV island.  A floor, not a discriminator
     # -- it is here so a single sprawling wisp does not qualify.  Measured
@@ -1067,7 +1113,7 @@ class ContrastConfig:
     # How big a void has to be before it gets an interior path of its own.
     # A dial bezel encloses one; the speckle of unfired texels inside a
     # thick digit does not, and outlining every hole would bury the glyph.
-    min_void_texels: int = 36
+    min_void_texels: int = 10
     # Thickness of the painted path, in texels.  One erosion per texel.
     outline_px: int = 1
 
@@ -1076,6 +1122,7 @@ class LabConfig:
     """Everything one run of the lab is parameterised by."""
 
     contrast: ContrastConfig = field(default_factory=ContrastConfig)
+    grouping: GroupingConfig = field(default_factory=GroupingConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1205,6 +1252,27 @@ def sparse_field(
     width = max(int(kernel), 1)
     width += 1 - width % 2  # centred, so the disc has a texel at its middle
     return (disc_counts(lit, width) <= int(count)) & sample
+
+
+def sparse_field_with_mesh_cuts(
+    lit: np.ndarray,
+    sample: np.ndarray,
+    mesh_regions: np.ndarray | None,
+    kernel: int,
+    count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the sparse field independently on each seam-bounded mesh piece."""
+    if mesh_regions is None:
+        return sparse_field(lit, sample, kernel, count), sample
+    field_sample = sample & (mesh_regions > 0)
+    labels = np.unique(mesh_regions[field_sample])
+    if not labels.size:
+        return sparse_field(lit, sample, kernel, count), sample
+    blank = np.zeros(lit.shape, dtype=bool)
+    for label in labels:
+        piece = field_sample & (mesh_regions == label)
+        blank |= sparse_field(lit & piece, piece, kernel, count)
+    return blank, field_sample
 
 
 def island_size(domain: np.ndarray) -> float:
@@ -2517,6 +2585,23 @@ def response_threshold(
     )
 
 
+def recover_nearby_contrast(
+    response: np.ndarray,
+    detected: np.ndarray,
+    sample: np.ndarray,
+    radius_px: int,
+    min_response: float,
+) -> np.ndarray:
+    """Add high-contrast texels only around the first local-threshold pass."""
+    radius = int(radius_px)
+    if radius <= 0 or min_response <= 0 or not detected.any():
+        return detected
+    neighbourhood = ndimage.binary_dilation(
+        detected, structure=NEIGHBOURHOOD, iterations=radius,
+    )
+    return detected | (neighbourhood & sample & (response >= min_response))
+
+
 # Rec. 601 luma, as float64: the cast to float32 happens after the sum, so the
 # weights stay double and the arithmetic matches what three scaled channels did.
 GREY_WEIGHTS = np.array([0.299, 0.587, 0.114])
@@ -2767,6 +2852,8 @@ def regions_in_domain(
     timings: dict[str, float] | None = None,
     probe: RegionProbe | None = None,
     texture_name: str = "",
+    normal_flat: np.ndarray | None = None,
+    mesh_regions: np.ndarray | None = None,
 ) -> tuple[list[Region], np.ndarray, np.ndarray]:
     """One domain, start to finish: the marks in it, their paths, their texels.
 
@@ -2858,6 +2945,18 @@ def regions_in_domain(
         level = response_threshold(response, sample, contrast)
 
     lit = (response >= level) & sample
+    # An empty list, not nothing: it records that this stage has a region
+    # count and that the count is zero, which is what the viewer needs to
+    # say "no regions yet" rather than falling back on the final tally.
+    note(AT_THRESHOLD, lit, found=[])
+    if halted(AT_THRESHOLD):
+        return stopped(lit)
+
+    lit = recover_nearby_contrast(
+        response, lit, sample,
+        contrast.nearby_contrast_radius_px,
+        contrast.nearby_contrast_min_response,
+    )
     # 2026-08-28: kept for the bridging stage, which reads the voids in it.  It
     # has to be the threshold itself and not a later mask: what the gate needs
     # to know is whether the surface has any clear ground on it, and every
@@ -2870,18 +2969,16 @@ def regions_in_domain(
     ratio = np.divide(
         response, level, out=np.zeros_like(response), where=np.asarray(level) > 0
     )
-    # An empty list, not nothing: it records that this stage has a region
-    # count and that the count is zero, which is what the viewer needs to
-    # say "no regions yet" rather than falling back on the final tally.
-    note(AT_THRESHOLD, lit, found=[])
-    if halted(AT_THRESHOLD):
+    note(NEARBY_CONTRAST, lit, found=[])
+    if halted(NEARBY_CONTRAST):
         return stopped(lit)
 
     # A marker, not a filter: `lit` goes on untouched.  What is recorded is the
     # blank ground the marks stand on, which is the one thing a mask of what
     # fired cannot show.
-    blank = sparse_field(
-        lit, sample, contrast.sparse_kernel_px, contrast.max_sparse_texels
+    blank, field_sample = sparse_field_with_mesh_cuts(
+        lit, sample, mesh_regions,
+        contrast.sparse_kernel_px, contrast.max_sparse_texels,
     )
     sparse[:] = blank
     # The stage answers with the *inverse* of what it computes: the blank
@@ -2891,14 +2988,14 @@ def regions_in_domain(
     # counts company among *all* of them, not only the ones that clear the
     # size floor, because the floor has already thinned the very field it
     # would otherwise be judging.
-    holes = regions_from_holes(blank, sample, label, offset)
+    holes = regions_from_holes(blank, field_sample, label, offset)
     # Painting every hole is dear and only the viewer ever wants it, so it
     # happens when a stage is being captured or when the run stops here.
     unsorted = (
         paint_holes(holes, sample.shape, offset, contrast)
         if stages is not None or halted(SPARSE) else None
     )
-    note(SPARSE, sample & ~blank,
+    note(SPARSE, field_sample & ~blank,
          None if unsorted is None else unsorted[0], holes)
     if halted(SPARSE):
         # Every hole, unsorted, which is what stopping here is for.
@@ -2963,10 +3060,25 @@ def regions_in_domain(
     if halted(UNRIMMED):
         return found, painted, kept
 
+    rim_region_ids = {id(candidate.region) for candidate in rim_measurements}
+    compact_transition_args = (
+        contrast.transition_compact_min_span_px,
+        contrast.transition_compact_max_span_px,
+        contrast.transition_compact_max_fill,
+        contrast.transition_compact_max_holes,
+        contrast.transition_compact_min_body_void_share,
+        contrast.transition_compact_max_enclosure,
+        contrast.transition_compact_rim_max_span_px,
+    )
     transition_measurements = material_transition_candidates(
         found, colour, contrast.transition_min_span_px,
         contrast.transition_max_fill, contrast.transition_close_gap_px, offset,
         include_all=True, measure_all=probe is not None,
+        rim_regions=rim_region_ids,
+        compact_min_span=contrast.transition_compact_min_span_px,
+        compact_max_span=contrast.transition_compact_max_span_px,
+        compact_max_fill=contrast.transition_compact_max_fill,
+        compact_max_holes=contrast.transition_compact_max_holes,
     )
     classify_material_transition_candidates(
         transition_measurements, contrast.transition_min_enclosed_texels,
@@ -2976,7 +3088,10 @@ def regions_in_domain(
         contrast.transition_max_thin_trace_span_px,
         contrast.transition_min_thin_trace_aspect,
         contrast.transition_max_flat_loop_texels,
+        contrast.transition_max_flat_loop_holes,
+        contrast.transition_min_glyph_loop_detail,
         contrast.transition_context_gap_px,
+        *compact_transition_args,
     )
     if probe is not None:
         for candidate in transition_measurements:
@@ -2996,12 +3111,42 @@ def regions_in_domain(
         contrast.transition_max_thin_trace_span_px,
         contrast.transition_min_thin_trace_aspect,
         contrast.transition_max_flat_loop_texels,
+        contrast.transition_max_flat_loop_holes,
+        contrast.transition_min_glyph_loop_detail,
         contrast.transition_context_gap_px,
         measurements=transition_measurements, offset=offset,
+        rim_regions=rim_region_ids,
+        compact_min_span=contrast.transition_compact_min_span_px,
+        compact_max_span=contrast.transition_compact_max_span_px,
+        compact_max_fill=contrast.transition_compact_max_fill,
+        compact_max_holes=contrast.transition_compact_max_holes,
+        compact_min_body_void_share=(
+            contrast.transition_compact_min_body_void_share
+        ),
+        compact_max_enclosure=contrast.transition_compact_max_enclosure,
+        compact_rim_max_span=contrast.transition_compact_rim_max_span_px,
     )
     painted, kept = paint_holes(found, sample.shape, offset, contrast)
     note(UNTRANSITIONED, kept, painted, found)
     if halted(UNTRANSITIONED):
+        return found, painted, kept
+
+    found = group_regions_across_flat_ground(
+        found, colour, normal_flat, config.grouping, offset, mesh_regions,
+    )
+    painted, kept = paint_mark_regions(
+        found, kept.shape, offset, contrast.mark_gap_px, contrast,
+    )
+    note(FLAT_GROUPED, kept, painted, found)
+    if halted(FLAT_GROUPED):
+        return found, painted, kept
+
+    found = convex_region_hulls(found)
+    painted, kept = paint_mark_regions(
+        found, kept.shape, offset, contrast.mark_gap_px, contrast,
+    )
+    note(CONVEX_HULLED, kept, painted, found)
+    if halted(CONVEX_HULLED):
         return found, painted, kept
 
     lit = clear_of_boundary(lit, sample, contrast.min_boundary_reach_px)
@@ -3069,12 +3214,20 @@ def regions_in_domain(
     # stage view, but this is the list that becomes the response.  Apply the
     # same decision here, then redraw both the texels and paths from exactly
     # the kept regions so a rim setting affects the displayed result.
+    final_rim_measurements = rim_artifact_candidates(
+        found, sample, offset, contrast.min_rim_margin_px,
+        contrast.max_rim_margin_px, contrast.rim_margin_share,
+        contrast.min_rim_contact, contrast.rim_artifact_max_span_px,
+        contrast.rim_artifact_min_perimeter_contact,
+        contrast.rim_artifact_large_max_fill,
+    )
     found = clear_of_the_rim(
         found, sample, offset, contrast.min_rim_margin_px,
         contrast.max_rim_margin_px, contrast.rim_margin_share,
         contrast.min_rim_contact, contrast.rim_artifact_max_span_px,
         contrast.rim_artifact_min_perimeter_contact,
         contrast.rim_artifact_large_max_fill,
+        measurements=final_rim_measurements,
     )
     found = clear_of_material_transitions(
         found, colour, contrast.transition_min_span_px,
@@ -3086,8 +3239,20 @@ def regions_in_domain(
         contrast.transition_max_thin_trace_span_px,
         contrast.transition_min_thin_trace_aspect,
         contrast.transition_max_flat_loop_texels,
+        contrast.transition_max_flat_loop_holes,
+        contrast.transition_min_glyph_loop_detail,
         contrast.transition_context_gap_px,
         offset=offset,
+        rim_regions={id(candidate.region) for candidate in final_rim_measurements},
+        compact_min_span=contrast.transition_compact_min_span_px,
+        compact_max_span=contrast.transition_compact_max_span_px,
+        compact_max_fill=contrast.transition_compact_max_fill,
+        compact_max_holes=contrast.transition_compact_max_holes,
+        compact_min_body_void_share=(
+            contrast.transition_compact_min_body_void_share
+        ),
+        compact_max_enclosure=contrast.transition_compact_max_enclosure,
+        compact_rim_max_span=contrast.transition_compact_rim_max_span_px,
     )
     painted, lit = paint_mark_regions(
         found, lit.shape, offset, contrast.mark_gap_px, contrast
@@ -3103,6 +3268,7 @@ def detect(
     config: LabConfig | None = None,
     capture: bool = False,
     probe: RegionProbe | None = None,
+    normal_config: object | None = None,
 ) -> Detection:
     """Detect over every UV domain of one texture.
 
@@ -3131,6 +3297,17 @@ def detect(
     )
     if repeat_texture is not None:
         timings[UNREPEATED] = time.perf_counter() - repeat_started
+    normal_flat = None
+    if normal_config is not None:
+        from glyph_lab.normal_map import absence_of_slopes
+        normal_flat = absence_of_slopes(
+            texture,
+            boundary_skip_px=int(normal_config.boundary_skip_px),
+            slope_threshold=int(normal_config.slope_threshold),
+            absence_kernel_px=int(normal_config.absence_kernel_px),
+            max_slope_texels=int(normal_config.max_slope_texels),
+        )
+    mesh_regions = mesh_region_labels(texture.domains, texture.seams)
     for label, window in enumerate(texture.domain_windows(), start=1):
         if window is None:
             continue
@@ -3143,6 +3320,8 @@ def detect(
             texture.colour[window], domain, label, (x, y), config, blank,
             repeat_texture, captured, drawn, counts, timings=timings,
             probe=probe, texture_name=texture.name,
+            normal_flat=(None if normal_flat is None else normal_flat[window]),
+            mesh_regions=mesh_regions[window],
         )
         sparse[window] |= blank
         for source, whole_atlas in ((captured, stages), (drawn, stage_outlines)):

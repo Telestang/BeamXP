@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,7 +13,7 @@ from mesh_segmentation_transform.mirror_texture_for_rhd import (
     DEFAULT_RHD_CONFIG,
 )
 
-DEFAULT_SEAM_PARALLELOGRAM_OPPOSITE_EDGE_DOT = 0.98
+DEFAULT_SEAM_PARALLELOGRAM_OPPOSITE_EDGE_DOT = 0.90
 SEAM_CORNER_TOLERANCE_PX = 0.5
 PARALLELOGRAM_MIN_EDGE_PX = 2.0
 PARALLELOGRAM_MIN_BOUNDARY_COVERAGE = 0.90
@@ -26,11 +27,11 @@ class SimpleUvGeometryConfig:
     seam_parallelogram_opposite_edge_dot: float = (
         DEFAULT_SEAM_PARALLELOGRAM_OPPOSITE_EDGE_DOT
     )
-    seam_symmetry_min_score: float = DEFAULT_RHD_CONFIG.min_island_symmetry
+    seam_symmetry_min_score: float = 0.90
     seam_symmetry_min_area_px: int = DEFAULT_RHD_CONFIG.simple_uv_min_area_px
     seam_symmetry_axis_search_ratio: float = DEFAULT_RHD_CONFIG.island_axis_search_ratio
     # 2026-08-30: zero keeps the pixel-error gate disabled for existing tuning.
-    seam_symmetry_max_unmirrored_area_px: int = 0
+    seam_symmetry_max_unmirrored_area_px: int = 256
     seam_corner_tolerance_px: float = SEAM_CORNER_TOLERANCE_PX
     parallelogram_min_edge_px: float = PARALLELOGRAM_MIN_EDGE_PX
     parallelogram_min_boundary_coverage: float = PARALLELOGRAM_MIN_BOUNDARY_COVERAGE
@@ -85,6 +86,15 @@ def simplified_hull(hull: np.ndarray, tolerance_px: float = SEAM_CORNER_TOLERANC
     return points
 
 
+def _has_axis_aligned_edge(edges: np.ndarray, tolerance_px: float) -> bool:
+    """Whether a frame side is indistinguishable from horizontal or vertical."""
+    tolerance = max(float(tolerance_px), 1e-9)
+    return bool(
+        (np.abs(edges[:, 0]) <= tolerance).any()
+        or (np.abs(edges[:, 1]) <= tolerance).any()
+    )
+
+
 def fit_seam_parallelogram(
     seams: np.ndarray,
     opposite_edge_dot: float = DEFAULT_SEAM_PARALLELOGRAM_OPPOSITE_EDGE_DOT,
@@ -114,6 +124,8 @@ def fit_seam_parallelogram(
     edges = np.roll(corners, -1, axis=0) - corners
     lengths = np.linalg.norm(edges, axis=1)
     if bool((lengths <= max(float(min_edge_px), 1e-6)).any()):
+        return None
+    if _has_axis_aligned_edge(edges, corner_tolerance_px):
         return None
     unit = edges / lengths[:, None]
     if (float(unit[0] @ unit[2]) > -opposite_edge_dot
@@ -152,6 +164,8 @@ def fit_source_seam_parallelogram(
     edges = np.roll(corners, -1, axis=0) - corners
     lengths = np.linalg.norm(edges, axis=1)
     if bool((lengths <= max(float(config.parallelogram_min_edge_px), 1e-9)).any()):
+        return None
+    if _has_axis_aligned_edge(edges, config.seam_corner_tolerance_px):
         return None
     unit = edges / lengths[:, None]
     threshold = config.seam_parallelogram_opposite_edge_dot
@@ -501,6 +515,30 @@ def source_seam_guides(
         for point in frame
     )
     return (("parallelogram", corners, coverage),)
+
+
+def wrapped_axis_copies(
+    axis: tuple[tuple[float, float], tuple[float, float]],
+    size: tuple[int, int],
+) -> tuple[tuple[tuple[float, float], tuple[float, float]], ...]:
+    """Translate an unwrapped source-UV axis into every visible atlas tile."""
+    width, height = size
+    points = np.asarray(axis, dtype=np.float64)
+    minimum, maximum = points.min(axis=0), points.max(axis=0)
+    x_shifts = range(
+        math.ceil(-maximum[0] / width),
+        math.floor((width - 1 - minimum[0]) / width) + 1,
+    )
+    y_shifts = range(
+        math.ceil(-maximum[1] / height),
+        math.floor((height - 1 - minimum[1]) / height) + 1,
+    )
+    copies = []
+    for shift_x in x_shifts:
+        for shift_y in y_shifts:
+            shifted = points + (shift_x * width, shift_y * height)
+            copies.append(tuple(tuple(float(value) for value in point) for point in shifted))
+    return tuple(copies)
 
 
 def seam_region_axes(
