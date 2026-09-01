@@ -2286,7 +2286,7 @@ def region_flip_axis(
 # between two separate pieces of a vehicle, and orders of magnitude above the
 # noise a part matrix leaves on an already welded vertex, so neither a real
 # seam nor a real boundary lands on the wrong side of it.
-SURFACE_WELD_KEYS_PER_METRE = 100_000
+SURFACE_WELD_KEYS_PER_METRE = 1000
 
 
 @dataclass(slots=True)

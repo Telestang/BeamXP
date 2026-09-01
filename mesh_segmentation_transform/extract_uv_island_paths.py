@@ -95,7 +95,7 @@ def _uv_at(values: list[float], stride: int, index: int) -> tuple[float, float]:
 # Corners land on the same surface point when they land in the same cell of this
 # grid.  It matches ``mirror_texture_for_rhd.SURFACE_WELD_KEYS_PER_METRE`` so the
 # harness previews the islands the exporter will actually work on.
-SURFACE_WELD_KEYS_PER_UNIT = 100_000
+SURFACE_WELD_KEYS_PER_UNIT = 1000
 # The same idea for the texture coordinate.  Far finer than the surface grid
 # because UVs are authored in 0..1 and two charts can be packed a texel apart:
 # at 1e8 keys per unit a 4096 atlas gets ~24000 keys per texel, so nothing welds
@@ -699,8 +699,8 @@ def _clip_segment_to_unit_tile(
     if upper < lower:
         return None
     return (
-        (ax + dx * lower, ay + dy * lower),
-        (ax + dx * upper, ay + dy * upper),
+        a if lower == 0.0 else (ax + dx * lower, ay + dy * lower),
+        b if upper == 1.0 else (ax + dx * upper, ay + dy * upper),
     )
 
 
@@ -856,6 +856,9 @@ def discontinuous_edge_extents(
         segments = [
             placement[edge] for edge, count in carriers.items() if count < 2
         ]
+        region_segments = [
+            placement[edge] for edge, count in carriers.items() if count % 2 != 0
+        ] if collect_regions else []
         edge_total += len(carriers)
         open_total += len(segments)
         if segments:
@@ -877,43 +880,44 @@ def discontinuous_edge_extents(
         value = max(min(round(extent), 65_535), 1)
         region_canvas = Image.new("1", (width, height), 0) if collect_regions else None
         region_pen = ImageDraw.Draw(region_canvas) if region_canvas is not None else None
-        for a, b in segments:
-            for shift_u in range(
-                math.floor(min(a[0], b[0])), math.floor(max(a[0], b[0])) + 1
-            ):
-                for shift_v in range(
-                    math.floor(min(a[1], b[1])), math.floor(max(a[1], b[1])) + 1
+        drawn = 0
+
+        def _draw_segments(segment_list, dest_pen, fill_val, line_width=1):
+            drawn_count = 0
+            for a, b in segment_list:
+                for shift_u in range(
+                    math.floor(min(a[0], b[0]) - 1e-5), math.floor(max(a[0], b[0]) + 1e-5) + 1
                 ):
-                    clipped = _clip_segment_to_unit_tile(
-                        (a[0] - shift_u, a[1] - shift_v),
-                        (b[0] - shift_u, b[1] - shift_v),
-                    )
-                    if clipped is None:
-                        continue
-                    points = _uv_polygon_to_pixels(list(clipped), width, height)
-                    pen.line(
-                        [
-                            (int(points[0][0]), int(points[0][1])),
-                            (int(points[1][0]), int(points[1][1])),
-                        ],
-                        fill=value,
-                        width=1,
-                    )
-                    if region_pen is not None:
-                        region_pen.line(
+                    for shift_v in range(
+                        math.floor(min(a[1], b[1]) - 1e-5), math.floor(max(a[1], b[1]) + 1e-5) + 1
+                    ):
+                        clipped = _clip_segment_to_unit_tile(
+                            (a[0] - shift_u, a[1] - shift_v),
+                            (b[0] - shift_u, b[1] - shift_v),
+                        )
+                        if clipped is None:
+                            continue
+                        points = _uv_polygon_to_pixels(list(clipped), width, height)
+                        dest_pen.line(
                             [
                                 (int(points[0][0]), int(points[0][1])),
                                 (int(points[1][0]), int(points[1][1])),
                             ],
-                            fill=1,
-                            width=1,
+                            fill=fill_val,
+                            width=line_width,
                         )
-                    drawn += 1
+                        drawn_count += 1
+            return drawn_count
+
+        drawn += _draw_segments(segments, pen, value)
+        if region_pen is not None:
+            _draw_segments(region_segments, region_pen, 1)
+
         if region_canvas is not None:
             region_masks.append(np.asarray(region_canvas, dtype=bool))
             region_wraps.append(any(
                 min(a[axis], b[axis]) < 0.0 or max(a[axis], b[axis]) > 1.0
-                for a, b in segments for axis in (0, 1)
+                for a, b in region_segments for axis in (0, 1)
             ))
 
     extents = np.asarray(canvas).astype(np.uint16)
