@@ -46,11 +46,12 @@ from glyph_lab.region_grouping import (
     mesh_region_labels,
 )
 from glyph_lab.region_hulls import convex_region_hulls
+from glyph_lab.region_padding import pad_regions
 from glyph_lab.regions import NEIGHBOURHOOD, Region, closed_body
 
 # The last stage `stop_after_stage` can name, which is the last stage there
 # is: explicit diagnostic runs can still reach the legacy marks stage.
-LAST_STOP = 17
+LAST_STOP = 18
 
 # Every point in the pipeline worth looking at, in the order it happens.  The
 # viewer lists these and draws whichever is picked in place of the response, so
@@ -75,13 +76,14 @@ UNRIMMED = "7 clear of the rim"
 UNTRANSITIONED = "8 clear material transitions"
 FLAT_GROUPED = "9 grouped across flat ground"
 CONVEX_HULLED = "10 convex region hull"
-OFF_BOUNDARY = "11 clear of the boundary"
-SEEDED = "12 structure seed"
-DENSE_SEED = "13 seed over density"
-PATTERNED = "14 pattern candidates"
-TRANSFORMED = "15 past the transform"
-BRIDGED = "16 bridged across the gaps"
-MARKED = "17 grouped into marks"
+PADDED = "11 final padding"
+OFF_BOUNDARY = "12 clear of the boundary"
+SEEDED = "13 structure seed"
+DENSE_SEED = "14 seed over density"
+PATTERNED = "15 pattern candidates"
+TRANSFORMED = "16 past the transform"
+BRIDGED = "17 bridged across the gaps"
+MARKED = "18 grouped into marks"
 
 STAGES: tuple[str, ...] = (
     AT_THRESHOLD,
@@ -94,6 +96,7 @@ STAGES: tuple[str, ...] = (
     UNTRANSITIONED,
     FLAT_GROUPED,
     CONVEX_HULLED,
+    PADDED,
     OFF_BOUNDARY,
     SEEDED,
     DENSE_SEED,
@@ -190,37 +193,39 @@ STAGE_OF: dict[str, int] = {
     "transition_compact_min_body_void_share": 8,
     "transition_compact_max_enclosure": 8,
     "transition_compact_rim_max_span_px": 8,
-    # 11 clear of the boundary
-    "min_boundary_reach_px": 11,
-    # 12 structure seed
-    "structure_px": 12,
-    "structure_inner_px": 12,
-    "min_structure": 12,
-    # 13 seed over density
-    "seed_density_px": 13,
-    "min_seed_density": 13,
-    # 14 pattern candidates
-    "pattern_gap_px": 14,
-    "min_pattern_texels": 14,
-    "min_pattern_fill": 14,
-    "min_pattern_area": 14,
-    "min_pattern_coverage": 14,
-    # 15 past the transform
-    "repeat_skip_px": 15,
-    "repeat_longest_px": 15,
-    "min_repeat_energy": 15,
-    "min_repeat_overlap": 15,
-    "min_repeat_dip": 15,
-    # 16 bridged across the gaps
-    "bridge_clear_px": 16,
-    "bridge_void_px": 16,
-    "min_bridge_void": 16,
-    "bridge_span_px": 16,
-    "min_bridge_response": 16,
-    "max_bridge_share": 16,
-    # 17 grouped into marks
-    "mark_gap_px": 17,
-    "min_stroke_texels": 17,
+    # 11 final padding
+    "final_padding_px": 11,
+    # 12 clear of the boundary
+    "min_boundary_reach_px": 12,
+    # 13 structure seed
+    "structure_px": 13,
+    "structure_inner_px": 13,
+    "min_structure": 13,
+    # 14 seed over density
+    "seed_density_px": 14,
+    "min_seed_density": 14,
+    # 15 pattern candidates
+    "pattern_gap_px": 15,
+    "min_pattern_texels": 15,
+    "min_pattern_fill": 15,
+    "min_pattern_area": 15,
+    "min_pattern_coverage": 15,
+    # 16 past the transform
+    "repeat_skip_px": 16,
+    "repeat_longest_px": 16,
+    "min_repeat_energy": 16,
+    "min_repeat_overlap": 16,
+    "min_repeat_dip": 16,
+    # 17 bridged across the gaps
+    "bridge_clear_px": 17,
+    "bridge_void_px": 17,
+    "min_bridge_void": 17,
+    "bridge_span_px": 17,
+    "min_bridge_response": 17,
+    "max_bridge_share": 17,
+    # 18 grouped into marks
+    "mark_gap_px": 18,
+    "min_stroke_texels": 18,
 }
 
 
@@ -243,7 +248,7 @@ class ContrastConfig:
     """What the front end reads.  One knob per decision, and no more."""
 
     # 2026-08-27: where the pipeline ends, as a stage number.  0 runs the lot,
-    # and so does 10, the colour interactive endpoint.
+    # and so does 11, the colour interactive endpoint.
     #
     # 2026-08-28: a debugging tool now rather than a way of holding the old
     # tail back -- there is no tail.  Set it to an earlier stage and that
@@ -254,7 +259,10 @@ class ContrastConfig:
     #
     # The panel hides the parameters of every stage past the stop, so it also
     # narrows the window down to the step being worked on.
-    stop_after_stage: int = 10
+    stop_after_stage: int = 11
+    # 2026-09-01: final display masks need a modest margin without changing
+    # the region grouping that produced them.
+    final_padding_px: int = 2
 
     # 2026-08-27: how far in from an island's rim a texel has to be before its
     # colour is treated as a measurement of the surface.
@@ -3147,6 +3155,16 @@ def regions_in_domain(
     )
     note(CONVEX_HULLED, kept, painted, found)
     if halted(CONVEX_HULLED):
+        return found, painted, kept
+
+    found = pad_regions(
+        found, contrast.final_padding_px, sample, offset,
+    )
+    painted, kept = paint_mark_regions(
+        found, kept.shape, offset, contrast.mark_gap_px, contrast,
+    )
+    note(PADDED, kept, painted, found)
+    if halted(PADDED):
         return found, painted, kept
 
     lit = clear_of_boundary(lit, sample, contrast.min_boundary_reach_px)

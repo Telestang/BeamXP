@@ -25,6 +25,7 @@ from glyph_lab.detect import (
     MARKED,
     NEARBY_CONTRAST,
     OFF_BOUNDARY,
+    PADDED,
     PATTERNED,
     SEEDED,
     SIZED,
@@ -652,7 +653,8 @@ class BoundaryReachTests(unittest.TestCase):
         self.assertEqual(STAGES[STAGES.index(UNRIMMED) + 1], UNTRANSITIONED)
         self.assertEqual(STAGES[STAGES.index(UNTRANSITIONED) + 1], FLAT_GROUPED)
         self.assertEqual(STAGES[STAGES.index(FLAT_GROUPED) + 1], CONVEX_HULLED)
-        self.assertEqual(STAGES[STAGES.index(CONVEX_HULLED) + 1], OFF_BOUNDARY)
+        self.assertEqual(STAGES[STAGES.index(CONVEX_HULLED) + 1], PADDED)
+        self.assertEqual(STAGES[STAGES.index(PADDED) + 1], OFF_BOUNDARY)
         self.assertEqual(STAGES[STAGES.index(OFF_BOUNDARY) + 1], SEEDED)
 
     def test_the_stage_only_ever_removes(self) -> None:
@@ -2138,17 +2140,17 @@ class StopAfterStageTests(unittest.TestCase):
         """
         found = detect(self.probe(), LabConfig(), capture=True)
         self.assertEqual(
-            STAGES[LabConfig().contrast.stop_after_stage - 1], CONVEX_HULLED
+            STAGES[LabConfig().contrast.stop_after_stage - 1], PADDED
         )
-        np.testing.assert_array_equal(found.stage_mask(CONVEX_HULLED), found.fired)
+        np.testing.assert_array_equal(found.stage_mask(PADDED), found.fired)
         self.assertNotEqual(found.regions, [])
         self.assertGreater(int(found.outlines.sum()), 0)
 
     def test_the_stages_past_the_stop_never_happen(self) -> None:
         found = detect(self.probe(), LabConfig(), capture=True)
-        for name in STAGES[:STAGES.index(CONVEX_HULLED) + 1]:
+        for name in STAGES[:STAGES.index(PADDED) + 1]:
             self.assertIsNotNone(found.stage_mask(name), name)
-        for name in STAGES[STAGES.index(CONVEX_HULLED) + 1:]:
+        for name in STAGES[STAGES.index(PADDED) + 1:]:
             self.assertIsNone(found.stage_mask(name), f"{name} still ran")
 
     def test_zero_puts_the_whole_pipeline_back(self) -> None:
@@ -2233,7 +2235,7 @@ class StopAfterStageTests(unittest.TestCase):
             if STAGES[number - 1] in (
                     SPARSE, SIZED, UNCROWDED, UNREPEATED, UNRIMMED,
                     UNTRANSITIONED, PATTERNED, MARKED, FLAT_GROUPED,
-                    CONVEX_HULLED):
+                    CONVEX_HULLED, PADDED):
                 self.assertNotEqual(found.regions, [], f"stop {number}")
             else:
                 self.assertEqual(

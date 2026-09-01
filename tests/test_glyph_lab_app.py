@@ -710,7 +710,7 @@ class GlyphLabWindowTests(unittest.TestCase):
         offer a blank picture with nothing to say why it is blank.
         """
         from glyph_lab.app import NO_STAGE
-        from glyph_lab.detect import CONVEX_HULLED, STAGE_OF, STAGES
+        from glyph_lab.detect import PADDED, STAGE_OF, STAGES
 
         app = self.build()
         stop = app.stage_stop()
@@ -726,7 +726,7 @@ class GlyphLabWindowTests(unittest.TestCase):
         self.assertEqual(
             list(app._stage_box.cget("values")), [NO_STAGE, *STAGES[:stop]]
         )
-        self.assertEqual(STAGES[stop - 1], CONVEX_HULLED)
+        self.assertEqual(STAGES[stop - 1], PADDED)
         # ...and the stage's own heading goes with its knobs, so the panel
         # does not end on a run of empty titles.
         for heading, names in app._colour_section_rows:

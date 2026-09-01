@@ -16,7 +16,9 @@ from glyph_lab.normal_detect import (
     NORMAL_CLEAR_OF_RIM,
     NORMAL_CLEAR_OF_STRIPE,
     NORMAL_CONVEX_HULLED,
+    NORMAL_FITTED_RECTANGLE,
     NORMAL_GROUPED_FLAT_GROUND,
+    NORMAL_PADDED,
     NORMAL_PAST_SIZE_FLOOR,
     NormalMapConfig,
     clear_of_normal_crowd,
@@ -185,3 +187,7 @@ class NormalSlopeDetectorTests(unittest.TestCase):
         self.assertIn(NORMAL_GROUPED_FLAT_GROUND, found.stage_outlines)
         self.assertIn(NORMAL_CONVEX_HULLED, found.stages)
         self.assertIn(NORMAL_CONVEX_HULLED, found.stage_outlines)
+        self.assertIn(NORMAL_FITTED_RECTANGLE, found.stages)
+        self.assertIn(NORMAL_FITTED_RECTANGLE, found.stage_outlines)
+        self.assertIn(NORMAL_PADDED, found.stages)
+        self.assertIn(NORMAL_PADDED, found.stage_outlines)

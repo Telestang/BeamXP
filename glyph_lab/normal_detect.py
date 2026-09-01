@@ -31,6 +31,8 @@ from glyph_lab.region_grouping import (
     mesh_region_labels,
 )
 from glyph_lab.region_hulls import convex_region_hulls, convex_region_mask
+from glyph_lab.region_padding import pad_regions
+from glyph_lab.region_rectangles import fit_region_rectangles
 
 NORMAL_ABSENT_SLOPES = "1 absence of slopes"
 NORMAL_CLEAR_OF_CROWD = "2 clear of a crowd"
@@ -41,6 +43,8 @@ NORMAL_CLEAR_OF_STRIPE = "6 clear of a stripe"
 NORMAL_GROUPED_FLAT_GROUND = "7 grouped across flat ground"
 NORMAL_CLEAR_OF_PANEL = "8 clear of a panel face"
 NORMAL_CONVEX_HULLED = "9 convex region hull"
+NORMAL_FITTED_RECTANGLE = "10 best fit rectangle"
+NORMAL_PADDED = "11 final padding"
 NORMAL_STAGES = (
     NORMAL_ABSENT_SLOPES,
     NORMAL_CLEAR_OF_CROWD,
@@ -51,6 +55,8 @@ NORMAL_STAGES = (
     NORMAL_GROUPED_FLAT_GROUND,
     NORMAL_CLEAR_OF_PANEL,
     NORMAL_CONVEX_HULLED,
+    NORMAL_FITTED_RECTANGLE,
+    NORMAL_PADDED,
 )
 NORMAL_STAGE_OF = {
     "stop_after_stage": 0,
@@ -87,6 +93,9 @@ NORMAL_STAGE_OF = {
     "panel_solid_min_minor_span_px": 8,
     "panel_solid_min_fill": 8,
     "panel_solid_min_hull_fill": 8,
+    "rectangle_chain_tolerance_degrees": 10,
+    "rectangle_min_axis_lead_ratio": 10,
+    "final_padding_px": 11,
 }
 
 
@@ -149,6 +158,11 @@ class NormalMapConfig:
     panel_solid_min_minor_span_px: int = 40
     panel_solid_min_fill: float = 0.60
     panel_solid_min_hull_fill: float = 0.65
+    # 2026-09-01: text baselines often have a few rasterised hull steps, but
+    # a permissive angle follows a nearby glyph side rather than the baseline.
+    rectangle_chain_tolerance_degrees: float = 5.0
+    rectangle_min_axis_lead_ratio: float = 1.25
+    final_padding_px: int = 2
 
 
 @dataclass(slots=True)
@@ -674,6 +688,37 @@ def detect_normal(
                                 if capture:
                                     stage_masks[NORMAL_CONVEX_HULLED][window] |= accepted_kept
                                     stage_outlines[NORMAL_CONVEX_HULLED][window] |= accepted_outline
+                            if stop not in (6, 7, 8, 9):
+                                before_rectangle = time.perf_counter()
+                                accepted = fit_region_rectangles(
+                                    accepted, config.rectangle_chain_tolerance_degrees,
+                                    config.rectangle_min_axis_lead_ratio,
+                                )
+                                accepted_outline, accepted_kept = paint_holes(
+                                    accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                )
+                                stage_times[NORMAL_FITTED_RECTANGLE] += (
+                                    time.perf_counter() - before_rectangle
+                                )
+                                stage_counts[NORMAL_FITTED_RECTANGLE] += len(accepted)
+                                if capture:
+                                    stage_masks[NORMAL_FITTED_RECTANGLE][window] |= accepted_kept
+                                    stage_outlines[NORMAL_FITTED_RECTANGLE][window] |= accepted_outline
+                            if stop not in (6, 7, 8, 9, 10):
+                                before_padding = time.perf_counter()
+                                accepted = pad_regions(
+                                    accepted, config.final_padding_px, sample, (x, y),
+                                )
+                                accepted_outline, accepted_kept = paint_holes(
+                                    accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                )
+                                stage_times[NORMAL_PADDED] += (
+                                    time.perf_counter() - before_padding
+                                )
+                                stage_counts[NORMAL_PADDED] += len(accepted)
+                                if capture:
+                                    stage_masks[NORMAL_PADDED][window] |= accepted_kept
+                                    stage_outlines[NORMAL_PADDED][window] |= accepted_outline
         sparse[window] |= slope_free
         fired[window] |= accepted_kept
         outlines[window] |= accepted_outline
@@ -688,7 +733,9 @@ def detect_normal(
         - stage_times[NORMAL_CLEAR_OF_STRIPE]
         - stage_times[NORMAL_GROUPED_FLAT_GROUND]
         - stage_times[NORMAL_CLEAR_OF_PANEL]
-        - stage_times[NORMAL_CONVEX_HULLED], 0.0,
+        - stage_times[NORMAL_CONVEX_HULLED]
+        - stage_times[NORMAL_FITTED_RECTANGLE]
+        - stage_times[NORMAL_PADDED], 0.0,
     )
     stages = {name: np.packbits(mask) for name, mask in stage_masks.items()}
     packed_outlines = {
