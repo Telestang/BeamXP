@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageDraw
 
+from glyph_lab.hulls import convex_hull
 from glyph_lab.regions import Region
-from glyph_lab.uv_geometry import convex_hull
 
 
 def longest_straight_hull_chain_axis(
@@ -62,23 +62,26 @@ def longest_straight_hull_chain_axis(
     return best_axis
 
 
-def fitted_rectangle(
+def region_rectangle_corners(
     region: Region, tolerance_degrees: float, min_axis_lead_ratio: float,
-) -> Region:
-    """Fit one grouped region to the rectangle aligned with its longest edge.
+) -> np.ndarray | None:
+    """The four corners of a region's baseline-aligned rectangle, or None.
 
-    Text and engraved legends usually contribute one long near-straight hull
-    edge: their baseline.  The least-area orientation instead compromises
-    between every serif and terminal.  Use that strongest edge as the local
-    horizontal axis, and take the full normal extent perpendicular to it.
+    In coordinates local to ``region.bounds``.  Split out of
+    ``fitted_rectangle`` so the shape can be asked for without rasterising it:
+    the export path mirrors about these corners directly, and drawing them into
+    a mask only to fit a rectangle back around it would lose the angle that is
+    the whole point of having them.  2026-09-02.
     """
     rows, columns = np.nonzero(region.mask)
+    if rows.size == 0:
+        return None
     points = np.column_stack((columns, rows)).astype(float)
     axis_u = longest_straight_hull_chain_axis(
         points, tolerance_degrees, min_axis_lead_ratio,
     )
     if axis_u is None:
-        return region
+        return None
     axis_v = np.array((-axis_u[1], axis_u[0]))
     # Fit pixel squares, rather than their centres: the result is an envelope
     # even at the one-pixel terminals of a relief glyph.
@@ -90,12 +93,43 @@ def fitted_rectangle(
     across = pixel_corners @ axis_v
     u0, u1 = float(along.min()), float(along.max())
     v0, v1 = float(across.min()), float(across.max())
-    corners = np.asarray((
+    return np.asarray((
         axis_u * u0 + axis_v * v0,
         axis_u * u1 + axis_v * v0,
         axis_u * u1 + axis_v * v1,
         axis_u * u0 + axis_v * v1,
     ))
+
+
+def atlas_rectangle_corners(
+    region: Region, tolerance_degrees: float, min_axis_lead_ratio: float,
+) -> tuple[tuple[float, float], ...] | None:
+    """``region_rectangle_corners`` moved into atlas coordinates."""
+    corners = region_rectangle_corners(
+        region, tolerance_degrees, min_axis_lead_ratio,
+    )
+    if corners is None:
+        return None
+    return tuple(
+        (float(x) + region.x, float(y) + region.y) for x, y in corners
+    )
+
+
+def fitted_rectangle(
+    region: Region, tolerance_degrees: float, min_axis_lead_ratio: float,
+) -> Region:
+    """Fit one grouped region to the rectangle aligned with its longest edge.
+
+    Text and engraved legends usually contribute one long near-straight hull
+    edge: their baseline.  The least-area orientation instead compromises
+    between every serif and terminal.  Use that strongest edge as the local
+    horizontal axis, and take the full normal extent perpendicular to it.
+    """
+    corners = region_rectangle_corners(
+        region, tolerance_degrees, min_axis_lead_ratio,
+    )
+    if corners is None:
+        return region
     local_left, local_top = np.floor(corners.min(axis=0)).astype(int)
     local_right, local_bottom = np.ceil(corners.max(axis=0)).astype(int)
     width, height = int(local_right - local_left + 1), int(local_bottom - local_top + 1)

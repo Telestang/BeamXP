@@ -63,6 +63,7 @@ docs/
 
 # Generated RHD texture outputs (large binaries)
 rhd_textures/
+normal_probe/
 
 # glyph_lab's extracted texture corpus: derived from the game's own zips, and
 # tens of MB per 4k atlas.  Rebuild it with scripts/build_glyph_corpus.py.

@@ -305,7 +305,7 @@ class EnvelopeTests(unittest.TestCase):
             merge_region_sets_with_rotations,
         )
 
-        _merged, _contributed, rotations = merge_region_sets_with_rotations(
+        _merged, _contributed, rotations, _masks = merge_region_sets_with_rotations(
             [(6, 2, 40, 32)],
             [(8, 4, 36, 28)],
             DEFAULT_RHD_CONFIG,
@@ -333,7 +333,7 @@ class EnvelopeTests(unittest.TestCase):
             deduplicate_region_detections,
         )
 
-        _regions, rotations, _removed = deduplicate_region_detections(
+        _regions, rotations, _removed, _masks = deduplicate_region_detections(
             [(6, 2, 40, 32), (7, 3, 39, 31)], [LEANING, None]
         )
         self.assertIsNotNone(rotations[0])

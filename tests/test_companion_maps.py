@@ -623,7 +623,7 @@ class ReliefFieldTests(unittest.TestCase):
 
 class RegionMergeTests(unittest.TestCase):
     def test_duplicate_atlas_regions_from_multiple_uv_domains_collapse(self) -> None:
-        regions, rotations, removed = deduplicate_region_detections(
+        regions, rotations, removed, _masks = deduplicate_region_detections(
             [(163, 241, 58, 56), (162, 241, 59, 56), (320, 200, 20, 20)]
         )
 
@@ -632,7 +632,7 @@ class RegionMergeTests(unittest.TestCase):
         self.assertEqual(rotations, [None, None])
 
     def test_distinct_overlapping_atlas_regions_are_collapsed(self) -> None:
-        regions, _rotations, removed = deduplicate_region_detections(
+        regions, _rotations, removed, _masks = deduplicate_region_detections(
             [(100, 100, 40, 20), (120, 100, 40, 20)]
         )
 
@@ -640,7 +640,7 @@ class RegionMergeTests(unittest.TestCase):
         self.assertEqual(regions, [(100, 100, 60, 20)])
 
     def test_region_collapse_repeats_when_union_creates_new_overlap(self) -> None:
-        regions, rotations, removed = deduplicate_region_detections(
+        regions, rotations, removed, _masks = deduplicate_region_detections(
             [(0, 0, 10, 10), (8, 8, 10, 10), (16, 0, 5, 7)]
         )
 

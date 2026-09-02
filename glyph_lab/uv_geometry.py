@@ -9,12 +9,20 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
 
+# 2026-09-02: the hull helpers moved to ``glyph_lab.hulls`` and are re-exported
+# here so callers that always found them in this module still do.  The move is
+# about imports, not about geometry: this module reads production defaults, and
+# the detector -- which the export path now imports -- must not reach them.
+from glyph_lab.hulls import (
+    SEAM_CORNER_TOLERANCE_PX,
+    convex_hull,
+    simplified_hull,
+)
 from mesh_segmentation_transform.mirror_texture_for_rhd import (
     DEFAULT_RHD_CONFIG,
 )
 
 DEFAULT_SEAM_PARALLELOGRAM_OPPOSITE_EDGE_DOT = 0.90
-SEAM_CORNER_TOLERANCE_PX = 0.5
 PARALLELOGRAM_MIN_EDGE_PX = 2.0
 PARALLELOGRAM_MIN_BOUNDARY_COVERAGE = 0.90
 PARALLELOGRAM_MAX_BOUNDARY_GAP_PX = 1.0
@@ -39,51 +47,6 @@ class SimpleUvGeometryConfig:
 
 
 DEFAULT_SIMPLE_UV_GEOMETRY_CONFIG = SimpleUvGeometryConfig()
-
-
-def convex_hull(points: np.ndarray) -> np.ndarray:
-    """Return the monotonic-chain hull without adding an OpenCV dependency."""
-    unique = sorted({(float(x), float(y)) for x, y in np.asarray(points).reshape(-1, 2)})
-    if len(unique) < 3:
-        return np.asarray(unique, dtype=np.float64)
-
-    def cross(origin, first, second) -> float:
-        return ((first[0] - origin[0]) * (second[1] - origin[1])
-                - (first[1] - origin[1]) * (second[0] - origin[0]))
-
-    lower = []
-    for point in unique:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
-            lower.pop()
-        lower.append(point)
-    upper = []
-    for point in reversed(unique):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
-            upper.pop()
-        upper.append(point)
-    return np.asarray(lower[:-1] + upper[:-1], dtype=np.float64)
-
-
-def simplified_hull(hull: np.ndarray, tolerance_px: float = SEAM_CORNER_TOLERANCE_PX) -> np.ndarray:
-    """Remove raster staircase vertices without erasing a real chart corner."""
-    points = np.asarray(hull, dtype=np.float64).copy()
-    while len(points) > 3:
-        distances: list[float] = []
-        for index, point in enumerate(points):
-            first, second = points[index - 1], points[(index + 1) % len(points)]
-            edge = second - first
-            length = float(np.linalg.norm(edge))
-            distance = (
-                abs(edge[0] * (point[1] - first[1])
-                    - edge[1] * (point[0] - first[0])) / length
-                if length > 1e-6 else 0.0
-            )
-            distances.append(distance)
-        candidate = int(np.argmin(distances))
-        if distances[candidate] > tolerance_px:
-            break
-        points = np.delete(points, candidate, axis=0)
-    return points
 
 
 def _has_axis_aligned_edge(edges: np.ndarray, tolerance_px: float) -> bool:

@@ -14,6 +14,7 @@ import numpy as np
 
 from glyph_lab.corpus import UvDomainGeometry, domain_boundaries
 from glyph_lab.render import (
+    OUTSIDE_UV_DIM,
     PARALLELOGRAM_COLOUR,
     REGION_COLOUR,
     TEXEL_COLOUR,
@@ -63,7 +64,7 @@ class ComposeViewTests(unittest.TestCase):
     def test_the_texel_overlay_paints_amber_where_it_fired(self) -> None:
         colour, domains, fired = texture()
         image = compose_view(colour, domains, fired, None, (0.0, 0.0, 64.0, 64.0),
-                             (64, 64), ViewOptions(show_regions=False))
+                             (64, 64), ViewOptions(show_texels=True, show_regions=False))
         self.assertEqual(image.getpixel((20, 16)), TEXEL_COLOUR)
         self.assertNotEqual(image.getpixel((20, 30)), TEXEL_COLOUR)
 
@@ -81,7 +82,7 @@ class ComposeViewTests(unittest.TestCase):
         fired[:] = False  # replaced by a single long stroke below
         fired[256, 64:448] = True
         image = compose_view(colour, domains, fired, None, (0.0, 0.0, 512.0, 512.0),
-                             (64, 64), ViewOptions(show_regions=False))
+                             (64, 64), ViewOptions(show_texels=True, show_regions=False))
         pixels = np.asarray(image)
         self.assertTrue((pixels[:, :, 0] > pixels[:, :, 2]).any(), "no amber survived")
 
@@ -102,10 +103,15 @@ class ComposeViewTests(unittest.TestCase):
     def test_outside_the_uv_domain_is_dimmed_only_when_asked(self) -> None:
         colour, domains, _fired = texture()
         rect, size = (0.0, 0.0, 64.0, 64.0), (64, 64)
+        # 2026-09-02: the brightness is passed explicitly.  ``outside_uv_dim``
+        # defaults to 1.0 -- no wash at all -- so leaving it out would compare
+        # an undimmed view against an undimmed view and pass on anything.
         dim = compose_view(colour, domains, None, None, rect, size,
-                           ViewOptions(show_texels=False, show_regions=False))
+                           ViewOptions(show_texels=False, show_regions=False,
+                                       outside_uv_dim=OUTSIDE_UV_DIM))
         plain = compose_view(colour, domains, None, None, rect, size,
                              ViewOptions(show_texels=False, show_regions=False,
+                                         outside_uv_dim=OUTSIDE_UV_DIM,
                                          dim_outside_uv=False))
         self.assertLess(dim.getpixel((2, 2))[0], plain.getpixel((2, 2))[0])
         self.assertEqual(dim.getpixel((32, 32)), plain.getpixel((32, 32)))
@@ -151,7 +157,8 @@ class UvEdgeTests(unittest.TestCase):
         fired[8, 16:48] = True          # laid along the island's top edge
         image = compose_view(
             colour, domains, fired, None, (0.0, 0.0, 64.0, 64.0), (64, 64),
-            ViewOptions(show_regions=False, show_uv_edges=True), edges,
+            ViewOptions(show_texels=True, show_regions=False, show_uv_edges=True),
+            edges,
         )
         self.assertEqual(image.getpixel((20, 8)), TEXEL_COLOUR)
 

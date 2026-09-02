@@ -1783,6 +1783,12 @@ class MultiPartPreviewTests(unittest.TestCase):
                     base_member,
                     workspace,
                     config=rhd.RhdTextureConfig(
+                        # 2026-09-02: these pin the legacy front end's own
+                        # choices -- which box_source it picks per layer, and
+                        # that a companion normal reaches it as a GPU edge
+                        # response.  glyph_lab answers neither question, so
+                        # asserting them against it would be asserting nothing.
+                        detector="legacy",
                         detect_on_normal_map=True,
                         write_debug_overlays=False,
                     ),
@@ -1910,7 +1916,9 @@ class MultiPartPreviewTests(unittest.TestCase):
                     SimpleNamespace(),
                     normal_member,
                     workspace,
-                    config=rhd.RhdTextureConfig(write_debug_overlays=False),
+                    config=rhd.RhdTextureConfig(
+                        detector="legacy", write_debug_overlays=False,
+                    ),
                     part_scope=[dash],
                     masks=masks,
                     detection_session=session,
@@ -3436,7 +3444,7 @@ class SharedLayerRegionTests(unittest.TestCase):
             [],
         )
 
-        regions, rotations, sources, added = ledger.combined(
+        regions, rotations, sources, added, _masks = ledger.combined(
             "vehicles/ardente/interior_b.color.dds",
             (8, 8),
             [],
@@ -3459,7 +3467,7 @@ class SharedLayerRegionTests(unittest.TestCase):
             [((1.0, 0.0), (3.0, 0.0), (3.0, 1.0), (1.0, 1.0))],
         )
 
-        regions, rotations, _sources, _added = ledger.combined(
+        regions, rotations, _sources, _added, _masks = ledger.combined(
             "vehicles/ardente/interior_r.data.dds",
             (8, 4),
             [],
@@ -3493,7 +3501,7 @@ class SharedLayerRegionTests(unittest.TestCase):
 
         ledger = rhd.SharedLayerRegionLedger()
         ledger.record_evidence("vehicles/car/null_n.dds", evidence)
-        regions, _rotations, _sources, _added = ledger.combined(
+        regions, _rotations, _sources, _added, _masks = ledger.combined(
             "vehicles/car/labels.color.dds", (1024, 1024), [], []
         )
         self.assertEqual(regions, [native_region])

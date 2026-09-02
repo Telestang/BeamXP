@@ -62,11 +62,24 @@ class ProductionDetectionSession(Generic[DetectionResult]):
     def __init__(self) -> None:
         self._results: dict[tuple[Hashable, ...], DetectionResult] = {}
         self._normal_edges: dict[tuple[Hashable, ...], NormalGpuEdgeData] = {}
+        # 2026-09-02: the glyph_lab equivalents of ``_normal_edges``, and there
+        # for the same reason.  A material's colour, scalar and normal maps are
+        # separate texture jobs sharing one companion normal and one UV
+        # topology, so without these each layer repeats a full-atlas gradient
+        # pass, a windowed filter per domain, and a DAE topology walk that
+        # cannot differ between them.
+        self._flat_ground: dict[tuple[Hashable, ...], np.ndarray] = {}
+        self._steepness: dict[tuple[Hashable, ...], np.ndarray] = {}
+        self._mesh_seams: dict[tuple[Hashable, ...], np.ndarray | None] = {}
         self._lock = Lock()
         self.hits = 0
         self.misses = 0
         self.normal_edge_hits = 0
         self.normal_edge_misses = 0
+        self.normal_evidence_hits = 0
+        self.normal_evidence_misses = 0
+        self.mesh_seam_hits = 0
+        self.mesh_seam_misses = 0
 
     def prewarm_gpu(self) -> None:
         """Start creation of the one shared ModernGL context asynchronously."""
@@ -83,15 +96,21 @@ class ProductionDetectionSession(Generic[DetectionResult]):
         relief_bridge_response: np.ndarray | None = None,
         policy: Hashable = "",
     ) -> tuple[Hashable, ...]:
-        return (
-            _array_fingerprint(image),
-            _array_fingerprint(mirror_mask),
-            _array_fingerprint(domain_mask),
-            tuple(_array_fingerprint(mask) for mask in island_masks),
-            _array_fingerprint(relief_bridge_response),
-            detector_config,
-            policy,
-        )
+        from mesh_segmentation_transform.export_timings import timed
+
+        # Hashing a 4k atlas is not free, and this runs for every layer of
+        # every job; it is worth seeing in the breakdown rather than hiding
+        # inside whatever called it.
+        with timed("detection cache key"):
+            return (
+                _array_fingerprint(image),
+                _array_fingerprint(mirror_mask),
+                _array_fingerprint(domain_mask),
+                tuple(_array_fingerprint(mask) for mask in island_masks),
+                _array_fingerprint(relief_bridge_response),
+                detector_config,
+                policy,
+            )
 
     def get(self, key: tuple[Hashable, ...]) -> DetectionResult | None:
         with self._lock:
@@ -140,6 +159,83 @@ class ProductionDetectionSession(Generic[DetectionResult]):
         with self._lock:
             existing = self._normal_edges.setdefault(key, prepared)
         return existing, existing is not prepared
+
+
+    # -- glyph_lab shared evidence ---------------------------------------
+    #
+    # Each of these takes a ``produce`` callable rather than the arrays it
+    # needs, so this module keeps owning scheduling only and never grows a
+    # dependency on the detector.  The keys are pixels and parameters, not
+    # filenames, matching how ``key`` identifies a detection: mods ship
+    # byte-identical maps under different names, and two genuinely different
+    # normals must not share an answer.
+
+    def normal_steepness(
+        self,
+        normal_rgb: np.ndarray,
+        domains: np.ndarray,
+        produce: Callable[[], np.ndarray],
+    ) -> tuple[np.ndarray, bool]:
+        """One normal map's edge-steepness image, derived once per export."""
+        key = (_array_fingerprint(normal_rgb), _array_fingerprint(domains))
+        return self._shared(self._steepness, key, produce, "normal_evidence")
+
+    def normal_flat_ground(
+        self,
+        normal_rgb: np.ndarray,
+        domains: np.ndarray,
+        config: Hashable,
+        produce: Callable[[], np.ndarray],
+    ) -> tuple[np.ndarray, bool]:
+        """The slope-free field every layer of one material groups against."""
+        key = (
+            _array_fingerprint(normal_rgb), _array_fingerprint(domains), config,
+        )
+        return self._shared(self._flat_ground, key, produce, "normal_evidence")
+
+    def mesh_seam_extents(
+        self,
+        identity: Hashable,
+        produce: Callable[[], np.ndarray | None],
+    ) -> tuple[np.ndarray | None, bool]:
+        """One material's mesh discontinuities, walked once per export.
+
+        Keyed by the caller's identity -- the DAE, the COLLADA symbols and the
+        atlas size -- because the input is a parsed XML tree that has no cheap
+        fingerprint and does not change within an export.
+        """
+        with self._lock:
+            if identity in self._mesh_seams:
+                self.mesh_seam_hits += 1
+                return self._mesh_seams[identity], True
+            self.mesh_seam_misses += 1
+        produced = produce()
+        with self._lock:
+            existing = self._mesh_seams.setdefault(identity, produced)
+        return existing, existing is not produced
+
+    def _shared(
+        self,
+        store: dict,
+        key: tuple[Hashable, ...],
+        produce: Callable[[], np.ndarray],
+        counter: str,
+    ) -> tuple[np.ndarray, bool]:
+        with self._lock:
+            cached = store.get(key)
+            if cached is not None:
+                setattr(self, f"{counter}_hits", getattr(self, f"{counter}_hits") + 1)
+                return cached, True
+            setattr(self, f"{counter}_misses", getattr(self, f"{counter}_misses") + 1)
+        # Produced outside the lock: these are whole-atlas passes, and holding
+        # the lock across one would serialise the colour/relief job pair that
+        # ``run_colour_and_relief_jobs`` exists to overlap.  A concurrent
+        # duplicate wastes one derivation and then agrees, which is cheaper
+        # than making every other layer wait.
+        produced = produce()
+        with self._lock:
+            existing = store.setdefault(key, produced)
+        return existing, existing is not produced
 
 
 @dataclass(frozen=True, slots=True)

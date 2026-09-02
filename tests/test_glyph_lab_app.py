@@ -16,12 +16,13 @@ import json
 import tempfile
 import time
 import unittest
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import numpy as np
 
 from glyph_lab.corpus import MANIFEST_NAME, UvDomainGeometry, write_texture
+from glyph_lab.render import ViewOptions
 
 
 def tiny_corpus(directory: Path, count: int = 3) -> Path:
@@ -335,25 +336,35 @@ class GlyphLabWindowTests(unittest.TestCase):
         self.assertEqual(app.view_origin, (0.0, 0.0))
 
     def test_the_view_options_read_the_checkboxes(self) -> None:
+        # 2026-09-02: the starting state is compared against ViewOptions rather
+        # than spelled out.  Three overlay defaults have been retuned since this
+        # was written, and each time the literals here went stale they failed
+        # the round trip this test is actually for.
         app = self.build()
-        self.assertTrue(app.view_options().show_texels)
-        self.assertFalse(app.view_options().show_uv_edges)
-        self.assertFalse(app.view_options().show_mesh_seams)
-        self.assertFalse(app.view_options().show_uv_geometry)
-        app.show_texels.set(False)
+        defaults = ViewOptions()
+        opening = app.view_options()
+        for entry in fields(ViewOptions):
+            with self.subTest(option=entry.name):
+                self.assertEqual(
+                    getattr(opening, entry.name), getattr(defaults, entry.name)
+                )
+        for name in (
+            "show_texels", "show_uv_edges", "show_mesh_seams", "show_uv_geometry",
+        ):
+            getattr(app, name).set(not getattr(defaults, name))
         app.dim_outside.set(False)
-        app.show_uv_edges.set(True)
-        app.show_mesh_seams.set(True)
-        app.show_uv_geometry.set(True)
         app.geometry_vars["seam_parallelogram_opposite_edge_dot"].set("0.97")
         app.geometry_vars["seam_symmetry_min_score"].set("0.98")
         app.geometry_vars["parallelogram_min_edge_px"].set("3.5")
         options = app.view_options()
-        self.assertFalse(options.show_texels)
         self.assertFalse(options.dim_outside_uv)
-        self.assertTrue(options.show_uv_edges)
-        self.assertTrue(options.show_mesh_seams)
-        self.assertTrue(options.show_uv_geometry)
+        for name in (
+            "show_texels", "show_uv_edges", "show_mesh_seams", "show_uv_geometry",
+        ):
+            with self.subTest(option=name):
+                self.assertEqual(
+                    getattr(options, name), not getattr(defaults, name)
+                )
         self.assertEqual(app.geometry_config().seam_parallelogram_opposite_edge_dot, 0.97)
         self.assertEqual(app.geometry_config().seam_symmetry_min_score, 0.98)
         self.assertEqual(app.geometry_config().parallelogram_min_edge_px, 3.5)

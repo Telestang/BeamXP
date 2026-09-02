@@ -3287,12 +3287,19 @@ def detect(
     capture: bool = False,
     probe: RegionProbe | None = None,
     normal_config: object | None = None,
+    normal_flat: np.ndarray | None = None,
 ) -> Detection:
     """Detect over every UV domain of one texture.
 
     ``capture`` records every stage in ``STAGES`` as it happens, for the
     viewer.  It costs a dict of references per domain and a pack at the end;
     nothing at all when it is off.
+
+    ``normal_flat`` is the companion normal's flat-ground field, precomputed.
+    It is derived from the normal map and the domains alone, so every layer of
+    one material has the same one and an export can build it once -- which is
+    worth doing: it is a full-atlas gradient pass plus a windowed filter per
+    domain.  Supplying it makes ``normal_config`` unnecessary.  2026-09-02.
     """
     config = config or LabConfig()
     stages: dict[str, np.ndarray] = {}
@@ -3315,8 +3322,7 @@ def detect(
     )
     if repeat_texture is not None:
         timings[UNREPEATED] = time.perf_counter() - repeat_started
-    normal_flat = None
-    if normal_config is not None:
+    if normal_flat is None and normal_config is not None:
         from glyph_lab.normal_map import absence_of_slopes
         normal_flat = absence_of_slopes(
             texture,

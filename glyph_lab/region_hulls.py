@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageDraw
 
+from glyph_lab.hulls import convex_hull
 from glyph_lab.regions import Region, enclosed_voids
-from glyph_lab.uv_geometry import convex_hull
 
 
 def convex_region_mask(region: Region) -> np.ndarray:

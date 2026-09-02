@@ -46,6 +46,17 @@ from glyph_lab.corpus import (
     domain_labels_from_crops,
     write_texture,
 )
+# 2026-09-02: this ``material_symbols_for_binding`` is NOT the one the export
+# path uses.  ``mirror_texture_for_rhd`` has its own, which prefers an exact
+# ``dae_material`` match and only falls back to the looser alias union; this one
+# takes the union outright.  Measured across the shipped selections they agree
+# on eight of eleven bindings and differ on the Volvo, where this one also picks
+# up ``v60_andronisk_int_buttons_off-material`` -- so that corpus texture's seam
+# map covers the off-state geometry and the export's would not.  Left divergent
+# rather than unified: both are defensible (a seam map wants every symbol
+# painting the atlas; a layer correction wants the symbol it is correcting), and
+# changing this one silently rebuilds the corpus that the detector was tuned
+# against.  Reconcile deliberately, with a corpus rebuild and a re-judge.
 from mesh_segmentation_transform.annotate_texture_tuning_app import (
     build_texture_source,
     load_normal_map,
