@@ -16,7 +16,7 @@ import traceback
 import zipfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
 from xml.etree import ElementTree as ET
@@ -284,11 +284,6 @@ class SymmetryMeasurement:
     sibling_pair_count: int
     mirror_crossings: int
     passed: bool
-    # 2026-09-03: filled in at acceptance, not by measure_perimeter_symmetry --
-    # the perimeter measurement never sees the region's faces. Defaults keep the
-    # measurement constructible from the perimeter alone.
-    self_reflection_rms_error: float = 0.0
-    self_reflection_max_error: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -2664,78 +2659,6 @@ def measure_region_depth_ratio(
     return depth / facade
 
 
-def measure_region_self_reflection(
-    topology: Topology,
-    faces: tuple[int, ...],
-    centroid: tuple[float, float, float],
-    plane_normal: tuple[float, float, float],
-) -> tuple[float, float]:
-    """How well reflecting a region about its own plane maps it back onto itself.
-
-    2026-09-03: this is the invariant ``_candidate_transform_metres`` already
-    documents -- for a candidate S symmetric about its detected plane L,
-    ``L(S) = S``, which is the only reason ``G L`` lands S in the mirrored
-    carrier's recess without mirroring its geometry. Nothing measured it. The
-    perimeter test is a proxy for it, and an outline can be symmetric while the
-    surface inside it is not: etk800's light-switch fascia fitted its perimeter
-    to 0.38 mm, inside the 0.5 mm gate, yet reflecting the plate about that
-    plane moved it 10.3 mm and carried the adopted dial island 24.3 mm -- more
-    than the dial's own 18 mm diameter -- clean out of its recess.
-
-    Returned as (rms, max) over the symmetric nearest-neighbour residuals, in
-    metres, so the caller can gate on the same tolerance the perimeter used.
-    Perimeter RMS does not predict this: candidate 6 on the same part fits its
-    outline to 0.08 mm and still moves 7.9 mm.
-    """
-    if not faces:
-        return float("inf"), float("inf")
-    normal = np.asarray(plane_normal, dtype=float)
-    length = float(np.linalg.norm(normal))
-    if length <= 1e-15:
-        return float("inf"), float("inf")
-    normal = normal / length
-    centre = np.asarray(centroid, dtype=float)
-
-    vertex_indices = np.unique(topology.triangles[np.asarray(faces, dtype=np.int64)])
-    points = topology.vertices[vertex_indices]
-    reflected = points - 2.0 * ((points - centre) @ normal)[:, None] * normal[None, :]
-
-    # Both directions: a region that reflects onto a subset of itself would
-    # otherwise pass on the forward residual alone.
-    forward = _nearest_sample_distances(reflected, points)
-    backward = _nearest_sample_distances(points, reflected)
-    residuals = np.concatenate((forward, backward))
-    return (
-        float(np.sqrt(float(np.mean(residuals**2)))),
-        float(residuals.max(initial=0.0)),
-    )
-
-
-def _measurement_survives_self_reflection(
-    topology: Topology,
-    faces: tuple[int, ...],
-    measurement: SymmetryMeasurement,
-    direct_rms_tolerance: float,
-) -> SymmetryMeasurement | None:
-    """Record the region's self-reflection on the measurement, or reject it.
-
-    Gated on the same direct tolerance the perimeter had to meet, because it
-    measures the same thing one step closer to what the transform actually
-    does. Returns None when the accepted plane does not map the region onto
-    itself, in which case the region belongs on the mirrored carrier.
-    """
-    rms, maximum = measure_region_self_reflection(
-        topology, faces, measurement.centroid, measurement.plane_normal
-    )
-    if not math.isfinite(rms) or rms > direct_rms_tolerance:
-        return None
-    return replace(
-        measurement,
-        self_reflection_rms_error=rms,
-        self_reflection_max_error=maximum,
-    )
-
-
 def _classify_region(
     topology: Topology,
     island_index: int,
@@ -2965,23 +2888,12 @@ def _find_eager_child_adoptions(
     island_geometry: tuple[_IslandGeometry, ...],
     active_by_island: list[set[int]],
     island_candidate_counts: list[int],
-    host_measurement: SymmetryMeasurement,
-    direct_rms_tolerance: float,
 ) -> tuple[ChildAdoption, ...]:
     """Claim untouched whole islands strongly supported by a symmetric host.
 
     This first POC intentionally handles one direct generation only. It favours
     precision over recall because an adopted island is skipped by later symmetry
     testing and inherits the host transform.
-
-    2026-09-03: inheriting the host transform is exactly why the child has to
-    satisfy the host plane's self-reflection as well. ``G L`` returns the host
-    to the mirrored carrier because ``L(host) = host``; a child for which
-    ``L(child) != child`` is not carried to its mirrored place but to its
-    reflected place *within* the host, which is somewhere else. Physical
-    support says the child belongs to the host; only this says the host's
-    transform can carry it. Without it the child is better left on the mirrored
-    carrier with the rest of the mesh.
     """
     host_points, host_samples = _surface_points_and_samples(topology, host_faces)
     if len(host_points) < 3 or len(host_samples) == 0 or host_area <= 1e-15:
@@ -3018,15 +2930,6 @@ def _find_eager_child_adoptions(
         if containment_ratio < 0.05:
             continue
 
-        child_rms, _child_max = measure_region_self_reflection(
-            topology,
-            child_faces,
-            host_measurement.centroid,
-            host_measurement.plane_normal,
-        )
-        if not math.isfinite(child_rms) or child_rms > direct_rms_tolerance:
-            continue
-
         distances = _nearest_sample_distances(child.samples, host_samples)
         median_gap = float(np.median(distances))
         p90_gap = float(np.percentile(distances, 90.0))
@@ -3054,8 +2957,6 @@ def _late_candidate_adoption(
     child: IslandCandidate,
     source_candidate_id: int,
     island_remainder: frozenset[int] = frozenset(),
-    *,
-    direct_rms_tolerance: float,
 ) -> ChildAdoption | None:
     """Return a late-host adoption when a later facade supports an earlier root.
 
@@ -3108,18 +3009,6 @@ def _late_candidate_adoption(
     if containment_ratio < 0.05:
         return None
 
-    # The host's plane has to carry the whole reassembled child, not just
-    # qualify it: see _find_eager_child_adoptions on why L(child) = child is
-    # what makes G L a placement rather than a displacement.
-    child_rms, _child_max = measure_region_self_reflection(
-        topology,
-        adopted_faces,
-        host.measurement.centroid,
-        host.measurement.plane_normal,
-    )
-    if not math.isfinite(child_rms) or child_rms > direct_rms_tolerance:
-        return None
-
     distances = _nearest_sample_distances(child_samples, host_samples)
     median_gap = float(np.median(distances))
     p90_gap = float(np.percentile(distances, 90.0))
@@ -3143,8 +3032,6 @@ def _resolve_late_host_adoptions(
     candidates: list[IslandCandidate],
     premerge_id_by_key: dict[tuple[int, int], int],
     islands: tuple[tuple[int, ...], ...] = (),
-    *,
-    direct_rms_tolerance: float,
 ) -> tuple[list[IslandCandidate], dict[tuple[int, int], tuple[int, int]]]:
     """Merge early roots into later-discovered supported hosts.
 
@@ -3181,12 +3068,7 @@ def _resolve_late_host_adoptions(
             if host.key == child.key:
                 continue
             adoption = _late_candidate_adoption(
-                topology,
-                host,
-                child,
-                premerge_id_by_key[child.key],
-                remainder,
-                direct_rms_tolerance=direct_rms_tolerance,
+                topology, host, child, premerge_id_by_key[child.key], remainder
             )
             if adoption is None:
                 continue
@@ -3355,22 +3237,6 @@ def _resolve_touching_symmetric_unions(
         if union_depth_ratio > max_depth_ratio:
             survivors.extend(group)
             continue
-
-        # The union's plane is fitted to the union's outline, so it earns its
-        # own self-reflection check too; the members' planes say nothing about
-        # whether this one maps the merged surface onto itself. Measured over
-        # everything the union's transform will move, which includes the
-        # members' own adopted children, not just the merged host faces.
-        union_moved_faces = tuple(
-            sorted({face for candidate in group for face in candidate.faces})
-        )
-        validated = _measurement_survives_self_reflection(
-            topology, union_moved_faces, measurement, direct_rms_tolerance
-        )
-        if validated is None:
-            survivors.extend(group)
-            continue
-        measurement = validated
 
         union_area = float(topology.face_areas[list(union_host_faces)].sum())
         group.sort(
@@ -3562,19 +3428,6 @@ def analyse_symmetry_sweep(
                 )
                 if not measurement.passed:
                     continue
-                # Before anything is claimed: the accepted plane has to map the
-                # region's own surface onto itself, or G*L will not put it back
-                # in the mirrored carrier's recess. A region rejected here must
-                # not consume child islands on its way out.
-                validated = _measurement_survives_self_reflection(
-                    topology,
-                    region.faces,
-                    measurement,
-                    direct_symmetry_tolerance_metres,
-                )
-                if validated is None:
-                    continue
-                measurement = validated
 
                 island_candidate_counts[island_offset] += 1
                 key = (region.island_index, island_candidate_counts[island_offset])
@@ -3588,8 +3441,6 @@ def analyse_symmetry_sweep(
                     island_geometry,
                     active_by_island,
                     island_candidate_counts,
-                    measurement,
-                    direct_symmetry_tolerance_metres,
                 )
                 all_faces = tuple(
                     sorted(
@@ -3688,11 +3539,7 @@ def analyse_symmetry_sweep(
         max_depth_ratio,
     )
     accepted_candidates, absorbed_key_to_host_key = _resolve_late_host_adoptions(
-        topology,
-        accepted_candidates,
-        premerge_id_by_key,
-        islands,
-        direct_rms_tolerance=direct_symmetry_tolerance_metres,
+        topology, accepted_candidates, premerge_id_by_key, islands
     )
     accepted_candidates.sort(
         key=lambda candidate: (
@@ -5123,8 +4970,6 @@ def export_transformed_part_dae(
                 "symmetry_plane_normal_world": list(candidate.measurement.plane_normal),
                 "initial_rms_error_millimetres": candidate.measurement.initial_rms_error * 1000.0,
                 "corrected_rms_error_millimetres": candidate.measurement.rms_error * 1000.0,
-                "self_reflection_rms_error_millimetres": candidate.measurement.self_reflection_rms_error * 1000.0,
-                "self_reflection_max_error_millimetres": candidate.measurement.self_reflection_max_error * 1000.0,
                 "mirror_plane_y_tilt_degrees": candidate.measurement.mirror_plane_y_tilt_degrees,
                 "nominal_rigid_y_rotation_correction_degrees": candidate.measurement.rigid_y_rotation_correction_degrees,
                 "tilt_search_applied": candidate.measurement.tilt_search_applied,
@@ -5502,10 +5347,6 @@ def _candidate_json(candidate: AcceptedCandidate) -> dict[str, object]:
             "rms_error_millimetres": measurement.rms_error * 1000.0,
             "max_error_metres": measurement.max_error,
             "max_error_millimetres": measurement.max_error * 1000.0,
-            "self_reflection_rms_error_metres": measurement.self_reflection_rms_error,
-            "self_reflection_rms_error_millimetres": measurement.self_reflection_rms_error * 1000.0,
-            "self_reflection_max_error_metres": measurement.self_reflection_max_error,
-            "self_reflection_max_error_millimetres": measurement.self_reflection_max_error * 1000.0,
         },
         "adopted_children": [
             {
@@ -5571,11 +5412,10 @@ def write_report(
             "plane": "first pass resamples complete closed perimeters at a fixed physical spacing; PCA gives the best-fit perimeter-plane normal; crossing it with global Z gives the deterministic vertical mirror-plane normal through the sample centroid",
             "comparison": "second pass inserts exact mirror-plane crossings, walks opposite half-perimeters in opposite directions, resamples sibling positions at equal travelled arc distance, reflects one half and averages the full 3-D squared sibling residuals",
             "acceptance": "candidate pseudo aspect ratio and perimeter-plane depth ratio must not exceed their configured maxima, initial post-reflection RMS must not exceed the outer tolerance, and final RMS must not exceed the stricter direct threshold; candidates initially below the direct threshold use the deterministic plane unchanged",
-            "self_reflection_check": "the accepted plane must also reflect the region's own surface back onto itself within the direct threshold, measured as symmetric nearest-neighbour residuals over the region vertices; the rigid transform G*L only returns a region to the mirrored carrier because L(S)=S, and a symmetric outline does not imply a symmetric surface",
             "borderline_tilt_correction": "candidates initially between the direct and outer RMS thresholds sweep the original mirror-plane normal about global Y over +/-6 degrees, refine the local minimum, and pass only if the corrected final RMS reaches the direct threshold; composing that reflection with the global X reflection applies the corresponding double-angle rigid correction",
             "touching_union_recovery": "after the sweep, accepted symmetric segmentations in the same geometric island that share boundary edges are grouped when their union has a closed symmetric perimeter; the parent is retained with the largest available union perimeter and absorbs the touching symmetric children",
-            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host, at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal, and reflecting the child about the host's own plane maps it back onto itself within the direct threshold; only one direct child generation is used",
-            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, footprint-overlap, extruded-perimeter containment and host-plane self-reflection tests applied to the child's whole reassembled island; this recovers parents that only separate from the main carrier at low crease angles",
+            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host and at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal; only one direct child generation is used",
+            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, footprint-overlap and extruded-perimeter containment tests; this recovers parents that only separate from the main carrier at low crease angles",
         },
         "timing": {
             "processing_seconds": result.processing_seconds,
