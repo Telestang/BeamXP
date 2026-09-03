@@ -2471,6 +2471,14 @@ class DomainMasks:
     island_label_count: int = 0
     island_labels: np.ndarray | None = None
     island_stats: np.ndarray | None = None
+    # 2026-09-03: the chart plan and the authored corners it is scored against
+    # are functions of this domain, not of any texture. A material's layers all
+    # share one of these and are corrected one after another in a single
+    # worker, so the first layer's answer serves the rest -- see
+    # ``planned_simple_uv_flips``.
+    island_corners: dict[int, np.ndarray] | None = None
+    simple_uv_flips: tuple[IslandFlip, ...] | None = None
+    simple_uv_flips_key: tuple[object, ...] | None = None
     skew_frames: tuple[
         tuple[tuple[float, float, float, float], np.ndarray, np.ndarray], ...
     ] | None = None
@@ -3386,11 +3394,55 @@ def _source_uv_boundary_points(
     return np.asarray([points[key] for key in boundary_keys], dtype=np.float64)
 
 
+def planned_simple_uv_flips(
+    masks: DomainMasks,
+    config: RhdTextureConfig,
+    components: tuple[int, np.ndarray, np.ndarray],
+    source_corners: dict[int, np.ndarray] | None,
+) -> list[IslandFlip]:
+    """This domain's chart plan, derived once however many maps ask for it.
+
+    ``simple_uv_domain_flips`` reads no texture: its mirror mask, axis map,
+    components and corners all come from the domain, so every map of a material
+    was deriving the same answer. They are corrected one after another in one
+    worker off one ``DomainMasks``, which is why the result can live on it.
+
+    2026-09-03: measured on etkc, where 87 corrections made 87 calls that took
+    123.6 s between them and had only ten distinct shapes -- two of them, the
+    4096-square interior domains at 54 and 74 charts, were 118 s across 36
+    calls. The cost is the whole-texel axis search: one 1792x3435 chart is
+    rolled and scored against itself 133 times, 2.9 s for that chart alone.
+
+    A fresh list each time because callers own what they are handed; the
+    ``IslandFlip`` objects inside it are never written to after construction.
+    """
+    key = (
+        bool(config.enable_simple_uv_domain_fallback),
+        float(config.min_island_symmetry),
+        int(config.simple_uv_min_area_px),
+        float(config.island_axis_search_ratio),
+        float(config.simple_uv_min_area_share),
+    )
+    if masks.simple_uv_flips is not None and masks.simple_uv_flips_key == key:
+        return list(masks.simple_uv_flips)
+    flips = simple_uv_domain_flips(
+        masks.mirror, config, masks.axis_map, components, source_corners,
+    )
+    masks.simple_uv_flips = tuple(flips)
+    masks.simple_uv_flips_key = key
+    return list(flips)
+
+
 def source_uv_island_corners(
     masks: DomainMasks,
     components: tuple[int, np.ndarray, np.ndarray],
 ) -> dict[int, np.ndarray]:
     """Map each labelled chart to its authored boundary corners in pixels."""
+    # 2026-09-03: memoised for the same reason the labels above it are -- this
+    # re-rasterises every source triangle group, and a material's layers all
+    # ask for it over one domain.
+    if masks.island_corners is not None:
+        return masks.island_corners
     if masks.island_triangle_groups is None:
         masks.island_triangle_groups = uv_island_triangle_groups(
             masks.mirrored_uv, masks.mirrored_xyz,
@@ -3415,10 +3467,11 @@ def source_uv_island_corners(
         source = _source_uv_boundary_points(tuple(group), width, height)
         if source is not None:
             corners.setdefault(int(label[index]), []).append(source)
-    return {
+    masks.island_corners = {
         label: np.concatenate(points, axis=0)
         for label, points in corners.items()
     }
+    return masks.island_corners
 
 
 def _parallelogram_chart_outline(
@@ -8720,9 +8773,7 @@ def build_rhd_texture(
     # glyph-led planner remains callable unchanged for every mixed atlas.
     with timed("plan simple uv flips"):
         flips = (
-            simple_uv_domain_flips(
-                mirror_mask, config, masks.axis_map, components, source_corners,
-            )
+            planned_simple_uv_flips(masks, config, components, source_corners)
             if masks.mirrored_uv
             else []
         )

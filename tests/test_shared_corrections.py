@@ -7,6 +7,8 @@ the line between "never meet" and "collide" is drawn.
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -254,3 +256,81 @@ class UvFlippedMaterialTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SimpleUvFlipPlanCacheTests(unittest.TestCase):
+    """The chart plan is a property of the domain, so its maps share one."""
+
+    @staticmethod
+    def _components(mirror: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
+        labels = np.zeros(mirror.shape, dtype=np.int32)
+        labels[mirror] = 1
+        ys, xs = np.nonzero(mirror)
+        stats = np.array(
+            [
+                [0, 0, mirror.shape[1], mirror.shape[0], int((~mirror).sum())],
+                [
+                    int(xs.min()), int(ys.min()),
+                    int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1),
+                    int(mirror.sum()),
+                ],
+            ],
+            dtype=np.int32,
+        )
+        return 2, labels, stats
+
+    def test_a_second_map_reuses_the_first_map_s_plan(self) -> None:
+        mirror = _box(64, 8, 8, 24, 24)
+        masks = _masks(mirror)
+        components = self._components(mirror)
+        config = rhd.RhdTextureConfig()
+
+        calls = []
+        real = rhd.simple_uv_domain_flips
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        with patch.object(rhd, "simple_uv_domain_flips", counted):
+            first = rhd.planned_simple_uv_flips(masks, config, components, None)
+            second = rhd.planned_simple_uv_flips(masks, config, components, None)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, second)
+        # A fresh list each time: a caller mutating one must not reach the next.
+        self.assertIsNot(first, second)
+
+    def test_a_changed_setting_is_not_served_from_the_cache(self) -> None:
+        mirror = _box(64, 8, 8, 24, 24)
+        masks = _masks(mirror)
+        components = self._components(mirror)
+
+        calls = []
+        real = rhd.simple_uv_domain_flips
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        with patch.object(rhd, "simple_uv_domain_flips", counted):
+            rhd.planned_simple_uv_flips(masks, rhd.RhdTextureConfig(), components, None)
+            rhd.planned_simple_uv_flips(
+                masks,
+                replace(rhd.RhdTextureConfig(), min_island_symmetry=0.1),
+                components,
+                None,
+            )
+
+        self.assertEqual(len(calls), 2)
+
+    def test_corners_are_derived_once_per_domain(self) -> None:
+        mirror = _box(64, 8, 8, 24, 24)
+        masks = _masks(mirror)
+        masks.island_corners = {7: np.zeros((1, 2), dtype=float)}
+        # Already answered for this domain, so the rasterising loop is skipped
+        # even though the domain carries no triangle groups to rasterise.
+        self.assertIs(
+            rhd.source_uv_island_corners(masks, self._components(mirror)),
+            masks.island_corners,
+        )
