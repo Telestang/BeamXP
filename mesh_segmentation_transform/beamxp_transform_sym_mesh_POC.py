@@ -16,15 +16,12 @@ import traceback
 import zipfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
 from xml.etree import ElementTree as ET
 
 import numpy as np
-from scipy.spatial.distance import pdist
-
-from mesh_segmentation_transform.export_timings import timed
 
 APP_NAME = "BeamXP Vehicle ZIP Mesh Transform POC"
 PRIMITIVE_TAGS = {"triangles", "polylist", "polygons", "trifans", "tristrips"}
@@ -287,6 +284,11 @@ class SymmetryMeasurement:
     sibling_pair_count: int
     mirror_crossings: int
     passed: bool
+    # 2026-09-03: filled in at acceptance, not by measure_perimeter_symmetry --
+    # the perimeter measurement never sees the region's faces. Defaults keep the
+    # measurement constructible from the perimeter alone.
+    self_reflection_rms_error: float = 0.0
+    self_reflection_max_error: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -2087,7 +2089,7 @@ def _failed_symmetry_measurement(
         passed=False,
     )
 
-def _measure_sampled_perimeter_symmetry(
+def measure_perimeter_symmetry(
     vertices: np.ndarray,
     loops: tuple[tuple[int, ...], ...],
     sample_spacing: float,
@@ -2458,223 +2460,6 @@ def _measure_sampled_perimeter_symmetry(
     )
 
 
-def _raw_perimeter_vertex_match(
-    points: np.ndarray,
-    indices: np.ndarray,
-    loops: tuple[tuple[int, ...], ...],
-    centre: np.ndarray,
-    mirror_normal: np.ndarray,
-    tolerance: float,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return the exact reflected vertex pairing, including boundary topology.
-
-    2026-09-03: A nearest-neighbour score can let several reflected vertices
-    claim one destination.  Augmenting-path matching makes the raw perimeter
-    test a genuine one-to-one correspondence before its reflected edges are
-    checked, rather than another approximate curve fit.
-    """
-    reflected = points - 2.0 * (
-        (points - centre) @ mirror_normal
-    )[:, None] * mirror_normal[None, :]
-    delta = reflected[:, None, :] - points[None, :, :]
-    squared_distances = np.einsum("ijk,ijk->ij", delta, delta)
-    tolerance_squared = tolerance * tolerance
-    adjacency = [
-        np.flatnonzero(row <= tolerance_squared).tolist()
-        for row in squared_distances
-    ]
-    if any(not candidates for candidates in adjacency):
-        return None
-
-    matched_left_by_right = np.full(len(points), -1, dtype=np.int64)
-
-    def claim(left: int, seen: np.ndarray) -> bool:
-        for right in adjacency[left]:
-            if seen[right]:
-                continue
-            seen[right] = True
-            previous = int(matched_left_by_right[right])
-            if previous < 0 or claim(previous, seen):
-                matched_left_by_right[right] = left
-                return True
-        return False
-
-    for left in range(len(points)):
-        if not claim(left, np.zeros(len(points), dtype=bool)):
-            return None
-
-    matched_right_by_left = np.empty(len(points), dtype=np.int64)
-    for right, left in enumerate(matched_left_by_right):
-        if left < 0:
-            return None
-        matched_right_by_left[left] = right
-
-    vertex_mapping: dict[int, int] = {}
-    for local_index, source in enumerate(indices):
-        target = int(indices[matched_right_by_left[local_index]])
-        previous = vertex_mapping.setdefault(int(source), target)
-        if previous != target:
-            return None
-
-    boundary_edges = {
-        canonical_edge(int(first), int(second))
-        for loop in loops
-        for first, second in zip(loop, (*loop[1:], loop[0]))
-    }
-    for first, second in boundary_edges:
-        mapped = canonical_edge(vertex_mapping[first], vertex_mapping[second])
-        if mapped not in boundary_edges:
-            return None
-
-    residuals = squared_distances[
-        np.arange(len(points)), matched_right_by_left
-    ]
-    return matched_right_by_left, residuals
-
-
-def measure_perimeter_symmetry(
-    vertices: np.ndarray,
-    loops: tuple[tuple[int, ...], ...],
-    sample_spacing: float,
-    rms_tolerance: float,
-    direct_rms_tolerance: float,
-) -> SymmetryMeasurement:
-    """Accept only raw-vertex perimeter symmetries with an unambiguous axis.
-
-    2026-09-03: The sampled search admitted visually plausible perimeters whose
-    authored boundary topology could not support the eventual rigid transform.
-    The replacement projects the raw boundary vertices into their fitted plane,
-    takes the centred family of genuinely equal longest chords from ``pdist``,
-    and tests their angle bisectors.  A candidate passes only when one bisector reflects every
-    original 3-D boundary vertex one-to-one and maps every boundary edge back to
-    another boundary edge.  ``sample_spacing`` and ``rms_tolerance`` stay in the
-    signature for saved configurations, but this deliberately stricter path does
-    not resample or perform a tilt search.
-    """
-    _ = sample_spacing, rms_tolerance
-    frame = _perimeter_plane_frame(vertices, loops)
-    if frame is None:
-        origin = np.zeros(3, dtype=float)
-        return _failed_symmetry_measurement(
-            origin, np.array([1.0, 0.0, 0.0], dtype=float), 0, 0,
-        )
-    centroid, surface_normal, first_axis, second_axis = frame
-    indices = np.concatenate(
-        [np.asarray(loop, dtype=np.int64) for loop in loops if len(loop) >= 3]
-    )
-    if len(indices) < 4:
-        return _failed_symmetry_measurement(centroid, surface_normal, len(indices), 0)
-    points = vertices[indices]
-    projected = np.column_stack(
-        ((points - centroid) @ first_axis, (points - centroid) @ second_axis)
-    )
-    squared_lengths = pdist(projected, metric="sqeuclidean")
-    if len(squared_lengths) == 0:
-        return _failed_symmetry_measurement(centroid, surface_normal, len(points), 0)
-    longest_length = math.sqrt(float(squared_lengths.max()))
-    if longest_length <= 1e-15:
-        return _failed_symmetry_measurement(centroid, surface_normal, len(points), 0)
-
-    # Pair equality follows the strict raw-vertex tolerance, with only a
-    # floating-point allowance proportional to the perimeter size.
-    equal_length_tolerance = max(
-        float(direct_rms_tolerance), longest_length * 1e-9,
-    )
-    rows, columns = np.triu_indices(len(points), 1)
-    near_longest = np.flatnonzero(
-        squared_lengths >= max(longest_length - equal_length_tolerance, 0.0) ** 2
-    )
-    if len(near_longest) < 2:
-        return _failed_symmetry_measurement(centroid, surface_normal, len(points), 0)
-
-    pairs = tuple(
-        (int(rows[index]), int(columns[index])) for index in near_longest
-    )
-    midpoints = np.asarray([
-        (projected[first] + projected[second]) * 0.5
-        for first, second in pairs
-    ])
-    midpoint = midpoints.mean(axis=0)
-    if float(np.linalg.norm(midpoints - midpoint, axis=1).max(initial=0.0)) > equal_length_tolerance:
-        return _failed_symmetry_measurement(centroid, surface_normal, len(points), 0)
-
-    chords = []
-    for first, second in pairs:
-        chord = projected[second] - projected[first]
-        chords.append(chord / max(float(np.linalg.norm(chord)), 1e-15))
-    bisectors: list[np.ndarray] = []
-    for first_index, first_chord in enumerate(chords):
-        for second_chord in chords[first_index + 1:]:
-            if float(first_chord @ second_chord) < 0.0:
-                second_chord = -second_chord
-            for bisector in (first_chord + second_chord, first_chord - second_chord):
-                length = float(np.linalg.norm(bisector))
-                if length <= 1e-12:
-                    continue
-                unit_bisector = bisector / length
-                if unit_bisector[0] < 0.0 or (
-                    abs(float(unit_bisector[0])) <= 1e-12 and unit_bisector[1] < 0.0
-                ):
-                    unit_bisector = -unit_bisector
-                if any(abs(float(unit_bisector @ known)) >= 1.0 - 1e-10 for known in bisectors):
-                    continue
-                bisectors.append(unit_bisector)
-    if not bisectors:
-        return _failed_symmetry_measurement(centroid, surface_normal, len(points), 0)
-
-    # The full 3-D midpoint keeps the eventual reflection plane positioned at
-    # the authored perimeter rather than at an arbitrary projection height.
-    centre = points[np.asarray([vertex for pair in pairs for vertex in pair], dtype=np.int64)].mean(axis=0)
-    vertical_limit = math.sin(math.radians(5.0))
-    best: SymmetryMeasurement | None = None
-    for bisector in bisectors:
-        axis = (
-            first_axis * bisector[0]
-            + second_axis * bisector[1]
-        )
-        mirror_normal = np.cross(axis, surface_normal)
-        mirror_length = float(np.linalg.norm(mirror_normal))
-        if mirror_length <= 1e-12:
-            continue
-        mirror_normal /= mirror_length
-        # Rigid correction is G*L; retain the established vertical local plane
-        # rather than introduce roll/pitch transforms for dashboard pieces.
-        if abs(float(mirror_normal[2])) > vertical_limit:
-            continue
-        matched = _raw_perimeter_vertex_match(
-            points, indices, loops, centre, mirror_normal, equal_length_tolerance,
-        )
-        if matched is None:
-            continue
-        _mapping, residuals = matched
-        variance = float(np.mean(residuals))
-        rms_error = math.sqrt(variance)
-        max_error = math.sqrt(float(residuals.max(initial=0.0)))
-        measurement = SymmetryMeasurement(
-            centroid=tuple(float(value) for value in centre),
-            plane_normal=tuple(float(value) for value in mirror_normal),
-            post_reflection_variance=variance,
-            rms_error=rms_error,
-            max_error=max_error,
-            initial_plane_normal=tuple(float(value) for value in mirror_normal),
-            initial_post_reflection_variance=variance,
-            initial_rms_error=rms_error,
-            initial_max_error=max_error,
-            mirror_plane_y_tilt_degrees=0.0,
-            rigid_y_rotation_correction_degrees=0.0,
-            tilt_search_applied=False,
-            whole_loop_sample_count=len(points),
-            sibling_pair_count=len(points),
-            mirror_crossings=2,
-            passed=True,
-        )
-        if best is None or measurement.post_reflection_variance < best.post_reflection_variance:
-            best = measurement
-    return best or _failed_symmetry_measurement(
-        centre, surface_normal, len(points), 0,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Recursive coarse-to-fine sweep, sequential by disconnected island
 # ---------------------------------------------------------------------------
@@ -2877,6 +2662,78 @@ def measure_region_depth_ratio(
     if facade <= 1e-15:
         return float("inf")
     return depth / facade
+
+
+def measure_region_self_reflection(
+    topology: Topology,
+    faces: tuple[int, ...],
+    centroid: tuple[float, float, float],
+    plane_normal: tuple[float, float, float],
+) -> tuple[float, float]:
+    """How well reflecting a region about its own plane maps it back onto itself.
+
+    2026-09-03: this is the invariant ``_candidate_transform_metres`` already
+    documents -- for a candidate S symmetric about its detected plane L,
+    ``L(S) = S``, which is the only reason ``G L`` lands S in the mirrored
+    carrier's recess without mirroring its geometry. Nothing measured it. The
+    perimeter test is a proxy for it, and an outline can be symmetric while the
+    surface inside it is not: etk800's light-switch fascia fitted its perimeter
+    to 0.38 mm, inside the 0.5 mm gate, yet reflecting the plate about that
+    plane moved it 10.3 mm and carried the adopted dial island 24.3 mm -- more
+    than the dial's own 18 mm diameter -- clean out of its recess.
+
+    Returned as (rms, max) over the symmetric nearest-neighbour residuals, in
+    metres, so the caller can gate on the same tolerance the perimeter used.
+    Perimeter RMS does not predict this: candidate 6 on the same part fits its
+    outline to 0.08 mm and still moves 7.9 mm.
+    """
+    if not faces:
+        return float("inf"), float("inf")
+    normal = np.asarray(plane_normal, dtype=float)
+    length = float(np.linalg.norm(normal))
+    if length <= 1e-15:
+        return float("inf"), float("inf")
+    normal = normal / length
+    centre = np.asarray(centroid, dtype=float)
+
+    vertex_indices = np.unique(topology.triangles[np.asarray(faces, dtype=np.int64)])
+    points = topology.vertices[vertex_indices]
+    reflected = points - 2.0 * ((points - centre) @ normal)[:, None] * normal[None, :]
+
+    # Both directions: a region that reflects onto a subset of itself would
+    # otherwise pass on the forward residual alone.
+    forward = _nearest_sample_distances(reflected, points)
+    backward = _nearest_sample_distances(points, reflected)
+    residuals = np.concatenate((forward, backward))
+    return (
+        float(np.sqrt(float(np.mean(residuals**2)))),
+        float(residuals.max(initial=0.0)),
+    )
+
+
+def _measurement_survives_self_reflection(
+    topology: Topology,
+    faces: tuple[int, ...],
+    measurement: SymmetryMeasurement,
+    direct_rms_tolerance: float,
+) -> SymmetryMeasurement | None:
+    """Record the region's self-reflection on the measurement, or reject it.
+
+    Gated on the same direct tolerance the perimeter had to meet, because it
+    measures the same thing one step closer to what the transform actually
+    does. Returns None when the accepted plane does not map the region onto
+    itself, in which case the region belongs on the mirrored carrier.
+    """
+    rms, maximum = measure_region_self_reflection(
+        topology, faces, measurement.centroid, measurement.plane_normal
+    )
+    if not math.isfinite(rms) or rms > direct_rms_tolerance:
+        return None
+    return replace(
+        measurement,
+        self_reflection_rms_error=rms,
+        self_reflection_max_error=maximum,
+    )
 
 
 def _classify_region(
@@ -3108,12 +2965,23 @@ def _find_eager_child_adoptions(
     island_geometry: tuple[_IslandGeometry, ...],
     active_by_island: list[set[int]],
     island_candidate_counts: list[int],
+    host_measurement: SymmetryMeasurement,
+    direct_rms_tolerance: float,
 ) -> tuple[ChildAdoption, ...]:
     """Claim untouched whole islands strongly supported by a symmetric host.
 
     This first POC intentionally handles one direct generation only. It favours
     precision over recall because an adopted island is skipped by later symmetry
     testing and inherits the host transform.
+
+    2026-09-03: inheriting the host transform is exactly why the child has to
+    satisfy the host plane's self-reflection as well. ``G L`` returns the host
+    to the mirrored carrier because ``L(host) = host``; a child for which
+    ``L(child) != child`` is not carried to its mirrored place but to its
+    reflected place *within* the host, which is somewhere else. Physical
+    support says the child belongs to the host; only this says the host's
+    transform can carry it. Without it the child is better left on the mirrored
+    carrier with the rest of the mesh.
     """
     host_points, host_samples = _surface_points_and_samples(topology, host_faces)
     if len(host_points) < 3 or len(host_samples) == 0 or host_area <= 1e-15:
@@ -3150,6 +3018,15 @@ def _find_eager_child_adoptions(
         if containment_ratio < 0.05:
             continue
 
+        child_rms, _child_max = measure_region_self_reflection(
+            topology,
+            child_faces,
+            host_measurement.centroid,
+            host_measurement.plane_normal,
+        )
+        if not math.isfinite(child_rms) or child_rms > direct_rms_tolerance:
+            continue
+
         distances = _nearest_sample_distances(child.samples, host_samples)
         median_gap = float(np.median(distances))
         p90_gap = float(np.percentile(distances, 90.0))
@@ -3177,6 +3054,8 @@ def _late_candidate_adoption(
     child: IslandCandidate,
     source_candidate_id: int,
     island_remainder: frozenset[int] = frozenset(),
+    *,
+    direct_rms_tolerance: float,
 ) -> ChildAdoption | None:
     """Return a late-host adoption when a later facade supports an earlier root.
 
@@ -3229,6 +3108,18 @@ def _late_candidate_adoption(
     if containment_ratio < 0.05:
         return None
 
+    # The host's plane has to carry the whole reassembled child, not just
+    # qualify it: see _find_eager_child_adoptions on why L(child) = child is
+    # what makes G L a placement rather than a displacement.
+    child_rms, _child_max = measure_region_self_reflection(
+        topology,
+        adopted_faces,
+        host.measurement.centroid,
+        host.measurement.plane_normal,
+    )
+    if not math.isfinite(child_rms) or child_rms > direct_rms_tolerance:
+        return None
+
     distances = _nearest_sample_distances(child_samples, host_samples)
     median_gap = float(np.median(distances))
     p90_gap = float(np.percentile(distances, 90.0))
@@ -3252,6 +3143,8 @@ def _resolve_late_host_adoptions(
     candidates: list[IslandCandidate],
     premerge_id_by_key: dict[tuple[int, int], int],
     islands: tuple[tuple[int, ...], ...] = (),
+    *,
+    direct_rms_tolerance: float,
 ) -> tuple[list[IslandCandidate], dict[tuple[int, int], tuple[int, int]]]:
     """Merge early roots into later-discovered supported hosts.
 
@@ -3288,7 +3181,12 @@ def _resolve_late_host_adoptions(
             if host.key == child.key:
                 continue
             adoption = _late_candidate_adoption(
-                topology, host, child, premerge_id_by_key[child.key], remainder
+                topology,
+                host,
+                child,
+                premerge_id_by_key[child.key],
+                remainder,
+                direct_rms_tolerance=direct_rms_tolerance,
             )
             if adoption is None:
                 continue
@@ -3458,6 +3356,22 @@ def _resolve_touching_symmetric_unions(
             survivors.extend(group)
             continue
 
+        # The union's plane is fitted to the union's outline, so it earns its
+        # own self-reflection check too; the members' planes say nothing about
+        # whether this one maps the merged surface onto itself. Measured over
+        # everything the union's transform will move, which includes the
+        # members' own adopted children, not just the merged host faces.
+        union_moved_faces = tuple(
+            sorted({face for candidate in group for face in candidate.faces})
+        )
+        validated = _measurement_survives_self_reflection(
+            topology, union_moved_faces, measurement, direct_rms_tolerance
+        )
+        if validated is None:
+            survivors.extend(group)
+            continue
+        measurement = validated
+
         union_area = float(topology.face_areas[list(union_host_faces)].sum())
         group.sort(
             key=lambda candidate: (
@@ -3541,39 +3455,37 @@ def analyse_symmetry_sweep(
 ) -> SymmetrySweepResult:
     processing_started = time.perf_counter()
     topology_started = time.perf_counter()
-    with timed("symmetry topology"):
-        topology = topology_for_part(loaded, part)
+    topology = topology_for_part(loaded, part)
     topology_seconds = time.perf_counter() - topology_started
 
     sweep_started = time.perf_counter()
-    with timed("symmetry preparation"):
-        thresholds = inclusive_thresholds(crease_max, crease_min, threshold_steps)
-        islands = tuple(geometric_face_islands(topology))
-        island_edge_groups = _group_edges_by_island(topology, islands)
-        edge_lookups = [
-            {edge: (faces, angle) for edge, faces, angle in island_edges}
-            for island_edges in island_edge_groups
-        ]
-        original_boundary_faces = [
-            {
-                face
-                for _edge, faces, _angle in island_edges
-                if len(faces) == 1
-                for face in faces
-            }
-            for island_edges in island_edge_groups
-        ]
-        island_geometry_list: list[_IslandGeometry] = []
-        for faces in islands:
-            points, samples = _surface_points_and_samples(topology, faces)
-            island_geometry_list.append(
-                _IslandGeometry(
-                    area=float(topology.face_areas[list(faces)].sum()),
-                    points=points,
-                    samples=samples,
-                )
+    thresholds = inclusive_thresholds(crease_max, crease_min, threshold_steps)
+    islands = tuple(geometric_face_islands(topology))
+    island_edge_groups = _group_edges_by_island(topology, islands)
+    edge_lookups = [
+        {edge: (faces, angle) for edge, faces, angle in island_edges}
+        for island_edges in island_edge_groups
+    ]
+    original_boundary_faces = [
+        {
+            face
+            for _edge, faces, _angle in island_edges
+            if len(faces) == 1
+            for face in faces
+        }
+        for island_edges in island_edge_groups
+    ]
+    island_geometry_list: list[_IslandGeometry] = []
+    for faces in islands:
+        points, samples = _surface_points_and_samples(topology, faces)
+        island_geometry_list.append(
+            _IslandGeometry(
+                area=float(topology.face_areas[list(faces)].sum()),
+                points=points,
+                samples=samples,
             )
-        island_geometry = tuple(island_geometry_list)
+        )
+    island_geometry = tuple(island_geometry_list)
 
     active_by_island = [set(faces) for faces in islands]
     island_candidate_counts = [0 for _ in islands]
@@ -3593,21 +3505,12 @@ def analyse_symmetry_sweep(
                 if not active:
                     continue
                 island_index = island_offset + 1
-                with timed("symmetry segmentation"):
-                    if island_index != 1 and active == set(islands[island_offset]):
-                        # 2026-09-03: A detached geometric island is a child object, not
-                        # a source of independently cut patches.  It may either pass as
-                        # one exact-perimeter object, be claimed whole by a host, or stay
-                        # whole on the mirrored carrier.  Cutting it first strands the
-                        # rest of an otherwise single dial/knob object on another transform.
-                        components = [islands[island_offset]]
-                    else:
-                        components = _segment_active_faces(
-                            active,
-                            threshold,
-                            island_edge_groups[island_offset],
-                            topology.face_areas,
-                        )
+                components = _segment_active_faces(
+                    active,
+                    threshold,
+                    island_edge_groups[island_offset],
+                    topology.face_areas,
+                )
                 fallback_carrier_faces = _fallback_carrier_faces(
                     island_index,
                     components,
@@ -3616,19 +3519,18 @@ def analyse_symmetry_sweep(
                 for component in components:
                     if len(component) < min_region_faces:
                         continue
-                    with timed("symmetry boundary filters"):
-                        region = _classify_region(
-                            topology,
-                            island_index,
-                            island_index == 1,
-                            component,
-                            active,
-                            threshold,
-                            fallback_carrier_faces,
-                            max_pseudo_aspect_ratio,
-                            max_depth_ratio,
-                            edge_lookups[island_offset],
-                        )
+                    region = _classify_region(
+                        topology,
+                        island_index,
+                        island_index == 1,
+                        component,
+                        active,
+                        threshold,
+                        fallback_carrier_faces,
+                        max_pseudo_aspect_ratio,
+                        max_depth_ratio,
+                        edge_lookups[island_offset],
+                    )
                     if (
                         region.eligible
                         and component not in tested_signatures[island_offset]
@@ -3651,36 +3553,49 @@ def analyse_symmetry_sweep(
                     continue
                 tested_signatures[island_offset].add(region.faces)
                 tested_count += 1
-                with timed("symmetry perimeter fit"):
-                    measurement = measure_perimeter_symmetry(
-                        topology.vertices,
-                        region.boundary.loops,
-                        sample_spacing_metres,
-                        symmetry_tolerance_metres,
-                        direct_symmetry_tolerance_metres,
-                    )
+                measurement = measure_perimeter_symmetry(
+                    topology.vertices,
+                    region.boundary.loops,
+                    sample_spacing_metres,
+                    symmetry_tolerance_metres,
+                    direct_symmetry_tolerance_metres,
+                )
                 if not measurement.passed:
                     continue
+                # Before anything is claimed: the accepted plane has to map the
+                # region's own surface onto itself, or G*L will not put it back
+                # in the mirrored carrier's recess. A region rejected here must
+                # not consume child islands on its way out.
+                validated = _measurement_survives_self_reflection(
+                    topology,
+                    region.faces,
+                    measurement,
+                    direct_symmetry_tolerance_metres,
+                )
+                if validated is None:
+                    continue
+                measurement = validated
 
-                with timed("symmetry child adoption"):
-                    adoptions = _find_eager_child_adoptions(
-                        topology,
-                        region.faces,
-                        region.boundary.loops,
-                        region.area,
-                        region.island_index,
-                        islands,
-                        island_geometry,
-                        active_by_island,
-                        island_candidate_counts,
-                    )
+                island_candidate_counts[island_offset] += 1
+                key = (region.island_index, island_candidate_counts[island_offset])
+                adoptions = _find_eager_child_adoptions(
+                    topology,
+                    region.faces,
+                    region.boundary.loops,
+                    region.area,
+                    region.island_index,
+                    islands,
+                    island_geometry,
+                    active_by_island,
+                    island_candidate_counts,
+                    measurement,
+                    direct_symmetry_tolerance_metres,
+                )
                 all_faces = tuple(
                     sorted(
                         (*region.faces, *(face for adoption in adoptions for face in adoption.faces))
                     )
                 )
-                island_candidate_counts[island_offset] += 1
-                key = (region.island_index, island_candidate_counts[island_offset])
                 accepted_candidates.append(
                     IslandCandidate(
                         key=key,
@@ -3711,37 +3626,32 @@ def analyse_symmetry_sweep(
             if not active:
                 continue
             island_index = island_offset + 1
-            with timed("symmetry segmentation"):
-                if island_index != 1 and active == set(islands[island_offset]):
-                    components = [islands[island_offset]]
-                else:
-                    components = _segment_active_faces(
-                        active,
-                        threshold,
-                        island_edge_groups[island_offset],
-                        topology.face_areas,
-                    )
+            components = _segment_active_faces(
+                active,
+                threshold,
+                island_edge_groups[island_offset],
+                topology.face_areas,
+            )
             fallback_carrier_faces = _fallback_carrier_faces(
                 island_index,
                 components,
                 original_boundary_faces[island_offset],
             )
             for component in components:
-                with timed("symmetry boundary filters"):
-                    active_regions.append(
-                        _classify_region(
-                            topology,
-                            island_index,
-                            island_index == 1,
-                            component,
-                            active,
-                            threshold,
-                            fallback_carrier_faces,
-                            max_pseudo_aspect_ratio,
-                            max_depth_ratio,
-                            edge_lookups[island_offset],
-                        )
+                active_regions.append(
+                    _classify_region(
+                        topology,
+                        island_index,
+                        island_index == 1,
+                        component,
+                        active,
+                        threshold,
+                        fallback_carrier_faces,
+                        max_pseudo_aspect_ratio,
+                        max_depth_ratio,
+                        edge_lookups[island_offset],
                     )
+                )
         active_regions.sort(key=lambda region: (-region.area, region.island_index, region.faces[0]))
         for region_index, region in enumerate(active_regions, start=1):
             region.region_index = region_index
@@ -3768,19 +3678,22 @@ def analyse_symmetry_sweep(
         candidate.key: index
         for index, candidate in enumerate(accepted_candidates, start=1)
     }
-    with timed("symmetry recovery"):
-        accepted_candidates, touching_absorbed_key_to_host_key = _resolve_touching_symmetric_unions(
-            topology,
-            accepted_candidates,
-            premerge_id_by_key,
-            sample_spacing_metres,
-            symmetry_tolerance_metres,
-            direct_symmetry_tolerance_metres,
-            max_depth_ratio,
-        )
-        accepted_candidates, absorbed_key_to_host_key = _resolve_late_host_adoptions(
-            topology, accepted_candidates, premerge_id_by_key, islands
-        )
+    accepted_candidates, touching_absorbed_key_to_host_key = _resolve_touching_symmetric_unions(
+        topology,
+        accepted_candidates,
+        premerge_id_by_key,
+        sample_spacing_metres,
+        symmetry_tolerance_metres,
+        direct_symmetry_tolerance_metres,
+        max_depth_ratio,
+    )
+    accepted_candidates, absorbed_key_to_host_key = _resolve_late_host_adoptions(
+        topology,
+        accepted_candidates,
+        premerge_id_by_key,
+        islands,
+        direct_rms_tolerance=direct_symmetry_tolerance_metres,
+    )
     accepted_candidates.sort(
         key=lambda candidate: (
             candidate.accepted_level,
@@ -3847,14 +3760,7 @@ def analyse_symmetry_sweep(
             )
         )
 
-    claimed_faces = {
-        face
-        for candidate in candidates
-        for face in candidate.faces
-    }
-    remaining = tuple(
-        face for face in range(len(topology.triangles)) if face not in claimed_faces
-    )
+    remaining = tuple(sorted(face for active in active_by_island for face in active))
     adopted_island_count = sum(
         adoption.adoption_mode == "eager_island"
         for candidate in candidates
@@ -5217,6 +5123,8 @@ def export_transformed_part_dae(
                 "symmetry_plane_normal_world": list(candidate.measurement.plane_normal),
                 "initial_rms_error_millimetres": candidate.measurement.initial_rms_error * 1000.0,
                 "corrected_rms_error_millimetres": candidate.measurement.rms_error * 1000.0,
+                "self_reflection_rms_error_millimetres": candidate.measurement.self_reflection_rms_error * 1000.0,
+                "self_reflection_max_error_millimetres": candidate.measurement.self_reflection_max_error * 1000.0,
                 "mirror_plane_y_tilt_degrees": candidate.measurement.mirror_plane_y_tilt_degrees,
                 "nominal_rigid_y_rotation_correction_degrees": candidate.measurement.rigid_y_rotation_correction_degrees,
                 "tilt_search_applied": candidate.measurement.tilt_search_applied,
@@ -5594,6 +5502,10 @@ def _candidate_json(candidate: AcceptedCandidate) -> dict[str, object]:
             "rms_error_millimetres": measurement.rms_error * 1000.0,
             "max_error_metres": measurement.max_error,
             "max_error_millimetres": measurement.max_error * 1000.0,
+            "self_reflection_rms_error_metres": measurement.self_reflection_rms_error,
+            "self_reflection_rms_error_millimetres": measurement.self_reflection_rms_error * 1000.0,
+            "self_reflection_max_error_metres": measurement.self_reflection_max_error,
+            "self_reflection_max_error_millimetres": measurement.self_reflection_max_error * 1000.0,
         },
         "adopted_children": [
             {
@@ -5655,14 +5567,15 @@ def write_report(
             "main_island": "largest surface-area island; explicit fallback carrier regions are not tested",
             "shape_filter": "before symmetry testing, the candidate's area and closed-boundary perimeter are mapped to the equivalent rectangle aspect ratio; candidates above the configured maximum pseudo aspect ratio are rejected as thin bands",
             "depth_filter": "a plane is fitted to the closed perimeter by arc-length weighted PCA; the region's extent along that plane normal is divided by the side of its equivalent in-plane square, and candidates above the configured maximum are rejected as protrusions rather than fasciae, because a protrusion with a symmetric perimeter (a stalk leaving a circular collar) would otherwise be rotated end for end into its mirrored position",
-            "symmetry_scope": "raw closed-perimeter vertices and their boundary edges only; interior triangles, normals, materials and UVs are ignored",
-            "plane": "arc-length weighted PCA fits the perimeter plane; equal longest projected vertex pairs propose angle-bisector axes, retaining only the established near-vertical local reflection plane",
-            "comparison": "each proposed plane reflects every raw 3-D perimeter vertex through a one-to-one matching and requires every reflected boundary edge to exist",
-            "acceptance": "candidate pseudo aspect ratio and perimeter-plane depth ratio must not exceed their configured maxima; a centred family of equal longest vertex pairs must yield an axis whose raw 3-D vertex and edge reflection is within the direct tolerance",
-            "borderline_tilt_correction": "disabled: raw perimeter correspondence does not resample or search for a tilt correction",
+            "symmetry_scope": "closed perimeter samples only; interior triangles, normals, materials and UVs are ignored",
+            "plane": "first pass resamples complete closed perimeters at a fixed physical spacing; PCA gives the best-fit perimeter-plane normal; crossing it with global Z gives the deterministic vertical mirror-plane normal through the sample centroid",
+            "comparison": "second pass inserts exact mirror-plane crossings, walks opposite half-perimeters in opposite directions, resamples sibling positions at equal travelled arc distance, reflects one half and averages the full 3-D squared sibling residuals",
+            "acceptance": "candidate pseudo aspect ratio and perimeter-plane depth ratio must not exceed their configured maxima, initial post-reflection RMS must not exceed the outer tolerance, and final RMS must not exceed the stricter direct threshold; candidates initially below the direct threshold use the deterministic plane unchanged",
+            "self_reflection_check": "the accepted plane must also reflect the region's own surface back onto itself within the direct threshold, measured as symmetric nearest-neighbour residuals over the region vertices; the rigid transform G*L only returns a region to the mirrored carrier because L(S)=S, and a symmetric outline does not imply a symmetric surface",
+            "borderline_tilt_correction": "candidates initially between the direct and outer RMS thresholds sweep the original mirror-plane normal about global Y over +/-6 degrees, refine the local minimum, and pass only if the corrected final RMS reaches the direct threshold; composing that reflection with the global X reflection applies the corresponding double-angle rigid correction",
             "touching_union_recovery": "after the sweep, accepted symmetric segmentations in the same geometric island that share boundary edges are grouped when their union has a closed symmetric perimeter; the parent is retained with the largest available union perimeter and absorbs the touching symmetric children",
-            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host and at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal; only one direct child generation is used",
-            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, footprint-overlap and extruded-perimeter containment tests; this recovers parents that only separate from the main carrier at low crease angles",
+            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host, at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal, and reflecting the child about the host's own plane maps it back onto itself within the direct threshold; only one direct child generation is used",
+            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, footprint-overlap, extruded-perimeter containment and host-plane self-reflection tests applied to the child's whole reassembled island; this recovers parents that only separate from the main carrier at low crease angles",
         },
         "timing": {
             "processing_seconds": result.processing_seconds,

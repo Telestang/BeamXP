@@ -315,6 +315,8 @@ def _screens_fixture() -> tuple[object, object]:
         mirror_plane_y_tilt_degrees=0.0,
         rigid_y_rotation_correction_degrees=0.0,
         tilt_search_applied=False,
+        self_reflection_rms_error=0.0,
+        self_reflection_max_error=0.0,
     )
     sweep = SimpleNamespace(
         part=selected,

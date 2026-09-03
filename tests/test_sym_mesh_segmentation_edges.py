@@ -21,6 +21,7 @@ from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
     build_topology,
     measure_perimeter_symmetry,
     measure_region_depth_ratio,
+    measure_region_self_reflection,
     pseudo_aspect_ratio_from_area_perimeter,
 )
 
@@ -151,6 +152,38 @@ def _panel_with_capped_knob_topology():
     return build_topology(vertices, triangles, source_faces)
 
 
+
+def _plate_with_offset_interior_topology(interior_x: float):
+    """A square plate whose outline is symmetric but whose surface need not be.
+
+    The four boundary edges are a square, symmetric about x = 0 to machine
+    precision, so ``measure_perimeter_symmetry`` accepts the plane no matter
+    where the fan's interior vertex sits.  Moving that vertex off centre is the
+    synthetic form of etk800's light-switch fascia: an outline that fits its
+    plane to a fraction of a millimetre over a surface the same plane does not
+    map onto itself.
+    """
+    vertices = np.array(
+        [
+            [-1.0, 0.0, -1.0],
+            [1.0, 0.0, -1.0],
+            [1.0, 0.0, 1.0],
+            [-1.0, 0.0, 1.0],
+            [interior_x, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    triangles = np.array(
+        [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]],
+        dtype=np.int64,
+    )
+    source_faces = [
+        SourceFaceRef(0, "test", 0, triangle_index)
+        for triangle_index in range(len(triangles))
+    ]
+    return build_topology(vertices, triangles, source_faces)
+
+
 def _touching_symmetric_regions_topology():
     vertices = np.array(
         [
@@ -258,7 +291,7 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
     def test_pseudo_aspect_ratio_clamps_compact_shapes_to_one(self) -> None:
         self.assertEqual(pseudo_aspect_ratio_from_area_perimeter(math.pi, 2.0 * math.pi), 1.0)
 
-    def test_raw_vertex_asymmetry_is_rejected_without_tilt_search(self) -> None:
+    def test_symmetry_that_cannot_reach_direct_fit_is_rejected(self) -> None:
         vertices = np.array(
             [
                 [-1.0, 0.0, -1.0],
@@ -278,21 +311,79 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
         )
 
         self.assertFalse(measurement.passed)
-        self.assertFalse(measurement.tilt_search_applied)
+        self.assertTrue(measurement.tilt_search_applied)
+        self.assertLessEqual(measurement.initial_rms_error, 0.001)
+        self.assertGreater(measurement.rms_error, 0.0005)
 
-    def test_centred_equal_diameters_accept_a_round_perimeter(self) -> None:
-        angles = np.linspace(0.0, 2.0 * math.pi, 8, endpoint=False)
-        vertices = np.column_stack((np.cos(angles), np.zeros(8), np.sin(angles)))
+    def test_self_reflection_measures_the_surface_not_the_outline(self) -> None:
+        centred = _plate_with_offset_interior_topology(0.0)
+        offset = _plate_with_offset_interior_topology(0.3)
+        faces = (0, 1, 2, 3)
+        plane = (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)
 
-        measurement = measure_perimeter_symmetry(
-            vertices,
-            (tuple(range(8)),),
-            sample_spacing=0.05,
-            rms_tolerance=0.001,
-            direct_rms_tolerance=0.0005,
-        )
+        centred_rms, centred_max = measure_region_self_reflection(centred, faces, *plane)
+        offset_rms, offset_max = measure_region_self_reflection(offset, faces, *plane)
 
-        self.assertTrue(measurement.passed)
+        self.assertAlmostEqual(centred_rms, 0.0)
+        self.assertAlmostEqual(centred_max, 0.0)
+        # The interior vertex reflects to -0.3 and the nearest vertex it has to
+        # land on is itself, 0.6 away.
+        self.assertAlmostEqual(offset_max, 0.6)
+        self.assertGreater(offset_rms, 0.0005)
+
+    def test_symmetric_outline_over_asymmetric_surface_stays_on_the_carrier(self) -> None:
+        # etk800's light-switch fascia in synthetic form: the perimeter fits its
+        # plane, so the region used to be accepted and its rigid G*L pulled it
+        # out of the mirrored carrier's recess, carrying the adopted dial with
+        # it. The plane has to map the surface onto itself, not just the outline.
+        topology = _plate_with_offset_interior_topology(0.3)
+
+        with patch(
+            "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.topology_for_part",
+            return_value=topology,
+        ):
+            result = analyse_symmetry_sweep(
+                SimpleNamespace(),
+                SimpleNamespace(key="test"),
+                crease_max=90.0,
+                crease_min=15.0,
+                threshold_steps=2,
+                min_region_faces=1,
+                max_pseudo_aspect_ratio=10.0,
+                max_depth_ratio=0.35,
+                symmetry_tolerance_metres=0.001,
+                direct_symmetry_tolerance_metres=0.0005,
+                sample_spacing_metres=0.05,
+            )
+
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(result.remaining_faces, (0, 1, 2, 3))
+
+    def test_the_same_plate_is_accepted_once_its_surface_is_symmetric(self) -> None:
+        topology = _plate_with_offset_interior_topology(0.0)
+
+        with patch(
+            "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.topology_for_part",
+            return_value=topology,
+        ):
+            result = analyse_symmetry_sweep(
+                SimpleNamespace(),
+                SimpleNamespace(key="test"),
+                crease_max=90.0,
+                crease_min=15.0,
+                threshold_steps=2,
+                min_region_faces=1,
+                max_pseudo_aspect_ratio=10.0,
+                max_depth_ratio=0.35,
+                symmetry_tolerance_metres=0.001,
+                direct_symmetry_tolerance_metres=0.0005,
+                sample_spacing_metres=0.05,
+            )
+
+        self.assertEqual(len(result.candidates), 1)
+        candidate = result.candidates[0]
+        self.assertEqual(candidate.faces, (0, 1, 2, 3))
+        self.assertLessEqual(candidate.measurement.self_reflection_rms_error, 0.0005)
 
     def test_failed_corrected_fit_remains_on_mirrored_carrier(self) -> None:
         topology = _open_square_topology()
@@ -318,38 +409,6 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
 
         self.assertEqual(result.candidates, [])
         self.assertEqual(result.remaining_faces, (0, 1))
-
-    def test_detached_asymmetric_object_is_not_cut_into_a_rigid_cap(self) -> None:
-        topology = _panel_with_capped_knob_topology()
-        # The main fascia is deliberately asymmetric, so it cannot adopt the
-        # detached knob.  A deep knob's flat cap is symmetric on its own, but
-        # the complete loose object is not an eligible rigid region.
-        topology.vertices[2, 0] += 0.02
-        topology.vertices[8:12, 1] = 0.20
-
-        with patch(
-            "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.topology_for_part",
-            return_value=topology,
-        ):
-            result = analyse_symmetry_sweep(
-                SimpleNamespace(),
-                SimpleNamespace(key="test"),
-                crease_max=90.0,
-                crease_min=15.0,
-                threshold_steps=2,
-                min_region_faces=1,
-                max_pseudo_aspect_ratio=10.0,
-                max_depth_ratio=0.35,
-                symmetry_tolerance_metres=0.001,
-                direct_symmetry_tolerance_metres=0.0005,
-                sample_spacing_metres=0.05,
-            )
-
-        loose_faces = set(range(2, 12))
-        self.assertFalse(
-            any(loose_faces.intersection(candidate.faces) for candidate in result.candidates)
-        )
-        self.assertTrue(loose_faces.issubset(result.remaining_faces))
 
     def test_symmetry_above_outer_threshold_is_rejected_without_tilt_search(self) -> None:
         vertices = np.array(
@@ -531,6 +590,8 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             island_geometry=tuple(island_geometry),
             active_by_island=[set(islands[0]), set(islands[1])],
             island_candidate_counts=[0, 0],
+            host_measurement=_candidate_for_faces(topology, (1, 1), islands[0]).measurement,
+            direct_rms_tolerance=0.0005,
         )
 
         self.assertEqual(len(adoptions), 1)
@@ -538,6 +599,43 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
         self.assertGreaterEqual(adoptions[0].extruded_perimeter_sample_ratio, 0.05)
         self.assertLessEqual(adoptions[0].median_surface_gap, 0.015)
         self.assertLessEqual(adoptions[0].p90_surface_gap, 0.025)
+
+    def test_child_the_host_plane_cannot_carry_is_not_adopted(self) -> None:
+        # Physical support says the child belongs to the host; it does not say
+        # the host's transform can carry it. The host's plane is x = 0, so a
+        # child straddling it is carried to its mirrored place and an off-centre
+        # one is carried to its reflected place *within* the host, 100 mm away.
+        topology = _flat_panel_with_proud_child_topology()
+        topology.vertices[4:8, 0] += 0.050
+        islands = ((0, 1), (2, 3))
+        island_geometry = []
+        for faces in islands:
+            points, samples = _surface_points_and_samples(topology, faces)
+            island_geometry.append(
+                _IslandGeometry(
+                    area=float(topology.face_areas[list(faces)].sum()),
+                    points=points,
+                    samples=samples,
+                )
+            )
+        host = _candidate_for_faces(topology, (1, 1), islands[0])
+        self.assertAlmostEqual(abs(host.measurement.plane_normal[0]), 1.0)
+
+        adoptions = _find_eager_child_adoptions(
+            topology,
+            host_faces=islands[0],
+            host_boundary_loops=_candidate_union_boundary(topology, islands[0]).loops,
+            host_area=island_geometry[0].area,
+            host_island_index=1,
+            islands=islands,
+            island_geometry=tuple(island_geometry),
+            active_by_island=[set(islands[0]), set(islands[1])],
+            island_candidate_counts=[0, 0],
+            host_measurement=host.measurement,
+            direct_rms_tolerance=0.0005,
+        )
+
+        self.assertEqual(adoptions, ())
 
     def test_proud_child_inside_extruded_parent_perimeter_is_adopted(self) -> None:
         topology = _flat_panel_with_proud_child_topology()
@@ -563,6 +661,8 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             island_geometry=tuple(island_geometry),
             active_by_island=[set(islands[0]), set(islands[1])],
             island_candidate_counts=[0, 0],
+            host_measurement=_candidate_for_faces(topology, (1, 1), islands[0]).measurement,
+            direct_rms_tolerance=0.0005,
         )
 
         self.assertEqual(len(adoptions), 1)
@@ -587,6 +687,7 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             [cap, panel],
             {(2, 1): 1, (1, 1): 2},
             ((0, 1), (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+            direct_rms_tolerance=0.0005,
         )
 
         self.assertEqual(absorbed, {(2, 1): (1, 1)})
@@ -616,6 +717,7 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
             [cap, rival, panel],
             {(2, 1): 1, (2, 2): 2, (1, 1): 3},
             ((0, 1), (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+            direct_rms_tolerance=0.0005,
         )
 
         self.assertEqual(absorbed, {})
