@@ -258,7 +258,7 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
     def test_pseudo_aspect_ratio_clamps_compact_shapes_to_one(self) -> None:
         self.assertEqual(pseudo_aspect_ratio_from_area_perimeter(math.pi, 2.0 * math.pi), 1.0)
 
-    def test_symmetry_that_cannot_reach_direct_fit_is_rejected(self) -> None:
+    def test_raw_vertex_asymmetry_is_rejected_without_tilt_search(self) -> None:
         vertices = np.array(
             [
                 [-1.0, 0.0, -1.0],
@@ -278,9 +278,21 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
         )
 
         self.assertFalse(measurement.passed)
-        self.assertTrue(measurement.tilt_search_applied)
-        self.assertLessEqual(measurement.initial_rms_error, 0.001)
-        self.assertGreater(measurement.rms_error, 0.0005)
+        self.assertFalse(measurement.tilt_search_applied)
+
+    def test_centred_equal_diameters_accept_a_round_perimeter(self) -> None:
+        angles = np.linspace(0.0, 2.0 * math.pi, 8, endpoint=False)
+        vertices = np.column_stack((np.cos(angles), np.zeros(8), np.sin(angles)))
+
+        measurement = measure_perimeter_symmetry(
+            vertices,
+            (tuple(range(8)),),
+            sample_spacing=0.05,
+            rms_tolerance=0.001,
+            direct_rms_tolerance=0.0005,
+        )
+
+        self.assertTrue(measurement.passed)
 
     def test_failed_corrected_fit_remains_on_mirrored_carrier(self) -> None:
         topology = _open_square_topology()
@@ -306,6 +318,38 @@ class SymMeshSegmentationEdgeTests(unittest.TestCase):
 
         self.assertEqual(result.candidates, [])
         self.assertEqual(result.remaining_faces, (0, 1))
+
+    def test_detached_asymmetric_object_is_not_cut_into_a_rigid_cap(self) -> None:
+        topology = _panel_with_capped_knob_topology()
+        # The main fascia is deliberately asymmetric, so it cannot adopt the
+        # detached knob.  A deep knob's flat cap is symmetric on its own, but
+        # the complete loose object is not an eligible rigid region.
+        topology.vertices[2, 0] += 0.02
+        topology.vertices[8:12, 1] = 0.20
+
+        with patch(
+            "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.topology_for_part",
+            return_value=topology,
+        ):
+            result = analyse_symmetry_sweep(
+                SimpleNamespace(),
+                SimpleNamespace(key="test"),
+                crease_max=90.0,
+                crease_min=15.0,
+                threshold_steps=2,
+                min_region_faces=1,
+                max_pseudo_aspect_ratio=10.0,
+                max_depth_ratio=0.35,
+                symmetry_tolerance_metres=0.001,
+                direct_symmetry_tolerance_metres=0.0005,
+                sample_spacing_metres=0.05,
+            )
+
+        loose_faces = set(range(2, 12))
+        self.assertFalse(
+            any(loose_faces.intersection(candidate.faces) for candidate in result.candidates)
+        )
+        self.assertTrue(loose_faces.issubset(result.remaining_faces))
 
     def test_symmetry_above_outer_threshold_is_rejected_without_tilt_search(self) -> None:
         vertices = np.array(

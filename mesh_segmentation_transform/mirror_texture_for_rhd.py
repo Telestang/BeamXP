@@ -2004,20 +2004,19 @@ def sweep_part(
     """
     if cache is not None and part.key in cache:
         return cache[part.key]
-    with timed("symmetry sweep"):
-        result = analyse_symmetry_sweep(
-            loaded,
-            part,
-            config.crease_max,
-            config.crease_min,
-            config.threshold_steps,
-            config.min_region_faces,
-            config.max_pseudo_aspect_ratio,
-            config.max_candidate_depth_ratio,
-            config.symmetry_tolerance_metres,
-            config.direct_symmetry_tolerance_metres,
-            config.sample_spacing_metres,
-        )
+    result = analyse_symmetry_sweep(
+        loaded,
+        part,
+        config.crease_max,
+        config.crease_min,
+        config.threshold_steps,
+        config.min_region_faces,
+        config.max_pseudo_aspect_ratio,
+        config.max_candidate_depth_ratio,
+        config.symmetry_tolerance_metres,
+        config.direct_symmetry_tolerance_metres,
+        config.sample_spacing_metres,
+    )
     if cache is not None:
         cache[part.key] = result
     return result
