@@ -2664,6 +2664,65 @@ def measure_region_depth_ratio(
     return depth / facade
 
 
+def _nearest_triangle_distances(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    chunk: int = 256,
+) -> np.ndarray:
+    """Distance from each point to the nearest triangle, not the nearest vertex.
+
+    2026-09-03: the distinction decides the answer. Reflecting a coarsely
+    tessellated plate lands its vertices in the middle of edges, so a
+    vertex-to-vertex measure reports millimetres of asymmetry for a surface that
+    maps onto itself exactly -- etk800's light-switch fascia reads 2.649 mm
+    against vertices and 0.302 mm against the surface. Vertex distance is not a
+    conservative approximation of this; it ranks regions differently.
+    """
+    a, b, c = triangles[:, 0, :], triangles[:, 1, :], triangles[:, 2, :]
+    ab, ac = b - a, c - a
+    out = np.empty(len(points), dtype=float)
+    # Chunked so the point x triangle intermediates stay bounded.
+    for start in range(0, len(points), chunk):
+        p = points[start : start + chunk, None, :]
+        ap, bp, cp = p - a[None], p - b[None], p - c[None]
+        d1 = np.einsum("ijk,jk->ij", ap, ab)
+        d2 = np.einsum("ijk,jk->ij", ap, ac)
+        d3 = np.einsum("ijk,jk->ij", bp, ab)
+        d4 = np.einsum("ijk,jk->ij", bp, ac)
+        d5 = np.einsum("ijk,jk->ij", cp, ab)
+        d6 = np.einsum("ijk,jk->ij", cp, ac)
+        va, vb, vc = d3 * d6 - d5 * d4, d5 * d2 - d1 * d6, d1 * d4 - d3 * d2
+        denom = np.where(va + vb + vc == 0.0, 1e-30, va + vb + vc)
+        # Face interior first, then each vertex and edge region overrides it.
+        v = np.clip(vb / denom, 0.0, 1.0)
+        w = np.clip(vc / denom, 0.0, 1.0)
+        inside = (d1 <= 0) & (d2 <= 0)
+        v, w = np.where(inside, 0.0, v), np.where(inside, 0.0, w)
+        at_b = (d3 >= 0) & (d4 <= d3)
+        v, w = np.where(at_b, 1.0, v), np.where(at_b, 0.0, w)
+        at_c = (d6 >= 0) & (d5 <= d6)
+        v, w = np.where(at_c, 0.0, v), np.where(at_c, 1.0, w)
+        on_ab = (vc <= 0) & (d1 >= 0) & (d3 <= 0)
+        span = np.where(d1 - d3 == 0.0, 1e-30, d1 - d3)
+        v = np.where(on_ab, np.clip(d1 / span, 0.0, 1.0), v)
+        w = np.where(on_ab, 0.0, w)
+        on_ac = (vb <= 0) & (d2 >= 0) & (d6 <= 0)
+        span = np.where(d2 - d6 == 0.0, 1e-30, d2 - d6)
+        v = np.where(on_ac, 0.0, v)
+        w = np.where(on_ac, np.clip(d2 / span, 0.0, 1.0), w)
+        on_bc = (va <= 0) & (d4 - d3 >= 0) & (d5 - d6 >= 0)
+        span = np.where((d4 - d3) + (d5 - d6) == 0.0, 1e-30, (d4 - d3) + (d5 - d6))
+        t = np.clip((d4 - d3) / span, 0.0, 1.0)
+        v = np.where(on_bc, 1.0 - t, v)
+        w = np.where(on_bc, t, w)
+        closest = a[None] + v[:, :, None] * ab[None] + w[:, :, None] * ac[None]
+        delta = p - closest
+        out[start : start + chunk] = np.sqrt(
+            np.einsum("ijk,ijk->ij", delta, delta).min(axis=1)
+        )
+    return out
+
+
 def measure_region_self_reflection(
     topology: Topology,
     faces: tuple[int, ...],
@@ -2675,17 +2734,20 @@ def measure_region_self_reflection(
     2026-09-03: this is the invariant ``_candidate_transform_metres`` already
     documents -- for a candidate S symmetric about its detected plane L,
     ``L(S) = S``, which is the only reason ``G L`` lands S in the mirrored
-    carrier's recess without mirroring its geometry. Nothing measured it. The
-    perimeter test is a proxy for it, and an outline can be symmetric while the
-    surface inside it is not: etk800's light-switch fascia fitted its perimeter
-    to 0.38 mm, inside the 0.5 mm gate, yet reflecting the plate about that
-    plane moved it 10.3 mm and carried the adopted dial island 24.3 mm -- more
-    than the dial's own 18 mm diameter -- clean out of its recess.
+    carrier's recess without mirroring its geometry. Nothing measured it, and
+    perimeter symmetry cannot stand in for it: an outline can be symmetric while
+    the surface inside it is not, and the two do not even correlate.
 
-    Returned as (rms, max) over the symmetric nearest-neighbour residuals, in
-    metres, so the caller can gate on the same tolerance the perimeter used.
-    Perimeter RMS does not predict this: candidate 6 on the same part fits its
-    outline to 0.08 mm and still moves 7.9 mm.
+    What it separates is a submesh that was *authored* symmetric from one that
+    is merely approximately so. Measured over etk800, etkc and the ardente's
+    dash and button groups, every region the perimeter test accepts sits at or
+    below 0.49 mm here -- these are modelled symmetric, and it shows.
+
+    The measure is the distance from each reflected vertex to the region's own
+    *surface*, in metres, so the caller can gate on the same tolerance the
+    perimeter used. One direction suffices because a reflection is an isometry:
+    the image has the same area as the region, so a part of the region left
+    uncovered puts some reflected vertex far from it.
     """
     if not faces:
         return float("inf"), float("inf")
@@ -2696,15 +2758,11 @@ def measure_region_self_reflection(
     normal = normal / length
     centre = np.asarray(centroid, dtype=float)
 
-    vertex_indices = np.unique(topology.triangles[np.asarray(faces, dtype=np.int64)])
-    points = topology.vertices[vertex_indices]
+    face_indices = np.asarray(faces, dtype=np.int64)
+    triangles = topology.vertices[topology.triangles[face_indices]]
+    points = topology.vertices[np.unique(topology.triangles[face_indices])]
     reflected = points - 2.0 * ((points - centre) @ normal)[:, None] * normal[None, :]
-
-    # Both directions: a region that reflects onto a subset of itself would
-    # otherwise pass on the forward residual alone.
-    forward = _nearest_sample_distances(reflected, points)
-    backward = _nearest_sample_distances(points, reflected)
-    residuals = np.concatenate((forward, backward))
+    residuals = _nearest_triangle_distances(reflected, triangles)
     return (
         float(np.sqrt(float(np.mean(residuals**2)))),
         float(residuals.max(initial=0.0)),
@@ -2965,8 +3023,6 @@ def _find_eager_child_adoptions(
     island_geometry: tuple[_IslandGeometry, ...],
     active_by_island: list[set[int]],
     island_candidate_counts: list[int],
-    host_measurement: SymmetryMeasurement,
-    direct_rms_tolerance: float,
 ) -> tuple[ChildAdoption, ...]:
     """Claim untouched whole islands strongly supported by a symmetric host.
 
@@ -2974,14 +3030,14 @@ def _find_eager_child_adoptions(
     precision over recall because an adopted island is skipped by later symmetry
     testing and inherits the host transform.
 
-    2026-09-03: inheriting the host transform is exactly why the child has to
-    satisfy the host plane's self-reflection as well. ``G L`` returns the host
-    to the mirrored carrier because ``L(host) = host``; a child for which
-    ``L(child) != child`` is not carried to its mirrored place but to its
-    reflected place *within* the host, which is somewhere else. Physical
-    support says the child belongs to the host; only this says the host's
-    transform can carry it. Without it the child is better left on the mirrored
-    carrier with the rest of the mesh.
+    2026-09-03: the child is deliberately *not* asked to satisfy the host
+    plane's self-reflection. ``G L`` carries it to its reflected place within
+    the host, and the host's own recess moves under the same transform, so the
+    child stays seated in it -- that is what adoption is for. Requiring
+    ``L(child) = child`` would only ever admit children that could have been
+    candidates in their own right, which is the case adoption exists to avoid:
+    it left etk800's light-switch dial with no host and a transform of its own
+    while the panel around it stayed on the mirrored carrier.
     """
     host_points, host_samples = _surface_points_and_samples(topology, host_faces)
     if len(host_points) < 3 or len(host_samples) == 0 or host_area <= 1e-15:
@@ -3018,15 +3074,6 @@ def _find_eager_child_adoptions(
         if containment_ratio < 0.05:
             continue
 
-        child_rms, _child_max = measure_region_self_reflection(
-            topology,
-            child_faces,
-            host_measurement.centroid,
-            host_measurement.plane_normal,
-        )
-        if not math.isfinite(child_rms) or child_rms > direct_rms_tolerance:
-            continue
-
         distances = _nearest_sample_distances(child.samples, host_samples)
         median_gap = float(np.median(distances))
         p90_gap = float(np.percentile(distances, 90.0))
@@ -3054,8 +3101,6 @@ def _late_candidate_adoption(
     child: IslandCandidate,
     source_candidate_id: int,
     island_remainder: frozenset[int] = frozenset(),
-    *,
-    direct_rms_tolerance: float,
 ) -> ChildAdoption | None:
     """Return a late-host adoption when a later facade supports an earlier root.
 
@@ -3108,18 +3153,6 @@ def _late_candidate_adoption(
     if containment_ratio < 0.05:
         return None
 
-    # The host's plane has to carry the whole reassembled child, not just
-    # qualify it: see _find_eager_child_adoptions on why L(child) = child is
-    # what makes G L a placement rather than a displacement.
-    child_rms, _child_max = measure_region_self_reflection(
-        topology,
-        adopted_faces,
-        host.measurement.centroid,
-        host.measurement.plane_normal,
-    )
-    if not math.isfinite(child_rms) or child_rms > direct_rms_tolerance:
-        return None
-
     distances = _nearest_sample_distances(child_samples, host_samples)
     median_gap = float(np.median(distances))
     p90_gap = float(np.percentile(distances, 90.0))
@@ -3143,8 +3176,6 @@ def _resolve_late_host_adoptions(
     candidates: list[IslandCandidate],
     premerge_id_by_key: dict[tuple[int, int], int],
     islands: tuple[tuple[int, ...], ...] = (),
-    *,
-    direct_rms_tolerance: float,
 ) -> tuple[list[IslandCandidate], dict[tuple[int, int], tuple[int, int]]]:
     """Merge early roots into later-discovered supported hosts.
 
@@ -3186,7 +3217,6 @@ def _resolve_late_host_adoptions(
                 child,
                 premerge_id_by_key[child.key],
                 remainder,
-                direct_rms_tolerance=direct_rms_tolerance,
             )
             if adoption is None:
                 continue
@@ -3358,14 +3388,11 @@ def _resolve_touching_symmetric_unions(
 
         # The union's plane is fitted to the union's outline, so it earns its
         # own self-reflection check too; the members' planes say nothing about
-        # whether this one maps the merged surface onto itself. Measured over
-        # everything the union's transform will move, which includes the
-        # members' own adopted children, not just the merged host faces.
-        union_moved_faces = tuple(
-            sorted({face for candidate in group for face in candidate.faces})
-        )
+        # whether this one maps the merged surface onto itself. Over the merged
+        # host faces only, for the reason _find_eager_child_adoptions gives:
+        # the children ride the transform rather than having to satisfy it.
         validated = _measurement_survives_self_reflection(
-            topology, union_moved_faces, measurement, direct_rms_tolerance
+            topology, union_host_faces, measurement, direct_rms_tolerance
         )
         if validated is None:
             survivors.extend(group)
@@ -3588,8 +3615,6 @@ def analyse_symmetry_sweep(
                     island_geometry,
                     active_by_island,
                     island_candidate_counts,
-                    measurement,
-                    direct_symmetry_tolerance_metres,
                 )
                 all_faces = tuple(
                     sorted(
@@ -3692,7 +3717,6 @@ def analyse_symmetry_sweep(
         accepted_candidates,
         premerge_id_by_key,
         islands,
-        direct_rms_tolerance=direct_symmetry_tolerance_metres,
     )
     accepted_candidates.sort(
         key=lambda candidate: (
@@ -5571,11 +5595,11 @@ def write_report(
             "plane": "first pass resamples complete closed perimeters at a fixed physical spacing; PCA gives the best-fit perimeter-plane normal; crossing it with global Z gives the deterministic vertical mirror-plane normal through the sample centroid",
             "comparison": "second pass inserts exact mirror-plane crossings, walks opposite half-perimeters in opposite directions, resamples sibling positions at equal travelled arc distance, reflects one half and averages the full 3-D squared sibling residuals",
             "acceptance": "candidate pseudo aspect ratio and perimeter-plane depth ratio must not exceed their configured maxima, initial post-reflection RMS must not exceed the outer tolerance, and final RMS must not exceed the stricter direct threshold; candidates initially below the direct threshold use the deterministic plane unchanged",
-            "self_reflection_check": "the accepted plane must also reflect the region's own surface back onto itself within the direct threshold, measured as symmetric nearest-neighbour residuals over the region vertices; the rigid transform G*L only returns a region to the mirrored carrier because L(S)=S, and a symmetric outline does not imply a symmetric surface",
+            "self_reflection_check": "a host's accepted plane must also reflect its own surface back onto itself within the direct threshold, measured as the distance from each reflected vertex to the region's nearest triangle; the rigid transform G*L only returns a host to the mirrored carrier because L(S)=S, and a symmetric outline does not imply a symmetric surface. Applied to host faces only: an adopted child is carried to its reflected place within the host, whose recess moves with it, so the child is not asked to satisfy the host's plane",
             "borderline_tilt_correction": "candidates initially between the direct and outer RMS thresholds sweep the original mirror-plane normal about global Y over +/-6 degrees, refine the local minimum, and pass only if the corrected final RMS reaches the direct threshold; composing that reflection with the global X reflection applies the corresponding double-angle rigid correction",
             "touching_union_recovery": "after the sweep, accepted symmetric segmentations in the same geometric island that share boundary edges are grouped when their union has a closed symmetric perimeter; the parent is retained with the largest available union perimeter and absorbs the touching symmetric children",
-            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host, at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal, and reflecting the child about the host's own plane maps it back onto itself within the direct threshold; only one direct child generation is used",
-            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, footprint-overlap, extruded-perimeter containment and host-plane self-reflection tests applied to the child's whole reassembled island; this recovers parents that only separate from the main carrier at low crease angles",
+            "eager_child_adoption": "after a host passes, untouched whole islands are adopted before symmetry testing when at least 80% of the child projected footprint lies over the host and at least 5% of child samples lie inside the host's largest perimeter extruded 50 mm along the host normal; only one direct child generation is used",
+            "late_host_recovery": "after the sweep, a larger candidate discovered at a later threshold may absorb an earlier accepted candidate from another geometric island using the same area, footprint-overlap and extruded-perimeter containment tests applied to the child's whole reassembled island; this recovers parents that only separate from the main carrier at low crease angles",
         },
         "timing": {
             "processing_seconds": result.processing_seconds,
