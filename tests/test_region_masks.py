@@ -279,6 +279,35 @@ class DetectionPlumbingTests(unittest.TestCase):
         )
         self.assertEqual(masks, [None])
 
+    def test_a_maskless_run_joins_a_later_merge_as_its_whole_rectangle(self) -> None:
+        # The case that stops the merge's masks being flattened into their
+        # members. Two rectangles collapse to no mask at all, so when a masked
+        # region later joins them they contribute the whole union rectangle --
+        # which covers the gap between them that neither one did.
+        third = np.zeros((2, 2), dtype=bool)
+        third[0, 0] = True
+        _regions, _rotations, removed, masks = rhd.deduplicate_region_detections(
+            [(0, 0, 4, 4), (2, 0, 4, 4), (5, 0, 2, 2)],
+            [None, None, None],
+            [None, None, third],
+        )
+        self.assertEqual(removed, 2)
+        self.assertEqual(_regions, [(0, 0, 7, 4)])
+        merged = masks[0]
+        # The whole 6-wide maskless union, not the two 4-wide rectangles alone.
+        self.assertTrue(merged[:4, :6].all())
+        self.assertTrue(merged[0, 5])
+        self.assertFalse(merged[1, 6])
+
+    def test_a_dedupe_leaves_an_untouched_region_its_own_mask(self) -> None:
+        alone = np.zeros((3, 3), dtype=bool)
+        alone[1, 1] = True
+        _regions, _rotations, removed, masks = rhd.deduplicate_region_detections(
+            [(0, 0, 3, 3)], [None], [alone],
+        )
+        self.assertEqual(removed, 0)
+        self.assertIs(masks[0], alone)
+
 
 if __name__ == "__main__":
     unittest.main()

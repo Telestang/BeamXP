@@ -4974,60 +4974,136 @@ def _deduplicate_region_detections_uninstrumented(
     int,
     list[np.ndarray | None],
 ]:
-    """Collapse intersecting or repeated detections to a fixed point."""
+    """Collapse intersecting or repeated detections to a fixed point.
+
+    2026-09-03: two changes, neither of which moves a single decision -- all 87
+    of etkc's corrections planned identically before and after.
+
+    The scan no longer restarts from zero after each merge; see the loop below.
+    That was the cost. Instrumenting the real calls put this span at 142.1 s of
+    scanning against 0.1 s of mask building, so the masks were never the
+    problem -- a synthetic benchmark said otherwise and was wrong about the
+    region sizes production actually hands over.
+
+    Masks are nonetheless built once per surviving region now rather than once
+    per merge, which is the honest shape even though it saved nothing
+    measurable. Painting is an OR into a translated window, so folding a run of
+    merges into one list of parts is exact -- with the one exception the
+    ``maskless`` flag carries. ``union_region_masks`` answers None when every
+    part is a plain rectangle, and a None part is later painted as its *whole*
+    rectangle, which covers more than the parts it was merged from. Such a run
+    therefore has to collapse to a single whole-rectangle part rather than
+    flatten into its members, or a later merge would paint less than it used to.
+    """
     incoming_rotations = rotations or [None] * len(regions)
     deduplicated = list(regions)
     deduplicated_rotations = list(incoming_rotations)
-    deduplicated_masks = _padded_masks(masks, len(regions))
+    incoming_masks = _padded_masks(masks, len(regions))
+    # What each surviving region's mask will be painted from, and whether every
+    # part of it is still a plain rectangle.
+    mask_parts: list[list[tuple[tuple[int, int, int, int], np.ndarray | None]]] = [
+        [(region, mask)] for region, mask in zip(regions, incoming_masks)
+    ]
+    maskless = [mask is None for mask in incoming_masks]
     removed = 0
 
     # Union bounds can create a new intersection with an earlier region, so a
     # single streaming pass is insufficient.  Keep merging until no pair has
     # positive-area overlap (while retaining the near-duplicate tolerance used
     # for one-pixel differences between atlas consumers).
+    #
+    # 2026-09-03: the pair chosen is still the lexicographically first one that
+    # overlaps, because the choice is not free -- ``_near_duplicate_rectangles``
+    # is not monotone under merging (its 90% area ratio can be *broken* by a
+    # union), so a different order can reach a different fixed point. What has
+    # gone is re-deriving what the last pass already proved.
+    #
+    # ``clean`` counts leading positions whose every pair has been shown not to
+    # overlap; ``grown`` is the one region that has changed since, and so the
+    # only partner those positions can have gained. Restarting from zero
+    # re-tested the whole resolved prefix after every merge -- on the etkc calls
+    # where the shared-layer ledger hands over 500 donated boxes to collapse
+    # into ~85, that was ~85x500 rectangle tests on each of 419 merges. 142 s
+    # of a 498 s correction pass, against 0.7 s on the ardente; now 5.8 s.
+    clean = 0
+    grown: int | None = None
     while True:
-        merged = False
-        for left in range(len(deduplicated)):
-            for right in range(left + 1, len(deduplicated)):
-                first = deduplicated[left]
-                second = deduplicated[right]
-                if not (
-                    _rectangles_overlap(first, second)
-                    or _near_duplicate_rectangles(first, second)
+        pair: tuple[int, int] | None = None
+        # A grown region against the prefix that was already cleared. These
+        # indices are below every candidate the main scan can offer, so they
+        # are the lexicographically first pairs available.
+        if grown is not None:
+            for left in range(min(clean, grown)):
+                if _rectangles_overlap(
+                    deduplicated[left], deduplicated[grown]
+                ) or _near_duplicate_rectangles(
+                    deduplicated[left], deduplicated[grown]
                 ):
-                    continue
-                union = _union_rectangle([first, second])
-                deduplicated_masks[left] = union_region_masks(
+                    pair = (left, grown)
+                    break
+            if pair is None:
+                # Nothing in the prefix reaches it, so the prefix is whole again.
+                grown = None
+        if pair is None:
+            for left in range(clean, len(deduplicated)):
+                for right in range(left + 1, len(deduplicated)):
+                    if _rectangles_overlap(
+                        deduplicated[left], deduplicated[right]
+                    ) or _near_duplicate_rectangles(
+                        deduplicated[left], deduplicated[right]
+                    ):
+                        pair = (left, right)
+                        break
+                if pair is not None:
+                    break
+                # Every pair this position can form has been tested.
+                clean = left + 1
+        if pair is not None:
+            left, right = pair
+            first = deduplicated[left]
+            second = deduplicated[right]
+            union = _union_rectangle([first, second])
+            if maskless[left] and maskless[right]:
+                # The pair would have produced None, which paints as the whole
+                # union rectangle wherever it is merged next.
+                mask_parts[left] = [(union, None)]
+            else:
+                mask_parts[left] = mask_parts[left] + mask_parts[right]
+                maskless[left] = False
+            deduplicated[left] = union
+            if deduplicated_rotations[left] != deduplicated_rotations[right]:
+                # Keep the axis rather than falling back to the box.  Two
+                # atlas consumers of the same mark disagreeing about its
+                # outline by a pixel is not a reason to mirror it about the
+                # image axis instead of its own, which is what dropping the
+                # outline here quietly did.
+                deduplicated_rotations[left] = union_outline(
                     union,
-                    [
-                        (first, deduplicated_masks[left]),
-                        (second, deduplicated_masks[right]),
-                    ],
+                    (
+                        deduplicated_rotations[left],
+                        deduplicated_rotations[right],
+                    ),
                 )
-                deduplicated[left] = union
-                if deduplicated_rotations[left] != deduplicated_rotations[right]:
-                    # Keep the axis rather than falling back to the box.  Two
-                    # atlas consumers of the same mark disagreeing about its
-                    # outline by a pixel is not a reason to mirror it about the
-                    # image axis instead of its own, which is what dropping the
-                    # outline here quietly did.
-                    deduplicated_rotations[left] = union_outline(
-                        union,
-                        (
-                            deduplicated_rotations[left],
-                            deduplicated_rotations[right],
-                        ),
-                    )
-                del deduplicated[right]
-                del deduplicated_rotations[right]
-                del deduplicated_masks[right]
-                removed += 1
-                merged = True
-                break
-            if merged:
-                break
-        if not merged:
+            del deduplicated[right]
+            del deduplicated_rotations[right]
+            del mask_parts[right]
+            del maskless[right]
+            removed += 1
+            # ``left`` is the only region that changed, and it sits at or below
+            # the cleared prefix, so the prefix keeps its verdict on every other
+            # pair. Deleting ``right`` only shifts positions above it.
+            clean = min(clean, left)
+            grown = left
+        else:
             break
+
+    # One materialisation per surviving region. A region nothing merged into
+    # keeps the caller's own mask object, exactly as the per-merge version left
+    # it, so an untouched detection is not copied for nothing.
+    deduplicated_masks = [
+        parts[0][1] if len(parts) == 1 else union_region_masks(bounds, parts)
+        for bounds, parts in zip(deduplicated, mask_parts)
+    ]
 
     ordered = sorted(
         zip(deduplicated, deduplicated_rotations, deduplicated_masks),
