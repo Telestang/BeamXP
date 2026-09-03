@@ -690,20 +690,25 @@ def detect_normal(
                                     stage_outlines[NORMAL_CONVEX_HULLED][window] |= accepted_outline
                             if stop not in (6, 7, 8, 9):
                                 before_rectangle = time.perf_counter()
-                                accepted = fit_region_rectangles(
+                                fitted = fit_region_rectangles(
                                     accepted, config.rectangle_chain_tolerance_degrees,
                                     config.rectangle_min_axis_lead_ratio,
                                 )
                                 accepted_outline, accepted_kept = paint_holes(
-                                    accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                    fitted, sample.shape, (x, y), config,  # type: ignore[arg-type]
                                 )
                                 stage_times[NORMAL_FITTED_RECTANGLE] += (
                                     time.perf_counter() - before_rectangle
                                 )
-                                stage_counts[NORMAL_FITTED_RECTANGLE] += len(accepted)
+                                stage_counts[NORMAL_FITTED_RECTANGLE] += len(fitted)
                                 if capture:
                                     stage_masks[NORMAL_FITTED_RECTANGLE][window] |= accepted_kept
                                     stage_outlines[NORMAL_FITTED_RECTANGLE][window] |= accepted_outline
+                                # 2026-09-03: the fitted rectangle describes
+                                # a baseline for rotation, but must not replace
+                                # the convex region that correction flips. The
+                                # latter is passed through the exporter as a
+                                # mask, closed over its reflected partner.
                             if stop not in (6, 7, 8, 9, 10):
                                 before_padding = time.perf_counter()
                                 accepted = pad_regions(

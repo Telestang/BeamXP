@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -191,3 +192,22 @@ class NormalSlopeDetectorTests(unittest.TestCase):
         self.assertIn(NORMAL_FITTED_RECTANGLE, found.stage_outlines)
         self.assertIn(NORMAL_PADDED, found.stages)
         self.assertIn(NORMAL_PADDED, found.stage_outlines)
+
+    def test_fitted_rectangle_is_visualisation_not_the_final_flip_mask(self) -> None:
+        config = NormalMapConfig(
+            min_width_px=4,
+            min_height_px=4,
+            min_area_px=36,
+            panel_sparse_min_span_px=0,
+            panel_solid_min_minor_span_px=0,
+        )
+        # 2026-09-03: a rectangle fit is still computed for the harness, but
+        # the final region must retain its hull. Returning no fitted shapes
+        # must not erase the mark production hands to correction.
+        with patch(
+            "glyph_lab.normal_detect.fit_region_rectangles", return_value=[]
+        ):
+            found = detect_normal(edge_texture(), config, capture=True)
+
+        self.assertGreater(len(found.regions), 0)
+        self.assertTrue(found.fired.any())

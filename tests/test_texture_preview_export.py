@@ -13,8 +13,8 @@ from xml.etree import ElementTree as ET
 import numpy as np
 from PIL import Image
 
-from mesh_segmentation_transform import mirror_texture_for_rhd as rhd
 from mesh_segmentation_transform import beamxp_transform_sym_mesh_POC as sym_mesh
+from mesh_segmentation_transform import mirror_texture_for_rhd as rhd
 from mesh_segmentation_transform.beamxp_transform_sym_mesh_POC import (
     ArchiveMaterialRecord,
     ArchiveMaterialSwitchState,
@@ -1773,6 +1773,9 @@ class MultiPartPreviewTests(unittest.TestCase):
                 patch.object(rhd, "extract_archive_member", side_effect=extracted),
                 patch.object(rhd, "build_domain_masks", return_value=masks),
                 patch.object(rhd, "normal_maps_for_layer_bindings", return_value=normal_maps),
+                patch.object(
+                    rhd, "TEMPORARILY_DISABLED_TEXTURE_STAGE_KEYS", frozenset()
+                ),
                 patch.object(session, "normal_edge_data", return_value=(edge_data, False)),
                 patch.object(rhd, "detect_flip_regions_by_uv_island", side_effect=detect),
                 patch.object(rhd, "plan_island_flips", return_value=([], np.zeros((4, 4), dtype=bool))),
@@ -2809,7 +2812,7 @@ class UnchangedStageIsNotEncodedTests(unittest.TestCase):
             # texture it shipped with.
             self.assertFalse((output / "rhd_materials.json").exists())
 
-    def test_a_planned_flip_still_encodes(self) -> None:
+    def test_a_planned_flip_that_changes_nothing_is_not_encoded(self) -> None:
         dash = part("dash")
         member = "vehicles/lc500/textures/screen.png"
         binding = rhd.MaterialTextureLayerBinding(
@@ -2868,8 +2871,17 @@ class UnchangedStageIsNotEncodedTests(unittest.TestCase):
             names = {p.name for p in workspace.iterdir()}
 
         self.assertTrue(result.island_flips or result.in_place_flips)
-        self.assertIsNotNone(result.png_path)
-        self.assertIn("screen_rhd.png", names)
+        self.assertIsNone(result.png_path)
+        self.assertIsNone(result.dds_path)
+        self.assertNotIn("screen_rhd.png", names)
+        written = next(
+            entry
+            for entry in result.report["phase_timings"]
+            if entry["phase"] == "write_base_texture"
+        )
+        self.assertEqual(
+            written["skipped"], "flip plan left this layer's pixels unchanged"
+        )
 
 
 class PreviewPngTests(unittest.TestCase):
@@ -2890,7 +2902,10 @@ class PreviewPngTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             source = workspace / "screen.png"
-            Image.new("RGBA", size, (0, 0, 0, 255)).save(source)
+            image = Image.new("RGBA", size, (0, 0, 0, 255))
+            for y in range(4):
+                image.putpixel((0, y), (255, 255, 255, 255))
+            image.save(source)
             mirror = np.ones((size[1], size[0]), dtype=bool)
             masks = rhd.DomainMasks(
                 mirror=mirror,
@@ -3458,6 +3473,28 @@ class SharedLayerRegionTests(unittest.TestCase):
         )
         self.assertEqual(added, 1)
 
+    def test_sibling_detection_keeps_its_texel_shape(self) -> None:
+        ledger = rhd.SharedLayerRegionLedger()
+        detected_mask = np.array(
+            [[True, False, False, False, True], [False, True, True, False, False], [False, False, False, True, False]],
+            dtype=bool,
+        )
+        ledger.record(
+            "vehicles/ardente/interior_nm.normal.dds",
+            (8, 8),
+            [(1, 2, 5, 3)],
+            [None],
+            [detected_mask],
+        )
+
+        regions, _rotations, _sources, _added, masks = ledger.combined(
+            "vehicles/ardente/interior_b.color.dds", (8, 8), [], []
+        )
+
+        self.assertEqual(regions, [(1, 2, 5, 3)])
+        np.testing.assert_array_equal(masks[0], detected_mask)
+        self.assertLess(int(masks[0].sum()), detected_mask.size)
+
     def test_sibling_boxes_and_rotations_scale_to_this_layers_resolution(self) -> None:
         ledger = rhd.SharedLayerRegionLedger()
         ledger.record(
@@ -3465,9 +3502,10 @@ class SharedLayerRegionTests(unittest.TestCase):
             (4, 2),
             [(1, 0, 2, 1)],
             [((1.0, 0.0), (3.0, 0.0), (3.0, 1.0), (1.0, 1.0))],
+            [np.array([[True, False]], dtype=bool)],
         )
 
-        regions, rotations, _sources, _added, _masks = ledger.combined(
+        regions, rotations, _sources, _added, masks = ledger.combined(
             "vehicles/ardente/interior_r.data.dds",
             (8, 4),
             [],
@@ -3478,6 +3516,9 @@ class SharedLayerRegionTests(unittest.TestCase):
         self.assertEqual(
             rotations,
             [((2.0, 0.0), (6.0, 0.0), (6.0, 2.0), (2.0, 2.0))],
+        )
+        np.testing.assert_array_equal(
+            masks[0], np.array([[True, True, False, False], [True, True, False, False]])
         )
 
     def test_authoritative_evidence_keeps_mask_native_precision(self) -> None:

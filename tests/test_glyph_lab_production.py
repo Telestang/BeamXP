@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mesh_segmentation_transform import mirror_texture_for_rhd as rhd
 from mesh_segmentation_transform.glyph_lab_detection import (
+    DEFAULT_GLYPH_LAB_CONFIG,
     DetectedMark,
     detect_layer_marks,
 )
@@ -154,6 +155,9 @@ class DroppedFilterTests(unittest.TestCase):
 
 
 class LayerKindTests(unittest.TestCase):
+    def test_production_uses_the_promoted_rim_contact_threshold(self) -> None:
+        self.assertEqual(DEFAULT_GLYPH_LAB_CONFIG.contrast.min_rim_contact, 1.0)
+
     def test_a_colour_layer_reports_no_fitted_shape(self) -> None:
         """The colour pipeline has no rectangle-fitting stage to report one."""
         colour = np.zeros((32, 32, 3), dtype=np.uint8)

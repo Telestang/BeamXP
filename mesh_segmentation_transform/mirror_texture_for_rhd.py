@@ -28,13 +28,10 @@ there.  The island's own outline only decides whether the whole island may be
 turned over on that axis, or whether its glyphs have to be done individually.
 Off-axis cases are resolved to the nearer axis and not otherwise corrected.
 
-Every archive-backed material map is detected independently: base colour,
-emissive, opacity, overlay, normal, roughness, metallic, AO and palette maps.
-Within one material on one part/UV layout, the accepted regions are then shared
-across those maps before any is corrected.  A shallow printed mark can therefore
-inherit the box found in its embossed normal map, while powered materials still
-contribute their own otherwise-different artwork.  Repeated references to one
-physical file are still processed once.
+Base colour, emissive, opacity, overlay and normal maps are detector sources.
+Material-response maps are correction-only: they receive the accepted plan but
+never donate regions. Repeated references to one physical file are still
+processed once.
 
 A tangent-space normal map is rendered as slope magnitude and cached as edge
 barriers for local-contrast glyph grouping.  When reflected it also negates
@@ -65,7 +62,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Callable
 
 import cv2
@@ -326,6 +323,10 @@ class RhdTextureConfig:
     # least this much feather in their own texel units, otherwise a baked AO
     # rectangle gets an almost-hard edge after plan rescaling.
     companion_boundary_blend_min_px: float = 1.5
+    # 2026-09-03: a fitted region less than this far from an image axis uses
+    # the exact pixel flip. Its residual lean is at most twice this angle,
+    # whereas resampling even a near-axis normal-map glyph visibly softens it.
+    min_rotated_region_angle_degrees: float = 1.0
     # Normal-map detections already provide tight glyph bounds.  Do not apply a
     # second high-pass crop by default: shallow authored relief can sit below
     # the absolute activity floor even after the detector has found it, leaving
@@ -412,6 +413,24 @@ class RhdTextureConfig:
     # low-detail/background average back to the pre-flip patch.  This keeps the
     # broad panel normal direction continuous while still moving the glyph.
     correct_flipped_normal_background: bool = True
+    # 2026-09-03: AO carries authored detail throughout a control face. Keep
+    # the destination's low-frequency occlusion field and mirror only the
+    # source detail field, so a control's baked broad shading is not inverted.
+    correct_flipped_ao_background: bool = True
+    # The cutoff grows with the narrow dimension of each corrected mark. A
+    # single 3 px blur treated a whole switch face as high-frequency detail.
+    ao_background_sigma_px: float = 3.0
+    ao_background_region_fraction: float = 0.20
+    ao_background_max_sigma_px: float = 32.0
+    # Do not disturb a detected AO region that contains only broad baked
+    # shading. The floor ignores codec-scale noise; coverage stops one stray
+    # texel from causing an otherwise uniform control face to be rewritten.
+    ao_detail_analysis_sigma_px: float = 1.5
+    # Three standard deviations of the 1.5 px fine-detail blur, rounded up:
+    # excludes the full influence of a smooth control rim from this test.
+    ao_detail_rim_px: int = 5
+    ao_detail_floor: float = 4.0
+    ao_min_detail_coverage: float = 0.02
     # Production detector selection.  When enabled, colour glyphs are found by
     # GPU local contrast and a same-material normal map contributes cached
     # relief edges only as grouping barriers.  If no usable normal exists, the
@@ -543,14 +562,16 @@ class CompanionMap:
     """One non-colour map of the same material, on the same UV layout.
 
     ``kind`` is what the map's texels mean, which decides whether flipping them
-    is enough.  A scalar map -- roughness, metallic, AO, an opacity mask -- is
-    just moved.  A tangent-space normal map stores a direction, so the
-    component along the flipped axis has to be negated as well.
+    is enough.  Ordinary scalar maps -- roughness, metallic and opacity -- are
+    just moved.  AO is an ``occlusion`` map: its glyph detail moves, while its
+    local lighting ground is matched back to the destination.  A tangent-space
+    normal map stores a direction, so the component along the flipped axis has
+    to be negated as well.
     """
 
     member: str
     stage_key: str
-    kind: str  # "normal" or "scalar"
+    kind: str  # "normal", "scalar", or "occlusion"
 
 
 @dataclass(slots=True)
@@ -620,7 +641,9 @@ class RhdTextureResult:
 # surface, so they are registered to nothing in particular and flipping a
 # region of one would corrupt every other place it lands.  Cubemaps and
 # "@"-prefixed runtime aliases never name an archive member at all.
-NORMAL_MAP_STAGE_KEYS = ("normalMap", "bumpMap")
+# 2026-09-02: Every member here is corrected when a sibling's accepted plan
+# reaches it. Only ``DETECTION_SOURCE_STAGE_KEYS`` below may donate regions.
+NORMAL_MAP_STAGE_KEYS = ("normalMap", "clearCoatBottomNormalMap")
 COLOUR_MAP_STAGE_KEYS = ("baseColorMap", "colorMap", "diffuseMap")
 SCALAR_MAP_STAGE_KEYS = (
     "roughnessMap",
@@ -628,17 +651,41 @@ SCALAR_MAP_STAGE_KEYS = (
     "ambientOcclusionMap",
     "opacityMap",
     "specularMap",
+    "specularityMap",
     "clearCoatMap",
     "clearCoatRoughnessMap",
+    "reflectivityMap",
     "emissiveMap",
     "colorPaletteMap",
     "overlayMap",
+    "lightMap",
 )
 MATERIAL_TEXTURE_STAGE_KINDS = {
     **{key: "colour" for key in COLOUR_MAP_STAGE_KEYS},
     **{key: "normal" for key in NORMAL_MAP_STAGE_KEYS},
-    **{key: "scalar" for key in SCALAR_MAP_STAGE_KEYS},
+    **{
+        key: "scalar"
+        for key in SCALAR_MAP_STAGE_KEYS
+        if key != "ambientOcclusionMap"
+    },
+    "ambientOcclusionMap": "occlusion",
 }
+# 2026-09-03: the Ardente diagnosis isolated AO rather than tangent-space
+# normals. Both maps are again production inputs and outputs; the AO-specific
+# background correction above prevents its local lighting field from shifting.
+TEMPORARILY_DISABLED_TEXTURE_STAGE_KEYS = frozenset()
+# 2026-09-02: Material-response maps are correction-only. They can retain a
+# handedness correction found in a visible layer, but their baked lighting,
+# palette, or reflectance variation is not detector evidence.
+DETECTION_SOURCE_STAGE_KEYS = frozenset(
+    {
+        *NORMAL_MAP_STAGE_KEYS,
+        *COLOUR_MAP_STAGE_KEYS,
+        "opacityMap",
+        "emissiveMap",
+        "overlayMap",
+    }.difference(TEMPORARILY_DISABLED_TEXTURE_STAGE_KEYS)
+)
 RASTER_TEXTURE_SUFFIXES = frozenset(
     {".dds", ".png", ".jpg", ".jpeg", ".bmp", ".tga"}
 )
@@ -697,6 +744,19 @@ class MaterialTextureLayerBinding:
     preview_layers: tuple[object, ...] = ()
     stage_key: str = "baseColorMap"
     kind: str = "colour"
+
+
+def stage_keys_allow_detection(stage_keys: Iterable[str]) -> bool:
+    """Whether any material slot sharing this file may donate regions."""
+    return any(stage_key in DETECTION_SOURCE_STAGE_KEYS for stage_key in stage_keys)
+
+
+def stage_keys_allow_correction(stage_keys: Iterable[str]) -> bool:
+    """Whether at least one material slot is enabled for this diagnostic run."""
+    return any(
+        stage_key not in TEMPORARILY_DISABLED_TEXTURE_STAGE_KEYS
+        for stage_key in stage_keys
+    )
 
 
 def material_texture_layers_for_binding(
@@ -792,10 +852,7 @@ def companion_maps_for_binding(
     for stage in stages:
         if not isinstance(stage, dict):
             continue
-        for keys, kind in (
-            (NORMAL_MAP_STAGE_KEYS, "normal"),
-            (SCALAR_MAP_STAGE_KEYS, "scalar"),
-        ):
+        for keys in (NORMAL_MAP_STAGE_KEYS, SCALAR_MAP_STAGE_KEYS):
             for key in keys:
                 reference = stage.get(key)
                 if not isinstance(reference, str) or not reference.strip():
@@ -808,7 +865,13 @@ def companion_maps_for_binding(
                 if member is None or member.lower() in seen:
                     continue
                 seen.add(member.lower())
-                found.append(CompanionMap(member=member, stage_key=key, kind=kind))
+                found.append(
+                    CompanionMap(
+                        member=member,
+                        stage_key=key,
+                        kind=MATERIAL_TEXTURE_STAGE_KINDS[key],
+                    )
+                )
     return tuple(found)
 
 
@@ -1818,6 +1881,58 @@ def _scale_detection_rotation(
     )
 
 
+def _scale_detection_mask(
+    mask: np.ndarray | None,
+    bounds: tuple[int, int, int, int],
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+    scaled_bounds: tuple[int, int, int, int],
+) -> np.ndarray | None:
+    """Restate detected texels in another atlas resolution without widening.
+
+    ``None`` is the deliberate rectangle-only legacy/authoritative case. A
+    real mask remains a real mask at every scale: an area reduction keeps any
+    covered destination texel, and a one-texel fallback prevents a fine mark
+    disappearing and silently falling back to its whole rectangle.
+    """
+    if mask is None:
+        return None
+    _x, _y, width, height = (int(value) for value in bounds)
+    _sx, _sy, scaled_width, scaled_height = (
+        int(value) for value in scaled_bounds
+    )
+    local = np.asarray(mask, dtype=bool)
+    if local.shape != (height, width):
+        raise ValueError(
+            f"region mask {local.shape} does not match its bounds {(height, width)}"
+        )
+    if source_size == target_size and local.shape == (scaled_height, scaled_width):
+        return local.copy()
+    # Sample every target texel from its source counterpart, then project all
+    # positive source texels forward as well.  The second pass matters when a
+    # small mark is reduced: it makes the scaling conservative, so a mark
+    # cannot vanish and be replaced by its fitted rectangle.
+    source_y_at_target = np.minimum(
+        np.arange(scaled_height) * height // scaled_height, height - 1
+    )
+    source_x_at_target = np.minimum(
+        np.arange(scaled_width) * width // scaled_width, width - 1
+    )
+    scaled = local[np.ix_(source_y_at_target, source_x_at_target)].copy()
+    source_y, source_x = np.nonzero(local)
+    if source_y.size:
+        target_y = np.minimum(
+            ((source_y * 2 + 1) * scaled_height // (2 * height)),
+            scaled_height - 1,
+        )
+        target_x = np.minimum(
+            ((source_x * 2 + 1) * scaled_width // (2 * width)),
+            scaled_width - 1,
+        )
+        scaled[target_y, target_x] = True
+    return scaled
+
+
 def _scale_detection_to_texture(
     detection: RegionDetection,
     source_size: tuple[int, int],
@@ -1825,23 +1940,26 @@ def _scale_detection_to_texture(
 ) -> RegionDetection:
     if source_size == target_size:
         return detection
+    scaled_regions = [
+        _scale_detection_box(region, source_size, target_size)
+        for region in detection.regions
+    ]
     return RegionDetection(
         source=detection.source,
         detected=detection.detected,
-        regions=[
-            _scale_detection_box(region, source_size, target_size)
-            for region in detection.regions
-        ],
+        regions=scaled_regions,
         rotations=[
             _scale_detection_rotation(rotation, source_size, target_size)
             for rotation in detection.rotations
         ],
-        # 2026-09-02: masks are dropped rather than resampled, for the reason
-        # ``SharedLayerRegionLedger.combined`` gives -- a box crossing
-        # resolutions is already an approximation, and a mark's texels put
-        # through the same scaling would stack a second one.  Unscaled
-        # detections return early above and keep theirs.
-        masks=[None] * len(detection.regions),
+        masks=[
+            _scale_detection_mask(mask, bounds, source_size, target_size, scaled)
+            for bounds, scaled, mask in zip(
+                detection.regions,
+                scaled_regions,
+                _padded_masks(detection.masks, len(detection.regions)),
+            )
+        ],
         uncontained=[
             (
                 *_scale_detection_box((x, y, w, h), source_size, target_size),
@@ -3687,6 +3805,82 @@ def _correct_normal_sample_mean(
     return np.clip(np.rint(corrected), 0, 255).astype(np.uint8)
 
 
+def _restore_scalar_local_background(
+    replacement: np.ndarray,
+    destination_background: np.ndarray,
+    source_background: np.ndarray,
+) -> np.ndarray:
+    """Keep a scalar sample's reflected detail on the destination's ground."""
+    channels = min(
+        replacement.shape[1], destination_background.shape[1],
+        source_background.shape[1], 3,
+    )
+    if channels == 0:
+        return replacement
+    corrected = replacement.astype(np.float32, copy=True)
+    corrected[:, :channels] += (
+        destination_background[:, :channels] - source_background[:, :channels]
+    )
+    return np.clip(np.rint(corrected), 0, 255).astype(np.uint8)
+
+
+def occlusion_background_sigma_for_bounds(
+    bounds: tuple[int, int, int, int],
+    minimum_sigma_px: float,
+    region_fraction: float,
+    maximum_sigma_px: float,
+) -> float:
+    """Choose an AO LF cutoff that exceeds a mark's authored detail scale."""
+    _x, _y, width, height = bounds
+    minimum = max(float(minimum_sigma_px), 0.01)
+    maximum = max(float(maximum_sigma_px), minimum)
+    region_scale = max(min(abs(int(width)), abs(int(height))), 1)
+    return min(
+        max(minimum, region_scale * max(float(region_fraction), 0.0)),
+        maximum,
+    )
+
+
+def _mask_interior(mask: np.ndarray, rim_px: int) -> np.ndarray:
+    """Remove a mask's rim without treating edge contrast as interior detail."""
+    interior = np.asarray(mask, dtype=bool).copy()
+    for _ in range(max(int(rim_px), 0)):
+        eroded = np.zeros_like(interior)
+        if interior.shape[0] < 3 or interior.shape[1] < 3:
+            return eroded
+        eroded[1:-1, 1:-1] = (
+            interior[1:-1, 1:-1]
+            & interior[:-2, :-2]
+            & interior[:-2, 1:-1]
+            & interior[:-2, 2:]
+            & interior[1:-1, :-2]
+            & interior[1:-1, 2:]
+            & interior[2:, :-2]
+            & interior[2:, 1:-1]
+            & interior[2:, 2:]
+        )
+        interior = eroded
+    return interior
+
+
+def occlusion_region_has_detail(
+    detail: np.ndarray,
+    writable: np.ndarray,
+    floor: float,
+    minimum_coverage: float,
+    rim_px: int,
+) -> bool:
+    """Whether a prospective AO write has HF detail away from its rim."""
+    interior = _mask_interior(writable, rim_px)
+    if not bool(interior.any()):
+        return False
+    values = detail[interior]
+    if values.ndim > 1:
+        values = values.max(axis=1)
+    active = values >= max(float(floor), 0.0)
+    return float(active.mean()) >= max(float(minimum_coverage), 0.0)
+
+
 def _scalar_detail_activity(image: np.ndarray, sigma_px: float) -> np.ndarray:
     """Local scalar-map detail strength, ignoring broad panel variation."""
     values = image[:, :, 0].astype(np.float32)
@@ -3707,11 +3901,18 @@ def apply_masked_flip(
     normal_detail_floor: float = 16.0,
     normal_detail_percentile: float = 75.0,
     correct_normal_background: bool = False,
+    correct_scalar_background: bool = False,
     scalar_detail_gate: bool = False,
     scalar_detail_sigma_px: float = 1.0,
     scalar_detail_floor: float = 4.0,
     scalar_detail_percentile: float = 70.0,
     region_mask: np.ndarray | None = None,
+    occlusion_background_sigma_px: float = 3.0,
+    occlusion_background: np.ndarray | None = None,
+    occlusion_detail: np.ndarray | None = None,
+    occlusion_detail_floor: float = 0.0,
+    occlusion_min_detail_coverage: float = 0.0,
+    occlusion_detail_rim_px: int = 0,
 ) -> int:
     """Flip a rectangle's contents in place, writing only through a stencil.
 
@@ -3754,6 +3955,18 @@ def apply_masked_flip(
     both = mask & flip(mask)
     if not bool(both.any()):
         return 0
+    if (
+        correct_scalar_background
+        and occlusion_detail is not None
+        and not occlusion_region_has_detail(
+            occlusion_detail[y0:y1, x0:x1],
+            both,
+            occlusion_detail_floor,
+            occlusion_min_detail_coverage,
+            occlusion_detail_rim_px,
+        )
+    ):
+        return 0
     samples = flip(window)[both].copy()
     if negate_channel is not None and negate_channel < samples.shape[1]:
         samples[:, negate_channel] = 255 - samples[:, negate_channel]
@@ -3773,6 +3986,21 @@ def apply_masked_flip(
         sample_background = None if background is None else background[both]
         samples = _correct_normal_sample_mean(
             window[both].copy(), samples, sample_background
+        )
+    if correct_scalar_background and negate_channel is None:
+        background = (
+            occlusion_background
+            if occlusion_background is not None
+            else cv2.GaussianBlur(
+                image[:, :, :3].astype(np.float32),
+                (0, 0),
+                max(float(occlusion_background_sigma_px), 0.01),
+            )
+        )
+        destination_background = background[y0:y1, x0:x1][both]
+        source_background = flip(background[y0:y1, x0:x1])[both]
+        samples = _restore_scalar_local_background(
+            samples, destination_background, source_background
         )
     alpha_map = _boundary_alpha(both, boundary_blend_px)
     if normal_detail_gate and negate_channel is not None:
@@ -3881,6 +4109,20 @@ def rotated_axis_alignment_degrees(
     return math.degrees(math.acos(cosine))
 
 
+def rotation_requires_resampling(
+    corners: tuple[tuple[float, float], ...],
+    axis: str,
+    rotated_axis: str,
+    minimum_angle_degrees: float,
+) -> bool:
+    """Whether an oblique reflection earns a resampling pass."""
+    alignment = rotated_axis_alignment_degrees(corners, axis, rotated_axis)
+    return (
+        alignment is not None
+        and alignment >= max(float(minimum_angle_degrees), 0.0)
+    )
+
+
 def _reflect_normal_direction(
     image: np.ndarray,
     rows: np.ndarray,
@@ -3902,48 +4144,6 @@ def _reflect_normal_direction(
     image[rows, columns, :2] = np.clip(np.rint((xy + 1.0) * 127.5), 0, 255).astype(
         np.uint8
     )
-
-
-def _reflect_normal_samples(samples: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Return tangent-space normal samples carried through a reflection.
-
-    A normal is not carried by the map itself but by its inverse-transpose.
-    The reflection is an involution, so its inverse is itself and the transform
-    reduces to the plain transpose -- which for an *oblique* reflection is not
-    the same matrix.
-
-    This is worth stating because the rectangle case hides it: a right-angled
-    reflection is symmetric, so transpose and original coincide and reflecting
-    the vector along the mirror direction gave the right answer for free.  A
-    sheared outline breaks that silently, leaving the relief lit from a
-    direction the geometry never turned towards.
-
-    The XY pair is transformed and the vector renormalised; Z is a height and
-    the reflection does not touch it.
-    """
-    if samples.size == 0 or samples.shape[1] < 2:
-        return samples
-    reflected = samples.astype(np.float32, copy=True)
-    vector = reflected[:, :3] / 127.5 - 1.0 if samples.shape[1] >= 3 else None
-    xy = reflected[:, :2] / 127.5 - 1.0
-    # Rows are vectors, so ``xy @ matrix`` applies the transpose -- which is
-    # what is wanted, and writing it the other way round is the easy mistake.
-    # The flip resamples ``h'(p) = h(A(p))`` with ``A`` the reflection, so by
-    # the chain rule ``grad h' = matrix^T grad h``, and a normal's XY pair is
-    # the negated gradient.  Measured against a height field flipped directly,
-    # the transpose lands within a degree while the matrix itself is 26 degrees
-    # out.
-    xy = xy @ np.asarray(matrix, dtype=np.float32)
-    if vector is not None:
-        vector[:, :2] = xy
-        length = np.linalg.norm(vector, axis=1, keepdims=True)
-        vector = np.divide(
-            vector, length, out=np.zeros_like(vector), where=length > 1e-6
-        )
-        reflected[:, :3] = np.clip(np.rint((vector + 1.0) * 127.5), 0, 255)
-    else:
-        reflected[:, :2] = np.clip(np.rint((xy + 1.0) * 127.5), 0, 255)
-    return np.clip(np.rint(reflected), 0, 255).astype(np.uint8)
 
 
 # An oblique reflection preserves area but not shape: it stretches along one
@@ -3973,13 +4173,14 @@ def oblique_supersample_factor(matrix: np.ndarray) -> int:
     return int(min(math.ceil(anisotropy), _OBLIQUE_SUPERSAMPLE_MAX))
 
 
-def _resample_reflected(
+def _resample_reflected_float(
     source: np.ndarray,
     partner_x: np.ndarray,
     partner_y: np.ndarray,
     matrix: np.ndarray,
+    interpolation: int,
 ) -> np.ndarray:
-    """Sample the reflection, supersampling where it compresses an axis.
+    """Sample a floating-point reflection, supersampling compressed axes.
 
     The reflection is affine, so a sub-texel offset moves every partner by the
     same ``matrix @ offset``.  That makes each extra sample one vector add on
@@ -3990,7 +4191,7 @@ def _resample_reflected(
     if factor <= 1:
         return cv2.remap(
             source, partner_x, partner_y,
-            cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE,
+            interpolation, borderMode=cv2.BORDER_REPLICATE,
         )
     steps = [(index + 0.5) / factor - 0.5 for index in range(factor)]
     total = np.zeros(
@@ -4004,10 +4205,62 @@ def _resample_reflected(
                 source,
                 (partner_x + np.float32(shift[0])),
                 (partner_y + np.float32(shift[1])),
-                cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE,
+                interpolation, borderMode=cv2.BORDER_REPLICATE,
             ).astype(np.float32)
     total /= float(factor * factor)
-    return np.clip(np.rint(total), 0, 255).astype(source.dtype)
+    return total
+
+
+def _resample_reflected(
+    source: np.ndarray,
+    partner_x: np.ndarray,
+    partner_y: np.ndarray,
+    matrix: np.ndarray,
+) -> np.ndarray:
+    """Sample a colour/scalar reflection, supersampling compressed axes."""
+    sampled = _resample_reflected_float(
+        source, partner_x, partner_y, matrix, cv2.INTER_LANCZOS4
+    )
+    return np.clip(np.rint(sampled), 0, 255).astype(source.dtype)
+
+
+def _resample_reflected_normal(
+    source: np.ndarray,
+    partner_x: np.ndarray,
+    partner_y: np.ndarray,
+    matrix: np.ndarray,
+) -> np.ndarray:
+    """Reflect tangent normals as vectors rather than filtered RGB colours."""
+    if source.ndim != 3 or source.shape[2] < 2:
+        return _resample_reflected(source, partner_x, partner_y, matrix)
+    # 2026-09-03: interpolation in encoded RG creates visible yellow/green
+    # ringing on sharp normal-map glyphs. Decode the tangent pair first, then
+    # apply the reflection and renormalise it before writing it back.
+    encoded_xy = source[:, :, :2].astype(np.float32) / 127.5 - 1.0
+    sampled_xy = _resample_reflected_float(
+        encoded_xy, partner_x, partner_y, matrix, cv2.INTER_LINEAR
+    )
+    transformed_xy = sampled_xy @ np.asarray(matrix, dtype=np.float32)
+    sampled_z = np.sqrt(
+        np.clip(1.0 - np.sum(sampled_xy * sampled_xy, axis=2), 0.0, 1.0)
+    )
+    length = np.sqrt(
+        np.sum(transformed_xy * transformed_xy, axis=2) + sampled_z * sampled_z
+    )
+    transformed_xy = np.divide(
+        transformed_xy,
+        length[:, :, None],
+        out=np.zeros_like(transformed_xy),
+        where=length[:, :, None] > 1e-6,
+    )
+    sampled = cv2.remap(
+        source, partner_x, partner_y, cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    sampled[:, :, :2] = np.clip(
+        np.rint((transformed_xy + 1.0) * 127.5), 0, 255
+    ).astype(np.uint8)
+    return sampled
 
 
 def outline_local_grid(
@@ -4222,11 +4475,18 @@ def apply_masked_rotated_flip(
     normal_detail_floor: float = 16.0,
     normal_detail_percentile: float = 75.0,
     correct_normal_background: bool = False,
+    correct_scalar_background: bool = False,
     scalar_detail_gate: bool = False,
     scalar_detail_sigma_px: float = 1.0,
     scalar_detail_floor: float = 4.0,
     scalar_detail_percentile: float = 70.0,
     region_mask: np.ndarray | None = None,
+    occlusion_background_sigma_px: float = 3.0,
+    occlusion_background: np.ndarray | None = None,
+    occlusion_detail: np.ndarray | None = None,
+    occlusion_detail_floor: float = 0.0,
+    occlusion_min_detail_coverage: float = 0.0,
+    occlusion_detail_rim_px: int = 0,
 ) -> int:
     """Flip a fitted outline in place along one of its local directions.
 
@@ -4277,15 +4537,26 @@ def apply_masked_rotated_flip(
     dest_y, dest_x = np.nonzero(exchangeable)
     absolute_y = dest_y + y0
     absolute_x = dest_x + x0
-    remapped = _resample_reflected(
+    if (
+        correct_scalar_background
+        and occlusion_detail is not None
+        and not occlusion_region_has_detail(
+            occlusion_detail[y0:y1, x0:x1],
+            exchangeable,
+            occlusion_detail_floor,
+            occlusion_min_detail_coverage,
+            occlusion_detail_rim_px,
+        )
+    ):
+        return 0
+    resample = _resample_reflected_normal if reflect_normals else _resample_reflected
+    remapped = resample(
         source,
         partner_x_float.astype(np.float32),
         partner_y_float.astype(np.float32),
         reflection,
     )
     samples = remapped[dest_y, dest_x]
-    if reflect_normals:
-        samples = _reflect_normal_samples(samples, reflection)
     activity = None
     partner_activity = None
     if (normal_detail_gate or correct_normal_background) and reflect_normals:
@@ -4308,6 +4579,27 @@ def apply_masked_rotated_flip(
         sample_background = None if background is None else background[dest_y, dest_x]
         samples = _correct_normal_sample_mean(
             image[absolute_y, absolute_x].copy(), samples, sample_background
+        )
+    if correct_scalar_background and not reflect_normals:
+        background = (
+            occlusion_background
+            if occlusion_background is not None
+            else cv2.GaussianBlur(
+                source[:, :, :3].astype(np.float32),
+                (0, 0),
+                max(float(occlusion_background_sigma_px), 0.01),
+            )
+        )
+        reflected_background = _resample_reflected(
+            background,
+            partner_x_float.astype(np.float32),
+            partner_y_float.astype(np.float32),
+            reflection,
+        )
+        samples = _restore_scalar_local_background(
+            samples,
+            background[absolute_y, absolute_x],
+            reflected_background[dest_y, dest_x],
         )
     alpha_map = _boundary_alpha(exchangeable, boundary_blend_px)
     if normal_detail_gate and reflect_normals:
@@ -4412,7 +4704,15 @@ def apply_flip_plan(
     scalar_detail_floor: float = 4.0,
     scalar_detail_percentile: float = 70.0,
     correct_normal_background: bool = False,
+    correct_scalar_background: bool = False,
     reflect_normal_vectors: bool = True,
+    occlusion_background_sigma_px: float = 3.0,
+    occlusion_background_region_fraction: float = 0.0,
+    occlusion_background_max_sigma_px: float = 32.0,
+    occlusion_detail_analysis_sigma_px: float = 1.5,
+    occlusion_detail_floor: float = 0.0,
+    occlusion_min_detail_coverage: float = 0.0,
+    occlusion_detail_rim_px: int = 0,
 ) -> int:
     """Replay a plan onto one map, in the order the plan was built.
 
@@ -4423,6 +4723,16 @@ def apply_flip_plan(
     negate = NORMAL_AXIS_CHANNEL if kind == "normal" and reflect_normal_vectors else {}
     moved = 0
     region_stencil: np.ndarray | None = None
+    # The LF field is a reference to the pre-correction AO map. Each flip may
+    # alter a nearby region, but must never become the background another flip
+    # restores against.
+    occlusion_source = (
+        image.copy()
+        if kind == "occlusion" and correct_scalar_background
+        else None
+    )
+    occlusion_backgrounds: dict[float, np.ndarray] = {}
+    occlusion_detail: np.ndarray | None = None
     # 2026-09-02: a second scratch, kept apart from ``region_stencil`` because
     # the two answer different questions.  The stencil is where writing is
     # legal at all; this is which texels are the mark.  Folding the mark into
@@ -4434,8 +4744,40 @@ def apply_flip_plan(
     for step in steps:
         in_place = step.island_label is None
         gate_normals = kind == "normal" and in_place and normal_detail_gate
-        gate_scalars = kind == "scalar" and in_place and scalar_detail_gate
+        gate_scalars = (
+            kind in {"scalar", "occlusion"} and in_place and scalar_detail_gate
+        )
         correct_normals = kind == "normal" and in_place and correct_normal_background
+        correct_scalars = kind == "occlusion" and correct_scalar_background
+        background = None
+        detail = None
+        background_sigma = occlusion_background_sigma_px
+        if correct_scalars and occlusion_source is not None:
+            background_sigma = occlusion_background_sigma_for_bounds(
+                step.bounds,
+                occlusion_background_sigma_px,
+                occlusion_background_region_fraction,
+                occlusion_background_max_sigma_px,
+            )
+            cache_key = round(background_sigma, 6)
+            background = occlusion_backgrounds.get(cache_key)
+            if background is None:
+                background = cv2.GaussianBlur(
+                    occlusion_source[:, :, :3].astype(np.float32),
+                    (0, 0),
+                    background_sigma,
+                )
+                occlusion_backgrounds[cache_key] = background
+            if occlusion_detail is None:
+                fine_ground = cv2.GaussianBlur(
+                    occlusion_source[:, :, :3].astype(np.float32),
+                    (0, 0),
+                    max(float(occlusion_detail_analysis_sigma_px), 0.01),
+                )
+                occlusion_detail = np.abs(
+                    occlusion_source[:, :, :3].astype(np.float32) - fine_ground
+                ).max(axis=2)
+            detail = occlusion_detail
         if step.island_label is None:
             if step.stencil == STENCIL_REGION:
                 # 2026-08-26: the component's own bounds, not the whole atlas.
@@ -4490,11 +4832,18 @@ def apply_flip_plan(
                 normal_detail_floor,
                 normal_detail_percentile,
                 correct_normals,
+                correct_scalars,
                 gate_scalars,
                 scalar_detail_sigma_px,
                 scalar_detail_floor,
                 scalar_detail_percentile,
                 marked,
+                background_sigma,
+                background,
+                detail,
+                occlusion_detail_floor,
+                occlusion_min_detail_coverage,
+                occlusion_detail_rim_px,
             )
             continue
         moved += apply_masked_flip(
@@ -4509,11 +4858,18 @@ def apply_flip_plan(
             normal_detail_floor,
             normal_detail_percentile,
             correct_normals,
+            correct_scalars,
             gate_scalars,
             scalar_detail_sigma_px,
             scalar_detail_floor,
             scalar_detail_percentile,
             marked,
+            background_sigma,
+            background,
+            detail,
+            occlusion_detail_floor,
+            occlusion_min_detail_coverage,
+            occlusion_detail_rim_px,
         )
     return moved
 
@@ -5442,6 +5798,7 @@ class SharedLayerRegionEvidence:
     size: tuple[int, int]
     regions: tuple[tuple[int, int, int, int], ...]
     rotations: tuple[tuple[tuple[float, float], ...] | None, ...]
+    masks: tuple[np.ndarray | None, ...] = ()
 
 
 @dataclass(slots=True)
@@ -5468,6 +5825,7 @@ class SharedLayerRegionLedger:
         size: tuple[int, int],
         regions: list[tuple[int, int, int, int]],
         rotations: list[tuple[tuple[float, float], ...] | None],
+        masks: list[np.ndarray | None] | None = None,
     ) -> None:
         padded_rotations = list(rotations[: len(regions)])
         padded_rotations.extend([None] * (len(regions) - len(padded_rotations)))
@@ -5475,6 +5833,7 @@ class SharedLayerRegionLedger:
             size=size,
             regions=tuple(regions),
             rotations=tuple(padded_rotations),
+            masks=tuple(_padded_masks(masks, len(regions))),
         )
 
     def record_evidence(
@@ -5501,13 +5860,11 @@ class SharedLayerRegionLedger:
     ]:
         """Return this layer's regions unioned with every sibling's evidence.
 
-        2026-09-02: the ledger deliberately does not carry texel masks.  A
-        sibling's evidence already crosses resolutions -- companion maps are
-        commonly half size, and the docstring above says what that costs a box
-        -- and resampling a mark's texels through the same scaling would stack
-        a second approximation on a mark this layer never detected itself.  A
-        donated region arrives as a rectangle and flips as one, which is what
-        it has always done; only this layer's own regions keep their texels.
+        2026-09-03: masks travel with the evidence. A sibling's mark used to
+        arrive as ``None`` and therefore mean "flip this whole rectangle" on
+        the target layer, which made the Ardente's normal-map differences fill
+        66--75% of their fitted boxes. Conservative mask scaling preserves a
+        detected shape without inventing a rectangular write.
         """
         own_rotations = list(rotations[: len(regions)])
         own_rotations.extend([None] * (len(regions) - len(own_rotations)))
@@ -5521,23 +5878,32 @@ class SharedLayerRegionLedger:
         for source_member, evidence in self.layers.items():
             if source_member == member_key or not evidence.regions:
                 continue
-            donated = [
-                (
-                    _scale_detection_box(region, evidence.size, size),
-                    _scale_detection_rotation(rotation, evidence.size, size),
+            donated = []
+            for region, rotation, mask in zip(
+                evidence.regions,
+                evidence.rotations,
+                _padded_masks(list(evidence.masks), len(evidence.regions)),
+            ):
+                scaled_region = _scale_detection_box(region, evidence.size, size)
+                donated.append(
+                    (
+                        scaled_region,
+                        _scale_detection_rotation(rotation, evidence.size, size),
+                        _scale_detection_mask(
+                            mask, region, evidence.size, size, scaled_region
+                        ),
+                    )
                 )
-                for region, rotation in zip(evidence.regions, evidence.rotations)
-            ]
             donated = [
-                (box, rotation) for box, rotation in donated
+                (box, rotation, mask) for box, rotation, mask in donated
                 if not _swallows_resolved_regions(box, regions)
             ]
             if not donated:
                 continue
             contributors.append(source_member)
-            combined_regions.extend(box for box, _rotation in donated)
-            combined_rotations.extend(rotation for _box, rotation in donated)
-            combined_masks.extend([None] * len(donated))
+            combined_regions.extend(box for box, _rotation, _mask in donated)
+            combined_rotations.extend(rotation for _box, rotation, _mask in donated)
+            combined_masks.extend(mask for _box, _rotation, mask in donated)
 
         before = set(regions)
         combined_regions, combined_rotations, _removed, combined_masks = (
@@ -5622,18 +5988,21 @@ def shared_layer_evidence_at_finest_resolution(
     )
     regions: list[tuple[int, int, int, int]] = []
     rotations: list[tuple[tuple[float, float], ...] | None] = []
+    masks: list[np.ndarray | None] = []
     for source_size, detection in detections:
         scaled = _scale_detection_to_texture(detection, source_size, size)
-        # Masks are deliberately not threaded here: ``SharedLayerRegionEvidence``
-        # is rectangles-only by design, for the reason its consumer explains.
-        regions, _added, rotations, _masks = merge_region_sets_with_rotations(
+        regions, _added, rotations, masks = merge_region_sets_with_rotations(
             regions,
             scaled.regions,
             config,
             rotations,
             scaled.rotations,
+            masks,
+            scaled.masks,
         )
-    return SharedLayerRegionEvidence(size, tuple(regions), tuple(rotations))
+    return SharedLayerRegionEvidence(
+        size, tuple(regions), tuple(rotations), tuple(masks)
+    )
 
 
 FULL_MIRRORED_TEXTURE_MIN_COVERAGE = 0.95
@@ -7058,10 +7427,12 @@ def rebuild_companion_map(
     blend_px = companion_boundary_blend_px(config, size, expected)
     detail_sigma_px = float(config.normal_region_detail_sigma_px)
     scalar_detail_sigma_px = float(config.scalar_region_detail_sigma_px)
+    occlusion_background_sigma_px = float(config.ao_background_sigma_px)
     if size != expected:
         scale = size[0] / max(expected[0], 1)
         detail_sigma_px = max(detail_sigma_px * scale, 0.5)
         scalar_detail_sigma_px = max(scalar_detail_sigma_px * scale, 0.5)
+        occlusion_background_sigma_px = max(occlusion_background_sigma_px * scale, 0.5)
         log(f"    {PurePosixPath(companion.member).name}: {size[0]}x{size[1]}; "
             f"the plan restated at 1/{expected[0] // size[0]} scale")
     steps, mirror_mask, label_image, domain_mask = rescaled
@@ -7083,7 +7454,17 @@ def rebuild_companion_map(
         scalar_detail_floor=config.scalar_region_detail_floor,
         scalar_detail_percentile=config.scalar_region_detail_percentile,
         correct_normal_background=config.correct_flipped_normal_background,
+        correct_scalar_background=config.correct_flipped_ao_background,
         reflect_normal_vectors=config.reflect_flipped_normal_vectors,
+        occlusion_background_sigma_px=occlusion_background_sigma_px,
+        occlusion_background_region_fraction=(
+            config.ao_background_region_fraction
+        ),
+        occlusion_background_max_sigma_px=config.ao_background_max_sigma_px,
+        occlusion_detail_analysis_sigma_px=config.ao_detail_analysis_sigma_px,
+        occlusion_detail_floor=config.ao_detail_floor,
+        occlusion_min_detail_coverage=config.ao_min_detail_coverage,
+        occlusion_detail_rim_px=config.ao_detail_rim_px,
     )
     codec = source_dds_codec(source)
 
@@ -7180,6 +7561,7 @@ def build_rhd_texture(
     part_group_index: int = 0,
     shared_layer_regions: SharedLayerRegionLedger | None = None,
     detect_only: bool = False,
+    detect: bool = True,
     detection_size: tuple[int, int] | None = None,
     log=print,
     progress: ProgressCallback | None = None,
@@ -7203,9 +7585,8 @@ def build_rhd_texture(
     across every physical material layer in an export.
 
     ``shared_layer_regions`` is scoped by the caller to one material on one
-    part/UV layout.  A detect-only visit records this layer's accepted evidence;
-    the correction visit reuses the cached detection and adds the evidence from
-    its sibling maps, scaling boxes when their resolutions differ.
+    part/UV layout. A detect-only visit records source-layer evidence; a
+    correction-only layer records none and reuses its siblings' accepted plan.
     """
     started = time.perf_counter()
     phase_timings: list[dict[str, object]] = []
@@ -7297,6 +7678,8 @@ def build_rhd_texture(
         if layer_kinds == {"normal"}
         else "colour"
         if "colour" in layer_kinds
+        else "occlusion"
+        if layer_kinds == {"occlusion"}
         else "scalar"
     )
     timing = record_phase(
@@ -7384,7 +7767,7 @@ def build_rhd_texture(
     # cannot differ between them.  Only the glyph_lab detector reads these.
     mesh_seam_extents: np.ndarray | None = None
     seams_reused = False
-    if config.detector == "glyph_lab":
+    if detect and config.detector == "glyph_lab":
         seam_started = time.perf_counter()
 
         def walk_mesh_seams() -> np.ndarray | None:
@@ -7568,7 +7951,9 @@ def build_rhd_texture(
             "cache_reused": island_cache_reused,
         }
     )
-    use_authoritative_masks = bool(authoritative_masks) and full_domain_region is None
+    use_authoritative_masks = (
+        detect and bool(authoritative_masks) and full_domain_region is None
+    )
     authoritative_mask_regions = (
         use_authoritative_masks
         or layer_detection_config.box_source == "opacity_mask"
@@ -7580,7 +7965,8 @@ def build_rhd_texture(
         )
     direct_normal_edge_data = None
     if (
-        layer_kind == "normal"
+        detect
+        and layer_kind == "normal"
         and full_domain_region is None
         and not use_authoritative_masks
         # 2026-09-02: glyph_lab reads a normal layer's tangent vectors itself,
@@ -7616,13 +8002,18 @@ def build_rhd_texture(
             }
         )
 
-    normal_maps = (
-        normal_maps_for_layer_bindings(archive, candidates, texture_member)
-        if hybrid_gpu_detection
-        and layer_kind != "normal"
-        and full_domain_region is None
-        and not use_authoritative_masks
-        else ()
+    normal_maps = tuple(
+        normal_map
+        for normal_map in (
+            normal_maps_for_layer_bindings(archive, candidates, texture_member)
+            if detect
+            and hybrid_gpu_detection
+            and layer_kind != "normal"
+            and full_domain_region is None
+            and not use_authoritative_masks
+            else ()
+        )
+        if normal_map.stage_key not in TEMPORARILY_DISABLED_TEXTURE_STAGE_KEYS
     )
     normal_edge_responses: list[np.ndarray] = []
     normal_edge_sources: list[dict[str, object]] = []
@@ -7718,6 +8109,8 @@ def build_rhd_texture(
 
     def detect_primary_job() -> RegionDetection:
         nonlocal authoritative_shared_evidence
+        if not detect:
+            return RegionDetection(source="detection_policy_excluded", detected=0)
         if full_domain_region is not None:
             log(
                 "  dedicated mirrored texture domain covers "
@@ -7864,7 +8257,9 @@ def build_rhd_texture(
     # reads a normal layer's tangent vectors directly, so a job would report
     # itself as colour while running the slope-absence pipeline.
     primary_source = (
-        "opacity_mask"
+        "policy_excluded"
+        if not detect
+        else "opacity_mask"
         if use_authoritative_masks
         else "relief"
         if direct_normal_edge_data is not None
@@ -7901,7 +8296,9 @@ def build_rhd_texture(
             {
                 "source": primary_source,
                 "pipeline": (
-                    f"glyph_lab_{layer_kind}"
+                    "policy_excluded"
+                    if not detect
+                    else f"glyph_lab_{layer_kind}"
                     if config.detector == "glyph_lab"
                     else "relief_edge_gpu"
                     if direct_normal_edge_data is not None
@@ -8199,6 +8596,7 @@ def build_rhd_texture(
                 (width, height),
                 mirrored_regions,
                 mirrored_rotations,
+                mirrored_masks,
             )
         if detect_only:
             emit_progress(
@@ -8326,17 +8724,30 @@ def build_rhd_texture(
                 region_texels = np.zeros(mirror_mask.shape, dtype=bool)
             if paint_region_mask(region_texels, (x, y, w, h), region_mask):
                 writable = domain_mask & region_texels
-        # Every detected rotation is applied, however small.  A near-axis
-        # rectangle used to be snapped to the flat flip on the grounds that
-        # resampling cost detail for no geometric gain, but the gain is twice
-        # the detected angle: reflecting about the image axis instead of a
-        # mirror line sitting at 0.8 degrees to it leaves the mark turned by
-        # 1.6, and a baseline that far off is visible on text.
         rotated_axis = (
             rotated_axis_for_surface_axis(rotation, axis)
             if rotation is not None
             else None
         )
+        alignment = (
+            rotated_axis_alignment_degrees(rotation, axis, rotated_axis)
+            if rotation is not None and rotated_axis is not None
+            else None
+        )
+        if (
+            alignment is not None
+            and not rotation_requires_resampling(
+                rotation,
+                axis,
+                rotated_axis,
+                config.min_rotated_region_angle_degrees,
+            )
+        ):
+            log(
+                f"    ~ ({x},{y}) {w}x{h}: outline is {alignment:.2f} degrees "
+                "from the image axis; using an exact flat flip"
+            )
+            rotation, rotated_axis = None, None
         # An outline is only a frame to mirror in while the whole of it is on
         # the atlas.  Where it overhangs, the texels whose partner would sit
         # past the edge are silently left alone and the mark is torn along
@@ -8515,7 +8926,17 @@ def build_rhd_texture(
         scalar_detail_floor=config.scalar_region_detail_floor,
         scalar_detail_percentile=config.scalar_region_detail_percentile,
         correct_normal_background=config.correct_flipped_normal_background,
+        correct_scalar_background=config.correct_flipped_ao_background,
         reflect_normal_vectors=config.reflect_flipped_normal_vectors,
+        occlusion_background_sigma_px=config.ao_background_sigma_px,
+        occlusion_background_region_fraction=(
+            config.ao_background_region_fraction
+        ),
+        occlusion_background_max_sigma_px=config.ao_background_max_sigma_px,
+        occlusion_detail_analysis_sigma_px=config.ao_detail_analysis_sigma_px,
+        occlusion_detail_floor=config.ao_detail_floor,
+        occlusion_min_detail_coverage=config.ao_min_detail_coverage,
+        occlusion_detail_rim_px=config.ao_detail_rim_px,
     )
     TIMINGS.seconds["apply flip plan"] += time.perf_counter() - _apply_started
     TIMINGS.calls["apply flip plan"] += 1
@@ -8554,15 +8975,16 @@ def build_rhd_texture(
     dds_path: Path | None = output_directory / f"{stem}_rhd.dds"
     preview_path: Path | None = None
 
-    # An empty plan leaves the image exactly as it was loaded -- applying it is
-    # a loop over the steps -- so re-encoding it would spend a BC7 pass to
-    # reproduce the input.  Emitting nothing instead leaves this stage on the
-    # shipped texture, which is what the pixels already say: material
-    # retargeting only rewrites a stage that has a corrected counterpart.  On
-    # scintilla 77 of 141 corrections plan no flips and cost 215s of a 629s
-    # pass between them.
-    if not steps:
-        log("  no flip planned; this stage keeps the original texture")
+    # 2026-09-02: A plan can be non-empty yet leave a flat, symmetric, or gated
+    # layer exactly unchanged. Re-encoding it would reproduce the source
+    # texture, so only emit a counterpart when its pixels actually differ.
+    if not steps or not bool(changed_texels.any()):
+        no_op_reason = (
+            "no flip planned"
+            if not steps
+            else "flip plan left this layer's pixels unchanged"
+        )
+        log(f"  {no_op_reason}; this stage keeps the original texture")
         png_path = None
         dds_path = None
         info: dict[str, object] = {"codec": "none", "levels": 0, "bytes": 0}
@@ -8576,7 +8998,7 @@ def build_rhd_texture(
             codec="none",
             mip_levels=0,
             bytes=0,
-            skipped="no flip planned",
+            skipped=no_op_reason,
         )
     else:
         phase_started = time.perf_counter()
@@ -8808,8 +9230,13 @@ def build_rhd_texture(
         "rigid_triangles": masks.rigid_triangles,
         "phase_timings": phase_timings,
         "detection": detection_reports,
+        "detection_enabled": detect,
         "detection_authority": (
-            "opacity_mask" if use_authoritative_masks else "texture_layer"
+            "policy_excluded"
+            if not detect
+            else "opacity_mask"
+            if use_authoritative_masks
+            else "texture_layer"
         ),
         "authoritative_mask_sources": [
             mask.member for mask in authoritative_masks
@@ -8838,6 +9265,7 @@ def build_rhd_texture(
         ),
         "regions_detected": detected_total,
         "mirrored_regions": len(mirrored_regions),
+        "changed_texels": int(changed_texels.sum()),
         "companion_regions_added": companion_regions_added,
         "state_group_regions_added": state_group_regions_added,
         "shared_layer_regions_added": shared_layer_regions_added,
@@ -9570,6 +9998,7 @@ class TextureCorrectionTask:
     part_scope: tuple[DaePart, ...]
     masks: DomainMasks
     part_group_index: int
+    detect: bool = True
     # 2026-09-02: the resolution every layer of this material detects at -- the
     # finest of them, which is normally the base colour.  None means detect at
     # the layer's own size, which is what a lone layer does.
@@ -9592,7 +10021,7 @@ def assign_group_detection_size(
     tasks: list[TextureCorrectionTask],
     size_of: Callable[[str], tuple[int, int] | None],
 ) -> None:
-    """Give every layer of one material the finest resolution among them.
+    """Give each material's detector sources their finest source resolution.
 
     2026-09-02.  Companion maps are routinely authored smaller than the base
     colour -- the ardente ships its AO, roughness, metallic and opacity maps at
@@ -9603,9 +10032,9 @@ def assign_group_detection_size(
     that are plainly separate at 4096 came back welded into one blob.
 
     The group is exactly ``shared_layer_task_groups``' key -- one material on
-    one part scope -- because that is the set of layers that exchange evidence
-    through the ledger, and evidence they exchange has to have been gathered at
-    a common scale to be comparable at all.
+    one part scope -- because that is the set of detector sources that exchange
+    evidence through the ledger. Correction-only layers receive that evidence,
+    but must not raise the resolution at which it is gathered.
 
     Only exact integer ratios are adopted; anything else leaves the layer
     detecting at its own size, for the reason ``rescale_plan`` declines a
@@ -9613,7 +10042,10 @@ def assign_group_detection_size(
     """
     for group in shared_layer_task_groups(tasks):
         sizes = [
-            size for size in (size_of(task.member) for _index, task in group)
+            size
+            for _index, task in group
+            if task.detect
+            for size in (size_of(task.member),)
             if size is not None
         ]
         if not sizes:
@@ -9705,6 +10137,7 @@ def _run_texture_correction_task(
             detection_session=context["session"],
             part_group_index=task.part_group_index,
             shared_layer_regions=shared_layer_regions,
+            detect=task.detect,
             detection_size=task.detection_size,
             log=lines.append,
         )
@@ -9740,6 +10173,7 @@ def _record_texture_task_layer_evidence(
             part_group_index=task.part_group_index,
             shared_layer_regions=shared_layer_regions,
             detect_only=True,
+            detect=task.detect,
             detection_size=task.detection_size,
             log=lambda _line: None,
         )
@@ -9753,16 +10187,17 @@ def _run_texture_correction_task_group(
     output_directory: Path,
     context: Mapping[str, object],
 ) -> list[TextureCorrectionTaskOutcome]:
-    """Detect every sibling layer first, then correct each from their union."""
+    """Detect eligible sibling layers, then correct every layer from their union."""
     if len(tasks) < 2:
         return [
             _run_texture_correction_task(tasks[0], output_directory, context)
         ] if tasks else []
 
     shared_layer_regions = SharedLayerRegionLedger()
+    source_tasks = tuple(task for task in tasks if task.detect)
     prepass_errors = {
         task.member: error
-        for task in tasks
+        for task in source_tasks
         if (
             error := _record_texture_task_layer_evidence(
                 task, output_directory, context, shared_layer_regions
@@ -9784,7 +10219,7 @@ def _run_texture_correction_task_group(
                 0,
                 f"  ! shared-evidence pre-pass failed for "
                 f"{PurePosixPath(task.member).name}: {error}; "
-                "this layer still ran on its own detector",
+                "this source layer still ran on its own detector",
             )
         outcomes.append(outcome)
     return outcomes
@@ -10120,7 +10555,25 @@ def export_parts_preview(
             # A texture corrected once keeps the file name it has always had.
             scoped = len(merged) > 1
             for index, (material, scope, masks) in enumerate(merged, start=1):
-                detection_attempted_members.add(member)
+                stage_keys = {
+                    getattr(binding, "stage_key", "baseColorMap")
+                    for _part, binding in entries
+                    if _normalise_material_alias(binding.dae_material) == material
+                }
+                if not stage_keys_allow_correction(stage_keys):
+                    log(
+                        "  temporarily disabled texture layer: "
+                        + ", ".join(sorted(stage_keys))
+                    )
+                    continue
+                detect = stage_keys_allow_detection(stage_keys)
+                if detect:
+                    detection_attempted_members.add(member)
+                else:
+                    log(
+                        "  correction-only layer: "
+                        + ", ".join(sorted(stage_keys))
+                    )
                 tasks.append(
                     TextureCorrectionTask(
                         member=member,
@@ -10128,6 +10581,7 @@ def export_parts_preview(
                         part_scope=tuple(scope),
                         masks=masks,
                         part_group_index=index if scoped else 0,
+                        detect=detect,
                     )
                 )
         except Exception as exc:
@@ -10160,10 +10614,11 @@ def export_parts_preview(
     assign_group_detection_size(every_task, member_size)
     for group in shared_layer_task_groups(every_task):
         reference = group[0][1].detection_size
-        members = {task.member for _index, task in group}
+        source_tasks = [task for _index, task in group if task.detect]
+        members = {task.member for task in source_tasks}
         coarser = {
             PurePosixPath(task.member).name
-            for _index, task in group
+            for task in source_tasks
             if member_size(task.member) not in (None, reference)
         }
         if reference is not None and coarser:

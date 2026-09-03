@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -27,13 +28,19 @@ from mesh_segmentation_transform.glyph_lab_detection import (
 )
 
 
-def task(member: str, material: str, scope: tuple[str, ...] = ("a",)):
+def task(
+    member: str,
+    material: str,
+    scope: tuple[str, ...] = ("a",),
+    *,
+    detect: bool = True,
+):
     parts = tuple(
         type("P", (), {"key": name})() for name in scope
     )
     return rhd.TextureCorrectionTask(
         member=member, material=material, part_scope=parts,
-        masks=None, part_group_index=0,
+        masks=None, part_group_index=0, detect=detect,
     )
 
 
@@ -138,6 +145,102 @@ class GroupResolutionTests(unittest.TestCase):
         sizes = {"colour.dds": (4096, 4096), "broken.dds": None}
         rhd.assign_group_detection_size(tasks, sizes.get)
         self.assertEqual(tasks[0].detection_size, (4096, 4096))
+
+    def test_a_correction_only_layer_does_not_raise_detection_resolution(self) -> None:
+        tasks = [
+            task("colour.dds", "interior"),
+            task("roughness.dds", "interior", detect=False),
+        ]
+        sizes = {"colour.dds": (4096, 4096), "roughness.dds": (8192, 8192)}
+        rhd.assign_group_detection_size(tasks, sizes.get)
+        self.assertEqual(tasks[0].detection_size, (4096, 4096))
+
+    def test_only_detection_sources_enter_the_shared_evidence_prepass(self) -> None:
+        source = task("colour.dds", "interior")
+        correction_only = task("roughness.dds", "interior", detect=False)
+        evidence_members: list[str] = []
+        corrected_members: list[str] = []
+
+        def record(entry, *_args):
+            evidence_members.append(entry.member)
+
+        def correct(entry, *_args):
+            corrected_members.append(entry.member)
+            return rhd.TextureCorrectionTaskOutcome(None, [], None)
+
+        with (
+            patch.object(
+                rhd, "_record_texture_task_layer_evidence", side_effect=record
+            ),
+            patch.object(rhd, "_run_texture_correction_task", side_effect=correct),
+        ):
+            outcomes = rhd._run_texture_correction_task_group(
+                (source, correction_only), Path("."), {}
+            )
+
+        self.assertEqual(evidence_members, ["colour.dds"])
+        self.assertEqual(corrected_members, ["colour.dds", "roughness.dds"])
+        self.assertEqual(len(outcomes), 2)
+
+
+class TextureStagePolicyTests(unittest.TestCase):
+    def test_direct_detection_sources_are_the_visual_layer_family(self) -> None:
+        for stage_key in (
+            "clearCoatBottomNormalMap",
+            "baseColorMap",
+            "colorMap",
+            "diffuseMap",
+            "opacityMap",
+            "emissiveMap",
+            "overlayMap",
+        ):
+            self.assertIn(stage_key, rhd.MATERIAL_TEXTURE_STAGE_KINDS)
+            self.assertTrue(rhd.stage_keys_allow_detection((stage_key,)))
+
+    def test_response_layers_are_correction_only(self) -> None:
+        for stage_key in (
+            "ambientOcclusionMap",
+            "roughnessMap",
+            "metallicMap",
+            "specularMap",
+            "specularityMap",
+            "clearCoatMap",
+            "clearCoatRoughnessMap",
+            "reflectivityMap",
+            "colorPaletteMap",
+            "lightMap",
+        ):
+            self.assertIn(stage_key, rhd.MATERIAL_TEXTURE_STAGE_KINDS)
+            self.assertFalse(rhd.stage_keys_allow_detection((stage_key,)))
+
+    def test_normal_and_ao_maps_are_reenabled_after_the_diagnostic_build(self) -> None:
+        self.assertTrue(rhd.stage_keys_allow_detection(("normalMap",)))
+        self.assertFalse(rhd.stage_keys_allow_detection(("ambientOcclusionMap",)))
+        for stage_key in ("normalMap", "ambientOcclusionMap"):
+            self.assertIn(stage_key, rhd.MATERIAL_TEXTURE_STAGE_KINDS)
+            self.assertTrue(rhd.stage_keys_allow_correction((stage_key,)))
+        self.assertEqual(
+            rhd.MATERIAL_TEXTURE_STAGE_KINDS["ambientOcclusionMap"],
+            "occlusion",
+        )
+
+    def test_annotation_legacy_and_tiled_detail_layers_are_not_jobs(self) -> None:
+        for stage_key in (
+            "annotationMap",
+            "baseTex",
+            "bumpMap",
+            "bumpTex",
+            "detailTex",
+            "overlayTex",
+            "detailMap",
+            "detailNormalMap",
+            "ambientOcclusionDetailMap",
+            "roughnessDetailMap",
+            "metallicDetailMap",
+            "opacityDetailMap",
+            "macroMap",
+        ):
+            self.assertNotIn(stage_key, rhd.MATERIAL_TEXTURE_STAGE_KINDS)
 
 
 class DetectionScalingTests(unittest.TestCase):

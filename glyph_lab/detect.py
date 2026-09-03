@@ -484,7 +484,10 @@ class ContrastConfig:
     min_rim_margin_px: int = 0
     max_rim_margin_px: int = 30
     rim_margin_share: float = 0.20
-    min_rim_contact: float = 0.20
+    # 2026-09-02: promoted from the current lab session after the ardente
+    # replay; a region must follow the rim for its full measured length before
+    # this filter classifies it as rim artefact.
+    min_rim_contact: float = 1.0
     # 2026-08-29: an edge artefact has a bounded minor axis.  That includes a
     # continuous band and the separate, low-fill pieces of edge stitching.
     # Short pieces are only removed as a locally straight run along the rim;

@@ -41,8 +41,10 @@ from mesh_segmentation_transform.mirror_texture_for_rhd import (
     exchangeable_share,
     merge_region_sets,
     normal_map_relief,
+    occlusion_background_sigma_for_bounds,
     reconstruct_normal_z,
     rescale_plan,
+    rotation_requires_resampling,
     rotated_axis_alignment_degrees,
     rotated_axis_for_surface_axis,
     rotated_exchangeable_share,
@@ -230,6 +232,110 @@ class NormalChannelNegationTests(unittest.TestCase):
         self.assertAlmostEqual(int(image[1, 8, 0]), 100, delta=1)
         self.assertLess(int(image[7, 11, 0]), 70)
 
+    def test_occlusion_background_correction_keeps_local_gradient(self) -> None:
+        image = np.zeros((16, 16, 4), dtype=np.uint8)
+        image[:, :, :3] = 80 + np.arange(16, dtype=np.uint8)[None, :, None]
+        image[:, :, 3] = 255
+        image[6:10, 3:5, :3] = 180
+        original = image.copy()
+
+        apply_flip_plan(
+            image,
+            [FlipStep((0, 0, 16, 16), "horizontal")],
+            np.ones((16, 16), dtype=bool),
+            None,
+            kind="occlusion",
+            correct_scalar_background=True,
+            occlusion_background_sigma_px=3.0,
+        )
+
+        self.assertLess(
+            abs(int(image[1, 12, 0]) - int(original[1, 12, 0])),
+            abs(int(original[1, 3, 0]) - int(original[1, 12, 0])),
+        )
+        self.assertGreater(int(image[7, 12, 0]), 160)
+        self.assertLess(int(image[7, 3, 0]), 120)
+
+    def test_occlusion_background_cutoff_scales_with_the_mark(self) -> None:
+        self.assertEqual(
+            occlusion_background_sigma_for_bounds(
+                (20, 30, 50, 80), 3.0, 0.20, 32.0
+            ),
+            10.0,
+        )
+        self.assertEqual(
+            occlusion_background_sigma_for_bounds(
+                (20, 30, 500, 800), 3.0, 0.20, 32.0
+            ),
+            32.0,
+        )
+
+    def test_flat_ao_region_is_not_rewritten_for_another_layers_mark(self) -> None:
+        image = np.zeros((64, 64, 4), dtype=np.uint8)
+        image[:, :, :3] = 60 + np.arange(64, dtype=np.uint8)[None, :, None]
+        image[:, :, 3] = 255
+        original = image.copy()
+
+        moved = apply_flip_plan(
+            image,
+            [FlipStep((8, 8, 48, 48), "horizontal")],
+            np.ones((64, 64), dtype=bool),
+            None,
+            kind="occlusion",
+            correct_scalar_background=True,
+            occlusion_background_sigma_px=8.0,
+            occlusion_detail_floor=4.0,
+            occlusion_min_detail_coverage=0.02,
+        )
+
+        self.assertEqual(moved, 0)
+        np.testing.assert_array_equal(image, original)
+
+    def test_ao_rim_detail_does_not_justify_flipping_a_plain_control_face(self) -> None:
+        image = np.full((64, 64, 4), 100, dtype=np.uint8)
+        image[:, :, 3] = 255
+        rows, columns = np.ogrid[-24:24, -24:24]
+        radius = np.hypot(rows, columns)
+        disk = radius <= 20
+        rim = (radius >= 17) & disk
+        image[8:56, 8:56, :3][rim] = 180
+        original = image.copy()
+
+        moved = apply_flip_plan(
+            image,
+            [FlipStep((8, 8, 48, 48), "horizontal", mask=disk)],
+            np.ones((64, 64), dtype=bool),
+            None,
+            kind="occlusion",
+            correct_scalar_background=True,
+            occlusion_background_sigma_px=8.0,
+            occlusion_detail_analysis_sigma_px=1.5,
+            occlusion_detail_rim_px=5,
+            occlusion_detail_floor=4.0,
+            occlusion_min_detail_coverage=0.02,
+        )
+
+        self.assertEqual(moved, 0)
+        np.testing.assert_array_equal(image, original)
+
+    def test_rotated_occlusion_background_correction_resamples_its_ground(self) -> None:
+        image = np.zeros((16, 16, 4), dtype=np.uint8)
+        image[:, :, :3] = 80 + np.arange(16, dtype=np.uint8)[None, :, None]
+        image[:, :, 3] = 255
+        image[7:9, 4:6, :3] = 180
+
+        moved = apply_masked_rotated_flip(
+            image,
+            np.ones((16, 16), dtype=bool),
+            ((2.0, 4.0), (13.0, 4.0), (13.0, 11.0), (2.0, 11.0)),
+            "long",
+            correct_scalar_background=True,
+            occlusion_background_sigma_px=3.0,
+        )
+
+        self.assertGreater(moved, 0)
+        self.assertGreater(int(image[7, 11, 0]), 160)
+
     def test_scalar_detail_gate_leaves_quiet_background_in_place(self) -> None:
         image = np.zeros((16, 16, 4), dtype=np.uint8)
         image[:, :, 0] = 80 + np.arange(16, dtype=np.uint8)[None, :]
@@ -293,10 +399,7 @@ class NormalChannelNegationTests(unittest.TestCase):
         self.assertLess(int(image[10, 10, 0]), 128)
         self.assertLess(int(image[10, 10, 1]), 128)
 
-    def test_a_near_axis_rotated_rectangle_keeps_its_rotation(self) -> None:
-        """A mirror line a fraction of a degree off the image axis still gets
-        the rotated sampler.  Flipping about the axis instead would leave the
-        mark turned by twice that angle, which reads on a text baseline."""
+    def test_a_near_axis_rotated_rectangle_uses_an_exact_flat_flip(self) -> None:
         corners = ((0.0, 0.0), (100.0, 1.0), (100.0, 11.0), (0.0, 10.0))
         rotated_axis = rotated_axis_for_surface_axis(corners, "horizontal")
         self.assertEqual(rotated_axis, "long")
@@ -305,6 +408,18 @@ class NormalChannelNegationTests(unittest.TestCase):
         )
         self.assertIsNotNone(alignment)
         self.assertLess(alignment, 1.0)
+        self.assertFalse(
+            rotation_requires_resampling(corners, "horizontal", rotated_axis, 1.0)
+        )
+
+    def test_a_genuinely_oblique_rectangle_still_uses_the_rotated_sampler(self) -> None:
+        corners = ((0.0, 0.0), (100.0, 8.0), (99.0, 20.0), (-1.0, 12.0))
+        rotated_axis = rotated_axis_for_surface_axis(corners, "horizontal")
+
+        self.assertEqual(rotated_axis, "long")
+        self.assertTrue(
+            rotation_requires_resampling(corners, "horizontal", rotated_axis, 1.0)
+        )
 
 
 class ExchangeableShareTests(unittest.TestCase):
