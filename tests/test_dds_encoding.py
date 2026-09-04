@@ -214,6 +214,34 @@ class PartialReencodeTests(unittest.TestCase):
             self.assertTrue((source_blocks[kept] == written[kept]).all())
             self.assertFalse(kept.all(), "the change touched no block")
 
+    def test_a_non_square_surface_still_reuses_its_source_blocks(self):
+        """2026-09-04: it did not, and nothing said so.
+
+        ``mip_chain`` stopped once the *short* edge reached 1, so a 256x128
+        surface built 8 levels against the 9 its own DDS ships.
+        ``_reusable_source_layout`` compares the counts, so the reuse path was
+        rejected and every non-square texture re-encoded whole -- 12 of the 22
+        the ardente writes, and 4.93s against 0.41s on a 4096x2048 atlas.
+        """
+        original = _image(128, 256)
+        self.assertEqual(len(mt.mip_chain(original)), 9, "chain must reach 1x1")
+        with tempfile.TemporaryDirectory() as raw:
+            source = self._source(Path(raw), "bc7", original)
+            layout = mt.dds_surface_layout(source.read_bytes())
+            self.assertEqual(len(layout.levels), len(mt.mip_chain(original)))
+            corrected = original.copy()
+            corrected[16:48, 32:96] = corrected[16:48, 32:96][:, ::-1]
+            changed = np.any(corrected != original, axis=2)
+            full, _info, _calls = self._write("bc7", corrected)
+            partial, info, _calls = self._write(
+                "bc7", corrected, source=source, changed=changed
+            )
+            self.assertEqual(partial, full)
+            self.assertGreater(
+                info["reusedBlocks"], 0,
+                "a non-square surface fell back to a full re-encode",
+            )
+
     def test_an_unchanged_image_reencodes_nothing(self):
         original = _image(256, 256)
         with tempfile.TemporaryDirectory() as raw:

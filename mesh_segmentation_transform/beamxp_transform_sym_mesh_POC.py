@@ -160,6 +160,15 @@ class LoadedDae:
     geometries: dict[str, ET.Element]
     geometry_cache: dict[str, RawGeometry] = field(default_factory=dict)
     topology_cache: dict[str, Topology] = field(default_factory=dict)
+    # 2026-09-04: which COLLADA symbols a materials-JSON binding paints, by the
+    # normalised (dae_material, material_key) pair that is all the answer
+    # depends on.  Resolving one walks the whole document, and the export asks
+    # far more often than it has distinct questions -- 903 calls against 13
+    # answers on the ardente.  Safe to hold here because the tree is read-only
+    # for this object's life: the DAE export deep-copies before it prunes.
+    material_symbol_cache: dict[tuple[str, str], tuple[str, ...]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(slots=True, frozen=True)

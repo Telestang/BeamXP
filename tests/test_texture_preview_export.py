@@ -135,6 +135,62 @@ class RuntimeDisplayUvFlipTests(unittest.TestCase):
             ("ardente_gauges_screen-material",),
         )
 
+    def test_one_binding_walks_the_document_once(self) -> None:
+        """2026-09-04: it walked it per call, and the callers ask constantly.
+
+        ``material_symbols_for_binding`` iterates every element in the DAE.
+        The export asks once per binding per texture job -- profiled at 903
+        calls for 13 distinct answers on the ardente -- so the answer is held
+        on ``loaded``, whose tree is read-only for its lifetime.
+        """
+        loaded, _sweep = _screens_fixture()
+        binding = SimpleNamespace(
+            dae_material="ardente_gps_screen",
+            material_key="ardente_gauges_screen",
+        )
+        walks = []
+        real = rhd._material_targets_by_symbol
+
+        def counted(root, namespace):
+            walks.append(1)
+            return real(root, namespace)
+
+        with patch.object(rhd, "_material_targets_by_symbol", counted):
+            first = rhd.material_symbols_for_binding(loaded, binding)
+            second = rhd.material_symbols_for_binding(loaded, binding)
+            # A binding naming the same materials by a different spelling is
+            # the same question once normalised, so it must hit too.
+            third = rhd.material_symbols_for_binding(
+                loaded,
+                SimpleNamespace(
+                    dae_material="ARDENTE_GPS_SCREEN",
+                    material_key="ardente_gauges_screen",
+                ),
+            )
+        self.assertEqual(first, ("ardente_gps_screen-material",))
+        self.assertEqual(second, first)
+        self.assertEqual(third, first)
+        self.assertEqual(len(walks), 1, "the document was walked more than once")
+
+    def test_a_different_binding_is_not_served_from_the_cache(self) -> None:
+        loaded, _sweep = _screens_fixture()
+        first = rhd.material_symbols_for_binding(
+            loaded,
+            SimpleNamespace(
+                dae_material="ardente_gps_screen",
+                material_key="ardente_gauges_screen",
+            ),
+        )
+        second = rhd.material_symbols_for_binding(
+            loaded,
+            SimpleNamespace(
+                dae_material="switch_alias_not_exported",
+                material_key="ardente_gauges_screen",
+            ),
+        )
+        self.assertEqual(first, ("ardente_gps_screen-material",))
+        self.assertEqual(second, ("ardente_gauges_screen-material",))
+
     def test_runtime_display_uv_flip_is_material_scoped(self) -> None:
         namespace = "http://www.collada.org/2005/11/COLLADASchema"
         geometry = ET.fromstring(

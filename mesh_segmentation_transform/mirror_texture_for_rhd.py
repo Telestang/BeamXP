@@ -889,7 +889,20 @@ def material_symbols_for_binding(
     The binding names a material ("scintilla_interior") while primitives name a
     symbol ("scintilla_interior-material"), so match on the same normalised
     aliases the export path uses rather than on the raw string.
+
+    2026-09-04: memoised on ``loaded``.  The walk below visits every element in
+    the document, and the two callers ask once per binding per texture job --
+    903 calls for 13 distinct answers on the ardente, and 14M ``local_name``
+    calls between them.  The normalised pair is the whole of the input:
+    nothing else about the binding is read.
     """
+    dae_wanted = _normalise_material_alias(binding.dae_material)
+    material_wanted = _normalise_material_alias(binding.material_key)
+    memo_key = (dae_wanted, material_wanted)
+    cached = loaded.material_symbol_cache.get(memo_key)
+    if cached is not None:
+        return cached
+
     root = loaded.tree.getroot()
     namespace = loaded.namespace
     materials_library = root.find(f"./{qname(namespace, 'library_materials')}")
@@ -903,8 +916,6 @@ def material_symbols_for_binding(
         if material.get("id")
     }
     targets_by_symbol = _material_targets_by_symbol(root, namespace)
-    dae_wanted = _normalise_material_alias(binding.dae_material)
-    material_wanted = _normalise_material_alias(binding.material_key)
     exact_symbols: list[str] = []
     fallback_symbols: list[str] = []
     for primitive in root.iter():
@@ -932,7 +943,9 @@ def material_symbols_for_binding(
     # backing material to this switch's UV domain.  Prefer the DAE-bound alias
     # whenever it exists; retain the record-key match as compatibility fallback
     # for exporters whose symbol only exposes the resolved material name.
-    return tuple(exact_symbols or fallback_symbols)
+    resolved = tuple(exact_symbols or fallback_symbols)
+    loaded.material_symbol_cache[memo_key] = resolved
+    return resolved
 
 
 def uv_triangles_by_source(
@@ -5385,10 +5398,19 @@ def source_dds_codec(path: Path, default: str = "bc7") -> str:
 
 
 def mip_chain(rgba: np.ndarray) -> list[np.ndarray]:
-    """Box-filtered mip chain down to 1x1, as a GPU texture expects."""
+    """Box-filtered mip chain down to 1x1, as a GPU texture expects.
+
+    2026-09-04: the loop tests the *longer* edge.  On ``min`` a non-square
+    surface stopped as soon as its short edge reached 1 -- a 4096x2048 atlas
+    ended at 2x1 with 12 levels where the shipped DDS has 13 -- and since
+    ``_reusable_source_layout`` requires the level counts to match, every
+    non-square texture silently lost the block-reuse path and re-encoded whole.
+    Measured on Generic_racing_interior_b.color: 4.93s re-encoding against
+    0.41s reusing, and 12 of the ardente's 22 written textures were affected.
+    """
     levels = [rgba]
     current = Image.fromarray(rgba)
-    while min(current.size) > 1:
+    while max(current.size) > 1:
         current = current.resize(
             (max(current.width // 2, 1), max(current.height // 2, 1)), Image.BOX
         )
