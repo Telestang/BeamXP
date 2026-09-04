@@ -14,6 +14,8 @@ from pathlib import Path
 
 from glyph_lab.corpus import CorpusTexture, load_corpus
 from glyph_lab.detect import (
+    STAGES,
+    UNCROWDED,
     UNREPEATED,
     build_repeat_texture_index,
     detect,
@@ -75,7 +77,14 @@ def collect(
     )
     observations: list[RegionObservation] = []
     for texture in textures:
-        before_repeat = replace(config, contrast=replace(current, stop_after_stage=4))
+        # 2026-09-04: symbolic, because the number moved when the recovery
+        # went below the crowd filter.  It was 4 and meant the crowd stage.
+        before_repeat = replace(
+            config,
+            contrast=replace(
+                current, stop_after_stage=STAGES.index(UNCROWDED) + 1,
+            ),
+        )
         regions = detect(texture, before_repeat).regions
         current_index = build_repeat_texture_index(texture.colour, current)
         proposal_index = (

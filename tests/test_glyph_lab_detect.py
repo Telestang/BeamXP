@@ -21,12 +21,14 @@ from glyph_lab.detect import (
     CONVEX_HULLED,
     DENSE_SEED,
     FLAT_GROUPED,
+    GROUP_SIZED,
     LAST_STOP,
     MARKED,
     NEARBY_CONTRAST,
     OFF_BOUNDARY,
     PADDED,
     PATTERNED,
+    PROXIMITY_GROUPED,
     SEEDED,
     SIZED,
     SPARSE,
@@ -394,13 +396,16 @@ class StageOrderTests(unittest.TestCase):
             ),
         )
         found = detect(one_texture(colour), config, capture=True)
-        first = found.stage_mask(NEARBY_CONTRAST)
+        # 2026-09-04: the threshold itself.  It was the recovery, which was
+        # the widest mask only because it grew `lit`; the recovery now grows
+        # marks instead, so stage 1 is what the seed stages are handed.
+        first = found.stage_mask(AT_THRESHOLD)
         for name in (OFF_BOUNDARY, SEEDED, DENSE_SEED, PATTERNED):
             mask = found.stage_mask(name)
             self.assertIsNotNone(mask, name)
             self.assertEqual(
                 int((mask & ~first).sum()), 0,
-                f"{name} holds texels outside the recovered threshold",
+                f"{name} holds texels outside the threshold",
             )
         # The gate can only remove from the seed it is given.
         np.testing.assert_array_equal(
@@ -550,10 +555,19 @@ class NearbyContrastRecoveryTests(unittest.TestCase):
                 first_pass,
             )
 
-    def test_the_recovery_is_captured_as_its_own_stage(self) -> None:
+    def test_the_recovery_grows_a_mark_and_reaches_nothing_else(self) -> None:
+        """2026-09-04: it grows marks now, and only along their own contrast.
+
+        The old stage dilated the whole threshold and admitted any texel over
+        the bar, so two marks with contrast between them became one -- which
+        is what buried seven glyphs on etkc's alcantara interior.  A mark can
+        still recover its own faint edge; a speck across the panel is not part
+        of it however high it reads.
+        """
         response = np.zeros((15, 15), dtype=np.float32)
         response[7, 7] = 100.0
-        response[7, 10] = response[1, 1] = 25.0
+        response[7, 8:11] = 25.0          # the mark's own faint edge
+        response[1, 1] = 25.0             # a speck, reachable by neither
         colour = np.zeros((15, 15, 3), dtype=np.uint8)
         base = LabConfig()
         config = replace(
@@ -561,7 +575,7 @@ class NearbyContrastRecoveryTests(unittest.TestCase):
             contrast=replace(
                 base.contrast, local_floor_multiple=0.0, min_response=50.0,
                 nearby_contrast_radius_px=3, nearby_contrast_min_response=24.0,
-                stop_after_stage=2,
+                stop_after_stage=STAGES.index(NEARBY_CONTRAST) + 1,
             ),
         )
         with patch("glyph_lab.detect.contrast_response", return_value=response):
@@ -569,8 +583,9 @@ class NearbyContrastRecoveryTests(unittest.TestCase):
 
         self.assertTrue(found.stage_mask(AT_THRESHOLD)[7, 7])
         self.assertFalse(found.stage_mask(AT_THRESHOLD)[7, 10])
-        self.assertTrue(found.stage_mask(NEARBY_CONTRAST)[7, 10])
-        self.assertFalse(found.stage_mask(NEARBY_CONTRAST)[1, 1])
+        recovered = found.stage_mask(NEARBY_CONTRAST)
+        self.assertIsNotNone(recovered)
+        self.assertFalse(bool(recovered[1, 1]), "recovered a disconnected speck")
 
 
 class BoundaryReachTests(unittest.TestCase):
@@ -641,17 +656,27 @@ class BoundaryReachTests(unittest.TestCase):
     def test_the_stage_sits_between_the_threshold_and_the_seed(self) -> None:
         """Where it was asked to go, pinned against the pipeline itself.
 
-        The sparse field sits between, and reads the threshold rather than
-        filtering it, so the boundary stage still gets `lit` untouched.
+        2026-09-04: the field runs first, then the crowd filter, and the
+        recovery last.  Growing the threshold let one mark's contrast reach
+        another's; growing a mark the crowd filter is about to drop is work
+        for nothing.  The recovery now runs on the survivors alone.
         """
-        self.assertEqual(STAGES[STAGES.index(AT_THRESHOLD) + 1], NEARBY_CONTRAST)
-        self.assertEqual(STAGES[STAGES.index(NEARBY_CONTRAST) + 1], SPARSE)
+        self.assertEqual(STAGES[STAGES.index(AT_THRESHOLD) + 1], SPARSE)
         self.assertEqual(STAGES[STAGES.index(SPARSE) + 1], UNCROWDED)
-        self.assertEqual(STAGES[STAGES.index(UNCROWDED) + 1], SIZED)
+        self.assertEqual(STAGES[STAGES.index(UNCROWDED) + 1], NEARBY_CONTRAST)
+        self.assertEqual(STAGES[STAGES.index(NEARBY_CONTRAST) + 1], SIZED)
         self.assertEqual(STAGES[STAGES.index(SIZED) + 1], UNREPEATED)
         self.assertEqual(STAGES[STAGES.index(UNREPEATED) + 1], UNRIMMED)
         self.assertEqual(STAGES[STAGES.index(UNRIMMED) + 1], UNTRANSITIONED)
-        self.assertEqual(STAGES[STAGES.index(UNTRANSITIONED) + 1], FLAT_GROUPED)
+        self.assertEqual(
+            STAGES[STAGES.index(UNTRANSITIONED) + 1], PROXIMITY_GROUPED,
+        )
+        self.assertEqual(
+            STAGES[STAGES.index(PROXIMITY_GROUPED) + 1], GROUP_SIZED,
+        )
+        self.assertEqual(
+            STAGES[STAGES.index(GROUP_SIZED) + 1], FLAT_GROUPED,
+        )
         self.assertEqual(STAGES[STAGES.index(FLAT_GROUPED) + 1], CONVEX_HULLED)
         self.assertEqual(STAGES[STAGES.index(CONVEX_HULLED) + 1], PADDED)
         self.assertEqual(STAGES[STAGES.index(PADDED) + 1], OFF_BOUNDARY)
@@ -1642,6 +1667,46 @@ class ClearOfACrowdTests(unittest.TestCase):
         kept = self.keep([*crowd, alone])
         self.assertEqual(kept, [alone])
 
+    def test_company_is_only_counted_on_the_mark_s_own_chart(self) -> None:
+        """2026-09-04: atlas distance is not surface distance.
+
+        Two charts packed against each other in the atlas are a few texels
+        apart and no part of the same surface, so a busy chart used to
+        suppress the marks on a quiet one beside it.
+        """
+        busy = [self.spot(100 + 20 * (index % 6), 100 + 20 * (index // 6))
+                for index in range(36)]
+        quiet = self.spot(160, 160)          # sat inside the busy cluster
+        regions = [*busy, quiet]
+        # A Region holds a mask, so identity is the only safe comparison here.
+        held = lambda kept: {id(region) for region in kept}
+        # Without ids the quiet mark is buried by its neighbours.
+        self.assertNotIn(id(quiet), held(self.keep(regions)))
+        # Put it on its own chart and its company drops to nothing.
+        ids = [1] * len(busy) + [2]
+        kept = clear_of_a_crowd(
+            regions, regions, 120, 8, 0, region_ids=ids, company_ids=ids,
+        )
+        self.assertEqual(held(kept), {id(quiet)})
+
+    def test_a_mark_spanning_two_charts_has_no_company(self) -> None:
+        """None means no chart owns it, so nothing can crowd it out."""
+        busy = [self.spot(100 + 20 * (index % 6), 100 + 20 * (index // 6))
+                for index in range(36)]
+        spanning = self.spot(160, 160)
+        regions = [*busy, spanning]
+        ids = [1] * len(busy) + [None]
+        kept = clear_of_a_crowd(
+            regions, regions, 120, 8, 0, region_ids=ids, company_ids=ids,
+        )
+        self.assertEqual({id(region) for region in kept}, {id(spanning)})
+
+    def test_without_ids_the_stage_behaves_as_it_always_did(self) -> None:
+        crowd = [self.spot(100 + 20 * (index % 6), 100 + 20 * (index // 6))
+                 for index in range(36)]
+        alone = self.spot(500, 500)
+        self.assertEqual(self.keep([*crowd, alone]), [alone])
+
     def test_a_word_of_letters_is_not_a_crowd(self) -> None:
         """The case the bar has to clear: eight legends in a row."""
         row = [self.spot(100 + 30 * index, 300) for index in range(8)]
@@ -2233,8 +2298,11 @@ class StopAfterStageTests(unittest.TestCase):
             # group because a hole *is* a region, and the marks stage groups at
             # the end of the front end this replaces.
             if STAGES[number - 1] in (
-                    SPARSE, SIZED, UNCROWDED, UNREPEATED, UNRIMMED,
-                    UNTRANSITIONED, PATTERNED, MARKED, FLAT_GROUPED,
+                    SPARSE, NEARBY_CONTRAST, SIZED, UNCROWDED, UNREPEATED,
+                    UNRIMMED,
+                    UNTRANSITIONED, PATTERNED, MARKED, PROXIMITY_GROUPED,
+                    GROUP_SIZED,
+                    FLAT_GROUPED,
                     CONVEX_HULLED, PADDED):
                 self.assertNotEqual(found.regions, [], f"stop {number}")
             else:
@@ -2344,6 +2412,91 @@ class ConfigTests(unittest.TestCase):
     def test_the_tuned_seed_density_is_the_default(self) -> None:
         """The current corpus setting must be what a fresh session starts with."""
         self.assertEqual(ContrastConfig().min_seed_density, 0.02)
+
+class GroupNearbyRegionsTests(unittest.TestCase):
+    """The proximity stage: overlap first, then a gap, never across a seam."""
+
+    @staticmethod
+    def block(x: int, y: int, width: int = 4, height: int = 4, domain: int = 1):
+        from glyph_lab.regions import Region
+
+        return Region(
+            bounds=(x, y, width, height),
+            mask=np.ones((height, width), dtype=bool), domain=domain,
+        )
+
+    @staticmethod
+    def group(regions, gap, mesh=None):
+        from glyph_lab.region_grouping import group_nearby_regions
+
+        return group_nearby_regions(regions, gap, (0, 0), mesh)
+
+    def test_overlapping_regions_become_one(self) -> None:
+        """The case the stage was added for: one mark claimed twice."""
+        kept = self.group([self.block(10, 10), self.block(12, 10)], 0)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].bounds, (10, 10, 6, 4))
+
+    def test_a_gap_of_zero_leaves_separated_marks_alone(self) -> None:
+        kept = self.group([self.block(10, 10), self.block(30, 10)], 0)
+        self.assertEqual(len(kept), 2)
+
+    def test_the_gap_is_measured_between_the_texels(self) -> None:
+        """Four blank columns between them, so they are 5 apart.
+
+        Joined at 5 and left alone at 4 -- the Chebyshev distance between the
+        nearest texels, which is one more than the blank count.
+        """
+        pair = [self.block(10, 10), self.block(18, 10)]
+        self.assertEqual(len(self.group(pair, 4)), 2)
+        self.assertEqual(len(self.group(pair, 5)), 1)
+
+    def test_a_chain_joins_transitively(self) -> None:
+        row = [self.block(10 + 8 * step, 10) for step in range(4)]
+        kept = self.group(row, 5)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].bounds, (10, 10, 28, 4))
+
+    def test_the_gap_between_members_is_not_painted_in(self) -> None:
+        """Nearness is not evidence that the space between is part of either."""
+        kept = self.group([self.block(10, 10), self.block(18, 10)], 5)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(int(kept[0].mask.sum()), 32)
+        self.assertFalse(bool(kept[0].mask[0, 5]), "the corridor was filled in")
+
+    def test_marks_on_different_charts_stay_apart(self) -> None:
+        """Atlas distance is not surface distance; a seam is a different surface."""
+        mesh = np.zeros((40, 40), dtype=np.uint32)
+        mesh[:, :16] = 1
+        mesh[:, 16:] = 2
+        pair = [self.block(10, 10), self.block(18, 10)]
+        self.assertEqual(len(self.group(pair, 5, mesh)), 2)
+        # The same pair on one chart still joins, so it is the seam doing it.
+        self.assertEqual(
+            len(self.group(pair, 5, np.ones((40, 40), np.uint32))), 1,
+        )
+
+    def test_marks_in_different_uv_domains_stay_apart(self) -> None:
+        pair = [self.block(10, 10), self.block(12, 10, domain=2)]
+        self.assertEqual(len(self.group(pair, 5)), 2)
+
+    def test_nested_boxes_with_distant_texels_are_not_joined(self) -> None:
+        """Boxes overlap, texels do not: the reason the test is on the mask."""
+        from glyph_lab.regions import Region
+
+        left_mask = np.zeros((20, 20), dtype=bool)
+        left_mask[:2, :2] = True
+        right_mask = np.zeros((20, 20), dtype=bool)
+        right_mask[18:, 18:] = True
+        pair = [
+            Region(bounds=(0, 0, 20, 20), mask=left_mask, domain=1),
+            Region(bounds=(0, 0, 20, 20), mask=right_mask, domain=1),
+        ]
+        self.assertEqual(len(self.group(pair, 3)), 2)
+
+    def test_a_single_region_is_returned_untouched(self) -> None:
+        one = self.block(10, 10)
+        self.assertIs(self.group([one], 8)[0], one)
 
 
 if __name__ == "__main__":

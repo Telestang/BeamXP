@@ -42,7 +42,9 @@ from glyph_lab.material_transitions import (
 from glyph_lab.probe import RegionObservation, RegionProbe
 from glyph_lab.region_grouping import (
     GroupingConfig,
+    group_nearby_regions,
     group_regions_across_flat_ground,
+    mesh_region_ids,
     mesh_region_labels,
 )
 from glyph_lab.region_hulls import convex_region_hulls
@@ -51,7 +53,7 @@ from glyph_lab.regions import NEIGHBOURHOOD, Region, closed_body
 
 # The last stage `stop_after_stage` can name, which is the last stage there
 # is: explicit diagnostic runs can still reach the legacy marks stage.
-LAST_STOP = 18
+LAST_STOP = 20
 
 # Every point in the pipeline worth looking at, in the order it happens.  The
 # viewer lists these and draws whichever is picked in place of the response, so
@@ -67,33 +69,62 @@ LAST_STOP = 18
 # stage's contents into its neighbour's name.  The number stays in the label
 # because the picker is a flat list and reads better ordered.
 AT_THRESHOLD = "1 over threshold"
-NEARBY_CONTRAST = "2 recovered nearby contrast"
-SPARSE = "3 the sparse field"
-UNCROWDED = "4 clear of a crowd"
+# 2026-09-04: the field runs before the recovery, and the recovery grows marks
+# rather than the threshold.  Dilating every lit texel by
+# `nearby_contrast_radius_px` and admitting whatever cleared
+# `nearby_contrast_min_response` joined neighbouring marks into one blob before
+# anything had decided what a mark was: on etkc's alcantara interior -- a suede
+# weave that fires everywhere -- the merges cascaded until a single region
+# covered 3295x1791 of the atlas, read as skewed, and took seven real glyph
+# flips out with it.  The five other colourways of the same mesh, carrying
+# byte-identical artwork, kept all thirty-two.  Recovering per mark instead
+# cannot bridge, because the marks are already separate by the time it runs.
+SPARSE = "2 the sparse field"
+# 2026-09-04: and below the crowd filter too, which is pure removal.  Growing
+# a mark the next stage discards is work for nothing, and on a weave most of
+# the field's holes are discarded: etkc's alcantara interior left 98 holes
+# where its black twin left 77.
+UNCROWDED = "3 clear of a crowd"
+NEARBY_CONTRAST = "4 recovered nearby contrast"
 SIZED = "5 past the size floor"
 UNREPEATED = "6 clear of a repeat"
 UNRIMMED = "7 clear of the rim"
 UNTRANSITIONED = "8 clear material transitions"
-FLAT_GROUPED = "9 grouped across flat ground"
-CONVEX_HULLED = "10 convex region hull"
-PADDED = "11 final padding"
-OFF_BOUNDARY = "12 clear of the boundary"
-SEEDED = "13 structure seed"
-DENSE_SEED = "14 seed over density"
-PATTERNED = "15 pattern candidates"
-TRANSFORMED = "16 past the transform"
-BRIDGED = "17 bridged across the gaps"
-MARKED = "18 grouped into marks"
+# 2026-09-04: added because the labelling export showed the same mark
+# claimed twice -- two stages each finding a different part of it -- and
+# every filter below judged both copies.  Before the flat-ground pass so
+# that stage sees one mark where it saw a pile.
+PROXIMITY_GROUPED = "9 grouped by proximity"
+# 2026-09-04: a size floor *after* the grouping, not instead of the one at
+# stage 5.  A grouped region can be several members that each cleared the
+# early floor, so raising that one to catch the small survivors here
+# would take the members of legitimate merges with it.  Measured on 387
+# hand-labelled regions across nine textures: the smallest true mark is
+# 189 texels on an 11 px short side, and every false positive below that
+# is panel edge or weave.
+GROUP_SIZED = "10 past the grouped size floor"
+FLAT_GROUPED = "11 grouped across flat ground"
+CONVEX_HULLED = "12 convex region hull"
+PADDED = "13 final padding"
+OFF_BOUNDARY = "14 clear of the boundary"
+SEEDED = "15 structure seed"
+DENSE_SEED = "16 seed over density"
+PATTERNED = "17 pattern candidates"
+TRANSFORMED = "18 past the transform"
+BRIDGED = "19 bridged across the gaps"
+MARKED = "20 grouped into marks"
 
 STAGES: tuple[str, ...] = (
     AT_THRESHOLD,
-    NEARBY_CONTRAST,
     SPARSE,
     UNCROWDED,
+    NEARBY_CONTRAST,
     SIZED,
     UNREPEATED,
     UNRIMMED,
     UNTRANSITIONED,
+    PROXIMITY_GROUPED,
+    GROUP_SIZED,
     FLAT_GROUPED,
     CONVEX_HULLED,
     PADDED,
@@ -126,19 +157,19 @@ STAGE_OF: dict[str, int] = {
     "percentile": 1,
     "local_floor_multiple": 1,
     "local_floor_px": 1,
-    # 2 recovered nearby contrast
-    "nearby_contrast_radius_px": 2,
-    "nearby_contrast_min_response": 2,
-    # 3 the sparse field
-    "sparse_kernel_px": 3,
-    "max_sparse_texels": 3,
+    # 2 the sparse field
+    "sparse_kernel_px": 2,
+    "max_sparse_texels": 2,
     # ...and the paths drawn round the holes it leaves.
-    "min_void_texels": 3,
-    "outline_px": 3,
-    # 4 clear of a crowd
-    "crowd_radius_px": 4,
-    "max_neighbours": 4,
-    "crowd_large_region_area_px": 4,
+    "min_void_texels": 2,
+    "outline_px": 2,
+    # 3 clear of a crowd
+    "crowd_radius_px": 3,
+    "max_neighbours": 3,
+    "crowd_large_region_area_px": 3,
+    # 4 recovered nearby contrast
+    "nearby_contrast_radius_px": 4,
+    "nearby_contrast_min_response": 4,
     # 5 past the size floor
     "min_width_px": 5,
     "min_height_px": 5,
@@ -193,39 +224,44 @@ STAGE_OF: dict[str, int] = {
     "transition_compact_min_body_void_share": 8,
     "transition_compact_max_enclosure": 8,
     "transition_compact_rim_max_span_px": 8,
-    # 11 final padding
-    "final_padding_px": 11,
-    # 12 clear of the boundary
-    "min_boundary_reach_px": 12,
-    # 13 structure seed
-    "structure_px": 13,
-    "structure_inner_px": 13,
-    "min_structure": 13,
-    # 14 seed over density
-    "seed_density_px": 14,
-    "min_seed_density": 14,
-    # 15 pattern candidates
-    "pattern_gap_px": 15,
-    "min_pattern_texels": 15,
-    "min_pattern_fill": 15,
-    "min_pattern_area": 15,
-    "min_pattern_coverage": 15,
-    # 16 past the transform
-    "repeat_skip_px": 16,
-    "repeat_longest_px": 16,
-    "min_repeat_energy": 16,
-    "min_repeat_overlap": 16,
-    "min_repeat_dip": 16,
-    # 17 bridged across the gaps
-    "bridge_clear_px": 17,
-    "bridge_void_px": 17,
-    "min_bridge_void": 17,
-    "bridge_span_px": 17,
-    "min_bridge_response": 17,
-    "max_bridge_share": 17,
-    # 18 grouped into marks
-    "mark_gap_px": 18,
-    "min_stroke_texels": 18,
+    # 9 grouped by proximity
+    "proximity_gap_px": 9,
+    # 10 past the grouped size floor
+    "group_min_texels": 10,
+    "group_min_side_px": 10,
+    # 15 final padding
+    "final_padding_px": 13,
+    # 16 clear of the boundary
+    "min_boundary_reach_px": 14,
+    # 17 structure seed
+    "structure_px": 15,
+    "structure_inner_px": 15,
+    "min_structure": 15,
+    # 18 seed over density
+    "seed_density_px": 16,
+    "min_seed_density": 16,
+    # 19 pattern candidates
+    "pattern_gap_px": 17,
+    "min_pattern_texels": 17,
+    "min_pattern_fill": 17,
+    "min_pattern_area": 17,
+    "min_pattern_coverage": 17,
+    # 20 past the transform
+    "repeat_skip_px": 18,
+    "repeat_longest_px": 18,
+    "min_repeat_energy": 18,
+    "min_repeat_overlap": 18,
+    "min_repeat_dip": 18,
+    # 19 bridged across the gaps
+    "bridge_clear_px": 19,
+    "bridge_void_px": 19,
+    "min_bridge_void": 19,
+    "bridge_span_px": 19,
+    "min_bridge_response": 19,
+    "max_bridge_share": 19,
+    # 20 grouped into marks
+    "mark_gap_px": 20,
+    "min_stroke_texels": 20,
 }
 
 
@@ -248,7 +284,13 @@ class ContrastConfig:
     """What the front end reads.  One knob per decision, and no more."""
 
     # 2026-08-27: where the pipeline ends, as a stage number.  0 runs the lot,
-    # and so does 11, the colour interactive endpoint.
+    # and so does 13, the colour interactive endpoint.
+    #
+    # 2026-09-04: 11 before the proximity grouping was inserted at 9. It is a
+    # literal naming a stage by number, so it has to move whenever a stage is
+    # added below it -- and it moved silently, ending the pipeline one stage
+    # early with nothing to say so. `load_settings` carries a saved value
+    # forward against this default, so raising it here is the whole fix.
     #
     # 2026-08-28: a debugging tool now rather than a way of holding the old
     # tail back -- there is no tail.  Set it to an earlier stage and that
@@ -259,7 +301,33 @@ class ContrastConfig:
     #
     # The panel hides the parameters of every stage past the stop, so it also
     # narrows the window down to the step being worked on.
-    stop_after_stage: int = 11
+    stop_after_stage: int = 13
+    # 2026-09-04: how close two marks' texels may come before they are one.
+    # Measured between the texels, not the boxes, and never across a mesh
+    # seam. 0 still joins regions that actually overlap -- that pass is what
+    # the stage was added for; the gap is the looser half.
+    #
+    # 6 px: on a 4k interior atlas the gap inside a letter pair runs 2-5 and
+    # the gap between a legend and the trim beside it runs 20 and up, so this
+    # sits in the empty middle. It is a texel count, so a smaller atlas wants
+    # a smaller value -- the same caveat every distance in this file carries.
+    proximity_gap_px: int = 6
+    # 2026-09-04: the size floor the grouped regions face, in their own right.
+    #
+    # Fitted to 387 hand-labelled regions over nine textures (glyph_lab's
+    # labelling export). What it is asked to remove is what the crops show
+    # below the smallest real mark: panel silhouettes, curved trim, and
+    # alcantara weave -- none of which is a printed glyph, and all of which
+    # the flip planner below would otherwise carry.
+    #
+    # Deliberately under the smallest mark in the set rather than on it. The
+    # smallest true glyph measured 189 texels on an 11 px short side, and a
+    # floor sitting exactly there has no margin for a texture nobody labelled
+    # -- an atlas smaller than 4k puts every mark nearer it. On the labelled
+    # set these values cut 17 of 56 false positives and cost no true mark;
+    # 189/11 would cut 19, and 189/13 cuts 26 at the price of one real mark.
+    group_min_texels: int = 160
+    group_min_side_px: int = 10
     # 2026-09-01: final display masks need a modest margin without changing
     # the region grouping that produced them.
     final_padding_px: int = 2
@@ -334,7 +402,7 @@ class ContrastConfig:
     # emptiness either side of it.  All three at 0 keep every hole.
     #
     # There are a great many holes and almost all of them are nothing: at disc
-    # 11 the corpus leaves 1,020 to 3,445 per texture with a median of 3 to 9
+    # 15 the corpus leaves 1,020 to 3,445 per texture with a median of 3 to 9
     # texels, against legends and badges in the hundreds and up.  The floor is
     # the whole of the sorting, which is why the three of them are their own
     # stage rather than a clause in the one above.
@@ -1030,7 +1098,7 @@ class ContrastConfig:
     # piece.  Three distance transforms and no per-pair work.  It over-states
     # the true crossing, so what it admits is a subset of what a walk would.
     #
-    # 16 and 0.40 -- and both are this generous only because
+    # 20 and 0.40 -- and both are this generous only because
     # `min_bridge_void` above decides *where* bridging may happen at all.
     # Before that gate existed these were 10 and 0.60 and could not be opened:
     # every relaxation was spent on grain rather than on marks.  With the place
@@ -1157,6 +1225,12 @@ class Detection:
     # the one question the stage picker exists to answer.
     stage_outlines: dict[str, np.ndarray] = field(default_factory=dict)
     stage_counts: dict[str, int] = field(default_factory=dict)
+    # 2026-09-04: each stage's regions, not merely how many.  A count answers
+    # "did this stage drop it"; labelling has to show *which* mark, so the
+    # crops need the bounds and the mask.  Recorded only under capture, and a
+    # region carries a mask local to its own bounds, so this is small beside
+    # the atlas-wide stage masks alongside it.
+    stage_regions: dict[str, list[Region]] = field(default_factory=dict)
     # Seconds spent reaching each stage, summed over the texture's domains.
     # Always collected -- it is two `perf_counter` calls a stage -- because the
     # cost of a step is part of judging it, and having to switch capture on to
@@ -1178,6 +1252,18 @@ class Detection:
     def stage_mask(self, name: str) -> np.ndarray | None:
         """One captured stage, unpacked, or None if it was never captured."""
         return self._unpack(self.stages.get(name))
+
+    def regions_at(self, name: str | None) -> list[Region]:
+        """The regions as that stage left them, or the finished set for None.
+
+        2026-09-04: a stage that deals in texels rather than regions records
+        none, and comes back empty -- which is the honest answer for it, and
+        the caller can say so rather than showing the finished marks under an
+        early stage's name.
+        """
+        if name is None:
+            return list(self.regions)
+        return list(self.stage_regions.get(name, ()))
 
     def stage_outline(self, name: str) -> np.ndarray | None:
         """One captured stage's region paths, or None where it drew none."""
@@ -2333,12 +2419,22 @@ def region_centres(regions: list[Region]) -> np.ndarray:
 def clear_of_a_crowd(
     regions: list[Region], company: list[Region], radius: int, limit: int,
     large_area: int = 0,
+    region_ids: list[int | None] | None = None,
+    company_ids: list[int | None] | None = None,
 ) -> list[Region]:
     """Drop the regions that are one of many in a small neighbourhood.
 
     ``company`` is what counts as being nearby, which is every hole the field
     left rather than only the ones that cleared the size floor -- see
     `ContrastConfig.crowd_radius_px`.
+
+    2026-09-04: company is counted only within the mark's own seam-bounded mesh
+    piece, which is the rule `_links` has always used for grouping.  Atlas
+    distance is not surface distance: two charts packed against each other are
+    a few texels apart and no part of the same surface, so a crowded chart used
+    to suppress the marks on a quiet one beside it.  A mark that spans two
+    pieces has no owning chart, so nothing counts as its company and it is
+    kept -- this stage only ever rejects.
 
     2026-08-29: a k-d tree over the centres, not a disc filter over the domain.
     The filter was a 241-wide convolution run once per UV domain to count a few
@@ -2361,16 +2457,38 @@ def clear_of_a_crowd(
     ]
     if not judged:
         return regions
-    tree = cKDTree(region_centres(company))
-    near = tree.query_ball_point(
-        region_centres([regions[index] for index in judged]),
-        float(radius), return_length=True,
-    )
     # A region counts itself when it is part of its own company.
     same = regions is company
+    if region_ids is None or company_ids is None:
+        trees = {None: (cKDTree(region_centres(company)), None)}
+        buckets = {index: None for index in judged}
+    else:
+        by_piece: dict[int, list[Region]] = {}
+        for piece, member in zip(company_ids, company):
+            if piece is not None:
+                by_piece.setdefault(piece, []).append(member)
+        trees = {
+            piece: (cKDTree(region_centres(members)), piece)
+            for piece, members in by_piece.items()
+        }
+        buckets = {index: region_ids[index] for index in judged}
+    counted: dict[int, int] = {}
+    for piece in set(buckets.values()):
+        asking = [index for index in judged if buckets[index] == piece]
+        entry = trees.get(piece)
+        if entry is None:
+            # No chart owns this mark, so nothing is on its chart to crowd it.
+            counted.update({index: 0 for index in asking})
+            continue
+        tree, _piece = entry
+        near = tree.query_ball_point(
+            region_centres([regions[index] for index in asking]),
+            float(radius), return_length=True,
+        )
+        counted.update({index: int(count) for index, count in zip(asking, near)})
     refused = {
-        index for index, count in zip(judged, near)
-        if int(count) - (1 if same else 0) > int(limit)
+        index for index in judged
+        if counted[index] - (1 if same else 0) > int(limit)
     }
     return [
         region for index, region in enumerate(regions) if index not in refused
@@ -2603,7 +2721,12 @@ def recover_nearby_contrast(
     radius_px: int,
     min_response: float,
 ) -> np.ndarray:
-    """Add high-contrast texels only around the first local-threshold pass."""
+    """Add high-contrast texels only around the first local-threshold pass.
+
+    2026-09-04: no longer on the pipeline -- ``recover_region_contrast`` runs
+    in its place, after the sparse field.  Kept because it is the honest
+    statement of what growing a *mask* does, and the probes still reach for it.
+    """
     radius = int(radius_px)
     if radius <= 0 or min_response <= 0 or not detected.any():
         return detected
@@ -2611,6 +2734,76 @@ def recover_nearby_contrast(
         detected, structure=NEIGHBOURHOOD, iterations=radius,
     )
     return detected | (neighbourhood & sample & (response >= min_response))
+
+
+def recover_region_contrast(
+    regions: list[Region],
+    response: np.ndarray,
+    sample: np.ndarray,
+    mesh_regions: np.ndarray | None,
+    offset: tuple[int, int],
+    radius_px: int,
+    min_response: float,
+) -> list[Region]:
+    """Grow each mark into the high-contrast texels around it, one at a time.
+
+    2026-09-04: the recovery the pipeline runs, and it runs after the field.
+    Growing the threshold instead joined marks before anything had decided what
+    a mark was -- see ``SPARSE``.  Here each region is grown inside its own
+    window, so two marks cannot become one however much contrast lies between
+    them: the labelling that separated them has already happened.
+
+    Growth stays on the mark's own seam-bounded mesh piece for the same reason
+    the crowd filter counts company there -- across a seam the texels belong to
+    another surface, and pulling them in would widen a mark onto a chart it is
+    no part of.
+    """
+    radius = int(radius_px)
+    if radius <= 0 or min_response <= 0 or not regions:
+        return regions
+    height, width = sample.shape
+    x_offset, y_offset = offset
+    owners = mesh_region_ids(regions, mesh_regions, offset)
+    grown: list[Region] = []
+    for region, owner in zip(regions, owners):
+        left = max(region.x - x_offset - radius, 0)
+        top = max(region.y - y_offset - radius, 0)
+        right = min(region.x - x_offset + region.width + radius, width)
+        bottom = min(region.y - y_offset + region.height + radius, height)
+        window = (slice(top, bottom), slice(left, right))
+        seed = np.zeros((bottom - top, right - left), dtype=bool)
+        seed[
+            region.y - y_offset - top: region.y - y_offset - top + region.height,
+            region.x - x_offset - left: region.x - x_offset - left + region.width,
+        ] = region.mask
+        reach = ndimage.binary_dilation(
+            seed, structure=NEIGHBOURHOOD, iterations=radius,
+        )
+        admissible = reach & sample[window] & (response[window] >= min_response)
+        if mesh_regions is not None and owner is not None:
+            admissible &= mesh_regions[window] == owner
+        merged = seed | admissible
+        # Only what the seed can reach without crossing blank ground: an
+        # unconnected speck of contrast nearby is not part of this mark.
+        pieces, _count = ndimage.label(merged, structure=NEIGHBOURHOOD)
+        keep = np.isin(pieces, np.unique(pieces[seed]))
+        merged &= keep & (pieces > 0)
+        rows = np.flatnonzero(merged.any(axis=1))
+        columns = np.flatnonzero(merged.any(axis=0))
+        if not rows.size or not columns.size:
+            grown.append(region)
+            continue
+        box = merged[rows[0]: rows[-1] + 1, columns[0]: columns[-1] + 1]
+        grown.append(
+            Region(
+                bounds=(int(columns[0]) + left + x_offset,
+                        int(rows[0]) + top + y_offset,
+                        int(box.shape[1]), int(box.shape[0])),
+                mask=box, domain=region.domain,
+                _cache={"texels": int(box.sum())},
+            )
+        )
+    return grown
 
 
 # Rec. 601 luma, as float64: the cast to float32 happens after the sum, so the
@@ -2860,6 +3053,7 @@ def regions_in_domain(
     stages: dict[str, np.ndarray] | None = None,
     outlines: dict[str, np.ndarray] | None = None,
     counts: dict[str, int] | None = None,
+    kept_regions: dict[str, list[Region]] | None = None,
     timings: dict[str, float] | None = None,
     probe: RegionProbe | None = None,
     texture_name: str = "",
@@ -2909,6 +3103,9 @@ def regions_in_domain(
                 outlines[name] = painted
             if found is not None:
                 counts[name] = counts.get(name, 0) + len(found)
+                if kept_regions is not None:
+                    # Extended, not replaced: `note` runs once per UV domain.
+                    kept_regions.setdefault(name, []).extend(found)
         reached = time.perf_counter()
 
     stop = int(config.contrast.stop_after_stage)
@@ -2963,15 +3160,13 @@ def regions_in_domain(
     if halted(AT_THRESHOLD):
         return stopped(lit)
 
-    lit = recover_nearby_contrast(
-        response, lit, sample,
-        contrast.nearby_contrast_radius_px,
-        contrast.nearby_contrast_min_response,
-    )
     # 2026-08-28: kept for the bridging stage, which reads the voids in it.  It
     # has to be the threshold itself and not a later mask: what the gate needs
     # to know is whether the surface has any clear ground on it, and every
     # stage after this one has already cleared some.
+    #
+    # 2026-09-04: which is now the threshold exactly, the recovery having moved
+    # below the field.  It was already meant to be "the threshold itself".
     threshold = lit
     # What the bridging stage reads, kept from here because it is the only
     # place the threshold and the response are both still in hand.  A texel's
@@ -2980,9 +3175,6 @@ def regions_in_domain(
     ratio = np.divide(
         response, level, out=np.zeros_like(response), where=np.asarray(level) > 0
     )
-    note(NEARBY_CONTRAST, lit, found=[])
-    if halted(NEARBY_CONTRAST):
-        return stopped(lit)
 
     # A marker, not a filter: `lit` goes on untouched.  What is recorded is the
     # blank ground the marks stand on, which is the one thing a mask of what
@@ -3013,13 +3205,29 @@ def regions_in_domain(
         painted, kept = unsorted
         return holes, painted, kept
 
+    # One id list: the holes are their own company, so a mark is judged
+    # against the marks sharing its chart and nothing else.  Judged on the
+    # field's own holes, before the recovery grows any of them -- a mark's
+    # company is decided by where the marks are, not by how far each reaches.
+    hole_ids = mesh_region_ids(holes, mesh_regions, offset)
     found = clear_of_a_crowd(
         holes, holes, contrast.crowd_radius_px, contrast.max_neighbours,
         contrast.crowd_large_region_area_px,
+        region_ids=hole_ids, company_ids=hole_ids,
     )
     painted, kept = paint_holes(found, sample.shape, offset, contrast)
     note(UNCROWDED, kept, painted, found)
     if halted(UNCROWDED):
+        return found, painted, kept
+
+    found = recover_region_contrast(
+        found, response, field_sample, mesh_regions, offset,
+        contrast.nearby_contrast_radius_px,
+        contrast.nearby_contrast_min_response,
+    )
+    painted, kept = paint_holes(found, sample.shape, offset, contrast)
+    note(NEARBY_CONTRAST, kept, painted, found)
+    if halted(NEARBY_CONTRAST):
         return found, painted, kept
 
     found = past_the_size_floor(
@@ -3140,6 +3348,27 @@ def regions_in_domain(
     painted, kept = paint_holes(found, sample.shape, offset, contrast)
     note(UNTRANSITIONED, kept, painted, found)
     if halted(UNTRANSITIONED):
+        return found, painted, kept
+
+    found = group_nearby_regions(
+        found, contrast.proximity_gap_px, offset, mesh_regions,
+    )
+    painted, kept = paint_mark_regions(
+        found, kept.shape, offset, contrast.mark_gap_px, contrast,
+    )
+    note(PROXIMITY_GROUPED, kept, painted, found)
+    if halted(PROXIMITY_GROUPED):
+        return found, painted, kept
+
+    found = past_the_size_floor(
+        found, contrast.group_min_side_px, contrast.group_min_side_px,
+        contrast.group_min_texels,
+    )
+    painted, kept = paint_mark_regions(
+        found, kept.shape, offset, contrast.mark_gap_px, contrast,
+    )
+    note(GROUP_SIZED, kept, painted, found)
+    if halted(GROUP_SIZED):
         return found, painted, kept
 
     found = group_regions_across_flat_ground(
@@ -3308,6 +3537,7 @@ def detect(
     stages: dict[str, np.ndarray] = {}
     stage_outlines: dict[str, np.ndarray] = {}
     counts: dict[str, int] = {}
+    stage_regions: dict[str, list[Region]] = {}
     timings: dict[str, float] = {}
     fired = np.zeros(texture.shape, dtype=bool)
     outlines = np.zeros(texture.shape, dtype=bool)
@@ -3345,7 +3575,8 @@ def detect(
         blank = np.zeros(domain.shape, dtype=bool)
         found, outline, kept = regions_in_domain(
             texture.colour[window], domain, label, (x, y), config, blank,
-            repeat_texture, captured, drawn, counts, timings=timings,
+            repeat_texture, captured, drawn, counts,
+            kept_regions=stage_regions if capture else None, timings=timings,
             probe=probe, texture_name=texture.name,
             normal_flat=(None if normal_flat is None else normal_flat[window]),
             mesh_regions=mesh_regions[window],
@@ -3370,5 +3601,6 @@ def detect(
             name: np.packbits(mask) for name, mask in stage_outlines.items()
         },
         stage_counts=counts,
+        stage_regions=stage_regions,
         stage_times=timings,
     )

@@ -109,6 +109,21 @@ def _mesh_region_id(
     return int(labels[winner])
 
 
+def mesh_region_ids(
+    regions: list[Region], mesh_regions: np.ndarray | None,
+    offset: tuple[int, int],
+) -> list[int | None]:
+    """Each region's owning seam-bounded mesh piece, or None where it spans two.
+
+    2026-09-04: public because the crowd filters want the same question the
+    grouping stage has always asked.  A mark's neighbours are the marks on its
+    own chart: across a seam the two are different surfaces that merely landed
+    near each other in the atlas, and counting them as company let a busy chart
+    suppress a quiet one packed beside it.
+    """
+    return [_mesh_region_id(region, mesh_regions, offset) for region in regions]
+
+
 def _longest_run(values: np.ndarray) -> tuple[int, int] | None:
     """The longest inclusive run of true values, as offsets into ``values``."""
     best_start = best_stop = start = 0
@@ -359,6 +374,165 @@ def _merged_region(
         for x, top, bottom in link.columns:
             mask[top - y0:bottom - y0 + 1, x - x0] = True
     return Region((x0, y0, x1 - x0, y1 - y0), mask, members[0].domain)
+
+
+def _union_window(
+    first: Region, second: Region,
+) -> tuple[int, int, int, int]:
+    """The box holding both regions."""
+    x0 = min(first.x, second.x)
+    y0 = min(first.y, second.y)
+    x1 = max(first.x + first.width, second.x + second.width)
+    y1 = max(first.y + first.height, second.y + second.height)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def _drawn_in(region: Region, window: tuple[int, int, int, int]) -> np.ndarray:
+    """One region's mask placed in a shared window."""
+    x0, y0, width, height = window
+    canvas = np.zeros((height, width), dtype=bool)
+    canvas[
+        region.y - y0: region.y - y0 + region.height,
+        region.x - x0: region.x - x0 + region.width,
+    ] = region.mask
+    return canvas
+
+
+def boxes_within(first: Region, second: Region, gap: int) -> bool:
+    """Whether the two boxes come within ``gap``.  The cheap pre-test."""
+    return not (
+        first.x + first.width + gap <= second.x
+        or second.x + second.width + gap <= first.x
+        or first.y + first.height + gap <= second.y
+        or second.y + second.height + gap <= first.y
+    )
+
+
+def masks_within(first: Region, second: Region, gap: int) -> bool:
+    """Whether the two marks' texels come within ``gap`` of each other.
+
+    Measured between the texels rather than between the boxes: two L-shaped
+    marks nested into one another have overlapping boxes and no texel within
+    twenty of the other, and joining those is how a legend swallows the trim
+    beside it.
+
+    ``gap`` is the Chebyshev distance between the nearest texels of each, so a
+    mark ending at x=13 and one starting at x=18 -- four blank columns between
+    them -- are 5 apart and join at ``gap >= 5``. Stated because the other
+    reading ("how many blank texels may lie between") is one less, and a knob
+    that is quietly off by one is worse than either.
+    """
+    if not boxes_within(first, second, gap):
+        return False
+    window = _union_window(first, second)
+    left = _drawn_in(first, window)
+    right = _drawn_in(second, window)
+    if gap <= 0:
+        return bool((left & right).any())
+    grown = ndimage.binary_dilation(
+        left, structure=NEIGHBOURHOOD, iterations=int(gap),
+    )
+    return bool((grown & right).any())
+
+
+def _merge_all(members: list[Region]) -> Region:
+    """One region covering every member, with no bridge drawn between them.
+
+    Deliberately not `_merged_region`: that one fills in the corridor its
+    links walked, because it is joining marks it has just proved a path
+    between.  Here the members were joined by nearness alone, and painting the
+    gap in would invent texels the detector never fired.
+    """
+    x0 = min(region.x for region in members)
+    y0 = min(region.y for region in members)
+    x1 = max(region.x + region.width for region in members)
+    y1 = max(region.y + region.height for region in members)
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+    for region in members:
+        mask[
+            region.y - y0: region.y - y0 + region.height,
+            region.x - x0: region.x - x0 + region.width,
+        ] |= region.mask
+    return Region((x0, y0, x1 - x0, y1 - y0), mask, members[0].domain)
+
+
+def _group_by(
+    regions: list[Region], owners: list[int | None], gap: int,
+) -> tuple[list[Region], list[int | None]]:
+    """One pass: union every pair within ``gap`` that shares a chart."""
+    if len(regions) < 2:
+        return regions, owners
+    parent = list(range(len(regions)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for first in range(len(regions)):
+        for second in range(first + 1, len(regions)):
+            if find(first) == find(second):
+                continue
+            # Across a seam the two are different surfaces that merely landed
+            # near each other in the atlas, and a mark owned by neither chart
+            # has nothing to be near.  Same rule as `_links`.
+            if (
+                owners[first] is None
+                or owners[first] != owners[second]
+                or regions[first].domain != regions[second].domain
+            ):
+                continue
+            if masks_within(regions[first], regions[second], gap):
+                parent[find(second)] = find(first)
+
+    grouped: dict[int, list[int]] = {}
+    for index in range(len(regions)):
+        grouped.setdefault(find(index), []).append(index)
+    if len(grouped) == len(regions):
+        return regions, owners
+    output: list[Region] = []
+    kept_owners: list[int | None] = []
+    for indices in grouped.values():
+        output.append(
+            regions[indices[0]] if len(indices) == 1
+            else _merge_all([regions[index] for index in indices])
+        )
+        kept_owners.append(owners[indices[0]])
+    return output, kept_owners
+
+
+def group_nearby_regions(
+    regions: list[Region], gap_px: int,
+    offset: tuple[int, int] = (0, 0),
+    mesh_regions: np.ndarray | None = None,
+) -> list[Region]:
+    """Join marks that overlap, then marks that come within ``gap_px``.
+
+    2026-09-04: added because the detector was handing the flip planner
+    overlapping regions -- the same mark claimed twice, once by each of two
+    stages that found a different part of it -- and every filter downstream
+    then judged both copies.  It runs before the flat-ground grouping, so that
+    stage sees one mark where it used to see a pile.
+
+    Two passes rather than one, and in this order on purpose. Overlap is a
+    plain AND of two masks, so the first pass is nearly free and it is the
+    pass that removes the most regions; the dilation the second pass needs is
+    then run over a shorter list. Testing the boxes before the texels keeps
+    the pairwise sweep to arithmetic for all but the few pairs that could
+    plausibly touch.
+
+    A merged region does *not* have the gap between its members painted in.
+    Nearness is not evidence that the space between two marks is part of
+    either, and inventing those texels would widen every mark by the gap.
+    """
+    if len(regions) < 2:
+        return regions
+    owners = mesh_region_ids(regions, mesh_regions, offset)
+    grouped, owners = _group_by(regions, owners, 0)
+    if gap_px > 0:
+        grouped, owners = _group_by(grouped, owners, int(gap_px))
+    return grouped
 
 
 def group_regions_across_flat_ground(

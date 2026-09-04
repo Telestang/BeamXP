@@ -28,6 +28,7 @@ from glyph_lab.detect import (
 from glyph_lab.region_grouping import (
     GroupingConfig,
     group_regions_across_flat_ground,
+    mesh_region_ids,
     mesh_region_labels,
 )
 from glyph_lab.region_hulls import convex_region_hulls, convex_region_mask
@@ -378,8 +379,17 @@ def normal_region_centres(regions: list[Region]) -> np.ndarray:
 
 def clear_of_normal_crowd(
     regions: list[Region], company: list[Region], config: NormalMapConfig,
+    region_ids: list[int | None] | None = None,
+    company_ids: list[int | None] | None = None,
 ) -> list[Region]:
-    """The normal-map-owned copy of the colour detector's crowd filter."""
+    """The normal-map-owned copy of the colour detector's crowd filter.
+
+    2026-09-04: company is counted only within the mark's own seam-bounded mesh
+    piece, matching the colour detector and `_links`.  Relief runs into this
+    harder than colour does: a stitched or perforated panel fires densely and
+    sits hard against quieter charts in the atlas, so its company was crossing
+    the seam and suppressing them.
+    """
     radius, limit = config.crowd_radius_px, config.max_neighbours
     if radius <= 0 or limit < 0 or not regions or not company:
         return regions
@@ -390,15 +400,36 @@ def clear_of_normal_crowd(
     ]
     if not judged:
         return regions
-    tree = cKDTree(normal_region_centres(company))
-    near = tree.query_ball_point(
-        normal_region_centres([regions[index] for index in judged]),
-        float(radius), return_length=True,
-    )
     same = regions is company
+    if region_ids is None or company_ids is None:
+        trees = {None: cKDTree(normal_region_centres(company))}
+        buckets = {index: None for index in judged}
+    else:
+        by_piece: dict[int, list[Region]] = {}
+        for piece, member in zip(company_ids, company):
+            if piece is not None:
+                by_piece.setdefault(piece, []).append(member)
+        trees = {
+            piece: cKDTree(normal_region_centres(members))
+            for piece, members in by_piece.items()
+        }
+        buckets = {index: region_ids[index] for index in judged}
+    counted: dict[int, int] = {}
+    for piece in set(buckets.values()):
+        asking = [index for index in judged if buckets[index] == piece]
+        tree = trees.get(piece)
+        if tree is None:
+            # No chart owns this mark, so nothing is on its chart to crowd it.
+            counted.update({index: 0 for index in asking})
+            continue
+        near = tree.query_ball_point(
+            normal_region_centres([regions[index] for index in asking]),
+            float(radius), return_length=True,
+        )
+        counted.update({index: int(count) for index, count in zip(asking, near)})
     refused = {
-        index for index, count in zip(judged, near)
-        if int(count) - (1 if same else 0) > int(limit)
+        index for index in judged
+        if counted[index] - (1 if same else 0) > int(limit)
     }
     return [
         region for index, region in enumerate(regions) if index not in refused
@@ -573,7 +604,11 @@ def detect_normal(
             accepted_outline, accepted_kept = outline, kept
         else:
             before_crowd = time.perf_counter()
-            uncrowded = clear_of_normal_crowd(holes, holes, config)
+            hole_ids = mesh_region_ids(holes, mesh_regions[window], (x, y))
+            uncrowded = clear_of_normal_crowd(
+                holes, holes, config,
+                region_ids=hole_ids, company_ids=hole_ids,
+            )
             crowd_outline, crowd_kept = paint_holes(
                 uncrowded, sample.shape, (x, y), config,  # type: ignore[arg-type]
             )
