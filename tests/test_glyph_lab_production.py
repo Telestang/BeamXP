@@ -156,7 +156,13 @@ class DroppedFilterTests(unittest.TestCase):
 
 class LayerKindTests(unittest.TestCase):
     def test_production_uses_the_promoted_rim_contact_threshold(self) -> None:
-        self.assertEqual(DEFAULT_GLYPH_LAB_CONFIG.contrast.min_rim_contact, 1.0)
+        """The lab's tuned value, pinned where the exporter reads it.
+
+        2026-09-04: 0.5, re-promoted from the lab session.  The number is what
+        changed, not what this asks -- production still has to carry whatever
+        the lab settled on, and this fails if the two drift apart.
+        """
+        self.assertEqual(DEFAULT_GLYPH_LAB_CONFIG.contrast.min_rim_contact, 0.5)
 
     def test_a_colour_layer_reports_no_fitted_shape(self) -> None:
         """The colour pipeline has no rectangle-fitting stage to report one."""

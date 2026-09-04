@@ -243,3 +243,259 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarkGateTests(unittest.TestCase):
+    """Does a grouped region read as ink, or as a piece of the panel?
+
+    Fitted to two labelling sessions; these pin the three signals it reads
+    and the shapes of the cases each was added for.
+    """
+
+    @staticmethod
+    def gate(region, colour, contrast=12.0, tone=45.0):
+        from glyph_lab.region_grouping import looks_like_a_mark
+
+        return looks_like_a_mark(region, colour, (0, 0), contrast, tone)
+
+    @staticmethod
+    def region(mask, x=8, y=8):
+        from glyph_lab.regions import Region
+
+        return Region(bounds=(x, y, mask.shape[1], mask.shape[0]),
+                      mask=mask, domain=1)
+
+    @staticmethod
+    def panel(value=90):
+        return np.full((40, 40, 3), value, dtype=np.uint8)
+
+    def test_ink_on_a_panel_is_a_mark(self) -> None:
+        colour = self.panel()
+        colour[8:20, 8:20] = 240                 # a bright block on dark ground
+        self.assertTrue(self.gate(self.region(np.ones((12, 12), bool)), colour))
+
+    def test_a_piece_of_the_panel_is_not(self) -> None:
+        """Same texels as its surroundings: no step, one tone, and so no mark."""
+        colour = self.panel()
+        self.assertFalse(self.gate(self.region(np.ones((12, 12), bool)), colour))
+
+    def test_a_region_that_swallowed_its_background_is_kept(self) -> None:
+        """The scintilla badge: the mask is the whole plaque, script and all.
+
+        Its mean matches the ground outside it, so the boundary step reads as
+        nothing -- all of the contrast is inside. Two tones in the interior is
+        what keeps it, and 12 of 331 labelled marks depend on that clause.
+        """
+        # Sized so the plaque and its script average back to the ground
+        # around them: 1/3 of the mask at 30 and 2/3 at 210 means 150, which
+        # is the surround.  That is the badge's actual signature -- not that
+        # it is low contrast, but that its contrast is entirely internal.
+        colour = self.panel(150)
+        colour[8:20, 8:20] = 210                 # the plaque
+        colour[8:12, 8:20] = 30                  # the script across its top third
+        region = self.region(np.ones((12, 12), bool))
+        inside = colour[8:20, 8:20, 0].astype(float).mean()
+        self.assertLess(
+            abs(inside - 150.0), 12.0,
+            "the fixture must not step against its surround",
+        )
+        self.assertTrue(self.gate(region, colour))
+        # ...and it is the tone gap doing it, not the step: put the tone bar
+        # out of reach and nothing is left to save it.
+        self.assertFalse(self.gate(region, colour, tone=500.0))
+
+    def test_a_diagonal_sliver_still_reads_as_ink(self) -> None:
+        """Shape is not this gate's business.
+
+        A trim arc is high-contrast ink by every appearance measure, and it
+        is: the objection to it is that flipping it would put it somewhere
+        it never was, which is a question about the *flip* and is answered by
+        `GroupingConfig.min_lone_mirror`.  Asking this gate to drop it would
+        also drop a row of glyphs that happens to follow a curve.
+        """
+        colour = self.panel()
+        mask = np.zeros((24, 24), dtype=bool)
+        for i in range(24):
+            mask[i, max(i - 1, 0): i + 2] = True
+        colour[8:32, 8:32][mask] = 240
+        self.assertTrue(self.gate(self.region(mask), colour))
+
+    def test_zero_on_either_appearance_bar_switches_the_pair_off(self) -> None:
+        """Not one clause each: the two are ORed, so a zero bar passes both.
+
+        Worth pinning because the natural reading -- "0 disables that half" --
+        is wrong, and a config comment said so until this test was written.
+        """
+        colour = self.panel()
+        region = self.region(np.ones((12, 12), bool))
+        self.assertFalse(self.gate(region, colour))
+        self.assertTrue(self.gate(region, colour, contrast=0.0))
+        self.assertTrue(self.gate(region, colour, tone=0.0))
+
+    def test_the_tone_gap_ignores_a_smooth_ramp(self) -> None:
+        """A gradient splits into two halves as cleanly as a glyph does.
+
+        Which is why the gate reads the distance between the tones and not
+        how much variance the split explains -- scored the latter way a ramp
+        was indistinguishable from ink.
+        """
+        from glyph_lab.region_grouping import interior_tone_gap
+
+        ramp = np.linspace(100, 130, 400, dtype=np.float32)
+        two_tone = np.concatenate([np.full(200, 40.0, np.float32),
+                                   np.full(200, 210.0, np.float32)])
+        self.assertLess(interior_tone_gap(ramp), 20.0)
+        self.assertGreater(interior_tone_gap(two_tone), 150.0)
+
+
+class MergeSessionsTests(unittest.TestCase):
+    """Two passes over one region set, combined without losing either."""
+
+    @staticmethod
+    def session(directory, rows):
+        export_session(directory, {"stage": "8 clear material transitions"}, [
+            entry(label, index=index, texture=texture)
+            for texture, index, label in rows
+        ])
+
+    def test_a_later_session_wins_on_the_regions_it_covers(self) -> None:
+        """Re-labelling a range means putting the newer session last."""
+        from glyph_lab.labelling import merge_sessions
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.session(root / "first", [
+                ("etkc", 0, TRUE_POSITIVE), ("etkc", 1, TRUE_POSITIVE),
+            ])
+            self.session(root / "second", [("etkc", 1, FALSE_POSITIVE)])
+            _params, merged = merge_sessions(
+                [root / "first", root / "second"], root / "all",
+            )
+            verdicts = {e.index: e.label for e in merged}
+            self.assertEqual(verdicts, {0: TRUE_POSITIVE, 1: FALSE_POSITIVE})
+
+    def test_the_halves_of_a_split_session_add_up(self) -> None:
+        from glyph_lab.labelling import merge_sessions
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.session(root / "a", [("etkc", i, TRUE_POSITIVE) for i in range(100)])
+            self.session(root / "b", [("etkc", i, FALSE_POSITIVE)
+                                      for i in range(100, 160)])
+            _params, merged = merge_sessions([root / "a", root / "b"], root / "all")
+            self.assertEqual(len(merged), 160)
+            self.assertEqual(sum(1 for e in merged if e.label == TRUE_POSITIVE), 100)
+            self.assertEqual(sum(1 for e in merged if e.label == FALSE_POSITIVE), 60)
+
+    def test_sessions_at_different_stages_do_not_overwrite(self) -> None:
+        """The same index means a different region at a different stage."""
+        from glyph_lab.labelling import merge_sessions
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            export_session(root / "early", {}, [entry(TRUE_POSITIVE, index=0)])
+            export_session(root / "late", {}, [
+                entry(FALSE_POSITIVE, index=0, stage="13 final padding"),
+            ])
+            _params, merged = merge_sessions([root / "early", root / "late"],
+                                             root / "all")
+            self.assertEqual(len(merged), 2)
+            self.assertEqual({e.stage for e in merged},
+                             {"2 the sparse field", "13 final padding"})
+
+    def test_the_merge_records_where_it_came_from(self) -> None:
+        from glyph_lab.labelling import load_session, merge_sessions
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.session(root / "first", [("etkc", 0, TRUE_POSITIVE)])
+            merge_sessions([root / "first"], root / "all")
+            params, _entries = load_session(root / "all")
+            self.assertIn("merged_from", params)
+            self.assertEqual(len(params["merged_from"]), 1)
+
+
+class LabelWindowPagingTests(unittest.TestCase):
+    """A session of hundreds of regions has to stay reachable.
+
+    2026-09-04: it did not.  Tk addresses canvas coordinates as signed
+    16-bit, so a body frame taller than 32,767 px silently cut off every row
+    below that line -- on a 557-region session the frame reached 55,000 px
+    and roughly 220 rows could not be scrolled to.  Nothing said so: the
+    tally counted them, and a bulk verdict had labelled them.
+    """
+
+    @staticmethod
+    def build(count: int):
+        import tkinter as tk
+
+        from glyph_lab.label_window import LabelSubject, LabelWindow
+        from glyph_lab.regions import Region
+
+        rng = np.random.default_rng(3)
+        colour = rng.integers(0, 255, (1200, 1200, 3), dtype=np.uint8)
+        regions = tuple(
+            Region(bounds=(10 + (i % 12) * 90, 10 + (i // 12) % 12 * 90, 70, 70),
+                   mask=np.ones((70, 70), dtype=bool), domain=1)
+            for i in range(count)
+        )
+        root = tk.Tk()
+        root.withdraw()
+        window = LabelWindow(
+            root, [LabelSubject("t", "s", colour, None, regions)], {},
+        )
+        return root, window
+
+    @staticmethod
+    def settle(window):
+        while window._pending:
+            window._build_batch()
+        window.update_idletasks()
+
+    def test_every_row_stays_inside_tk_s_coordinate_limit(self) -> None:
+        root, window = self.build(557)
+        try:
+            self.settle(window)
+            self.assertLess(window._body.winfo_reqheight(), 32767)
+            for child in window._body.pack_slaves():
+                self.assertLessEqual(child.winfo_y(), 32767)
+        finally:
+            window.destroy(); root.destroy()
+
+    def test_every_region_is_reachable_across_the_pages(self) -> None:
+        root, window = self.build(557)
+        try:
+            seen = 0
+            for page in range(window.pages):
+                window.show_page(page)
+                self.settle(window)
+                seen += len(window._body.pack_slaves())
+            self.assertEqual(seen, 557)
+        finally:
+            window.destroy(); root.destroy()
+
+    def test_a_verdict_survives_leaving_its_page_and_coming_back(self) -> None:
+        root, window = self.build(150)
+        try:
+            self.settle(window)
+            window._set_page(TRUE_POSITIVE)
+            self.settle(window)
+            window.next_page(); self.settle(window)
+            window.previous_page(); self.settle(window)
+            self.assertEqual(window._tally_all()[TRUE_POSITIVE], 60)
+            self.assertEqual(window._choices[("t", 0)].get(), TRUE_POSITIVE)
+        finally:
+            window.destroy(); root.destroy()
+
+    def test_a_bulk_verdict_reaches_only_the_page_in_front_of_you(self) -> None:
+        """The failure that produced a corpus of unreviewed 'true'."""
+        root, window = self.build(150)
+        try:
+            self.settle(window)
+            window._set_page(TRUE_POSITIVE)
+            self.settle(window)
+            counts = window._tally_all()
+            self.assertEqual(counts[TRUE_POSITIVE], 60)
+            self.assertEqual(counts[""], 90, "it labelled regions off the page")
+        finally:
+            window.destroy(); root.destroy()

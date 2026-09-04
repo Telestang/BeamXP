@@ -50,10 +50,22 @@ UNSET = ""
 # modern display, and the judgement is about shape, so it is scaled up to a
 # fixed box rather than shown at its own size.
 THUMBNAIL_PX = 96
-# Rows built per idle slice. The whole point is to open at once on a texture
-# with hundreds of regions; building them all in one go freezes the window for
-# as long as it takes and looks like a hang.
+# Rows built per idle slice, so a page appears at once rather than freezing
+# the window for as long as it takes to build.
 BATCH = 24
+# Rows per page.
+#
+# 2026-09-04: paged because Tk addresses canvas coordinates as signed 16-bit.
+# A frame taller than 32,767 px is silently unreachable below that line: on a
+# 557-region session the body grew to 55,000 px and everything past roughly
+# the 335th row could not be scrolled to. The rows existed and were counted --
+# the tally said 557 with none unset -- so it read as "the list stops" rather
+# than as anything being wrong, and a bulk "all true" had quietly labelled
+# hundreds of regions nobody could see.
+#
+# 60 rows at ~110 px is about 6,600 px, comfortably inside the limit with room
+# for a taller thumbnail.
+PAGE = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,26 +124,52 @@ class LabelWindow(tk.Toplevel):
         self._subjects = subjects
         self._parameters = parameters
         self._initial_dir = initial_dir
-        self._choices: dict[tuple[str, int], tk.StringVar] = {}
-        self._photos: list[ImageTk.PhotoImage] = []
-        self._pending: list[tuple[LabelSubject, int]] = [
+        # Every region, in one flat order, so a page is a slice of it.  The
+        # verdicts live here rather than in the widgets: a page's rows are
+        # destroyed when you leave it, and a verdict must not go with them.
+        self._all: list[tuple[LabelSubject, int]] = [
             (subject, index)
             for subject in subjects
             for index in range(len(subject.regions))
         ]
+        self._choices: dict[tuple[str, int], tk.StringVar] = {}
+        self._photos: list[ImageTk.PhotoImage] = []
+        self._pending: list[tuple[LabelSubject, int]] = []
         self._built = 0
+        self._page = 0
 
         header = ttk.Frame(self)
         header.pack(side="top", fill="x", padx=8, pady=6)
         self._summary = ttk.Label(header, text="", anchor="w")
         self._summary.pack(side="left", fill="x", expand=True)
         ttk.Button(header, text="Export…", command=self.export).pack(side="right")
+        # Scoped to the page on purpose.  A bulk verdict over the whole set
+        # labels regions nobody has looked at, and reads afterwards exactly
+        # like one that was reviewed.
         ttk.Button(
-            header, text="All false", command=lambda: self._set_all(FALSE_POSITIVE),
+            header, text="Page: all false",
+            command=lambda: self._set_page(FALSE_POSITIVE),
         ).pack(side="right", padx=(0, 6))
         ttk.Button(
-            header, text="All true", command=lambda: self._set_all(TRUE_POSITIVE),
+            header, text="Page: all true",
+            command=lambda: self._set_page(TRUE_POSITIVE),
         ).pack(side="right", padx=(0, 6))
+
+        nav = ttk.Frame(self)
+        nav.pack(side="bottom", fill="x", padx=8, pady=6)
+        ttk.Button(nav, text="← Previous", command=self.previous_page).pack(
+            side="left",
+        )
+        ttk.Button(nav, text="Next →", command=self.next_page).pack(
+            side="left", padx=(6, 0),
+        )
+        self._page_label = ttk.Label(nav, text="", anchor="w")
+        self._page_label.pack(side="left", padx=12)
+        self._jump = tk.StringVar(master=self, value="")
+        ttk.Label(nav, text="go to region").pack(side="left", padx=(12, 4))
+        jump_box = ttk.Entry(nav, textvariable=self._jump, width=8)
+        jump_box.pack(side="left")
+        jump_box.bind("<Return>", lambda _e: self.jump_to_region())
 
         shell = tk.Canvas(self, background=BACKGROUND, highlightthickness=0)
         scroll = ttk.Scrollbar(self, orient="vertical", command=shell.yview)
@@ -147,10 +185,48 @@ class LabelWindow(tk.Toplevel):
         self._shell = shell
         shell.bind_all("<MouseWheel>", self._on_wheel)
 
+        self.show_page(0)
+
+    # -- building ---------------------------------------------------------
+
+    @property
+    def pages(self) -> int:
+        return max(1, (len(self._all) + PAGE - 1) // PAGE)
+
+    def show_page(self, number: int) -> None:
+        """Rebuild the body with one page's rows and nothing else.
+
+        The rows are destroyed rather than hidden.  Keeping every page's
+        widgets alive is what put the body past Tk's coordinate limit in the
+        first place, and a thumbnail per region is real memory besides.
+        """
+        self._page = max(0, min(int(number), self.pages - 1))
+        for child in self._body.pack_slaves():
+            child.destroy()
+        self._photos.clear()
+        start = self._page * PAGE
+        self._pending = list(self._all[start: start + PAGE])
+        self._built = 0
+        self._shell.yview_moveto(0.0)
         self._refresh_summary()
         self.after_idle(self._build_batch)
 
-    # -- building ---------------------------------------------------------
+    def next_page(self) -> None:
+        if self._page + 1 < self.pages:
+            self.show_page(self._page + 1)
+
+    def previous_page(self) -> None:
+        if self._page > 0:
+            self.show_page(self._page - 1)
+
+    def jump_to_region(self) -> None:
+        """Open the page holding the nth region, counting from 1."""
+        try:
+            wanted = int(float(self._jump.get()))
+        except (TypeError, ValueError):
+            return
+        wanted = max(1, min(wanted, len(self._all)))
+        self.show_page((wanted - 1) // PAGE)
 
     def _build_batch(self) -> None:
         """Add a slice of rows, then yield so the window stays alive."""
@@ -189,8 +265,16 @@ class LabelWindow(tk.Toplevel):
             width=42,
         ).pack(side="left", padx=8)
 
-        choice = tk.StringVar(value=UNSET)
-        self._choices[(subject.name, index)] = choice
+        # Reused, never replaced: leaving a page destroys its rows, and a
+        # fresh variable on the way back would silently drop the verdict this
+        # region already has.  master=self for the reason the main window
+        # documents -- an unmastered Variable binds to whichever Tk was made
+        # first in the process and is finalised against it.
+        key = (subject.name, index)
+        choice = self._choices.get(key)
+        if choice is None:
+            choice = tk.StringVar(master=self, value=UNSET)
+            self._choices[key] = choice
         for text, value in (
             ("true", TRUE_POSITIVE), ("false", FALSE_POSITIVE), ("ignore", IGNORE),
         ):
@@ -201,15 +285,18 @@ class LabelWindow(tk.Toplevel):
 
     # -- state ------------------------------------------------------------
 
-    def _set_all(self, value: str) -> None:
-        """Only the rows already built, and only the ones still unset.
+    def _set_page(self, value: str) -> None:
+        """Fill in the unset rows on this page, and no others.
 
-        Not a reset: the button is there to clear a page of obvious noise
-        quickly, and having it overwrite considered verdicts would make it
-        dangerous enough not to use.
+        Not a reset -- it is there to clear a page of obvious noise quickly,
+        and overwriting considered verdicts would make it too dangerous to
+        use.  And not the whole set: a bulk verdict over regions nobody has
+        seen produces a corpus that reads as reviewed and is not.
         """
-        for choice in self._choices.values():
-            if not choice.get():
+        start = self._page * PAGE
+        for subject, index in self._all[start: start + PAGE]:
+            choice = self._choices.get((subject.name, index))
+            if choice is not None and not choice.get():
                 choice.set(value)
         self._refresh_summary()
 
@@ -219,16 +306,34 @@ class LabelWindow(tk.Toplevel):
             counts[choice.get()] = counts.get(choice.get(), 0) + 1
         return counts
 
+    def _tally_all(self) -> dict[str, int]:
+        """Over every region, not merely the ones with a widget right now."""
+        counts = {TRUE_POSITIVE: 0, FALSE_POSITIVE: 0, IGNORE: 0, UNSET: 0}
+        for subject, index in self._all:
+            choice = self._choices.get((subject.name, index))
+            counts[choice.get() if choice is not None else UNSET] += 1
+        return counts
+
     def _refresh_summary(self) -> None:
-        counts = self._tally()
-        total = len(self._pending) + self._built
-        building = "" if not self._pending else f"  (building {self._built}/{total})"
+        counts = self._tally_all()
+        total = len(self._all)
+        building = (
+            "" if not self._pending
+            else f"  (drawing {self._built}/{self._built + len(self._pending)})"
+        )
+        stage = self._subjects[0].stage if self._subjects else "-"
         self._summary.configure(
-            text=(f"{total} region(s) at {self._subjects[0].stage if self._subjects else '-'}"
+            text=(f"{total} region(s) at {stage}"
                   f"   true {counts[TRUE_POSITIVE]}"
                   f"   false {counts[FALSE_POSITIVE]}"
                   f"   ignore {counts[IGNORE]}"
                   f"   unset {counts[UNSET]}{building}")
+        )
+        start = self._page * PAGE
+        last = min(start + PAGE, total)
+        self._page_label.configure(
+            text=f"page {self._page + 1} of {self.pages}"
+                 f"   — regions {start + 1}-{last}"
         )
 
     def _on_wheel(self, event: tk.Event) -> None:

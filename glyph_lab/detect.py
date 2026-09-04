@@ -44,16 +44,24 @@ from glyph_lab.region_grouping import (
     GroupingConfig,
     group_nearby_regions,
     group_regions_across_flat_ground,
+    looks_like_a_mark,
     mesh_region_ids,
     mesh_region_labels,
+    past_the_lone_mirror,
 )
 from glyph_lab.region_hulls import convex_region_hulls
 from glyph_lab.region_padding import pad_regions
 from glyph_lab.regions import NEIGHBOURHOOD, Region, closed_body
+from glyph_lab.seam_sides import (
+    clear_of_two_sided_seams,
+    divides_two_grounds,
+    measure_region_sides,
+    side_features,
+)
 
 # The last stage `stop_after_stage` can name, which is the last stage there
 # is: explicit diagnostic runs can still reach the legacy marks stage.
-LAST_STOP = 20
+LAST_STOP = 22
 
 # Every point in the pipeline worth looking at, in the order it happens.  The
 # viewer lists these and draws whichever is picked in place of the response, so
@@ -90,11 +98,17 @@ SIZED = "5 past the size floor"
 UNREPEATED = "6 clear of a repeat"
 UNRIMMED = "7 clear of the rim"
 UNTRANSITIONED = "8 clear material transitions"
+# 2026-09-04: its own stage rather than more knobs on stage 8, because it
+# asks the opposite question.  Stage 8 looks inward -- does this region
+# enclose quiet ground -- and so only ever sees closed loops; this looks
+# outward, at whether the ground differs on the two sides of the mark, and
+# so reaches the open C and the seam slivers stage 8 has no test for.
+UNSEAMED = "9 clear of a two-sided seam"
 # 2026-09-04: added because the labelling export showed the same mark
 # claimed twice -- two stages each finding a different part of it -- and
 # every filter below judged both copies.  Before the flat-ground pass so
 # that stage sees one mark where it saw a pile.
-PROXIMITY_GROUPED = "9 grouped by proximity"
+PROXIMITY_GROUPED = "10 grouped by proximity"
 # 2026-09-04: a size floor *after* the grouping, not instead of the one at
 # stage 5.  A grouped region can be several members that each cleared the
 # early floor, so raising that one to catch the small survivors here
@@ -102,17 +116,21 @@ PROXIMITY_GROUPED = "9 grouped by proximity"
 # hand-labelled regions across nine textures: the smallest true mark is
 # 189 texels on an 11 px short side, and every false positive below that
 # is panel edge or weave.
-GROUP_SIZED = "10 past the grouped size floor"
-FLAT_GROUPED = "11 grouped across flat ground"
-CONVEX_HULLED = "12 convex region hull"
-PADDED = "13 final padding"
-OFF_BOUNDARY = "14 clear of the boundary"
-SEEDED = "15 structure seed"
-DENSE_SEED = "16 seed over density"
-PATTERNED = "17 pattern candidates"
-TRANSFORMED = "18 past the transform"
-BRIDGED = "19 bridged across the gaps"
-MARKED = "20 grouped into marks"
+GROUP_SIZED = "11 grouped regions that read as marks"
+# 2026-09-04: its own stage, and it must sit above the grouping.  An arc
+# absorbed into a composite is no longer a lone mark, so run below the
+# grouping this saw 3 of etkc's arcs where here it sees every one.
+LONE_MIRRORED = "12 clear of a lone arc"
+FLAT_GROUPED = "13 grouped across flat ground"
+CONVEX_HULLED = "14 convex region hull"
+PADDED = "15 final padding"
+OFF_BOUNDARY = "16 clear of the boundary"
+SEEDED = "17 structure seed"
+DENSE_SEED = "18 seed over density"
+PATTERNED = "19 pattern candidates"
+TRANSFORMED = "20 past the transform"
+BRIDGED = "21 bridged across the gaps"
+MARKED = "22 grouped into marks"
 
 STAGES: tuple[str, ...] = (
     AT_THRESHOLD,
@@ -123,8 +141,10 @@ STAGES: tuple[str, ...] = (
     UNREPEATED,
     UNRIMMED,
     UNTRANSITIONED,
+    UNSEAMED,
     PROXIMITY_GROUPED,
     GROUP_SIZED,
+    LONE_MIRRORED,
     FLAT_GROUPED,
     CONVEX_HULLED,
     PADDED,
@@ -224,44 +244,55 @@ STAGE_OF: dict[str, int] = {
     "transition_compact_min_body_void_share": 8,
     "transition_compact_max_enclosure": 8,
     "transition_compact_rim_max_span_px": 8,
-    # 9 grouped by proximity
-    "proximity_gap_px": 9,
-    # 10 past the grouped size floor
-    "group_min_texels": 10,
-    "group_min_side_px": 10,
+    # 9 clear of a two-sided seam
+    "seam_side_reach_px": 9,
+    "seam_min_tone_gap": 9,
+    "seam_max_side_detail": 9,
+    "seam_min_side_balance": 9,
+    "seam_min_side_coherence": 9,
+    "seam_min_enclosed_texels": 9,
+    # 10 grouped by proximity
+    "proximity_gap_px": 10,
+    # 11 grouped regions that read as marks
+    "group_min_texels": 11,
+    "group_min_side_px": 11,
+    "group_min_contrast": 11,
+    "group_min_tone_gap": 11,
+    # 12 clear of a lone arc
+    "lone_min_mirror": 12,
     # 15 final padding
-    "final_padding_px": 13,
+    "final_padding_px": 15,
     # 16 clear of the boundary
-    "min_boundary_reach_px": 14,
+    "min_boundary_reach_px": 16,
     # 17 structure seed
-    "structure_px": 15,
-    "structure_inner_px": 15,
-    "min_structure": 15,
+    "structure_px": 17,
+    "structure_inner_px": 17,
+    "min_structure": 17,
     # 18 seed over density
-    "seed_density_px": 16,
-    "min_seed_density": 16,
+    "seed_density_px": 18,
+    "min_seed_density": 18,
     # 19 pattern candidates
-    "pattern_gap_px": 17,
-    "min_pattern_texels": 17,
-    "min_pattern_fill": 17,
-    "min_pattern_area": 17,
-    "min_pattern_coverage": 17,
+    "pattern_gap_px": 19,
+    "min_pattern_texels": 19,
+    "min_pattern_fill": 19,
+    "min_pattern_area": 19,
+    "min_pattern_coverage": 19,
     # 20 past the transform
-    "repeat_skip_px": 18,
-    "repeat_longest_px": 18,
-    "min_repeat_energy": 18,
-    "min_repeat_overlap": 18,
-    "min_repeat_dip": 18,
-    # 19 bridged across the gaps
-    "bridge_clear_px": 19,
-    "bridge_void_px": 19,
-    "min_bridge_void": 19,
-    "bridge_span_px": 19,
-    "min_bridge_response": 19,
-    "max_bridge_share": 19,
-    # 20 grouped into marks
-    "mark_gap_px": 20,
-    "min_stroke_texels": 20,
+    "repeat_skip_px": 20,
+    "repeat_longest_px": 20,
+    "min_repeat_energy": 20,
+    "min_repeat_overlap": 20,
+    "min_repeat_dip": 20,
+    # 21 bridged across the gaps
+    "bridge_clear_px": 21,
+    "bridge_void_px": 21,
+    "min_bridge_void": 21,
+    "bridge_span_px": 21,
+    "min_bridge_response": 21,
+    "max_bridge_share": 21,
+    # 22 grouped into marks
+    "mark_gap_px": 22,
+    "min_stroke_texels": 22,
 }
 
 
@@ -284,7 +315,7 @@ class ContrastConfig:
     """What the front end reads.  One knob per decision, and no more."""
 
     # 2026-08-27: where the pipeline ends, as a stage number.  0 runs the lot,
-    # and so does 13, the colour interactive endpoint.
+    # and so does 14, the colour interactive endpoint.
     #
     # 2026-09-04: 11 before the proximity grouping was inserted at 9. It is a
     # literal naming a stage by number, so it has to move whenever a stage is
@@ -301,7 +332,7 @@ class ContrastConfig:
     #
     # The panel hides the parameters of every stage past the stop, so it also
     # narrows the window down to the step being worked on.
-    stop_after_stage: int = 13
+    stop_after_stage: int = 15
     # 2026-09-04: how close two marks' texels may come before they are one.
     # Measured between the texels, not the boxes, and never across a mesh
     # seam. 0 still joins regions that actually overlap -- that pass is what
@@ -328,6 +359,37 @@ class ContrastConfig:
     # 189/11 would cut 19, and 189/13 cuts 26 at the price of one real mark.
     group_min_texels: int = 160
     group_min_side_px: int = 10
+    # 2026-09-04: does a grouped region read as ink, or as a piece of panel?
+    #
+    # Fitted to two labelling sessions over nine textures -- 331 marks, 56
+    # rejects.  `(step or tone gap) and mirror` removes 41 of the 56 and costs
+    # no mark; 33 go on appearance and 8 more on footprint.  See
+    # `looks_like_a_mark`.
+    #
+    # A mark stands off the ground it sits on.  Where a region swallowed its
+    # own background the step reads as nothing and the two tones inside carry
+    # the signal instead, so either will do -- and 12 of the 331 are kept only
+    # by the second.  They are ORed, so a 0 on *either* passes every region
+    # and switches the appearance test off entirely -- it does not disable
+    # one clause and leave the other standing.
+    group_min_contrast: float = 12.0
+    group_min_tone_gap: float = 45.0
+    # And whether this one mark could survive being reflected.  An etkc trim
+    # arc reflects onto the opposite diagonal and would land over atlas it
+    # never covered, so it goes.
+    #
+    # Its own stage, above the grouping, because that is the last point at
+    # which a mark is still its own region -- by stage 12 an arc has usually
+    # been absorbed into a composite, and a composite is a different question
+    # with a different answer (`GroupingConfig.min_group_mirror`, which
+    # ungroups rather than drops).
+    #
+    # 0.25 on the hull: zero-loss across both labelled sessions, whose lowest
+    # true mark reads 0.277.  Conservative on purpose -- failing here drops a
+    # region, and a bar fitted to the lowest mark ever seen has no margin for
+    # a texture nobody labelled.  0 switches it off.
+    lone_min_mirror: float = 0.25
+
     # 2026-09-01: final display masks need a modest margin without changing
     # the region grouping that produced them.
     final_padding_px: int = 2
@@ -402,7 +464,7 @@ class ContrastConfig:
     # emptiness either side of it.  All three at 0 keep every hole.
     #
     # There are a great many holes and almost all of them are nothing: at disc
-    # 15 the corpus leaves 1,020 to 3,445 per texture with a median of 3 to 9
+    # 16 the corpus leaves 1,020 to 3,445 per texture with a median of 3 to 9
     # texels, against legends and badges in the hundreds and up.  The floor is
     # the whole of the sorting, which is why the three of them are their own
     # stage rather than a clause in the one above.
@@ -555,7 +617,14 @@ class ContrastConfig:
     # 2026-09-02: promoted from the current lab session after the ardente
     # replay; a region must follow the rim for its full measured length before
     # this filter classifies it as rim artefact.
-    min_rim_contact: float = 1.0
+    #
+    # 2026-09-04: 0.5, promoted from the lab session.  This is now the bar
+    # for long runs only -- compact pieces are judged on
+    # `rim_artifact_min_perimeter_contact` -- and over the labelled corpus it
+    # is indistinguishable from 1.0: no region's length contact falls between
+    # the two, so both give the same 295 regions and the same survivors.  It
+    # is taken because it is the tuned value, not because it moved anything.
+    min_rim_contact: float = 0.5
     # 2026-08-29: an edge artefact has a bounded minor axis.  That includes a
     # continuous band and the separate, low-fill pieces of edge stitching.
     # Short pieces are only removed as a locally straight run along the rim;
@@ -609,6 +678,31 @@ class ContrastConfig:
     transition_compact_min_body_void_share: float = 0.50
     transition_compact_max_enclosure: float = 0.10
     transition_compact_rim_max_span_px: int = 48
+    # 2026-09-04: the outward companion to the transition knobs above.  A
+    # seam divides two flat grounds of different colour; a glyph sits on one.
+    # Measured over 557 labelled regions, `seam_min_tone_gap` is the decisive
+    # one and has a 47-unit void to sit in -- every true mark at or below 20.8,
+    # every seam at or above 67.9.  `seam_max_side_detail` is the finishing
+    # cut, seams at or below 6.6 against the nearest true mark at 13.3.
+    #
+    # The nearest true mark of all is a volvo_v60 region at 7.11, which would
+    # leave no margin at all.  It is not counted: that atlas is blurry source
+    # art kept in the corpus for volume, and its marks are corrected by the
+    # island-symmetry whole-domain flip rather than by per-mark detection.
+    seam_side_reach_px: int = 30
+    seam_min_tone_gap: float = 25.0
+    seam_max_side_detail: float = 8.0
+    # Both sides have to be a real share of the surroundings, and each has to
+    # be one arc rather than speckle.  Two-means returns a split on a single
+    # flat ground too; these are what refuse it.
+    seam_min_side_balance: float = 0.15
+    seam_min_side_coherence: float = 0.40
+    # 2026-09-04: a mark closes around its own counters, and a small one of
+    # those is not the far side of a material boundary.  The ardente's fuel
+    # pictogram encloses 142 texels and the etkc slider bezel 254; anything
+    # from 150 to 254 separates them.  A region enclosing nothing is not
+    # affected -- six of the seams removed here are open slivers.
+    seam_min_enclosed_texels: int = 200
     # 2026-08-27: how far a response that touches an island's edge has to
     # reach inward before it is believed.
     #
@@ -1098,7 +1192,7 @@ class ContrastConfig:
     # piece.  Three distance transforms and no per-pair work.  It over-states
     # the true crossing, so what it admits is a subset of what a walk would.
     #
-    # 20 and 0.40 -- and both are this generous only because
+    # 21 and 0.40 -- and both are this generous only because
     # `min_bridge_void` above decides *where* bridging may happen at all.
     # Before that gate existed these were 10 and 0.60 and could not be opened:
     # every relaxation was spent on grain rather than on marks.  With the place
@@ -2006,7 +2100,22 @@ def rim_artifact_candidates(
         major = max(width, height)
         length = rim_contact(contact_mask, rim_piece, major)
         perimeter_share = rim_perimeter_contact(contact_mask, rim_piece)
-        score = length if major >= long_run else perimeter_share
+        # 2026-09-04: each score against its own bar.  `length` is normalised
+        # by the region's long side and `min_rim_contact` is 1.0 because a band
+        # lying along an edge reads about 1; `perimeter_share` is a fraction of
+        # an outline and its bar is `min_perimeter_contact`.  Both were compared
+        # to the length bar, so a compact piece needed its *whole* perimeter on
+        # the rim to be eligible -- 0 of the corpus's 141 compact candidates ever
+        # were, which left the `perimeter_eligible` discard in
+        # `classify_rim_candidates` unreachable: long runs are discarded by the
+        # test above it, and nothing else could reach it.
+        if contact <= 0:
+            contact_eligible = True
+        elif major >= long_run:
+            contact_eligible = length >= float(contact)
+        else:
+            compact_bar = float(min_perimeter_contact)
+            contact_eligible = compact_bar > 0 and perimeter_share >= compact_bar
         width_eligible = max_span == 0 or minor <= max_span
         perimeter_eligible = (
             float(min_perimeter_contact) > 0.0
@@ -2023,7 +2132,7 @@ def rim_artifact_candidates(
             anchor_y=(float(rows_on_rim.mean() + row0 + y_offset)
                       if rows_on_rim.size else None),
             width_eligible=width_eligible,
-            contact_eligible=(contact <= 0 or score >= float(contact)),
+            contact_eligible=contact_eligible,
             perimeter_eligible=perimeter_eligible,
             large_low_fill_eligible=(
                 not width_eligible and float(large_max_fill) > 0.0
@@ -3350,6 +3459,40 @@ def regions_in_domain(
     if halted(UNTRANSITIONED):
         return found, painted, kept
 
+    # Measured once per region and reused by the filter, so opening the probe
+    # cannot change the verdict -- the transitions stage above learnt that.
+    side_measurements = {
+        id(region): measure_region_sides(
+            region, colour, domain, offset, contrast.seam_side_reach_px,
+        )
+        for region in found
+    } if contrast.seam_min_tone_gap > 0 else {}
+    if probe is not None:
+        for region in found:
+            evidence = side_measurements.get(id(region))
+            probe.observe(RegionObservation(
+                stage=UNSEAMED, texture_name=texture_name, domain=label,
+                region=region, features=side_features(evidence),
+                discarded=not divides_two_grounds(
+                    evidence, contrast.seam_min_tone_gap,
+                    contrast.seam_max_side_detail,
+                    contrast.seam_min_side_balance,
+                    contrast.seam_min_side_coherence,
+                    contrast.seam_min_enclosed_texels,
+                ),
+            ))
+    found = clear_of_two_sided_seams(
+        found, colour, domain, offset, contrast.seam_side_reach_px,
+        contrast.seam_min_tone_gap, contrast.seam_max_side_detail,
+        contrast.seam_min_side_balance, contrast.seam_min_side_coherence,
+        contrast.seam_min_enclosed_texels,
+        measurements=side_measurements,
+    )
+    painted, kept = paint_holes(found, sample.shape, offset, contrast)
+    note(UNSEAMED, kept, painted, found)
+    if halted(UNSEAMED):
+        return found, painted, kept
+
     found = group_nearby_regions(
         found, contrast.proximity_gap_px, offset, mesh_regions,
     )
@@ -3364,11 +3507,27 @@ def regions_in_domain(
         found, contrast.group_min_side_px, contrast.group_min_side_px,
         contrast.group_min_texels,
     )
+    if contrast.group_min_contrast > 0 and contrast.group_min_tone_gap > 0:
+        found = [
+            region for region in found
+            if looks_like_a_mark(
+                region, colour, offset, contrast.group_min_contrast,
+                contrast.group_min_tone_gap,
+            )
+        ]
     painted, kept = paint_mark_regions(
         found, kept.shape, offset, contrast.mark_gap_px, contrast,
     )
     note(GROUP_SIZED, kept, painted, found)
     if halted(GROUP_SIZED):
+        return found, painted, kept
+
+    found = past_the_lone_mirror(found, contrast.lone_min_mirror)
+    painted, kept = paint_mark_regions(
+        found, kept.shape, offset, contrast.mark_gap_px, contrast,
+    )
+    note(LONE_MIRRORED, kept, painted, found)
+    if halted(LONE_MIRRORED):
         return found, painted, kept
 
     found = group_regions_across_flat_ground(

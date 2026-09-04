@@ -889,12 +889,25 @@ class GlyphLab(tk.Tk):
         return LabConfig(**sections, grouping=self.current_grouping_config())
 
     def current_grouping_config(self) -> GroupingConfig:
-        """Read the final shared controls without either detector owning them."""
+        """Read the final shared controls without either detector owning them.
+
+        2026-09-04: typed from each field's default, as the two detector
+        readers already are.  Every field here was an int until the group
+        mirror threshold arrived, and casting the lot to int turned a
+        perfectly good 0.25 into "bad parameter" -- with the panel showing
+        the value it had refused.
+        """
         defaults = GroupingConfig()
-        overrides = {
-            entry.name: int(self.grouping_vars[entry.name].get())
-            for entry in fields(GroupingConfig)
-        }
+        overrides: dict[str, object] = {}
+        for entry in fields(GroupingConfig):
+            raw = self.grouping_vars[entry.name].get()
+            default = getattr(defaults, entry.name)
+            if isinstance(default, bool):
+                overrides[entry.name] = bool(raw)
+            elif isinstance(default, int):
+                overrides[entry.name] = int(raw)
+            else:
+                overrides[entry.name] = float(raw)
         return replace(defaults, **overrides)
 
     def current_normal_config(self) -> NormalMapConfig:

@@ -232,6 +232,42 @@ def load_session(out_dir: Path) -> tuple[dict, list[LabelledRegion]]:
     return payload.get("parameters", {}), entries
 
 
+def merge_sessions(
+    directories: Iterable[Path], out_dir: Path,
+) -> tuple[dict, list[LabelledRegion]]:
+    """Combine labelling sessions over the same regions into one manifest.
+
+    2026-09-04: added because a session can be split -- a long one gets done
+    in halves, or a first pass is redone after a bug.  Later directories win
+    on any region both cover, so re-labelling a range means putting the newer
+    session last and nothing else.
+
+    A region is identified by (texture, stage, index).  Sessions taken at
+    different stages therefore merge side by side rather than overwriting,
+    which is right: the same index means different regions at different
+    stages, and silently blending them would be worse than either.
+
+    The crops are not copied.  The manifest keeps whatever relative names it
+    was written with, so run this into a directory beside the sessions and
+    read the crops from those.
+    """
+    merged: dict[tuple[str, str, int], LabelledRegion] = {}
+    parameters: dict = {}
+    sources: list[str] = []
+    for directory in directories:
+        directory = Path(directory)
+        params, entries = load_session(directory)
+        parameters = params or parameters
+        sources.append(str(directory))
+        for entry in entries:
+            merged[(entry.texture, entry.stage, entry.index)] = entry
+    ordered = sorted(
+        merged.values(), key=lambda e: (e.texture, e.stage, e.index)
+    )
+    export_session(out_dir, {**parameters, "merged_from": sources}, ordered)
+    return parameters, ordered
+
+
 def fittable(entries: Iterable[LabelledRegion]) -> list[LabelledRegion]:
     """The entries a filter should be scored against: the ignored ones go."""
     return [entry for entry in entries if entry.label != IGNORE]

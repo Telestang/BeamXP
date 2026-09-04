@@ -9,6 +9,10 @@ from scipy import ndimage
 
 from glyph_lab.regions import NEIGHBOURHOOD, Region
 
+# Rec. 601 luma, matching `detect.GREY_WEIGHTS`. Held here too so the mark
+# gate does not have to import the detector it runs inside.
+GREY_WEIGHTS = np.array([0.299, 0.587, 0.114])
+
 
 @dataclass(frozen=True, slots=True)
 class GroupingConfig:
@@ -17,6 +21,22 @@ class GroupingConfig:
     # 2026-09-01: boundary distance, rather than centre distance, makes a
     # compact icon and its small detail eligible without joining a whole row.
     group_max_gap_px: int = 48
+    # 2026-09-04: a region has to land back on itself when flipped.  Two
+    # bars, because what the failure means -- and what it costs to act on --
+    # depends entirely on whether anything merged the region.
+    #
+    # A GROUP that fails is undone, not dropped, so its members go on and are
+    # flipped where they stand.  That makes the bar cheap: the worst a false
+    # refusal costs is a block flip becoming several correct individual ones.
+    # Measured on the merged *mask*, before any hull: etk800's run of four
+    # dash icons along the cluster's curve reads 0.176 against 0.763 for the
+    # next group on that texture, where their hulls read 0.514 against 0.922.
+    # Filling the gaps between members is exactly what hides the question.
+    min_group_mirror: float = 0.30
+    # The matching test for a *lone* arc is not here: it belongs above this
+    # stage, where a mark is still its own region.  By the time the grouping
+    # has run, an arc has usually been absorbed into a composite and is no
+    # longer lone -- see ``ContrastConfig.lone_min_mirror``.
     # 2026-09-01: a one-pixel alignment is accidental raster contact, not a
     # shared run.
     group_min_shared_span_px: int = 4
@@ -535,6 +555,188 @@ def group_nearby_regions(
     return grouped
 
 
+def region_grey(
+    region: Region, colour: np.ndarray, offset: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """The region's own grey values, and the ring of ground just outside it."""
+    x0, y0 = offset
+    pad = 2
+    top = max(region.y - y0 - pad, 0)
+    left = max(region.x - x0 - pad, 0)
+    bottom = min(region.y - y0 + region.height + pad, colour.shape[0])
+    right = min(region.x - x0 + region.width + pad, colour.shape[1])
+    if bottom <= top or right <= left:
+        return np.zeros(0, np.float32), np.zeros(0, np.float32)
+    window = colour[top:bottom, left:right]
+    grey = (window @ GREY_WEIGHTS).astype(np.float32)
+    placed = np.zeros(grey.shape, dtype=bool)
+    rows = slice(region.y - y0 - top, region.y - y0 - top + region.height)
+    columns = slice(region.x - x0 - left, region.x - x0 - left + region.width)
+    piece = placed[rows, columns]
+    placed[rows, columns] = region.mask[:piece.shape[0], :piece.shape[1]]
+    ring = ndimage.binary_dilation(placed, NEIGHBOURHOOD, iterations=2) & ~placed
+    return grey[placed], grey[ring]
+
+
+def mark_contrast(inside: np.ndarray, ring: np.ndarray) -> float:
+    """How far the region's texels sit from the ground immediately outside.
+
+    A printed mark is ink *on* a surface, so it stands off the ground it sits
+    on.  A piece of that surface -- a panel silhouette, a trim arc, the step
+    between two materials -- does not, because both sides are the same stuff.
+    """
+    if not inside.size or not ring.size:
+        return 0.0
+    return abs(float(inside.mean()) - float(ring.mean()))
+
+
+def interior_tone_gap(inside: np.ndarray) -> float:
+    """The distance between the two tones inside the region, by Otsu's split.
+
+    2026-09-04: the second half of `mark_contrast`, and the reason it is not
+    enough on its own.  Where a region swallowed its own background -- the
+    scintilla badge is the whole plaque, script and all -- the mask's mean
+    matches the ring's and the contrast reads as nothing, because all of it
+    is *inside*.  On 331 hand-labelled marks the boundary step keeps 319 and
+    this keeps the other 12, so it is a twelfth of the recall rather than one
+    awkward badge.
+
+    The gap between the tones, not how cleanly they split: a smooth ramp also
+    divides into two halves, and scored by the share of variance explained it
+    looked as bimodal as any glyph (AUC 0.22 -- worse than a coin).
+    """
+    if inside.size < 16:
+        return 0.0
+    hist, edges = np.histogram(inside, bins=64, range=(0, 256))
+    total = int(hist.sum())
+    if total <= 0:
+        return 0.0
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    weight = np.cumsum(hist)
+    run = np.cumsum(hist * centres)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        share = weight / total
+        low = run / np.maximum(weight, 1)
+        high = (run[-1] - run) / np.maximum(total - weight, 1)
+        between = np.nan_to_num(share * (1.0 - share) * (low - high) ** 2)
+    # Only splits with texels on both sides.  A region of one tone has no
+    # split at all, and the degenerate one -- everything above, nothing below
+    # -- reports the distance from zero to the mean, which is large and
+    # meaningless.  That is exactly the uniform panel this gate exists to
+    # reject, so it has to come back as no gap rather than a big one.
+    usable = (weight > 0) & (weight < total)
+    if not usable.any():
+        return 0.0
+    split = int(np.argmax(np.where(usable, between, -1.0)))
+    return float(abs(low[split] - high[split]))
+
+
+def mask_mirror(region: Region) -> float:
+    """How much the region's own texels cover their reflection, at best.
+
+    2026-09-04: for a group, this is the question and the hull is not.  A run
+    of separate icons has gaps between them; the hull fills those in and the
+    composite then mirrors onto itself whatever order its members are in,
+    which is the thing that needed asking.
+    """
+    rows, columns = np.nonzero(region.mask)
+    if not rows.size:
+        return 0.0
+    tight = region.mask[rows.min(): rows.max() + 1,
+                        columns.min(): columns.max() + 1]
+
+    def overlap(mirrored: np.ndarray) -> float:
+        union = int((tight | mirrored).sum())
+        return int((tight & mirrored).sum()) / union if union else 0.0
+
+    return max(overlap(tight[:, ::-1]), overlap(tight[::-1, :]))
+
+
+def mirror_footprint(region: Region) -> float:
+    """How much the region's hull covers its own reflection, at best.
+
+    The flip is a reflection about the region's own axis, so a shape that
+    does not land back on itself ends up occupying atlas it did not before.
+    A diagonal arc mirrors onto the opposite diagonal and the two barely
+    meet; a glyph block lands on itself whatever it says.
+
+    The hull rather than the mask: the mask of a thin curve is a poor proxy
+    for where the flip puts it, and measured over 331 marks the raw mask
+    costs recall for the same cut -- 0.30 on the mask loses 4 marks where
+    0.25 on the hull loses none.
+    """
+    from glyph_lab.region_hulls import convex_region_mask
+
+    rows, columns = np.nonzero(region.mask)
+    if not rows.size:
+        return 0.0
+    hull = convex_region_mask(region)
+    tight = hull[rows.min(): rows.max() + 1, columns.min(): columns.max() + 1]
+    if not tight.size:
+        return 0.0
+
+    def overlap(mirrored: np.ndarray) -> float:
+        union = int((tight | mirrored).sum())
+        return int((tight & mirrored).sum()) / union if union else 0.0
+
+    return max(overlap(tight[:, ::-1]), overlap(tight[::-1, :]))
+
+
+def past_the_lone_mirror(
+    regions: list[Region], min_mirror: float,
+) -> list[Region]:
+    """Drop marks that cannot cover their own reflection.
+
+    2026-09-04: its own stage, and it has to run before the flat-ground
+    grouping.  An etkc trim arc reflects onto the opposite diagonal and would
+    land over atlas it never covered -- but by stage 12 it has usually been
+    absorbed into a composite and is no longer a lone mark at all.  Run
+    after the grouping this caught 3 of them; run here it sees every one.
+
+    A composite that fails is a different question with a different answer:
+    ``GroupingConfig.min_group_mirror`` undoes the group rather than dropping
+    it, because a run of glyphs along an arc is badly grouped rather than not
+    ink, and dropping it would lose every glyph in the run.
+
+    The hull rather than the mask: a glyph's own strokes do not cover their
+    reflection, and measuring it that way costs four real marks for the same
+    cut across the two labelled sessions.
+    """
+    if min_mirror <= 0:
+        return regions
+    return [
+        region for region in regions
+        if mirror_footprint(region) >= min_mirror
+    ]
+
+
+def looks_like_a_mark(
+    region: Region, colour: np.ndarray, offset: tuple[int, int],
+    min_contrast: float, min_tone_gap: float,
+) -> bool:
+    """Whether a region reads as ink rather than as a piece of the panel.
+
+    2026-09-04: fitted to two labelling sessions over nine textures, 331
+    marks and 56 rejects.  Either signal will do, and together they remove 33
+    of the 56 while costing no mark.
+
+    Appearance only: is there ink here at all.  Whether a mark is the wrong
+    *shape* to flip is asked separately, by ``past_the_lone_mirror`` on the
+    stage below this one.
+
+    Every reject in both sessions came from the etkc interior, so this is
+    tuned against one vehicle's failure modes: panel silhouettes, painted
+    trim arcs, and alcantara weave.  A texture that fails differently is not
+    represented, which is why the thresholds sit where nothing is lost rather
+    than where the most is caught.
+    """
+    inside, ring = region_grey(region, colour, offset)
+    if not inside.size:
+        return True
+    return not (mark_contrast(inside, ring) < min_contrast
+                and interior_tone_gap(inside) < min_tone_gap)
+
+
 def group_regions_across_flat_ground(
     regions: list[Region], colour: np.ndarray, normal_flat: np.ndarray | None,
     config: GroupingConfig, offset: tuple[int, int] = (0, 0),
@@ -548,6 +750,12 @@ def group_regions_across_flat_ground(
     colour atlases, including Volvo's dashboard, have no normal sidecar; the
     direct colour-edge check is then the available evidence rather than a
     reason to disable grouping for the whole texture.
+
+    2026-09-04: also where an unflippable shape is dealt with, because this
+    is the only place that knows whether a shape is the region's own or one
+    the grouping just invented.  See ``GroupingConfig.min_group_mirror``:
+    a group that fails is undone, a lone region that fails is dropped, and
+    the members of an undone group are exempt.
     """
     if (
         len(regions) < 2 or config.group_max_gap_px <= 0
@@ -556,6 +764,10 @@ def group_regions_across_flat_ground(
             and config.group_close_gap_px <= 0
         )
     ):
+        # Nothing to group, which is not the same as nothing to judge: every
+        # region here is one nothing merged, so each faces the lone-region
+        # test on its own shape.  Returning early without it was the bug --
+        # and since most regions never link, it was the common path.
         return regions
     colour_edges = significant_colour_edges(
         colour, config.group_colour_edge_threshold,
@@ -585,7 +797,15 @@ def group_regions_across_flat_ground(
         if len(indices) == 1:
             output.append(regions[indices[0]])
             continue
-        output.append(_merged_region(
+        merged = _merged_region(
             [regions[index] for index in indices], links, set(indices),
-        ))
+        )
+        if (config.min_group_mirror > 0
+                and mask_mirror(merged) < config.min_group_mirror):
+            # The group is the wrong shape to flip, but its members are not,
+            # and they are exempt from the test below: whatever shape each of
+            # them is, it is not the shape this grouping just invented.
+            output.extend(regions[index] for index in indices)
+            continue
+        output.append(merged)
     return output

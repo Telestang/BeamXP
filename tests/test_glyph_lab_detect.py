@@ -23,6 +23,7 @@ from glyph_lab.detect import (
     FLAT_GROUPED,
     GROUP_SIZED,
     LAST_STOP,
+    LONE_MIRRORED,
     MARKED,
     NEARBY_CONTRAST,
     OFF_BOUNDARY,
@@ -39,6 +40,7 @@ from glyph_lab.detect import (
     UNCROWDED,
     UNREPEATED,
     UNRIMMED,
+    UNSEAMED,
     UNTRANSITIONED,
     ContrastConfig,
     LabConfig,
@@ -64,6 +66,7 @@ from glyph_lab.detect import (
     regions_from_marks,
     repeat_scores,
     repeat_texture_evidence,
+    rim_artifact_candidates,
     rim_contact,
     rim_perimeter_contact,
     sampling_mask,
@@ -167,6 +170,11 @@ class PerStageRegionsTests(unittest.TestCase):
         """A big mark and a small one, on ground blank enough to be blank."""
         colour = np.zeros((160, 220, 3), dtype=np.uint8)
         colour[40:70, 30:60] = 240
+        # 2026-09-04: a bar through the big one, so it is printed rather than
+        # plain.  A solid block on solid ground is two flat plateaus meeting at
+        # an edge, which is what stage 9 removes and what no real glyph is; the
+        # mark this class needs is one that survives to be counted.
+        colour[50:60, 36:54] = 40
         colour[110:118, 150:158] = 240
         return one_texture(colour)
 
@@ -668,14 +676,21 @@ class BoundaryReachTests(unittest.TestCase):
         self.assertEqual(STAGES[STAGES.index(SIZED) + 1], UNREPEATED)
         self.assertEqual(STAGES[STAGES.index(UNREPEATED) + 1], UNRIMMED)
         self.assertEqual(STAGES[STAGES.index(UNRIMMED) + 1], UNTRANSITIONED)
+        # 2026-09-04: the outward seam test sits between the inward one and
+        # the grouping.  Below the grouping it cannot work: merging a rim with
+        # the legend inside it leaves the interior reading as blank ground.
+        self.assertEqual(STAGES[STAGES.index(UNTRANSITIONED) + 1], UNSEAMED)
         self.assertEqual(
-            STAGES[STAGES.index(UNTRANSITIONED) + 1], PROXIMITY_GROUPED,
+            STAGES[STAGES.index(UNSEAMED) + 1], PROXIMITY_GROUPED,
         )
         self.assertEqual(
             STAGES[STAGES.index(PROXIMITY_GROUPED) + 1], GROUP_SIZED,
         )
         self.assertEqual(
-            STAGES[STAGES.index(GROUP_SIZED) + 1], FLAT_GROUPED,
+            STAGES[STAGES.index(GROUP_SIZED) + 1], LONE_MIRRORED,
+        )
+        self.assertEqual(
+            STAGES[STAGES.index(LONE_MIRRORED) + 1], FLAT_GROUPED,
         )
         self.assertEqual(STAGES[STAGES.index(FLAT_GROUPED) + 1], CONVEX_HULLED)
         self.assertEqual(STAGES[STAGES.index(CONVEX_HULLED) + 1], PADDED)
@@ -1312,6 +1327,50 @@ class ClearOfTheRimTests(unittest.TestCase):
         )
         self.assertEqual(self.keep([ribbon]), [])
 
+    def test_a_compact_edge_piece_is_scored_on_its_perimeter(self) -> None:
+        """Each measure against its own bar, not both against the length bar.
+
+        2026-09-04: `min_rim_contact` is 1.0 because a band along an edge reads
+        about 1 over its own length.  `perimeter_contact` is a fraction of an
+        outline and cannot reach 1 for anything but a region the rim wraps, so
+        comparing it to the same bar made every compact piece ineligible -- 0
+        of the corpus's 141 -- and left the `perimeter_eligible` discard in
+        `classify_rim_candidates` unreachable.  The etkc door-card seam is one
+        of these: 21x86, never deeper than 11 texels into a 30 texel margin,
+        with 0.399 of its outline on the rim.
+        """
+        seam = self.bar(0, 40, 12, 84)
+        candidates = rim_artifact_candidates(
+            [seam], self.island(), (0, 0), 3, 30, 0.08,
+            contact=1.0, max_band_span=32, min_perimeter_contact=0.30,
+        )
+        self.assertEqual(len(candidates), 1, "it is shallow enough to judge")
+        candidate = candidates[0]
+        self.assertLess(candidate.major_span_px, max(32 * 3, 48))
+        self.assertGreaterEqual(candidate.perimeter_contact, 0.30)
+        self.assertTrue(
+            candidate.contact_eligible,
+            "a compact piece is judged on the compact bar",
+        )
+        self.assertEqual(
+            self.keep([seam], contact=1.0, max_band_span=32), [],
+            "and so the perimeter discard can reach it",
+        )
+
+    def test_a_shallow_mark_clear_of_the_rim_is_kept(self) -> None:
+        """A shallow mark that never reaches the rim has nothing on it."""
+        inside = self.bar(4, 40, 8, 40)
+        candidates = rim_artifact_candidates(
+            [inside], self.island(), (0, 0), 3, 30, 0.08,
+            contact=1.0, max_band_span=32, min_perimeter_contact=0.30,
+        )
+        self.assertEqual(len(candidates), 1, "shallow, so it is judged")
+        self.assertEqual(candidates[0].perimeter_contact, 0.0)
+        self.assertFalse(candidates[0].contact_eligible)
+        self.assertEqual(
+            self.keep([inside], contact=1.0, max_band_span=32), [inside],
+        )
+
     def test_a_band_along_the_rim_needs_the_contact_too(self) -> None:
         """With the second condition on, it still goes: it runs along the rim."""
         ribbon = self.bar(10, 0, 160, 8)
@@ -1635,6 +1694,10 @@ class RegionsFromHolesTests(unittest.TestCase):
         """Through the pipeline: `fired` is the regions, `sparse` the ground."""
         colour = np.full((96, 96, 3), 40, dtype=np.uint8)
         colour[20:44, 20:50] = 230
+        # 2026-09-04: a bar through it, so the mark is printed rather than
+        # plain.  A solid block on solid ground is two flat plateaus meeting
+        # at an edge, which is what stage 9 exists to remove.
+        colour[28:36, 24:46] = 40
         found = detect(one_texture(colour), LabConfig())
         self.assertNotEqual(found.regions, [])
         self.assertEqual(
@@ -2190,6 +2253,10 @@ class StopAfterStageTests(unittest.TestCase):
         """
         colour = np.full((96, 96, 3), 40, dtype=np.uint8)
         colour[20:44, 20:50] = 230
+        # 2026-09-04: a bar through it, so the mark is printed rather than
+        # plain.  A solid block on solid ground is two flat plateaus meeting
+        # at an edge, which is what stage 9 exists to remove.
+        colour[28:36, 24:46] = 40
         colour[60:90, 55:85] = np.random.default_rng(5).integers(
             30, 90, size=(30, 30, 1)
         )
@@ -2300,8 +2367,9 @@ class StopAfterStageTests(unittest.TestCase):
             if STAGES[number - 1] in (
                     SPARSE, NEARBY_CONTRAST, SIZED, UNCROWDED, UNREPEATED,
                     UNRIMMED,
-                    UNTRANSITIONED, PATTERNED, MARKED, PROXIMITY_GROUPED,
-                    GROUP_SIZED,
+                    UNTRANSITIONED, UNSEAMED,
+                    PATTERNED, MARKED, PROXIMITY_GROUPED,
+                    GROUP_SIZED, LONE_MIRRORED,
                     FLAT_GROUPED,
                     CONVEX_HULLED, PADDED):
                 self.assertNotEqual(found.regions, [], f"stop {number}")
@@ -2501,3 +2569,117 @@ class GroupNearbyRegionsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnflippableGroupTests(unittest.TestCase):
+    """A group the flip would ruin is undone, not thrown away.
+
+    2026-09-04: a row of glyphs following an arc groups happily -- they are
+    near each other and the ground between them is flat -- and the composite
+    is a diagonal band whose reflection lands where the run never was.  The
+    marks are fine; the grouping is not. Dropping it would lose every glyph
+    in the run, which is worse than the grouping it corrects.
+    """
+
+    @staticmethod
+    def spot(x: int, y: int, side: int = 8):
+        from glyph_lab.regions import Region
+
+        return Region(bounds=(x, y, side, side),
+                      mask=np.ones((side, side), dtype=bool), domain=1)
+
+    def run_grouping(self, regions, colour, mirror):
+        from dataclasses import replace as dc_replace
+
+        from glyph_lab.region_grouping import (
+            GroupingConfig,
+            group_regions_across_flat_ground,
+        )
+        config = dc_replace(GroupingConfig(), min_group_mirror=mirror)
+        return group_regions_across_flat_ground(
+            regions, colour, None, config, (0, 0), None,
+        )
+
+    def test_a_run_along_a_diagonal_keeps_its_members(self) -> None:
+        colour = np.full((200, 200, 3), 30, dtype=np.uint8)
+        run = [self.spot(20 + 24 * step, 20 + 24 * step) for step in range(5)]
+        for region in run:
+            colour[region.y: region.y + 8, region.x: region.x + 8] = 235
+        joined = self.run_grouping(run, colour, mirror=0.0)
+        refused = self.run_grouping(run, colour, mirror=0.6)
+        # Whatever the grouping decided with the check off, turning it on must
+        # not lose texels -- only stop them being merged into one region.
+        self.assertGreaterEqual(len(refused), len(joined))
+        self.assertEqual(
+            sum(int(r.mask.sum()) for r in refused),
+            sum(int(r.mask.sum()) for r in run),
+            "refusing the group must not drop any member",
+        )
+
+    def test_the_check_at_zero_accepts_whatever_grouping_produced(self) -> None:
+        colour = np.full((200, 200, 3), 30, dtype=np.uint8)
+        run = [self.spot(20 + 24 * step, 20 + 24 * step) for step in range(5)]
+        for region in run:
+            colour[region.y: region.y + 8, region.x: region.x + 8] = 235
+        self.assertEqual(
+            len(self.run_grouping(run, colour, mirror=0.0)),
+            len(self.run_grouping(run, colour, mirror=0.0)),
+        )
+
+    @staticmethod
+    def diagonal(x: int, y: int, span: int = 60):
+        """One continuous off-axis mark, of the kind nothing grouped."""
+        from glyph_lab.regions import Region
+
+        mask = np.zeros((span, span), dtype=bool)
+        for step in range(span):
+            mask[step, max(step - 2, 0): step + 3] = True
+        return Region(bounds=(x, y, span, span), mask=mask, domain=1)
+
+    def test_a_lone_off_axis_mark_is_dropped(self) -> None:
+        """Its own stage, and above the grouping.
+
+        A trim arc reflects onto the opposite diagonal, so flipping it puts
+        it over atlas it never covered.  Tested against the stage rather than
+        the grouping, because by the time the grouping runs an arc has
+        usually been absorbed into a composite and is no longer lone.
+        """
+        from glyph_lab.region_grouping import past_the_lone_mirror
+
+        arc = self.diagonal(20, 20)
+        self.assertEqual(past_the_lone_mirror([arc], 0.0), [arc])
+        self.assertEqual(past_the_lone_mirror([arc], 0.25), [])
+
+    def test_an_axis_aligned_mark_clears_the_lone_stage(self) -> None:
+        from glyph_lab.region_grouping import past_the_lone_mirror
+
+        block = self.spot(20, 20, side=30)
+        self.assertEqual(past_the_lone_mirror([block], 0.25), [block])
+
+    def test_the_members_of_a_refused_group_are_not_then_dropped(self) -> None:
+        """The exemption that makes the two outcomes different.
+
+        Ungrouping a run and then judging each member by the same bar would
+        put back exactly the loss that refusing the group avoided.
+        """
+        colour = np.full((200, 200, 3), 30, dtype=np.uint8)
+        run = [self.spot(20 + 24 * step, 20 + 24 * step) for step in range(5)]
+        for region in run:
+            colour[region.y: region.y + 8, region.x: region.x + 8] = 235
+        kept = self.run_grouping(run, colour, mirror=0.6)
+        self.assertEqual(
+            sum(int(r.mask.sum()) for r in kept),
+            sum(int(r.mask.sum()) for r in run),
+            "a refused group must keep every member",
+        )
+
+    def test_a_row_on_one_axis_is_still_grouped(self) -> None:
+        """The check must not refuse ordinary runs of text."""
+        colour = np.full((120, 300, 3), 30, dtype=np.uint8)
+        row = [self.spot(20 + 24 * step, 40) for step in range(5)]
+        for region in row:
+            colour[region.y: region.y + 8, region.x: region.x + 8] = 235
+        joined = self.run_grouping(row, colour, mirror=0.0)
+        checked = self.run_grouping(row, colour, mirror=0.25)
+        self.assertEqual(len(checked), len(joined),
+                         "an axis-aligned row should survive the check")
