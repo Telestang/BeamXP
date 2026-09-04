@@ -73,6 +73,13 @@ glyph_corpus/
 glyph_corpus_selection.json
 glyph_doorcards_selection.json
 
+# Labelling sessions from glyph_lab's 'Label detections' export: crops of
+# every region, which are regenerable, beside a labels.json that is not --
+# it is hand-made judgements. Ignored for the crops' bulk, so keep a copy
+# of the manifest somewhere before deleting a session you care about.
+glyph_labelled_data/
+etkc_pair_selection.json
+
 # Local reveal GIF scratch/output assets
 reveal_gif_work/
 
