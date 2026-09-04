@@ -650,6 +650,13 @@ class GlyphLab(tk.Tk):
         ttk.Button(panel, text="Run detection", command=self.run_detection).pack(
             fill="x", pady=(8, 2)
         )
+        # 2026-09-04: labelling is a judgement about the stage on screen, so it
+        # is reached from here rather than from a menu -- the stage picker and
+        # the parameters that produced it are both in this panel, and the
+        # export is only meaningful together with them.
+        ttk.Button(
+            panel, text="Label detections…", command=self.open_label_window,
+        ).pack(fill="x", pady=(0, 2))
         ttk.Separator(panel).pack(fill="x", pady=8)
 
         # Generated from ViewOptions for the same reason the sections above are
@@ -904,6 +911,87 @@ class GlyphLab(tk.Tk):
             else:
                 overrides[entry.name] = float(raw)
         return replace(defaults, **overrides)
+
+    def label_subjects(self) -> list:
+        """Every texture's regions as the selected stage left them.
+
+        The zoomed texture alone when one is open, the whole corpus otherwise:
+        zooming in is already the gesture for "this one", and labelling a
+        contact sheet of eight atlases in one sitting is the other thing this
+        is for.
+        """
+        from glyph_lab.label_window import LabelSubject
+
+        stage = self.stage
+        wanted = (
+            [t for t in self.textures if t.name == self.zoomed]
+            if self.zoomed else list(self.textures)
+        )
+        subjects = []
+        for texture in wanted:
+            found = self.results.get(texture.name)
+            if found is None:
+                continue
+            regions = found.regions_at(stage)
+            if not regions:
+                continue
+            subjects.append(
+                LabelSubject(
+                    name=texture.name,
+                    stage=stage or "final",
+                    colour=texture.colour,
+                    # The response the stage picker draws is a mask, not a
+                    # continuous field, so the edge crop comes from the marks
+                    # that survived rather than from a response this window
+                    # would have to recompute per domain.
+                    edges=found.fired,
+                    regions=tuple(regions),
+                )
+            )
+        return subjects
+
+    def open_label_window(self) -> None:
+        """Open the labelling modal over the current stage's regions."""
+        from tkinter import messagebox
+
+        from glyph_lab.label_window import LabelWindow
+
+        if self._busy:
+            messagebox.showinfo(
+                "Still detecting", "Wait for the run to finish.", parent=self,
+            )
+            return
+        subjects = self.label_subjects()
+        if not subjects:
+            messagebox.showinfo(
+                "No regions",
+                "This stage recorded no regions to label. Texel-only stages "
+                "(the threshold) have none by design -- pick a stage from "
+                "the sparse field onward.",
+                parent=self,
+            )
+            return
+        LabelWindow(
+            self, subjects, self.labelling_parameters(),
+            initial_dir=Path.cwd(),
+        )
+
+    def labelling_parameters(self) -> dict:
+        """Everything needed to reproduce the region set being labelled."""
+        from dataclasses import asdict
+
+        return {
+            "stage": self.stage or "final",
+            "source": self.source_var.get(),
+            "detector": (
+                "normal" if is_normal_source(self.source_var.get()) else "colour"
+            ),
+            "config": asdict(
+                self.current_normal_config()
+                if is_normal_source(self.source_var.get())
+                else self.current_config()
+            ),
+        }
 
     def _on_stage_change(self, _event: object = None) -> None:
         """Pick a stage.  Turning capture on or off needs a fresh run.
