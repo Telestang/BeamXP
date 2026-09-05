@@ -1425,6 +1425,8 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                 ),
             ]
             progress_messages: list[str] = []
+            progress_events: list[dict[str, object]] = []
+            emit_texture_event = progress_events.append
 
             with (
                 patch("mesh_segmentation_transform.beamxp_transform_sym_mesh_POC.scan_vehicle_archive", return_value=object()) as scan,
@@ -1437,6 +1439,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
                     tmp / "unpacked_output",
                     ["scintilla_dashboard", "scintilla_dash_controls"],
                     progress=progress_messages.append,
+                    progress_events=emit_texture_event,
                 )
 
             scan.assert_called_once()
@@ -1457,6 +1460,7 @@ class TextureCorrectionIntegrationTests(unittest.TestCase):
             self.assertEqual(report["missing"], [])
             self.assertTrue(any("Texture correction:" in message for message in progress_messages))
             self.assertTrue(any("finished" in message for message in progress_messages))
+            self.assertIs(export.call_args.kwargs["progress"], emit_texture_event)
 
     def test_export_auto_includes_only_mirrored_dependencies_sharing_an_atlas(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

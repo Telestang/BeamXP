@@ -34,6 +34,7 @@ def task(
     scope: tuple[str, ...] = ("a",),
     *,
     detect: bool = True,
+    material_layer_scope: tuple[str, str] = ("", ""),
 ):
     parts = tuple(
         type("P", (), {"key": name})() for name in scope
@@ -41,6 +42,7 @@ def task(
     return rhd.TextureCorrectionTask(
         member=member, material=material, part_scope=parts,
         masks=None, part_group_index=0, detect=detect,
+        material_layer_scope=material_layer_scope,
     )
 
 
@@ -139,6 +141,33 @@ class GroupResolutionTests(unittest.TestCase):
         rhd.assign_group_detection_size(tasks, sizes.get)
         self.assertEqual(tasks[0].detection_size, (4096, 4096))
         self.assertEqual(tasks[1].detection_size, (1024, 1024))
+
+    def test_mutually_exclusive_skin_materials_do_not_share_evidence(self) -> None:
+        """A brown trim false positive must not correct the black trim."""
+        tasks = [
+            task(
+                "black_b.color.dds", "interior",
+                material_layer_scope=("main.materials.json", "interior"),
+            ),
+            task(
+                "black_nm.normal.dds", "interior",
+                material_layer_scope=("main.materials.json", "interior"),
+            ),
+            task(
+                "brown_b.color.dds", "interior",
+                material_layer_scope=("skin.materials.json", "interior.brown"),
+            ),
+        ]
+
+        groups = rhd.shared_layer_task_groups(tasks)
+
+        self.assertEqual(
+            [[entry.member for _index, entry in group] for group in groups],
+            [
+                ["black_b.color.dds", "black_nm.normal.dds"],
+                ["brown_b.color.dds"],
+            ],
+        )
 
     def test_an_unreadable_member_does_not_stop_the_others(self) -> None:
         tasks = [task("colour.dds", "interior"), task("broken.dds", "interior")]

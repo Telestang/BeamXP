@@ -171,6 +171,7 @@ def generate_daes(
     jbeam_positioned_flexbodies: set[str],
     baked_shared_specs: list[BakedMeshSpec],
     texture_flip_ids: set[str] | None = None,
+    progress: Callable[[int, int, str], None] | None = None,
 ) -> list[Path]:
     texture_flip_ids = texture_flip_ids or set()
     # Per-mesh display material scope: which UV island(s) to reflect. A
@@ -203,7 +204,9 @@ def generate_daes(
         set(objects_by_dae) | set(baked_by_dae),
         key=lambda item: (str(item[0]).lower(), item[1].lower()),
     )
-    for dae_source_zip, dae_path in dae_keys:
+    for dae_index, (dae_source_zip, dae_path) in enumerate(dae_keys, start=1):
+        if progress is not None:
+            progress(dae_index - 1, len(dae_keys), dae_path)
         object_pairs = objects_by_dae.get((dae_source_zip, dae_path), [])
         baked_specs = baked_by_dae.get((dae_source_zip, dae_path), [])
         tree = parse_dae(dae_source_zip, dae_path)

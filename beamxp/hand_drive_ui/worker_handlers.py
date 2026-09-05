@@ -37,6 +37,9 @@ class WorkerHandlersMixin:
         if kind == "variant_hands_done":
             self._handle_variant_hands_done(payload)
             return
+        if kind == "build_progress":
+            self._handle_build_progress(payload)
+            return
         if kind == "status":
             self.status_var.set(str(payload))
             return
@@ -69,6 +72,54 @@ class WorkerHandlersMixin:
             self._show_error("Operation failed", str(payload))
             self.status_var.set("Operation failed")
         self._refresh_all()
+
+    def _handle_build_progress(self, payload: object) -> None:
+        """Show a build stage and its real current-stage work count."""
+        if not isinstance(payload, dict):
+            return
+        try:
+            stage = int(payload.get("stage") or 0)
+            stage_total = int(payload.get("stage_total") or 0)
+        except (TypeError, ValueError):
+            return
+        message = str(payload.get("message") or "Working...")
+        prefix = (
+            f"Stage {stage}/{stage_total} — "
+            if stage > 0 and stage_total > 0
+            else ""
+        )
+        phase = str(payload.get("phase") or "")
+        current = payload.get("current")
+        total = payload.get("total")
+        try:
+            current = int(current) if current is not None else None
+            total = int(total) if total is not None else None
+        except (TypeError, ValueError):
+            current = total = None
+
+        if phase == "build_domain_masks" and total and current is not None:
+            message = f"UV masks — {current}/{total} atlas files"
+        elif phase == "correct_textures" and total and current is not None:
+            remaining = int(payload.get("remaining_corrections") or 0)
+            workers = int(payload.get("workers") or 1)
+            message = (
+                f"Texture correction — {current}/{total} groups complete; "
+                f"{remaining} map corrections remaining ({workers} worker(s))"
+            )
+
+        self.status_var.set(prefix + message)
+        if not hasattr(self, "busy_progress"):
+            return
+        if total is not None and total > 0 and current is not None:
+            self.busy_progress.stop()
+            self.busy_progress.configure(
+                mode="determinate",
+                maximum=total,
+                value=max(0, min(current, total)),
+            )
+        else:
+            self.busy_progress.configure(mode="indeterminate", value=0)
+            self.busy_progress.start(12)
 
     def _handle_parts_success(self, payload: object) -> None:
         seq, context, reset_view, selected, future = payload

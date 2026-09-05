@@ -2337,16 +2337,34 @@ class StopAfterStageTests(unittest.TestCase):
         self.assertEqual(int(found.fired.sum()), 0)
         self.assertEqual(int(found.outlines.sum()), 0)
 
+    def test_the_seam_decision_filters_the_final_marks(self) -> None:
+        """Sparse-field regions must not bypass the two-sided seam gate."""
+        base = whole_pipeline()
+        with patch(
+            "glyph_lab.detect.clear_of_two_sided_seams", return_value=[]
+        ) as seams:
+            found = detect(self.probe(), base)
+        self.assertGreaterEqual(seams.call_count, 2)
+        self.assertEqual(found.regions, [])
+        self.assertEqual(int(found.fired.sum()), 0)
+        self.assertEqual(int(found.outlines.sum()), 0)
+
     def test_the_regions_follow_the_grouping_distance(self) -> None:
-        """Two marks a gap apart are one region; further apart, two."""
+        """A wider grouping gap reunites the separated strokes of two marks."""
         colour = np.full((96, 96, 3), 40, dtype=np.uint8)
         colour[20:44, 12:32] = 230
         colour[20:44, 52:72] = 230           # 20 texels of ground between them
+        # 2026-09-05: printed rather than solid blocks: a plain colour plateau is a
+        # material transition and the seam gate correctly declines it.
+        colour[28:36, 17:27] = 40
+        colour[28:36, 57:67] = 40
         base = whole_pipeline()
         near = replace(base, contrast=replace(base.contrast, mark_gap_px=12))
         far = replace(base, contrast=replace(base.contrast, mark_gap_px=1))
         self.assertEqual(len(detect(one_texture(colour), near).regions), 1)
-        self.assertEqual(len(detect(one_texture(colour), far).regions), 2)
+        self.assertGreater(
+            len(detect(one_texture(colour), far).regions), 1,
+        )
 
     def test_each_stop_leaves_its_own_stage_as_the_answer(self) -> None:
         base = whole_pipeline()

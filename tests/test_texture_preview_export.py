@@ -2670,6 +2670,13 @@ class MultiPartPreviewTests(unittest.TestCase):
         self.assertIn("preview_export", phases)
         self.assertIn("resolve_materials", phases)
         self.assertIn("build_domain_masks", phases)
+        correction_updates = [
+            event for event in events
+            if event["phase"] == "correct_textures" and event["event"] == "progress"
+        ]
+        self.assertEqual(len(correction_updates), 1)
+        self.assertEqual(correction_updates[0]["completed_groups"], 1)
+        self.assertEqual(correction_updates[0]["remaining_corrections"], 0)
         self.assertIn("export_part_dae", phases)
         self.assertIn("write_preview_report", phases)
         reported_phases = [entry["phase"] for entry in report["phase_timings"]]
@@ -3058,11 +3065,18 @@ class PerMeshCorrectionJobTests(unittest.TestCase):
     def _part(self, key: str):
         return SimpleNamespace(key=key, node_id=key, node_name=key, label=key)
 
-    def _binding(self, material: str, stage_key: str = "baseColorMap"):
+    def _binding(
+        self,
+        material: str,
+        stage_key: str = "baseColorMap",
+        *,
+        material_key: str | None = None,
+        materials_member: str = "vehicles/lc500/main.materials.json",
+    ):
         return SimpleNamespace(
             dae_material=material,
-            material_key=f"{material}_on",
-            materials_member="vehicles/lc500/main.materials.json",
+            material_key=material_key or f"{material}_on",
+            materials_member=materials_member,
             stage_key=stage_key,
             kind="colour",
         )
@@ -3120,6 +3134,46 @@ class PerMeshCorrectionJobTests(unittest.TestCase):
         self.assertEqual(jobs[0].symbols, frozenset({"lc500_screens-material"}))
         self.assertEqual(
             jobs[1].symbols, frozenset({"lc500_centralscreen-material"})
+        )
+
+    def test_skin_material_definitions_on_one_dae_material_stay_separate(self) -> None:
+        """A skin's detector evidence is not evidence for another skin."""
+        interior = self._part("etkc_doorpanel_R")
+        jobs = self._jobs(
+            [
+                (
+                    interior,
+                    self._binding(
+                        "etkc_interior",
+                        material_key="etkc_interior",
+                    ),
+                ),
+                (
+                    interior,
+                    self._binding(
+                        "etkc_interior",
+                        material_key="etkc_interior.skin_interior.brown",
+                        materials_member="vehicles/etkc/skin.materials.json",
+                    ),
+                ),
+            ]
+        )
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(
+            [job.evidence_scope for job in jobs],
+            [
+                (
+                    "etkc_interior",
+                    "vehicles/lc500/main.materials.json",
+                    "etkc_interior",
+                ),
+                (
+                    "etkc_interior",
+                    "vehicles/etkc/skin.materials.json",
+                    "etkc_interior.skin_interior.brown",
+                ),
+            ],
         )
 
     def test_stage_keys_of_one_material_share_a_job(self) -> None:
@@ -3370,6 +3424,43 @@ class SplitTextureManifestTests(unittest.TestCase):
 
         self.assertEqual(len(materials), 1)
         self.assertNotIn("partKeys", materials[0])
+
+    def test_a_single_colour_and_split_scalar_scope_reunite_in_one_material(self) -> None:
+        colour = self._result(0, [])
+        colour.report.update(
+            {
+                "part_scope": ["door"],
+                "material_scope": ["interior"],
+            }
+        )
+        ao = self._result(0, [])
+        ao.texture_member = "vehicles/lc500/textures/screen_ao.dds"
+        ao.png_path = Path("screen_ao_rhd.png")
+        ao.dds_path = Path("screen_ao_rhd.dds")
+        ao.report.update(
+            {
+                "part_scope": ["door"],
+                "material_scope": ["interior"],
+                "layer_bindings": [
+                    {
+                        **ao.report["layer_bindings"][0],
+                        "stage_key": "ambientOcclusionMap",
+                        "kind": "occlusion",
+                    }
+                ],
+            }
+        )
+
+        materials = self._manifest([colour, ao])["materials"]
+
+        self.assertEqual(len(materials), 1)
+        self.assertEqual(
+            materials[0]["maps"],
+            {
+                "baseColorMap": "screen_rhd.png",
+                "ambientOcclusionMap": "screen_ao_rhd.png",
+            },
+        )
 
     def _tell_tale(self, index: int, dae_material: str) -> rhd.RhdTextureResult:
         """One of several DAE materials sharing a single materials-JSON entry."""

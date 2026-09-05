@@ -651,7 +651,11 @@ class ContrastConfig:
     transition_max_fill: float = 0.30
     transition_close_gap_px: int = 6
     transition_min_enclosed_texels: int = 512
-    transition_min_body_void_share: float = 0.03
+    # 2026-09-05: a broad textured trim seam need not enclose quiet ground.
+    # The etkc brown door boundary is an open 102x227 trace with 15.7% body
+    # void; 0.20 still asks for a sparse, unclosed candidate before declining
+    # it, rather than treating texture detail as proof that it is a glyph.
+    transition_min_body_void_share: float = 0.20
     transition_max_interior_detail: float = 6.0
     transition_min_long_aspect: float = 4.5
     # 2026-08-30: tiny, dense dashes on a material boundary are below the
@@ -3567,7 +3571,7 @@ def regions_in_domain(
             probe.observe(RegionObservation(
                 stage=UNSEAMED, texture_name=texture_name, domain=label,
                 region=region, features=side_features(evidence),
-                discarded=not divides_two_grounds(
+                discarded=divides_two_grounds(
                     evidence, contrast.seam_min_tone_gap,
                     contrast.seam_max_side_detail,
                     contrast.seam_min_side_balance,
@@ -3756,6 +3760,23 @@ def regions_in_domain(
         ),
         compact_max_enclosure=contrast.transition_compact_max_enclosure,
         compact_rim_max_span=contrast.transition_compact_rim_max_span_px,
+    )
+    # 2026-09-05: the sparse-field branch has rebuilt `found` since the
+    # earlier seam pass.  It can therefore recreate a material boundary that
+    # was correctly discarded there; apply the same final decision that the
+    # rim and material-transition filters already receive below.
+    final_side_measurements = {
+        id(region): measure_region_sides(
+            region, colour, domain, offset, contrast.seam_side_reach_px,
+        )
+        for region in found
+    } if contrast.seam_min_tone_gap > 0 else {}
+    found = clear_of_two_sided_seams(
+        found, colour, domain, offset, contrast.seam_side_reach_px,
+        contrast.seam_min_tone_gap, contrast.seam_max_side_detail,
+        contrast.seam_min_side_balance, contrast.seam_min_side_coherence,
+        contrast.seam_min_enclosed_texels,
+        measurements=final_side_measurements,
     )
     painted, lit = paint_mark_regions(
         found, lit.shape, offset, contrast.mark_gap_px, contrast

@@ -62,6 +62,19 @@ class MaterialTransitionProbeTests(unittest.TestCase):
         self.assertTrue(trace.discarded)
         self.assertTrue(loop.discarded)
 
+    def test_broad_open_trace_can_be_textured_material_not_a_glyph(self) -> None:
+        """The etkc brown door seam is large, sparse, and only shallowly closed."""
+        trace = self.candidate(
+            (3901, 270, 102, 227), np.ones((227, 102), dtype=bool),
+            detail=19.0, eligible=True,
+        )
+        trace.body_void_share = 0.157
+        trace.enclosed_texels = 17
+        classify_material_transition_candidates(
+            [trace], 512, 0.20, 6.0, 4.5, 10, 3.5, 6_000, 3, 2.0, 3,
+        )
+        self.assertTrue(trace.discarded)
+
     def test_short_dense_trace_is_discarded_below_the_broad_gate(self) -> None:
         trace = self.candidate((0, 0, 34, 9), np.ones((9, 34), dtype=bool))
         classify_material_transition_candidates(

@@ -91,6 +91,7 @@ class BuildAndPreviewMixin:
         if hasattr(self, "busy_progress"):
             if busy:
                 self.busy_progress.grid()
+                self.busy_progress.configure(mode="indeterminate", value=0)
                 self.busy_progress.start(12)
             else:
                 self.busy_progress.stop()
@@ -163,6 +164,7 @@ class BuildAndPreviewMixin:
                 install=install,
                 mods_folder=Path(self.mods_folder_var.get()) if install else None,
                 progress=lambda message: self.worker_queue.put(("status", message)),
+                progress_events=lambda event: self.worker_queue.put(("build_progress", event)),
             )
             self.worker_queue.put(("build_success", result))
         except Exception as exc:

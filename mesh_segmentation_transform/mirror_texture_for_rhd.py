@@ -2767,6 +2767,13 @@ class TextureCorrectionJob:
     part: DaePart
     material: str
     symbols: frozenset[str]
+    materials_member: str = ""
+    material_key: str = ""
+
+    @property
+    def evidence_scope(self) -> tuple[str, str, str]:
+        """The DAE material and concrete material definition sharing evidence."""
+        return self.material, self.materials_member, self.material_key
 
     @property
     def label(self) -> str:
@@ -2931,7 +2938,7 @@ def group_shareable_jobs(
     groups: list[list[tuple[TextureCorrectionJob, DomainMasks]]] = []
     for job, masks in jobs:
         for group in groups:
-            if group[0][0].material != job.material:
+            if group[0][0].evidence_scope != job.evidence_scope:
                 continue
             if all(
                 domains_can_share_a_correction(masks, other) for _job, other in group
@@ -3000,7 +3007,7 @@ def correction_jobs_for_texture(
     Several stage keys of one material -- a base colour and its emissive --
     share a job, because they share the layout.
     """
-    jobs: dict[tuple[str, str], TextureCorrectionJob] = {}
+    jobs: dict[tuple[str, str, str, str], TextureCorrectionJob] = {}
     for part, binding in entries:
         material = _normalise_material_alias(binding.dae_material)
         if not material:
@@ -3008,10 +3015,25 @@ def correction_jobs_for_texture(
         symbols = frozenset(material_symbols_for_binding(loaded, binding))
         if not symbols:
             continue
-        key = (part.key, material)
+        # 2026-09-05: skin materials can share a DAE material and UV layout
+        # while carrying mutually exclusive colour/normal maps. Their glyph
+        # evidence must not cross that boundary: a mark visible only in brown
+        # interior trim otherwise becomes a correction in black and alcantara.
+        key = (
+            part.key,
+            material,
+            str(binding.materials_member),
+            str(binding.material_key),
+        )
         existing = jobs.get(key)
         if existing is None:
-            jobs[key] = TextureCorrectionJob(part, material, symbols)
+            jobs[key] = TextureCorrectionJob(
+                part,
+                material,
+                symbols,
+                str(binding.materials_member),
+                str(binding.material_key),
+            )
         else:
             jobs[key] = replace(existing, symbols=existing.symbols | symbols)
     return list(jobs.values())
@@ -7706,6 +7728,7 @@ def build_rhd_texture(
     part_filter: tuple[str, ...] = (),
     part_scope: list[DaePart] | None = None,
     material_scope: tuple[str, ...] = (),
+    material_layer_scope: tuple[tuple[str, str], ...] = (),
     masks: DomainMasks | None = None,
     sweep_cache: dict[str, object] | None = None,
     written_companions: set[str] | None = None,
@@ -7810,6 +7833,17 @@ def build_rhd_texture(
             (part, binding)
             for part, binding in candidates
             if _normalise_material_alias(binding.dae_material) in wanted_materials
+        ]
+    if material_layer_scope:
+        wanted_layers = {
+            (str(materials_member), str(material_key))
+            for materials_member, material_key in material_layer_scope
+        }
+        candidates = [
+            (part, binding)
+            for part, binding in candidates
+            if (str(binding.materials_member), str(binding.material_key))
+            in wanted_layers
         ]
     if not candidates:
         raise ValueError(f"No part in the DAE resolves to {texture_member}")
@@ -9346,11 +9380,11 @@ def build_rhd_texture(
         ],
         "material_aliases": list(material_aliases),
         "switch_base_aliases": list(switch_base_aliases),
-        # Named only for one of several corrections of this texture. Absent
-        # means the correction speaks for the alias wherever it is bound.
+        # A concrete materials-JSON definition can split a shared scalar map
+        # into several files while its colour map has only one. Keep their
+        # common part scope in both reports so the manifest reunites the maps.
         **(
             {
-                "part_group": part_group_index,
                 "part_scope": sorted(
                     {
                         key
@@ -9359,6 +9393,13 @@ def build_rhd_texture(
                         if key
                     }
                 ),
+                **({"part_group": part_group_index} if part_group_index else {}),
+            }
+            if part_group_index or material_layer_scope
+            else {}
+        ),
+        **(
+            {
                 "material_scope": sorted(
                     {
                         _normalise_material_alias(name)
@@ -9366,8 +9407,12 @@ def build_rhd_texture(
                         if _normalise_material_alias(name)
                     }
                 ),
+                "material_layer_scope": [
+                    [str(materials_member), str(material_key)]
+                    for materials_member, material_key in material_layer_scope
+                ],
             }
-            if part_group_index
+            if material_scope or material_layer_scope
             else {}
         ),
         "source_materials": source_materials,
@@ -10148,6 +10193,7 @@ class TextureCorrectionTask:
     part_scope: tuple[DaePart, ...]
     masks: DomainMasks
     part_group_index: int
+    material_layer_scope: tuple[str, str] = ("", "")
     detect: bool = True
     # 2026-09-02: the resolution every layer of this material detects at -- the
     # finest of them, which is normally the base colour.  None means detect at
@@ -10223,6 +10269,7 @@ def shared_layer_task_groups(
     for index, task in enumerate(tasks):
         key = (
             task.material,
+            task.material_layer_scope,
             tuple(sorted(str(part.key) for part in task.part_scope)),
         )
         grouped.setdefault(key, []).append((index, task))
@@ -10283,6 +10330,7 @@ def _run_texture_correction_task(
             context["relief_mser_config"],
             part_scope=list(task.part_scope),
             material_scope=(task.material,),
+            material_layer_scope=(task.material_layer_scope,),
             masks=task.masks,
             detection_session=context["session"],
             part_group_index=task.part_group_index,
@@ -10318,6 +10366,7 @@ def _record_texture_task_layer_evidence(
             context["relief_mser_config"],
             part_scope=list(task.part_scope),
             material_scope=(task.material,),
+            material_layer_scope=(task.material_layer_scope,),
             masks=task.masks,
             detection_session=context["session"],
             part_group_index=task.part_group_index,
@@ -10343,8 +10392,9 @@ def _run_texture_correction_task_group(
             _run_texture_correction_task(tasks[0], output_directory, context)
         ] if tasks else []
 
-    domain_hits_before = getattr(context["session"], "glyph_domain_hits", 0)
-    domain_misses_before = getattr(context["session"], "glyph_domain_misses", 0)
+    session = context.get("session")
+    domain_hits_before = getattr(session, "glyph_domain_hits", 0)
+    domain_misses_before = getattr(session, "glyph_domain_misses", 0)
     shared_layer_regions = SharedLayerRegionLedger()
     source_tasks = tuple(task for task in tasks if task.detect)
     prepass_errors = {
@@ -10374,8 +10424,8 @@ def _run_texture_correction_task_group(
                 "this source layer still ran on its own detector",
             )
         outcomes.append(outcome)
-    domain_hits = getattr(context["session"], "glyph_domain_hits", 0) - domain_hits_before
-    domain_misses = getattr(context["session"], "glyph_domain_misses", 0) - domain_misses_before
+    domain_hits = getattr(session, "glyph_domain_hits", 0) - domain_hits_before
+    domain_misses = getattr(session, "glyph_domain_misses", 0) - domain_misses_before
     if domain_hits:
         outcomes[0].log_lines.append(
             f"  [{tasks[0].material}] reused {domain_hits} unchanged UV "
@@ -10640,9 +10690,15 @@ def export_parts_preview(
                     continue
                 measured.append((job, masks))
 
-            merged: list[tuple[str, list[DaePart], DomainMasks]] = []
+            merged: list[
+                tuple[str, tuple[str, str], list[DaePart], DomainMasks]
+            ] = []
             for group in group_shareable_jobs(measured):
                 material = group[0][0].material
+                material_layer_scope = (
+                    group[0][0].materials_member,
+                    group[0][0].material_key,
+                )
                 # Never ``parts``: that is this function's own parameter, and
                 # the DAE export below iterates it to convert every selected
                 # mesh. Shadowing it left scintilla exporting one mesh instead
@@ -10651,7 +10707,9 @@ def export_parts_preview(
                 group_parts = [job.part for job, _masks in group]
                 first = group[0][1]
                 if len(group) == 1:
-                    merged.append((material, group_parts, first))
+                    merged.append((
+                        material, material_layer_scope, group_parts, first,
+                    ))
                     continue
                 same_domain = all(
                     np.array_equal(masks.mirror, first.mirror)
@@ -10665,7 +10723,9 @@ def export_parts_preview(
                     for job, _masks in group[1:]:
                         log(f"  {job.label}: same UV domain as an earlier mesh "
                             f"here; sharing one correction")
-                    merged.append((material, group_parts, first))
+                    merged.append((
+                        material, material_layer_scope, group_parts, first,
+                    ))
                     continue
                 log(
                     f"  {', '.join(job.part.label for job, _m in group)}: "
@@ -10690,7 +10750,9 @@ def export_parts_preview(
                         config, sweep_cache, log, force_mirrored_part_keys,
                     )
                     mask_cache[group_key] = group_masks
-                merged.append((material, group_parts, group_masks))
+                merged.append((
+                    material, material_layer_scope, group_parts, group_masks,
+                ))
             timing = record_phase(
                 phase_timings,
                 "build_domain_masks",
@@ -10713,7 +10775,9 @@ def export_parts_preview(
             )
             # A texture corrected once keeps the file name it has always had.
             scoped = len(merged) > 1
-            for index, (material, scope, masks) in enumerate(merged, start=1):
+            for index, (material, material_layer_scope, scope, masks) in enumerate(
+                merged, start=1,
+            ):
                 stage_keys = {
                     getattr(binding, "stage_key", "baseColorMap")
                     for _part, binding in entries
@@ -10740,6 +10804,7 @@ def export_parts_preview(
                         part_scope=tuple(scope),
                         masks=masks,
                         part_group_index=index if scoped else 0,
+                        material_layer_scope=material_layer_scope,
                         detect=detect,
                     )
                 )
@@ -10792,8 +10857,11 @@ def export_parts_preview(
         progress,
         "begin",
         "correct_textures",
-        f"Correcting {len(every_task)} texture job(s) on {workers} worker(s)",
+        f"Correcting {len(task_groups)} texture group(s) on {workers} worker(s)",
         texture_jobs=len(every_task),
+        texture_groups=len(task_groups),
+        completed_groups=0,
+        remaining_corrections=len(every_task),
         workers=workers,
     )
 
@@ -10825,6 +10893,31 @@ def export_parts_preview(
     # Outcomes are consumed in submission order, so the log, the result order
     # and therefore every output name are exactly what a serial pass produced.
     outcomes: dict[int, TextureCorrectionTaskOutcome] = {}
+    completed_groups = 0
+    completed_group_indexes: set[int] = set()
+
+    def report_completed_group(group_index: int) -> None:
+        nonlocal completed_groups
+        if group_index in completed_group_indexes:
+            return
+        completed_group_indexes.add(group_index)
+        completed_groups += 1
+        completed_corrections = sum(
+            len(task_groups[index]) for index in completed_group_indexes
+        )
+        emit_progress(
+            progress,
+            "progress",
+            "correct_textures",
+            f"Corrected {completed_groups}/{len(task_groups)} texture group(s)",
+            texture_jobs=len(every_task),
+            texture_groups=len(task_groups),
+            completed_groups=completed_groups,
+            completed_corrections=completed_corrections,
+            remaining_corrections=max(len(every_task) - completed_corrections, 0),
+            workers=workers,
+        )
+
     if workers > 1:
         with ProcessPoolExecutor(
             max_workers=workers,
@@ -10838,14 +10931,14 @@ def export_parts_preview(
             ),
         ) as pool:
             futures = {
-                group_index: pool.submit(
+                pool.submit(
                     _run_texture_correction_task_group_in_worker,
                     tuple(task for _index, task in group),
                     output_directory,
-                )
+                ): group_index
                 for group_index, group in enumerate(task_groups)
             }
-            for group_index, future in futures.items():
+            for future, group_index in futures.items():
                 group = task_groups[group_index]
                 group_outcomes = future.result()
                 # Compatibility with single-task pool shims and callers from
@@ -10861,6 +10954,8 @@ def export_parts_preview(
                     ]
                 for (task_index, _task), outcome in zip(group, group_outcomes):
                     outcomes[task_index] = outcome
+                if not any(outcome.error for outcome in group_outcomes):
+                    report_completed_group(group_index)
 
         # A worker fails for reasons the same work in this process may not
         # have: four of them hold four GL contexts on one card, and a texture
@@ -10875,7 +10970,7 @@ def export_parts_preview(
                 f"running them again on the serial path"
             )
             lost_set = set(lost)
-            for group in task_groups:
+            for group_index, group in enumerate(task_groups):
                 if not any(index in lost_set for index, _task in group):
                     continue
                 retried_group = _run_texture_correction_task_group(
@@ -10892,8 +10987,10 @@ def export_parts_preview(
                         log(f"    {PurePosixPath(task.member).name}: "
                             f"recovered on the serial path")
                     outcomes[index] = retried
+                if not any(outcomes[index].error for index, _task in group):
+                    report_completed_group(group_index)
     else:
-        for group in task_groups:
+        for group_index, group in enumerate(task_groups):
             group_outcomes = _run_texture_correction_task_group(
                 tuple(task for _index, task in group),
                 output_directory,
@@ -10901,6 +10998,7 @@ def export_parts_preview(
             )
             for (index, _task), outcome in zip(group, group_outcomes):
                 outcomes[index] = outcome
+            report_completed_group(group_index)
 
     consumed = 0
     for member, held, tasks in planned:
@@ -10925,6 +11023,9 @@ def export_parts_preview(
         "correct_textures",
         f"Corrected {len(results)} texture job(s)",
         texture_jobs=len(every_task),
+        texture_groups=len(task_groups),
+        completed_groups=completed_groups,
+        remaining_corrections=0,
         workers=workers,
         seconds=timing["seconds"],
     )

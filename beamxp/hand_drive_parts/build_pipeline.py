@@ -611,6 +611,7 @@ def export_texture_correction_artifacts(
     artifact_root: Path,
     mesh_ids: Iterable[str],
     progress: Callable[[str], None] | None = None,
+    progress_events: Callable[[dict[str, object]], None] | None = None,
     shared_atlas_dependency_targets: dict[str, set[str]] | None = None,
     force_mirrored_dependency_ids: set[str] | None = None,
     whole_mesh_mirror_ids: set[str] | None = None,
@@ -838,6 +839,7 @@ def export_texture_correction_artifacts(
                 force_mirrored_part_keys=forced_part_keys,
                 texture_part_scope=texture_parts,
                 uv_flipped_materials=uv_flipped_materials,
+                progress=progress_events,
             )
             (job_dir / "texture_correction.log").write_text(
                 "\n".join(log_lines) + ("\n" if log_lines else ""),
@@ -956,6 +958,7 @@ def export_texture_correction_artifacts(
             artifact_root / "structural_mirror",
             deferred_forced_meshes,
             progress=progress,
+            progress_events=progress_events,
             force_mirrored_dependency_ids=deferred_forced_meshes,
             whole_mesh_mirror_ids=whole_mesh_mirror_ids,
             texture_member_scope_by_source=deferred_forced_scope,
@@ -5025,12 +5028,60 @@ def build_batch(
     install: bool = False,
     mods_folder: Path | None = None,
     progress: Callable[[str], None] | None = None,
+    progress_events: Callable[[dict[str, object]], None] | None = None,
 ) -> BuildResult:
-    def emit_progress(message: str) -> None:
-        if progress is not None:
-            progress(message)
+    stage_total = 8
 
-    emit_progress("Preparing build plan...")
+    def emit_stage(
+        stage: int,
+        phase: str,
+        message: str,
+        *,
+        current: int | None = None,
+        total: int | None = None,
+        **details: object,
+    ) -> None:
+        """Publish one stable build stage to text and structured listeners."""
+        label = f"Stage {stage}/{stage_total} — {message}"
+        if progress is not None:
+            progress(label)
+        if progress_events is not None:
+            event: dict[str, object] = {
+                "event": "update",
+                "stage": stage,
+                "stage_total": stage_total,
+                "phase": phase,
+                "message": message,
+            }
+            if current is not None:
+                event["current"] = current
+            if total is not None:
+                event["total"] = total
+            event.update(details)
+            progress_events(event)
+
+    def forward_texture_progress(event: dict[str, object]) -> None:
+        """Place the exporter's finer-grained events inside build stage five."""
+        if progress_events is None:
+            return
+        forwarded = dict(event)
+        forwarded["stage"] = 5
+        forwarded["stage_total"] = stage_total
+        phase = str(forwarded.get("phase") or "texture_correction")
+        if phase == "build_domain_masks":
+            index = int(forwarded.get("texture_index") or 0)
+            total = int(forwarded.get("texture_total") or 0)
+            if total > 0:
+                forwarded["current"] = index if forwarded.get("event") == "end" else max(index - 1, 0)
+                forwarded["total"] = total
+        elif phase == "correct_textures":
+            groups = int(forwarded.get("texture_groups") or 0)
+            if groups > 0:
+                forwarded["current"] = int(forwarded.get("completed_groups") or 0)
+                forwarded["total"] = groups
+        progress_events(forwarded)
+
+    emit_stage(1, "build_plan", "Preparing build plan...", current=0, total=1)
     variant_targets, skipped, source_hands = _selected_variant_targets_and_source_hands(
         context, conversion
     )
@@ -5179,12 +5230,37 @@ def build_batch(
                 + ". Select a steering reference, enter a global manual delta, or set per-part offsets."
             )
 
+    transform_dae_sources = {
+        (
+            (source.dae_source_zip or context.source_zip),
+            source.dae_path,
+        )
+        for mesh in object_modes
+        if (source := context.objects.get(structural_sources.get(mesh, mesh)))
+        is not None and source.dae_path
+    }
+    emit_stage(
+        1,
+        "build_plan",
+        f"Plan ready: {len(output_plans)} config output(s), "
+        f"{len(object_modes)} mesh transform(s) across "
+        f"{len(transform_dae_sources)} source DAE(s), "
+        f"{len(texture_correction_source_ids)} texture scope(s) queued",
+        current=1,
+        total=1,
+        config_outputs=len(output_plans),
+        mesh_transforms=len(object_modes),
+        source_daes=len(transform_dae_sources),
+        texture_scopes=len(texture_correction_source_ids),
+    )
+
     output_root = context.project_dir / "unpacked_output"
     build_dir = context.project_dir / "build"
-    emit_progress("Preparing build output...")
+    emit_stage(2, "prepare_output", "Preparing build output...", current=0, total=1)
     clean_dir(output_root)
     build_dir.mkdir(parents=True, exist_ok=True)
     output_vehicle_dir = output_root / context.vehicle_path
+    emit_stage(2, "prepare_output", "Build output prepared", current=1, total=1)
 
     baked_shared_specs: list[BakedMeshSpec] = []
     generated_configs: list[str] = []
@@ -5203,7 +5279,13 @@ def build_batch(
         "colladaRetargets": [],
     }
     if variant_targets:
-        emit_progress("Writing generated JBeam and config files...")
+        emit_stage(
+            3,
+            "write_generated_configs",
+            f"Writing generated JBeam and config files for {len(variant_targets)} variant(s)...",
+            current=0,
+            total=len(variant_targets),
+        )
         generated_configs.extend(write_generated_jbeam_and_configs(
             context,
             output_vehicle_dir,
@@ -5223,8 +5305,24 @@ def build_batch(
             authored_groups,
             slot_pair_plans,
         ))
+        emit_stage(
+            3,
+            "write_generated_configs",
+            "Generated JBeam and config files written",
+            current=len(variant_targets),
+            total=len(variant_targets),
+        )
+    else:
+        emit_stage(3, "write_generated_configs", "Generated JBeam/config work skipped", current=1, total=1)
     if generated_variant_targets and object_modes:
-        emit_progress("Generating transformed vehicle meshes...")
+        dae_total = max(len(transform_dae_sources), 1)
+        emit_stage(
+            4,
+            "generate_daes",
+            f"Generating transformed vehicle meshes across {len(transform_dae_sources)} DAE(s)...",
+            current=0,
+            total=dae_total,
+        )
         generated_daes = generate_daes(
             context,
             output_root,
@@ -5238,14 +5336,31 @@ def build_batch(
             context.jbeam_positioned_flexbodies,
             baked_shared_specs,
             texture_flip_ids,
+            progress=lambda current, total, dae: emit_stage(
+                4,
+                "generate_daes",
+                f"Generating transformed DAE {current + 1}/{total}: {Path(dae).name}",
+                current=current,
+                total=total,
+                dae=dae,
+            ),
         )
+        emit_stage(4, "generate_daes", "Transformed vehicle meshes generated", current=dae_total, total=dae_total)
+    else:
+        emit_stage(4, "generate_daes", "Transformed DAE work skipped", current=1, total=1)
     if generated_variant_targets and texture_correction_ids:
-        emit_progress(f"Running texture correction for {len(texture_correction_ids)} mesh(es)...")
+        emit_stage(
+            5,
+            "texture_correction",
+            f"Preparing texture correction for {len(texture_correction_ids)} mesh(es)...",
+            texture_scopes=len(texture_correction_source_ids),
+        )
         texture_correction_report = export_texture_correction_artifacts(
             context,
             context.project_dir / "build" / "texture_correction",
             texture_correction_source_ids,
-            progress=emit_progress,
+            progress=progress,
+            progress_events=forward_texture_progress,
             shared_atlas_dependency_targets=shared_atlas_dependency_targets,
             force_mirrored_dependency_ids=force_mirrored_dependency_ids,
             whole_mesh_mirror_ids=whole_mesh_mirror_ids,
@@ -5262,7 +5377,16 @@ def build_batch(
                 texture_correction_targets.setdefault(str(source_mesh), set()).update(
                     str(target) for target in targets
                 )
-        emit_progress("Integrating texture-corrected meshes...")
+        emit_stage(5, "texture_correction", "Texture correction complete", current=1, total=1)
+        texture_jobs = texture_correction_report.get("jobs", [])
+        job_count = len(texture_jobs) if isinstance(texture_jobs, list) else 0
+        emit_stage(
+            6,
+            "integrate_texture_correction",
+            f"Integrating {job_count} texture-correction export(s)...",
+            current=0,
+            total=1,
+        )
         texture_correction_report["integration"] = integrate_texture_correction_artifacts(
             context,
             output_root,
@@ -5278,12 +5402,16 @@ def build_batch(
         texture_correction_report["pruned"] = prune_unused_texture_correction_assets(
             output_root, output_vehicle_dir
         )
+        emit_stage(6, "integrate_texture_correction", "Texture-corrected artifacts integrated", current=1, total=1)
         report_path = texture_correction_report.get("reportPath")
         if isinstance(report_path, str) and report_path:
             Path(report_path).write_text(
                 json.dumps(texture_correction_report, indent=2) + "\n",
                 encoding="utf-8",
             )
+    else:
+        emit_stage(5, "texture_correction", "Texture correction skipped; no reflected texture meshes", current=1, total=1)
+        emit_stage(6, "integrate_texture_correction", "Texture-artifact integration skipped", current=1, total=1)
     if generated_variant_targets and object_modes:
         # After correction, not before: correction rebuilds a switched trigger's
         # row from the donor's jbeam, so a runtime rebind applied first is
@@ -5320,7 +5448,13 @@ def build_batch(
             ),
         )
     texture_correction_report["runtimeScreens"] = runtime_screen_patch
-    emit_progress("Writing original config outputs...")
+    emit_stage(
+        7,
+        "write_original_configs",
+        f"Writing {len(original_configs)} original-layout config output(s)...",
+        current=0,
+        total=2,
+    )
     generated_configs.extend(write_original_plate_configs(
         context,
         output_vehicle_dir,
@@ -5335,10 +5469,17 @@ def build_batch(
         generated_configs,
         output_config_sources(context, conversion),
     )
+    emit_stage(7, "write_original_configs", "Original-layout configs written", current=1, total=2)
     # Licence plates are generated as a separate pass over the written output
     # so plate logic stays fully decoupled from the handedness transforms.
     try:
-        emit_progress("Applying licence plate settings...")
+        emit_stage(
+            7,
+            "apply_plates",
+            f"Applying licence plate settings to {len(output_plans)} config output(s)...",
+            current=1,
+            total=2,
+        )
         plate_summary = plate_generator.apply_to_build(
             context,
             conversion,
@@ -5348,6 +5489,7 @@ def build_batch(
         )
     except plate_generator.PlateError as exc:
         raise RuntimeError(str(exc)) from exc
+    emit_stage(7, "apply_plates", "Licence plate settings applied", current=2, total=2)
     embedded_dir = output_root / "handedness_conversion"
     embedded_dir.mkdir(parents=True, exist_ok=True)
     delta = conversion.setdefault("delta", {})
@@ -5380,19 +5522,21 @@ def build_batch(
     installed_zip = None
     installed_plates_zip = None
     if write_zip:
-        emit_progress("Packaging XP conversion zip...")
+        package_steps = 2 if install else 1
+        emit_stage(8, "package", "Packaging XP conversion zip...", current=0, total=package_steps)
         package_name = package_name_for_context(context)
         package_zip = build_dir / package_name
         if install:
             package_zip = build_dir / f"{package_name}.installing"
         make_zip(output_root, package_zip)
+        emit_stage(8, "package", "XP conversion zip packaged", current=1, total=package_steps)
     if install:
         if package_zip is None:
             raise RuntimeError("Install requires zip build")
         if mods_folder is None:
             raise RuntimeError("Install requested without a mods folder")
         mods_folder.mkdir(parents=True, exist_ok=True)
-        emit_progress("Installing XP conversion zip...")
+        emit_stage(8, "install", "Installing XP conversion zip...", current=1, total=2)
         installed_zip = mods_folder / package_name_for_context(context)
         _atomic_move_file(package_zip, installed_zip)
         package_zip = installed_zip
@@ -5412,9 +5556,12 @@ def build_batch(
                 else:
                     plate_summary["libraryModInstalled"] = False
                 plate_summary["libraryModDesigns"] = plates_mod["designs"]
+        emit_stage(8, "install", "XP conversion installed", current=2, total=2)
+    elif not write_zip:
+        emit_stage(8, "package", "Packaging skipped for this build", current=1, total=1)
 
     save_conversion(context, conversion)
-    emit_progress("Build complete.")
+    emit_stage(8, "complete", "Build complete.", current=1, total=1)
     return BuildResult(
         unpacked_dir=output_root,
         package_zip=package_zip,
