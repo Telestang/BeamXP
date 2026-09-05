@@ -278,6 +278,7 @@ def detect_layer_marks(
     config: GlyphLabDetectorConfig = DEFAULT_GLYPH_LAB_CONFIG,
     steepness: np.ndarray | None = None,
     flat_ground: np.ndarray | None = None,
+    domain_cache: object | None = None,
 ) -> list[DetectedMark]:
     """Detect over one physical layer and return its marks.
 
@@ -325,6 +326,7 @@ def detect_layer_marks(
             LabConfig(contrast=config.contrast, grouping=config.grouping),
             normal_config=config.normal if texture.normal is not None else None,
             normal_flat=flat_ground,
+            domain_cache=domain_cache,
         )
         # The colour pipeline fits no rectangle -- it has no stage that does --
         # so a colour mark is turned over about the image axis, exactly as

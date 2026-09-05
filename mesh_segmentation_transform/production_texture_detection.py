@@ -71,6 +71,11 @@ class ProductionDetectionSession(Generic[DetectionResult]):
         self._flat_ground: dict[tuple[Hashable, ...], np.ndarray] = {}
         self._steepness: dict[tuple[Hashable, ...], np.ndarray] = {}
         self._mesh_seams: dict[tuple[Hashable, ...], np.ndarray | None] = {}
+        # 2026-09-05: sibling skin maps commonly differ in one upholstery or
+        # trim chart while the controls on other charts are byte-identical.
+        # The glyph_lab front end runs one domain at a time, so retain exact
+        # domain results as well as the whole-layer cache above.
+        self._glyph_domains: dict[tuple[Hashable, ...], object] = {}
         self._lock = Lock()
         self.hits = 0
         self.misses = 0
@@ -80,6 +85,8 @@ class ProductionDetectionSession(Generic[DetectionResult]):
         self.normal_evidence_misses = 0
         self.mesh_seam_hits = 0
         self.mesh_seam_misses = 0
+        self.glyph_domain_hits = 0
+        self.glyph_domain_misses = 0
 
     def prewarm_gpu(self) -> None:
         """Start creation of the one shared ModernGL context asynchronously."""
@@ -213,6 +220,21 @@ class ProductionDetectionSession(Generic[DetectionResult]):
         with self._lock:
             existing = self._mesh_seams.setdefault(identity, produced)
         return existing, existing is not produced
+
+    def get_glyph_domain(self, key: tuple[Hashable, ...]) -> object | None:
+        """Return one exact glyph_lab UV-domain result, if this export has it."""
+        with self._lock:
+            cached = self._glyph_domains.get(key)
+            if cached is None:
+                self.glyph_domain_misses += 1
+            else:
+                self.glyph_domain_hits += 1
+            return cached
+
+    def put_glyph_domain(self, key: tuple[Hashable, ...], value: object) -> None:
+        """Keep the first exact result; concurrent equivalents agree."""
+        with self._lock:
+            self._glyph_domains.setdefault(key, value)
 
     def _shared(
         self,

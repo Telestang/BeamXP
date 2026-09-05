@@ -7221,6 +7221,7 @@ def detect_layer_regions_with_glyph_lab(
             config=DEFAULT_GLYPH_LAB_CONFIG,
             steepness=steepness,
             flat_ground=flat_ground,
+            domain_cache=session,
         )
     marks = scale_marks_to_native(marks, factor)
     result.detected = len(marks)
@@ -10342,6 +10343,8 @@ def _run_texture_correction_task_group(
             _run_texture_correction_task(tasks[0], output_directory, context)
         ] if tasks else []
 
+    domain_hits_before = getattr(context["session"], "glyph_domain_hits", 0)
+    domain_misses_before = getattr(context["session"], "glyph_domain_misses", 0)
     shared_layer_regions = SharedLayerRegionLedger()
     source_tasks = tuple(task for task in tasks if task.detect)
     prepass_errors = {
@@ -10371,6 +10374,13 @@ def _run_texture_correction_task_group(
                 "this source layer still ran on its own detector",
             )
         outcomes.append(outcome)
+    domain_hits = getattr(context["session"], "glyph_domain_hits", 0) - domain_hits_before
+    domain_misses = getattr(context["session"], "glyph_domain_misses", 0) - domain_misses_before
+    if domain_hits:
+        outcomes[0].log_lines.append(
+            f"  [{tasks[0].material}] reused {domain_hits} unchanged UV "
+            f"domain detection(s); {domain_misses} changed domain(s) ran"
+        )
     return outcomes
 
 

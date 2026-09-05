@@ -24,6 +24,7 @@ they went once the front end had earned it.  The history has them.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from dataclasses import dataclass, field, replace
@@ -2263,6 +2264,99 @@ class RepeatSearch:
     transform_shape: tuple[int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class DomainDetectionCacheEntry:
+    """The complete production result for one UV-domain detector visit.
+
+    ``detect`` normally keeps these three masks only long enough to paint them
+    into the atlas-wide result.  Keeping them here lets the export reuse an
+    unchanged domain from a sibling texture while still running every changed
+    domain through the detector.
+    """
+
+    regions: tuple[Region, ...]
+    sparse: np.ndarray
+    outline: np.ndarray
+    kept: np.ndarray
+
+
+def _array_fingerprint(value: np.ndarray | None) -> tuple[object, ...] | None:
+    """A compact exact identity for a detector input view."""
+    if value is None:
+        return None
+    contiguous = np.ascontiguousarray(value)
+    digest = hashlib.blake2b(contiguous.view(np.uint8), digest_size=16).digest()
+    return contiguous.shape, contiguous.dtype.str, digest
+
+
+def _repeat_context_fingerprint(
+    index: RepeatTextureIndex | None,
+    window: tuple[slice, slice],
+    config: ContrastConfig,
+) -> tuple[object, ...] | None:
+    """Fingerprint every repeat-filter texel a domain's candidate can read.
+
+    2026-09-05: ``regions_in_domain`` is otherwise local to a UV domain, but
+    the repeat-material filter searches a bounded area around a candidate.
+    A whole-atlas key would make distinct interior variants miss even when this
+    domain is unchanged; a domain-only key could miss a changed repeat verdict.
+    The largest search is ``repeat_texture_max_search_px``. Context probes can
+    also shift their template by half a candidate's span; a candidate can be
+    as wide or tall as this domain window. Expanding accordingly covers every
+    detail texel either route can read and preserves the exact verdict.
+    """
+    if index is None:
+        return None
+    y_slice, x_slice = window
+    step = max(int(index.decimation), 1)
+    search_margin = (max(
+        int(config.repeat_texture_min_search_px),
+        int(config.repeat_texture_max_search_px),
+    ) + 1) // 2
+    tile_margin = max(int(config.repeat_texture_tile_px) // 2, 2)
+    context_margin = max(int(config.repeat_texture_context_margin_px), 1)
+    x_margin = max(
+        search_margin,
+        (int(x_slice.stop) - int(x_slice.start) + 1) // 2
+        + tile_margin + context_margin,
+    )
+    y_margin = max(
+        search_margin,
+        (int(y_slice.stop) - int(y_slice.start) + 1) // 2
+        + tile_margin + context_margin,
+    )
+    x0 = max(int(x_slice.start) - x_margin, 0) // step
+    y0 = max(int(y_slice.start) - y_margin, 0) // step
+    x1 = min(int(x_slice.stop) + x_margin, index.detail.shape[1] * step)
+    y1 = min(int(y_slice.stop) + y_margin, index.detail.shape[0] * step)
+    x1 = (x1 + step - 1) // step
+    y1 = (y1 + step - 1) // step
+    return _array_fingerprint(index.detail[y0:y1, x0:x1])
+
+
+def _domain_detection_cache_key(
+    colour: np.ndarray,
+    domain: np.ndarray,
+    window: tuple[slice, slice],
+    normal_flat: np.ndarray | None,
+    mesh_regions: np.ndarray,
+    repeat_texture: RepeatTextureIndex | None,
+    config: LabConfig,
+) -> tuple[object, ...]:
+    """Exact inputs to one colour-domain visit, excluding its label number."""
+    return (
+        int(window[1].start), int(window[0].start),
+        _array_fingerprint(colour[window]),
+        _array_fingerprint(domain),
+        _array_fingerprint(
+            None if normal_flat is None else normal_flat[window]
+        ),
+        _array_fingerprint(mesh_regions[window]),
+        _repeat_context_fingerprint(repeat_texture, window, config.contrast),
+        config,
+    )
+
+
 def build_repeat_texture_index(
     colour: np.ndarray, config: ContrastConfig,
 ) -> RepeatTextureIndex:
@@ -3679,6 +3773,7 @@ def detect(
     probe: RegionProbe | None = None,
     normal_config: object | None = None,
     normal_flat: np.ndarray | None = None,
+    domain_cache: object | None = None,
 ) -> Detection:
     """Detect over every UV domain of one texture.
 
@@ -3691,6 +3786,10 @@ def detect(
     one material has the same one and an export can build it once -- which is
     worth doing: it is a full-atlas gradient pass plus a windowed filter per
     domain.  Supplying it makes ``normal_config`` unnecessary.  2026-09-02.
+
+    ``domain_cache`` is an optional production-only exact cache.  Captures
+    and probes always run the detector directly, because their stage records
+    are part of the harness result rather than incidental logging.
     """
     config = config or LabConfig()
     stages: dict[str, np.ndarray] = {}
@@ -3732,14 +3831,41 @@ def detect(
         captured: dict[str, np.ndarray] | None = {} if capture else None
         drawn: dict[str, np.ndarray] | None = {} if capture else None
         blank = np.zeros(domain.shape, dtype=bool)
-        found, outline, kept = regions_in_domain(
-            texture.colour[window], domain, label, (x, y), config, blank,
-            repeat_texture, captured, drawn, counts,
-            kept_regions=stage_regions if capture else None, timings=timings,
-            probe=probe, texture_name=texture.name,
-            normal_flat=(None if normal_flat is None else normal_flat[window]),
-            mesh_regions=mesh_regions[window],
-        )
+        cached = None
+        cache_key = None
+        # 2026-09-05: whole-atlas image keys miss every unchanged panel on a
+        # skin variant. The domain key below includes every input this visit
+        # can read, including the bounded repeat-filter context.
+        if domain_cache is not None and not capture and probe is None:
+            cache_key = _domain_detection_cache_key(
+                texture.colour, domain, window, normal_flat, mesh_regions,
+                repeat_texture, config,
+            )
+            cached = domain_cache.get_glyph_domain(cache_key)
+        if cached is None:
+            found, outline, kept = regions_in_domain(
+                texture.colour[window], domain, label, (x, y), config, blank,
+                repeat_texture, captured, drawn, counts,
+                kept_regions=stage_regions if capture else None, timings=timings,
+                probe=probe, texture_name=texture.name,
+                normal_flat=(None if normal_flat is None else normal_flat[window]),
+                mesh_regions=mesh_regions[window],
+            )
+            final = DomainDetectionCacheEntry(
+                tuple(found), blank.copy(), outline.copy(), kept.copy(),
+            )
+            if cache_key is not None:
+                domain_cache.put_glyph_domain(cache_key, final)
+        else:
+            # A cache key deliberately excludes the layer-local label number.
+            # Region preserves that number for reports, so restore it here.
+            found = [
+                replace(region, domain=label, _cache={})
+                for region in cached.regions
+            ]
+            blank = cached.sparse
+            outline = cached.outline
+            kept = cached.kept
         sparse[window] |= blank
         for source, whole_atlas in ((captured, stages), (drawn, stage_outlines)):
             if source is None:

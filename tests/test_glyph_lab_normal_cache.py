@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import glyph_lab.detect as glyph_detect
 from glyph_lab.normal_map import absence_of_slopes, edge_steepness
 from mesh_segmentation_transform.glyph_lab_detection import (
     DEFAULT_GLYPH_LAB_CONFIG,
@@ -109,6 +112,74 @@ class EquivalenceTests(unittest.TestCase):
 
 
 class SessionCacheTests(unittest.TestCase):
+    def test_an_unchanged_uv_domain_reuses_its_detection_across_changed_atlas_pixels(self) -> None:
+        """2026-09-05: skin differences outside a chart must not rerun it."""
+        session = ProductionDetectionSession()
+        first = colour_map()
+        changed_elsewhere = first.copy()
+        changed_elsewhere[:, 40:] = 180
+        changed_inside = changed_elsewhere.copy()
+        changed_inside[20:28, 12:20] = 20
+        domain = [(0, 0, np.ones((64, 32), dtype=bool))]
+        config = replace(
+            DEFAULT_GLYPH_LAB_CONFIG,
+            contrast=replace(
+                DEFAULT_GLYPH_LAB_CONFIG.contrast,
+                enable_repeat_texture_filter=False,
+            ),
+        )
+        real = glyph_detect.regions_in_domain
+        with patch.object(glyph_detect, "regions_in_domain", wraps=real) as run:
+            baseline = detect_layer_marks(
+                "first", first, domain, "colour", config=config,
+                domain_cache=session,
+            )
+            reused = detect_layer_marks(
+                "second", changed_elsewhere, domain, "colour", config=config,
+                domain_cache=session,
+            )
+            changed = detect_layer_marks(
+                "third", changed_inside, domain, "colour", config=config,
+                domain_cache=session,
+            )
+            uncached_changed = detect_layer_marks(
+                "third-uncached", changed_inside, domain, "colour", config=config,
+            )
+
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(session.glyph_domain_hits, 1)
+        self.assertEqual(session.glyph_domain_misses, 2)
+        self.assertEqual(
+            [mark.bounds for mark in baseline], [mark.bounds for mark in reused]
+        )
+        self.assertEqual(
+            [mark.bounds for mark in changed],
+            [mark.bounds for mark in uncached_changed],
+        )
+
+    def test_a_changed_repeat_filter_context_does_not_reuse_a_domain(self) -> None:
+        """The bounded atlas-wide repeat search is a real detector input."""
+        session = ProductionDetectionSession()
+        first = np.zeros((512, 512, 3), dtype=np.uint8)
+        changed_context = first.copy()
+        # The domain ends at x=64; this lies outside it but within the 192 px
+        # maximum repeat-search radius and must therefore miss the cache.
+        changed_context[32:96, 128:192] = 255
+        domain = [(0, 0, np.ones((64, 64), dtype=bool))]
+        real = glyph_detect.regions_in_domain
+        with patch.object(glyph_detect, "regions_in_domain", wraps=real) as run:
+            detect_layer_marks(
+                "first", first, domain, "colour", domain_cache=session,
+            )
+            detect_layer_marks(
+                "changed-context", changed_context, domain, "colour",
+                domain_cache=session,
+            )
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(session.glyph_domain_hits, 0)
+        self.assertEqual(session.glyph_domain_misses, 2)
+
     def test_one_derivation_serves_every_layer_of_a_material(self) -> None:
         session = ProductionDetectionSession()
         normal = normal_map()
