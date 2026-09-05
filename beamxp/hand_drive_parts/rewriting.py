@@ -542,6 +542,7 @@ def mirror_row_node_ids(row: str) -> list[str]:
 def _reflected_mirror_plane(
     source_row: str,
     reference_position: tuple[float, float, float] | None = None,
+    target_reference_position: tuple[float, float, float] | None = None,
 ) -> tuple[
     tuple[float, float, float] | None,
     tuple[float, float, float] | None,
@@ -581,11 +582,17 @@ def _reflected_mirror_plane(
     normal = vector_from_row(source_row, "normal")
     if offset is not None:
         if reference_position is None:
-            reflected_x = -offset[0]
+            offset = (-offset[0], offset[1], offset[2])
         else:
-            # the glass reflected, expressed from the node it still hangs off
-            reflected_x = -(reference_position[0] + offset[0]) - reference_position[0]
-        offset = (reflected_x, offset[1], offset[2])
+            # 2026-09-05: a swapped asymmetric wing mirror uses a different
+            # reference node. Reflect the source world point, then measure
+            # from the destination node in all three axes (etkc differs in y).
+            target_reference = target_reference_position or reference_position
+            offset = tuple(
+                (reference_position[axis] + offset[axis]) * (-1 if axis == 0 else 1)
+                - target_reference[axis]
+                for axis in range(3)
+            )
     return (
         offset,
         mirrored_base_rotation_global(rotation) if rotation is not None else None,
@@ -612,10 +619,9 @@ def rewrite_mirror_rows(
     lets the offset reflect the glass rather than merely negate; see
     :func:`_reflected_mirror_plane`.
 
-    ``mirror_plane_sources`` maps a mesh to the authored row the converted row
-    inherits its plane from. A mesh the build left alone -- including one that
-    only swapped its art for the other side's, which does not move the glass --
-    is absent and keeps its authored plane.
+    2026-09-05: ``mirror_plane_sources`` maps a mesh to the authored row it
+    reflects. Asymmetric swapped mounts inherit the opposite row, measured
+    from their own reference node; symmetric swaps keep their authored plane.
     """
     node_positions = node_positions or {}
     out_lines: list[str] = []
@@ -632,9 +638,11 @@ def rewrite_mirror_rows(
             source_row = mirror_plane_sources.get(mesh)
             if source_row is not None:
                 reference = mirror_row_node_ids(source_row)
+                target_reference = mirror_row_node_ids(content)
                 offset, rotation, normal = _reflected_mirror_plane(
                     source_row,
                     node_positions.get(reference[0]) if reference else None,
+                    node_positions.get(target_reference[0]) if target_reference else None,
                 )
                 if offset is not None:
                     key = (

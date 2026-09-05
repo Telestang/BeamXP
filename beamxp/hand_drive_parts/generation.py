@@ -1302,6 +1302,8 @@ def mirror_plane_sources_for_meshes(
     mesh_hits: Iterable[str],
     object_modes: dict[str, str],
     mirror_rows: dict[str, str],
+    structural_sources: dict[str, str] | None = None,
+    node_positions: dict[str, tuple[float, float, float]] | None = None,
 ) -> dict[str, str]:
     """Which meshes need their ``mirrors`` plane reflected, and from whose row.
 
@@ -1312,9 +1314,9 @@ def mirror_plane_sources_for_meshes(
     with it and is reflected -- an interior mirror authored to the left of the
     windscreen has to end up the same distance to the right of it.
 
-    Swap Mesh and Replace Source move nothing. They hand an object the opposite
-    side's art while it stays bolted where it was, so the plane is left exactly
-    as authored and those meshes are absent from the map.
+    2026-09-05: Swap Mesh and Replace Source keep their destination plane when
+    the source and destination reference triads are mirror images. Asymmetric
+    mounts instead carry the reflected source plane with the swapped artwork.
 
     That is what the game itself does. The Covet ships both hands, and its RHD
     wing mirrors differ from the LHD ones by the mesh name alone -- each side
@@ -1324,11 +1326,45 @@ def mirror_plane_sources_for_meshes(
     each mirror aimed the way the other one had been, which shows up as the
     wrong amount of the car's own flank in the glass.
     """
-    return {
+    mesh_hits = tuple(mesh_hits)
+    sources = {
         mesh: mirror_rows[mesh]
         for mesh in mesh_hits
         if object_modes.get(mesh) == MODE_MIRROR and mesh in mirror_rows
     }
+    # 2026-09-05: etkc's wing-mirror triads are asymmetric. Its reflected
+    # housing/glass keeps the source shape, but the destination plane cuts
+    # through that housing. Preserve the symmetric-mount rule above; an
+    # asymmetric mount must carry the source plane along with its artwork.
+    # common/jbeam/sections/mirror.lua process() consumes these exact node
+    # references, offset and normal, independently of the flexbody geometry.
+    if not structural_sources or not node_positions:
+        return sources
+    for mesh in mesh_hits:
+        if mesh not in mirror_rows or object_modes.get(mesh) not in {
+            MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE,
+        }:
+            continue
+        source_row = mirror_rows.get(structural_sources.get(mesh, ""))
+        if source_row is None:
+            continue
+        target_ids = mirror_row_node_ids(mirror_rows[mesh])
+        source_ids = mirror_row_node_ids(source_row)
+        if len(target_ids) != 3 or len(source_ids) != 3:
+            continue
+        if any(node not in node_positions for node in target_ids + source_ids):
+            continue
+        target_points = [node_positions[node] for node in target_ids]
+        source_points = [node_positions[node] for node in source_ids]
+        if target_points[0][0] * source_points[0][0] >= 0:
+            continue
+        if any(
+            abs(target[axis] - source[axis] * (-1 if axis == 0 else 1)) > 1e-6
+            for target, source in zip(target_points, source_points)
+            for axis in range(3)
+        ):
+            sources[mesh] = source_row
+    return sources
 
 
 _BEAM_ROW_RE = re.compile(
@@ -1904,7 +1940,8 @@ def write_generated_jbeam_and_configs(
                 elif object_modes.get(mesh) in {MODE_MIRROR_STRUCTURAL, MODE_REPLACE_SOURCE}:
                     flexbody_row_transforms[mesh] = ("mirror", 0.0)
             mirror_plane_sources = mirror_plane_sources_for_meshes(
-                mesh_hits, object_modes, mirror_rows
+                mesh_hits, object_modes, mirror_rows, structural_sources,
+                prop_node_positions,
             )
             # An indicator repeater is a lamp inside a lens. Swap the lens for
             # the other side's and the lamp has to travel with it, or it goes

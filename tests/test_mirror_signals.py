@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 from beamxp import hand_drive_core as core
 from beamxp.core.geometry import (
@@ -172,6 +173,92 @@ class MirrorPlaneSourceTests(unittest.TestCase):
         self.assertIn('["covet_mirror_RHD_L","mi4l"', rewritten)
         self.assertIn('"refBaseTranslation":{"x":-0.09,"y":0.00,"z":0.04}', rewritten)
         self.assertIn('"baseRotationGlobal":{"x":0.2,"y":0.0,"z":-13.4}', rewritten)
+
+
+class AsymmetricMirrorPlaneTests(unittest.TestCase):
+    # 2026-09-05: stock etkc rows and mirror reference nodes. The destination
+    # left idRef is 30 mm behind the reflection of the source right idRef.
+    ROWS: ClassVar[dict[str, str]] = {
+        "etkc_mirror_L": (
+            '["etkc_mirror_L","mi4l","mi3l","mi2l",'
+            '{"refBaseTranslation":{"x":-0.1,"y":-0.02,"z":0.05},'
+            '"baseRotationGlobal":{"x":0,"y":0,"z":-5}}],'
+        ),
+        "etkc_mirror_R": (
+            '["etkc_mirror_R","mi4r","mi3r","mi2r",'
+            '{"refBaseTranslation":{"x":0.1,"y":-0.04,"z":0.05},'
+            '"baseRotationGlobal":{"x":0,"y":0,"z":19.8}}],'
+        ),
+    }
+    NODES: ClassVar[dict[str, tuple[float, float, float]]] = {
+        "mi4l": (1.04, -0.27, 0.92), "mi3l": (0.9, -0.29, 0.92),
+        "mi2l": (1.06, -0.27, 1.03),
+        "mi4r": (-1.04, -0.24, 0.92), "mi3r": (-0.9, -0.29, 0.92),
+        "mi2r": (-1.06, -0.24, 1.03),
+    }
+    SOURCES: ClassVar[dict[str, str]] = {
+        "etkc_mirror_L": "etkc_mirror_R", "etkc_mirror_R": "etkc_mirror_L",
+    }
+
+    def _sources(self, nodes=None, meshes=None, mode=None):
+        return core.mirror_plane_sources_for_meshes(
+            iter(self.ROWS if meshes is None else meshes),
+            dict.fromkeys(self.ROWS, mode or core.MODE_MIRROR_STRUCTURAL),
+            self.ROWS, self.SOURCES, self.NODES if nodes is None else nodes,
+        )
+
+    def test_asymmetric_swaps_take_the_reflected_source_plane(self):
+        for mode in (core.MODE_MIRROR_STRUCTURAL, core.MODE_REPLACE_SOURCE):
+            self.assertEqual(self._sources(mode=mode), {
+                mesh: self.ROWS[source] for mesh, source in self.SOURCES.items()
+            })
+
+    def test_symmetric_mounts_still_keep_their_destination_plane(self):
+        nodes = dict(self.NODES)
+        for stem in ("mi4", "mi3", "mi2"):
+            x, y, z = nodes[stem + "l"]
+            nodes[stem + "r"] = (-x, y, z)
+        self.assertEqual(self._sources(nodes), {})
+
+    def test_incomplete_mounts_do_not_guess_a_plane(self):
+        nodes = dict(self.NODES)
+        del nodes["mi2r"]
+        self.assertEqual(self._sources(nodes), {})
+
+    def test_only_meshes_in_this_part_are_returned(self):
+        self.assertEqual(self._sources(meshes=["etkc_mirror_L"]), {
+            "etkc_mirror_L": self.ROWS["etkc_mirror_R"],
+        })
+
+    def test_reflected_world_point_is_measured_from_the_destination_node(self):
+        sources = self._sources()
+        for mesh, source in self.SOURCES.items():
+            out = core.rewrite_mirror_rows(
+                "[\n" + self.ROWS[mesh] + "\n]", {mesh: mesh + "_xp_rhd"},
+                sources, self.NODES,
+            ).splitlines()[1]
+            target_ref = core.mirror_row_node_ids(self.ROWS[mesh])[0]
+            source_ref = core.mirror_row_node_ids(self.ROWS[source])[0]
+            self.assertEqual(core.mirror_row_node_ids(out), core.mirror_row_node_ids(self.ROWS[mesh]))
+            source_offset = core.vector_from_row(self.ROWS[source], "refBaseTranslation")
+            target_offset = core.vector_from_row(out, "refBaseTranslation")
+            for axis in range(3):
+                self.assertAlmostEqual(
+                    self.NODES[target_ref][axis] + target_offset[axis],
+                    (self.NODES[source_ref][axis] + source_offset[axis])
+                    * (-1 if axis == 0 else 1),
+                )
+            expected_z = -19.8 if mesh.endswith("_L") else 5.0
+            self.assertAlmostEqual(core.vector_from_row(out, "baseRotationGlobal")[2], expected_z)
+
+    def test_legacy_offset_follows_the_same_world_reflection(self):
+        rows = {mesh: row.replace('"refBaseTranslation"', '"offset"')
+                for mesh, row in self.ROWS.items()}
+        out = core.rewrite_mirror_rows(
+            "[\n" + rows["etkc_mirror_L"] + "\n]", {},
+            {"etkc_mirror_L": rows["etkc_mirror_R"]}, self.NODES,
+        ).splitlines()[1]
+        self.assertEqual(core.vector_from_row(out, "offset"), (-0.1, -0.01, 0.05))
 
 
 class SwappedBeamPreloadTests(unittest.TestCase):
