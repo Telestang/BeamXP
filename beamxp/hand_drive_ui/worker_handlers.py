@@ -142,7 +142,8 @@ class WorkerHandlersMixin:
         core.save_cached_part_ids(context, selected, self.resolved_part_ids)
         self._refresh_parts(reset_view=reset_view)
         self._update_detail()
-        self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed")
+        if self.part_table_snapshot_key == self._part_table_snapshot_key():
+            self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed")
         self._schedule_pending_parts_refresh()
 
     def _handle_part_table_success(self, payload: object) -> None:
@@ -159,9 +160,15 @@ class WorkerHandlersMixin:
         except Exception as exc:
             if should_apply:
                 self.status_var.set(f"Part table refresh failed: {exc}")
+            else:
+                self.part_table_pending = True
             self._schedule_pending_part_table_snapshot()
             return
         if not should_apply:
+            # 2026-09-06: The key can change without a pending request (for
+            # example when detected hands refresh the preview config choices).
+            # A rejected result must arrange a table for the current state.
+            self.part_table_pending = True
             self._schedule_pending_part_table_snapshot()
             return
         self.part_table_snapshot_key = key

@@ -978,9 +978,11 @@ class PartsWorkflowMixin:
             resolved = [part_id for part_id in cached_ids if part_id in context.objects]
             if resolved:
                 self.resolved_part_ids = resolved
+                self._invalidate_slot_usage()
                 self._refresh_parts(reset_view=reset_view)
                 self._update_detail()
-                self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed (parts cache)")
+                if self.part_table_snapshot_key == self._part_table_snapshot_key():
+                    self.status_var.set(f"{len(self.current_part_ids)} used part(s) displayed (parts cache)")
                 return
             core.clear_parts_cache(context)
         self.status_var.set(f"Resolving used parts for {len(selected)} trim(s)...")
@@ -1071,7 +1073,13 @@ class PartsWorkflowMixin:
                         visible_ids.add(str(preview_mesh))
             visible_ids |= set(getattr(scene, "extra", ()) or ()) & selected_meshes
             current_mesh_ids = {self._part_row_mesh_id(row_id) for row_id in self.current_part_ids}
-            dimmed_ids = visible_ids - current_mesh_ids
+            # 2026-09-06: Missing rows only mean "filtered out" after the current
+            # table has arrived. A scene can finish first during a vehicle load.
+            table_ready = (
+                isinstance(self.part_table_snapshot, dict)
+                and self.part_table_snapshot_key == self._part_table_snapshot_key()
+            )
+            dimmed_ids = visible_ids - current_mesh_ids if table_ready else set()
             self.viewer.set_visible_ids(list(visible_ids), reset=reset)
             if hasattr(self.viewer, "set_dimmed_ids"):
                 self.viewer.set_dimmed_ids(dimmed_ids)

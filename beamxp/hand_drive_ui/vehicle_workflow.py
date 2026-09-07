@@ -247,6 +247,7 @@ class VehicleWorkflowMixin:
         seq, source_zip, vehicle_id, context, conversion, loaded = payload
         if seq != self.vehicle_load_seq:
             return
+        self._reset_vehicle_ui_state()
         self.context = context
         self.conversion = conversion
         self.preview_output_var.set("")
@@ -262,16 +263,6 @@ class VehicleWorkflowMixin:
         self.vehicle_var.set(self._combo_label_for(source_zip, vehicle_id))
         self.last_model_label = self.vehicle_var.get()
         self._show_model_preview(self.vehicle_var.get())
-        self.part_refresh_seq += 1
-        self.resolved_part_ids = []
-        self.current_part_ids = []
-        self.part_columns_need_fit = True
-        self.mesh_instance_numbering_key = None
-        self.mesh_instance_numbering_cache = {}
-        self.mesh_instance_keys_cache = {}
-        self._clear_mesh_instance_cache()
-        self.mesh_scene_hash = None
-        self.mesh_scene_reset_pending = True
         self._set_load_busy(False)
         self._sync_delta_to_ui()
         self._sync_plate_to_ui()
@@ -288,6 +279,57 @@ class VehicleWorkflowMixin:
             f"Loaded {context.vehicle_id}{from_cache}: {len(context.variants)} variant(s), "
             f"{len(context.objects)} DAE object(s)"
         )
+
+    def _reset_vehicle_ui_state(self) -> None:
+        # 2026-09-06: Clear rows and their lookup maps together before the new
+        # context can reach selection handlers or preview filters. The new part
+        # table arrives asynchronously; until then no old vehicle rows are valid.
+        self._close_tree_combo_editor()
+        self._cancel_structural_prompt()
+        for name in ("part_refresh_after_id", "mesh_scene_after", "_preview_hover_after"):
+            after_id = getattr(self, name)
+            if after_id is not None:
+                self.after_cancel(after_id)
+                setattr(self, name, None)
+        self.preview_output_hover = None
+        self.preview_output_to_config = {}
+        self.preview_output_to_output = {}
+        for tree in (self.variant_tree, self.part_tree, self.slot_tree, self.trigger_tree):
+            children = tree.get_children()
+            if children:
+                tree.delete(*children)
+            tree.focus("")
+        self.resolved_part_ids = []
+        self.current_part_ids = []
+        self.part_row_mesh_ids = {}
+        self.part_row_side_refs = {}
+        self.part_row_positions = {}
+        self.part_instance_rows = {}
+        self.part_row_labels = {}
+        self.part_child_overrides = {}
+        self.current_slot_ids = []
+        self.side_pair_rows_by_iid = {}
+        self.side_pair_pick_target = None
+        self.trigger_rows_by_iid = {}
+        self._invalidate_slot_usage()
+        self._invalidate_trigger_cache()
+        self.box_preview_by_id.clear()
+        self._box_preview_config = None
+        self.part_columns_need_fit = True
+        self.mesh_instance_numbering_key = None
+        self.mesh_instance_numbering_cache = {}
+        self.mesh_instance_keys_cache = {}
+        self._clear_mesh_instance_cache()
+        self.part_table_snapshot_key = None
+        self.part_table_snapshot = None
+        self.part_table_requested_key = None
+        # 2026-09-06: Invalidate results, but retain running flags until their
+        # callbacks drain so each scheduler still owns at most one worker.
+        self.part_refresh_seq += 1
+        self.part_table_seq += 1
+        self.mesh_scene_seq += 1
+        self.mesh_scene_hash = None
+        self.mesh_scene_reset_pending = True
 
     def _handle_vehicle_load_error(self, payload: object) -> None:
         seq, exc = payload
