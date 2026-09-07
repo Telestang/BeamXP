@@ -14,8 +14,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from beamxp import hand_drive_core as core
+from beamxp.core import cache
 
 
 def make_context(root: Path, variants: tuple[str, ...] = ("trim_a", "trim_b")):
@@ -60,6 +62,13 @@ class MeshNumberingCacheTests(unittest.TestCase):
             core.save_cached_mesh_numbering(context, "pairs:none", INDEX)
             context.source_zip.write_bytes(b"a different vehicle entirely")
             self.assertIsNone(core.load_cached_mesh_numbering(context, "pairs:none"))
+
+    def test_numbering_from_an_older_pairing_rule_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context = make_context(Path(tmp))
+            with patch.object(cache, "PART_TABLE_CACHE_VERSION", cache.PART_TABLE_CACHE_VERSION - 1):
+                core.save_cached_mesh_numbering(context, "pairs:seats", INDEX)
+            self.assertIsNone(core.load_cached_mesh_numbering(context, "pairs:seats"))
 
     def test_half_an_entry_counts_as_a_miss(self) -> None:
         # The two maps come from one walk and neither is usable alone.

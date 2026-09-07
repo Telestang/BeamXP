@@ -31,7 +31,9 @@ CONTEXT_CACHE_VERSION = 13
 HAND_DETECTION_CACHE_VERSION = 1
 # Bump when the mesh numbering or the flexbody/prop role split changes shape or
 # meaning, so an existing project stops reusing what the old rule produced.
-PART_TABLE_CACHE_VERSION = 1
+# 2026-09-06: Lifted seat pairs now preserve the source base variant when
+# multiple bases expose the child slot; old instance numbering used the old side.
+PART_TABLE_CACHE_VERSION = 2
 
 
 def context_cache_path(source_zip: Path, vehicle_id: str) -> Path:

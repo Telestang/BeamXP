@@ -571,6 +571,80 @@ class EquivalentPartPlanTests(unittest.TestCase):
             [(entry["slotId"], entry.get("setEmpty")) for entry in plan["clears"]],
         )
 
+    def _multiple_race_base_context(self, source_base: str) -> core.VehicleContext:
+        # 2026-09-06: Sunburst has regular and offset bases exposing the same
+        # race-seat child slot. Track Attack fits only the left offset base.
+        parts = dict(EMPTY_OPPOSITE_PARTS)
+        for side in ("FL", "FR"):
+            base = f"race_base_{side}_offset"
+            seat = f"race_seat_{side}"
+            parts[base] = (
+                part(base, f"seat_{side}", f"Offset Race Base {side}", ((seat, seat),)),
+                "seats.jbeam",
+            )
+            parts[seat] = (
+                part(seat, seat, f"Race Seat {side}", extra=flexbodies(f"racing_seat_{side}")),
+                "seats.jbeam",
+            )
+        return context_with_parts(parts, {"trim": selection((
+            ("car", "main", "/"),
+            (source_base, "seat_FL", "/seat_FL/"),
+            ("race_seat_FL", "race_seat_FL", "/seat_FL/race_seat_FL/"),
+        ))})
+
+    def test_lift_preserves_the_base_variant_when_multiple_bases_open_the_slot(self) -> None:
+        for source, target in (
+            ("race_base_FL", "race_base_FR"),
+            ("race_base_FL_offset", "race_base_FR_offset"),
+        ):
+            for qualified in (False, True):
+                with self.subTest(source=source, qualified=qualified):
+                    left = "racing_seat_FL"
+                    right = "racing_seat_FR"
+                    if qualified:
+                        left += "@@/seat_FL/race_seat_FL/"
+                        right += "@@/seat_FR/race_seat_FR/"
+                    plan = core.resolve_side_pair_plan(
+                        self._multiple_race_base_context(source), "trim",
+                        [{"left": left, "right": right, "kind": "seat"}],
+                    )
+                    self.assertIsNotNone(plan)
+                    self.assertEqual(
+                        [(entry["slotId"], entry["partId"]) for entry in plan["selections"]],
+                        [("seat_FR", target), ("race_seat_FR", "race_seat_FR")],
+                    )
+                    self.assertIn(
+                        ("seat_FL", "1"),
+                        [(entry["slotId"], entry.get("setEmpty")) for entry in plan["clears"]],
+                    )
+
+    def test_lift_leaves_ambiguous_base_counterparts_unselected(self) -> None:
+        context = self._multiple_race_base_context("race_base_FL_offset")
+        context.part_body_index.pop("race_base_FR_offset")
+        for base in ("alternative_a", "alternative_b"):
+            context.part_body_index[base] = (
+                part(base, "seat_FR", "Offset Race Base FR", (("race_seat_FR", "race_seat_FR"),)),
+                "seats.jbeam",
+            )
+        plan = core.resolve_side_pair_plan(context, "trim", [{
+            "left": "racing_seat_FL", "right": "racing_seat_FR", "kind": "seat",
+        }])
+        self.assertIsNone(plan)
+
+    def test_lift_never_selects_a_matching_base_that_cannot_open_the_child_slot(self) -> None:
+        context = self._multiple_race_base_context("race_base_FL_offset")
+        context.part_body_index["race_base_FR_offset"] = (
+            part("race_base_FR_offset", "seat_FR", "Offset Race Base FR"), "seats.jbeam",
+        )
+        context.part_body_index["another_base"] = (
+            part("another_base", "seat_FR", "Other Base", (("race_seat_FR", "race_seat_FR"),)),
+            "seats.jbeam",
+        )
+        plan = core.resolve_side_pair_plan(context, "trim", [{
+            "left": "racing_seat_FL", "right": "racing_seat_FR", "kind": "seat",
+        }])
+        self.assertIsNone(plan)
+
     def test_the_lift_matches_pairing_the_assemblies_by_hand(self) -> None:
         # The whole justification: naming the child is a longer way of saying
         # what pairing the two bases says, so both must plan the same swap.

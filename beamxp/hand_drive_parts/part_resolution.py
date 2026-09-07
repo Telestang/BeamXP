@@ -1268,9 +1268,9 @@ def _lifted_side_pair_target(
     ancestor the trim really has: exactly the plan pairing the two bases
     directly already produces.
 
-    Only an empty ancestor slot is opened, and only when one authored part
-    both fits it and declares the next segment of the named path. Anything
-    less certain is left alone rather than guessed at.
+    2026-09-06: Only an empty ancestor slot is opened. Its part must fit and
+    declare the next segment; multiple candidates require a unique counterpart
+    of the selected source assembly, preserving its variant.
 
     Returns the lifted source and target, or None when the row needs no lift.
     """
@@ -1332,8 +1332,8 @@ def _lifted_side_pair_target(
         for part_id in parts_fitting_slot(context, slot_def)
         if _part_declares_slot(context, part_id, needed_slot)
     ]
-    if len(candidates) != 1:
-        return None  # nothing fits, or the choice is not ours to make
+    if not candidates:
+        return None
 
     source_part = next(
         (
@@ -1343,7 +1343,17 @@ def _lifted_side_pair_target(
         ),
         "",
     )
-    if not source_part or source_part == candidates[0]:
+    if not source_part:
+        return None
+    target_part = candidates[0] if len(candidates) == 1 else _sideless_counterpart(
+        context, source_part, slot_def
+    )
+    # 2026-09-06: slotSystem.lua fillSlots_rec() only reaches a child after its
+    # parent is fitted. Sunburst has both regular and offset racing bases, so
+    # reuse the assembly counterpart match instead of abandoning the lift.
+    # The chosen base must still declare the child; a name match alone cannot
+    # create a reachable slot, and an ambiguous counterpart remains unresolved.
+    if target_part not in candidates or source_part == target_part:
         return None
     return {
         "sourceSlot": source_segments[depth],
@@ -1351,7 +1361,7 @@ def _lifted_side_pair_target(
         "sourcePart": source_part,
         "targetSlot": target_slot,
         "targetPath": target_path,
-        "targetPart": candidates[0],
+        "targetPart": target_part,
     }
 
 
