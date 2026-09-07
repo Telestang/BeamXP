@@ -2,6 +2,44 @@ from __future__ import annotations
 
 from .shared import *
 
+# What share of the bar each build stage gets, in order. Eight equal stages
+# was the obvious reading and a badly wrong one: measured over two recorded
+# lc500 builds, texture correction is 86% of the wall clock and the other
+# seven stages share the rest, so an even bar sat between 50% and 61% for
+# ninety of a hundred and ten seconds and then jumped to the end.
+#
+# 2026-09-07: measured, not guessed -- 1.0 / 0.0 / 5.8 / 1.7 / 85.7 / 4.0 /
+# 0.8 / 0.9 percent, one trim, with and without packaging. Rounded, and stage
+# eight given more than it took here because that build zipped one small trim
+# and an install copies far more. A build that skips texture correction skips
+# most of the bar in one move, which the easing turns into a glide and which
+# is the truth: the work really was not done.
+STAGE_WEIGHTS: tuple[int, ...] = (1, 1, 6, 2, 80, 4, 1, 5)
+
+
+def _stage_span(stage: int, stage_total: int) -> tuple[float, float]:
+    """The (start, end) of one stage's share of the whole bar."""
+    weights = STAGE_WEIGHTS if stage_total == len(STAGE_WEIGHTS) else (1,) * stage_total
+    total = sum(weights) or 1
+    return sum(weights[: stage - 1]) / total, sum(weights[:stage]) / total
+
+
+# Where a stage's phases sit inside it, as (start, end) of that stage's share.
+#
+# Only stage five needs this, and it needs it badly: on an lc500 build it is
+# 89 of the 114 seconds, and it runs three phases back to back, each counting
+# something different. Masks count textures (34 of them, 30 s), corrections
+# count groups (28 of them, 54 s), and the export around them counts nothing.
+# Given the whole stage, each would drive the bar from its start to its end
+# and the next would drag it back; given a slice, they hand over.
+#
+# 2026-09-07: measured off a recorded build, not guessed -- the phases are
+# sequential, and the split is roughly where the time goes.
+STAGE_PHASE_SPANS: dict[tuple[int, str], tuple[float, float]] = {
+    (5, "build_domain_masks"): (0.05, 0.40),
+    (5, "correct_textures"): (0.40, 0.92),
+}
+
 
 class WorkerHandlersMixin:
     """Dispatch and completion handling for background worker messages."""
@@ -74,7 +112,12 @@ class WorkerHandlersMixin:
         self._refresh_all()
 
     def _handle_build_progress(self, payload: object) -> None:
-        """Show a build stage and its real current-stage work count."""
+        """Show a build stage, and place it on the bar as part of the whole run.
+
+        The bar reads the stage number, not the stage's own counts: eight
+        stages each driving the bar from empty to full meant eight sweeps and
+        seven snaps back to the start.
+        """
         if not isinstance(payload, dict):
             return
         try:
@@ -110,16 +153,19 @@ class WorkerHandlersMixin:
         self.status_var.set(prefix + message)
         if not hasattr(self, "busy_progress"):
             return
-        if total is not None and total > 0 and current is not None:
-            self.busy_progress.stop()
-            self.busy_progress.configure(
-                mode="determinate",
-                maximum=total,
-                value=max(0, min(current, total)),
-            )
-        else:
-            self.busy_progress.configure(mode="indeterminate", value=0)
-            self.busy_progress.start(12)
+        if stage <= 0 or stage_total <= 0:
+            self._sweep_progress()
+            return
+        # Where this stage has got to. A stage that reports nothing
+        # contributes its own start, which the monotonic clamp then reads as
+        # "stay put"; a phase with a slice of the stage reports inside it.
+        within = 0.0
+        if current is not None and total is not None and total > 0:
+            within = max(0.0, min(1.0, current / total))
+        phase_start, phase_end = STAGE_PHASE_SPANS.get((stage, phase), (0.0, 1.0))
+        within = phase_start + within * (phase_end - phase_start)
+        stage_start, stage_end = _stage_span(stage, stage_total)
+        self._advance_progress(stage_start + within * (stage_end - stage_start))
 
     def _handle_parts_success(self, payload: object) -> None:
         seq, context, reset_view, selected, future = payload

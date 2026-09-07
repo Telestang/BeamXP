@@ -2,6 +2,29 @@ from __future__ import annotations
 
 from .shared import *
 
+# Steps across the determinate bar. Finer than the bar is ever wide, so the
+# eight build stages and the work inside them all land on distinct pixels.
+PROGRESS_RESOLUTION = 1000
+
+# How long each step of the indeterminate sweep lasts. ttk's own default is
+# 50 ms; this build used 12 ms, which reads as agitation rather than work.
+PROGRESS_SWEEP_INTERVAL_MS = 50
+
+# The determinate bar walks toward the figure it was given rather than
+# snapping to it, closing this share of the remaining distance every tick.
+# Work does not arrive evenly: texture correction runs a process pool, and on
+# a recorded lc500 build twenty-five of its twenty-eight groups reported
+# completion in the same instant, which without this is the bar crossing a
+# tenth of its width between one frame and the next. A tick under about a
+# fifth makes that a glide of roughly half a second, and small steps still
+# land inside two or three ticks.
+PROGRESS_EASE_INTERVAL_MS = 40
+PROGRESS_EASE_SHARE = 0.18
+
+# Below this, stop easing and land: the last fraction of a percent is not
+# worth another twenty ticks, and it lets the loop stop rather than idle.
+PROGRESS_EASE_EPSILON = 0.001
+
 
 class BuildAndPreviewMixin:
     """Settings persistence, build launch, Blender preview, mesh-scene generation, and worker polling."""
@@ -90,17 +113,108 @@ class BuildAndPreviewMixin:
         self._refresh_vehicle_control_state()
         if hasattr(self, "busy_progress"):
             if busy:
+                self._reset_progress()
                 self.busy_progress.grid()
-                self.busy_progress.configure(mode="indeterminate", value=0)
-                self.busy_progress.start(12)
+                self._sweep_progress()
             else:
+                self._cancel_progress_ease()
                 self.busy_progress.stop()
+                self._progress_sweeping = False
                 self.busy_progress.grid_remove()
         if hasattr(self, "preview_output_combo"):
             if busy or not self.preview_output_to_config:
                 self.preview_output_combo.configure(state="disabled")
             else:
                 self.preview_output_combo.configure(state="readonly")
+
+    # ------------------------------------------------------------------
+    # The busy progress bar
+    #
+    # Two ways to drive it. A build reports stages, so it runs determinate off
+    # one fraction covering the whole run; a vehicle load or a Blender preview
+    # has nothing to count, so it sweeps.
+    # ------------------------------------------------------------------
+
+    def _reset_progress(self) -> None:
+        self._progress_fraction = 0.0
+        self._progress_target = 0.0
+        self._progress_sweeping = False
+        self._cancel_progress_ease()
+
+    def _cancel_progress_ease(self) -> None:
+        handle = getattr(self, "_progress_ease_after", None)
+        if handle is not None:
+            try:
+                self.after_cancel(handle)
+            except Exception:
+                pass
+        self._progress_ease_after = None
+
+    def _sweep_progress(self) -> None:
+        """Show the indeterminate sweep, starting it at most once.
+
+        Both halves matter. ``start`` restarts the animation from the
+        beginning, and ``value=0`` drags the block back to the left edge, so
+        calling either on every progress message -- which is what used to
+        happen for a stage that reported no counts -- made the block twitch
+        rather than travel. And the old 12 ms step was four times ttk's own
+        default: fast enough to read as agitation rather than activity.
+        """
+        bar = getattr(self, "busy_progress", None)
+        if bar is None or getattr(self, "_progress_sweeping", False):
+            return
+        self._cancel_progress_ease()
+        bar.configure(mode="indeterminate", maximum=PROGRESS_RESOLUTION, value=0)
+        bar.start(PROGRESS_SWEEP_INTERVAL_MS)
+        self._progress_sweeping = True
+
+    def _advance_progress(self, fraction: float) -> None:
+        """Move the determinate bar to ``fraction`` of the whole run.
+
+        Never backwards. A build's eight stages each used to set the bar's
+        maximum to their own step count and its value to their own position,
+        so the bar filled and snapped back to empty eight times over; and
+        inside the texture stage two sub-phases counting different things
+        drove it in turn, which moved it back and forth several times a
+        second. Clamping to the highest fraction seen makes every one of
+        those a pause instead of a rewind.
+        """
+        bar = getattr(self, "busy_progress", None)
+        if bar is None:
+            return
+        fraction = max(0.0, min(1.0, fraction))
+        fraction = max(fraction, getattr(self, "_progress_target", 0.0))
+        if getattr(self, "_progress_sweeping", False):
+            bar.stop()
+            self._progress_sweeping = False
+            bar.configure(mode="determinate", maximum=PROGRESS_RESOLUTION, value=0)
+        self._progress_target = fraction
+        if getattr(self, "_progress_ease_after", None) is None:
+            self._ease_progress()
+
+    def _ease_progress(self) -> None:
+        """One step of the walk toward the target, rescheduling until it lands."""
+        self._progress_ease_after = None
+        bar = getattr(self, "busy_progress", None)
+        if bar is None or getattr(self, "_progress_sweeping", False):
+            return
+        current = getattr(self, "_progress_fraction", 0.0)
+        target = getattr(self, "_progress_target", 0.0)
+        remaining = target - current
+        if abs(remaining) <= PROGRESS_EASE_EPSILON:
+            current = target
+        else:
+            current += remaining * PROGRESS_EASE_SHARE
+        self._progress_fraction = current
+        bar.configure(
+            mode="determinate",
+            maximum=PROGRESS_RESOLUTION,
+            value=round(current * PROGRESS_RESOLUTION),
+        )
+        if current != target:
+            self._progress_ease_after = self.after(
+                PROGRESS_EASE_INTERVAL_MS, self._ease_progress
+            )
 
     def _prompt_for_install_location(self) -> bool:
         """Ask where an install with no mods folder configured should land.

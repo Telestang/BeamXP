@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import json
 import os
 import subprocess
@@ -60,6 +61,7 @@ import math
 import struct
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -10460,6 +10462,30 @@ def _run_texture_correction_task_in_worker(
     return outcome
 
 
+def _note_group_done(group_index, task_groups, report, future) -> None:
+    """Report a finished task group from the pool thread that finished it.
+
+    Reads the result the future already holds -- the consuming loop reads the
+    same cached value again, so nothing is taken from it. A group that raised,
+    or that any worker reported an error for, is left unreported: it goes down
+    the serial retry path below, and saying it was done would be a lie the bar
+    could not take back.
+    """
+    try:
+        group_outcomes = future.result()
+    except Exception:
+        return
+    if isinstance(group_outcomes, TextureCorrectionTaskOutcome):
+        group_outcomes = [group_outcomes]
+    try:
+        if len(group_outcomes) != len(task_groups[group_index]):
+            return
+    except TypeError:
+        return
+    if not any(outcome.error for outcome in group_outcomes):
+        report(group_index)
+
+
 def _run_texture_correction_task_group_in_worker(
     tasks: tuple[TextureCorrectionTask, ...],
     output_directory: Path,
@@ -10905,16 +10931,21 @@ def export_parts_preview(
     outcomes: dict[int, TextureCorrectionTaskOutcome] = {}
     completed_groups = 0
     completed_group_indexes: set[int] = set()
+    # Guards the two counters above: a pool worker's done-callback reports a
+    # finished group from the pool's own thread, so the count is no longer
+    # touched by one thread alone.
+    completed_lock = threading.Lock()
 
     def report_completed_group(group_index: int) -> None:
         nonlocal completed_groups
-        if group_index in completed_group_indexes:
-            return
-        completed_group_indexes.add(group_index)
-        completed_groups += 1
-        completed_corrections = sum(
-            len(task_groups[index]) for index in completed_group_indexes
-        )
+        with completed_lock:
+            if group_index in completed_group_indexes:
+                return
+            completed_group_indexes.add(group_index)
+            completed_groups += 1
+            completed_corrections = sum(
+                len(task_groups[index]) for index in completed_group_indexes
+            )
         emit_progress(
             progress,
             "progress",
@@ -10948,6 +10979,19 @@ def export_parts_preview(
                 ): group_index
                 for group_index, group in enumerate(task_groups)
             }
+            # Say a group is done when it is done, not when the loop below
+            # reaches it. That loop consumes in submission order and blocks on
+            # each result in turn, so a slow first group hides every group
+            # that finished behind it: on a recorded lc500 build twenty-five
+            # of twenty-eight were reported in the same instant, after the
+            # progress bar had stood still for forty-nine seconds. This only
+            # reports -- the outcomes are still consumed in submission order
+            # below, which is what keeps the log, the result order and every
+            # output name identical to a serial pass.
+            for future, group_index in futures.items():
+                future.add_done_callback(
+                    functools.partial(_note_group_done, group_index, task_groups, report_completed_group)
+                )
             for future, group_index in futures.items():
                 group = task_groups[group_index]
                 group_outcomes = future.result()

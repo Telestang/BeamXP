@@ -4181,6 +4181,12 @@ class PoolFailureFallbackTests(unittest.TestCase):
         def result(self):
             return self._outcome
 
+        def add_done_callback(self, callback):
+            # A real Future runs the callback straight away when it is already
+            # done, and this stand-in always is: the outcome was decided
+            # before it was constructed.
+            callback(self)
+
     def _fake_pool(self, outcome_for_worker):
         test = self
 
