@@ -19,6 +19,11 @@ SIDE_PAIR_KIND_LABELS = {
 }
 SIDE_PAIR_KIND_BY_LABEL = {label: key for key, label in SIDE_PAIR_KIND_LABELS.items()}
 SIDE_PAIR_KIND_OPTIONS = ["Seat", "Door card", "Wing mirror"]
+# 2026-09-07: the counterpart modal opens just after the click that asked for
+# it, never during. A grab taken inside a Treeview button press leaves the tree
+# believing the button is still down. The Swap Mesh source prompt waits the
+# same 80 ms before it opens, for the same reason.
+SIDE_PAIR_MODAL_DELAY_MS = 80
 
 
 class SlotsWorkflowMixin:
@@ -336,14 +341,10 @@ class SlotsWorkflowMixin:
                 row_index += 1
             self.current_slot_ids = displayed
             self._restore_tree_order(self.slot_tree, previous_order)
-            target = getattr(self, "side_pair_pick_target", None)
-            if isinstance(target, dict):
-                item = str(target.get("item") or "")
-                field = str(target.get("field") or "")
-                if item and field in {"left", "right"} and self.slot_tree.exists(item):
-                    self.slot_tree.set(item, field, "click a part...")
-                else:
-                    self._clear_side_pair_pick_target()
+            # 2026-09-07: a pick used to be a half-filled row waiting on a cell,
+            # so a rebuild had to re-stamp its prompt or drop the pick when the
+            # row went. New holds the prompt in the status bar and no row until
+            # both sides are chosen, so a rebuild has nothing to say to it.
             visible_keep = [item for item in keep if self.slot_tree.exists(item)]
             if visible_keep:
                 self.slot_tree.selection_set(visible_keep)
@@ -391,10 +392,7 @@ class SlotsWorkflowMixin:
         return SIDE_PAIR_KIND_BY_LABEL.get(label, "part")
 
     def _side_pair_table_rows(self, context: dict[str, object]) -> list[dict[str, object]]:
-        table_pairs = [
-            *core.normalized_side_pairs(self.conversion.get("sidePairs")),
-            *self._side_pair_drafts(),
-        ]
+        table_pairs = core.normalized_side_pairs(self.conversion.get("sidePairs"))
         rows: list[dict[str, object]] = []
         for index, pair in enumerate(table_pairs):
             if not isinstance(pair, dict):
@@ -417,100 +415,198 @@ class SlotsWorkflowMixin:
         return left, right
 
     def _slot_click(self, event: tk.Event) -> str | None:
+        """Select the clicked row and nothing else.
+
+        2026-09-07: a click on the Left or Right cell used to arm a part pick,
+        so the click that meant "select this row so Remove can take it" put the
+        row back into editing instead. Rows are made by New and taken away by
+        Remove; the table itself only ever reports.
+        """
         self._close_tree_combo_editor()
         if not self._tree_body_click(self.slot_tree, event):
             return None
         item = self.slot_tree.identify_row(event.y)
-        column = self.slot_tree.identify_column(event.x)
         if not item:
             return None
-        self._edit_side_pair_cell(item, column)
+        self.slot_tree.selection_set([item])
+        self.slot_tree.focus(item)
         return "break"
 
     def _clear_side_pair_pick_target(self) -> None:
         self.side_pair_pick_target = None
 
-    def _start_side_pair_part_pick(self, item: str, field: str) -> None:
-        self.side_pair_pick_target = {"item": item, "field": field}
-        if self.slot_tree.exists(item):
-            self.slot_tree.set(item, field, "click a part...")
-            self.slot_tree.selection_set([item])
-            self.slot_tree.focus(item)
-            self.slot_tree.see(item)
-        label = "Left Part" if field == "left" else "Right Part"
-        self.status_var.set(f"{label}: click a row in Mesh Transforms or a mesh in the preview")
+    def _start_new_side_pair(self) -> None:
+        """New: pick a part, then name its opposite number in the modal.
+
+        2026-09-07: this used to drop a blank row into the table and wait for
+        two separate part picks to fill its cells. A row with neither side
+        chosen states nothing, and it made every later click on the table
+        ambiguous between selecting and editing, so a pair is now assembled
+        off-table and only lands once both sides are known.
+        """
+        if self.context is None:
+            self._show_error("No source", "Open a vehicle zip first.")
+            return
+        self.side_pair_pick_target = {"mode": "new"}
+        self.status_var.set(
+            "Equivalent Parts: click a row in Mesh Transforms or a mesh in the preview"
+        )
 
     def _commit_side_pair_part_pick_from_row(self, row_id: object) -> bool:
-        target = getattr(self, "side_pair_pick_target", None)
-        if not isinstance(target, dict):
+        """A part was clicked while New was waiting for one.
+
+        Answers whether the click was consumed, not whether a row was written:
+        the modal opens on a timer once the click has finished being handled.
+        """
+        if not isinstance(getattr(self, "side_pair_pick_target", None), dict):
             return False
-        item = str(target.get("item") or "")
-        field = str(target.get("field") or "")
-        if field not in {"left", "right"}:
-            self._clear_side_pair_pick_target()
-            return False
-        rows_by_iid = getattr(self, "side_pair_rows_by_iid", {})
-        pair = rows_by_iid.get(item) if isinstance(rows_by_iid, dict) else None
-        if not isinstance(pair, dict) or not hasattr(self, "part_tree") or not self.part_tree.exists(row_id):
-            self._clear_side_pair_pick_target()
+        self._clear_side_pair_pick_target()
+        ref = ""
+        if hasattr(self, "part_tree") and self.part_tree.exists(row_id):
+            ref = self._part_row_side_ref(row_id) or self._part_row_mesh_id(row_id)
+        if not ref:
             self.status_var.set("Equivalent part picker cancelled")
             return False
-        ref = self._part_row_side_ref(row_id)
-        if not ref:
-            ref = self._part_row_mesh_id(row_id)
-        if not ref:
+        ref = str(ref)
+        self.after(SIDE_PAIR_MODAL_DELAY_MS, lambda: self._choose_and_commit_side_pair(ref))
+        return True
+
+    def _side_pair_partner_ref(self, ref: str) -> str:
+        """The other side of the row this ref already sits on, if any."""
+        for pair in self._side_pair_current_pairs():
+            if str(pair.get("left") or "") == ref:
+                return str(pair.get("right") or "")
+            if str(pair.get("right") or "") == ref:
+                return str(pair.get("left") or "")
+        return ""
+
+    def _side_pair_ref_position(self, ref: str) -> tuple[float, float, float] | None:
+        """Where a ref sits, for a ref the candidate list does not carry."""
+        if self.context is None:
+            return None
+        obj = self.context.objects.get(self._side_pair_ref_part_id(ref))
+        if obj is None:
+            return None
+        return (float(obj.x), float(obj.y), float(obj.z))
+
+    @staticmethod
+    def _mirrored_position_ref(position: object, candidates: list[dict[str, object]]) -> str:
+        """The candidate closest to where this one's reflection would be.
+
+        The same score the Swap Mesh geometry test uses -- distance from the
+        reflection, lateral weighted four times the fore/aft and vertical drift
+        -- but over instance positions rather than mesh positions, because two
+        Equivalent Parts rows are routinely two instances of one mesh and a
+        mesh-level position cannot tell those apart.
+        """
+        if not isinstance(position, (tuple, list)) or len(position) < 3:
+            return ""
+        x, y, z = (float(position[0]), float(position[1]), float(position[2]))
+        best: tuple[float, str] | None = None
+        for candidate in candidates:
+            other = candidate.get("position")
+            if not isinstance(other, (tuple, list)) or len(other) < 3:
+                continue
+            other_x, other_y, other_z = (float(other[0]), float(other[1]), float(other[2]))
+            if abs(x) > 0.02 and abs(other_x) > 0.02 and x * other_x > 0:
+                continue  # both off-centre on the same side, so not a counterpart
+            ref = str(candidate.get("ref") or "")
+            if not ref:
+                continue
+            score = abs(x + other_x) * 4.0 + abs(y - other_y) + abs(z - other_z)
+            if best is None or score < best[0]:
+                best = (score, ref)
+        return best[1] if best is not None else ""
+
+    def _suggest_side_pair_counterpart(
+        self,
+        subject: dict[str, object],
+        candidates: list[dict[str, object]],
+    ) -> str:
+        """The part most likely to be the picked one's opposite number.
+
+        Name first -- an _FL mesh names its _FR -- then position, which is what
+        answers the case a name cannot: one mesh fitted twice, once per side.
+        """
+        mesh_id = str(subject.get("mesh_id") or subject.get("part_id") or "")
+        position = subject.get("position")
+        mesh_ids = sorted(
+            {
+                str(candidate.get("mesh_id") or candidate.get("part_id") or "")
+                for candidate in candidates
+            }
+            - {"", mesh_id}
+        )
+        named = self._name_pair_candidate(mesh_id, mesh_ids) if mesh_id and mesh_ids else None
+        if named:
+            pool = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("mesh_id") or candidate.get("part_id") or "") == named
+            ]
+            if len(pool) == 1:
+                return str(pool[0].get("ref") or "")
+            mirrored = self._mirrored_position_ref(position, pool)
+            if mirrored:
+                return mirrored
+            if pool:
+                return str(pool[0].get("ref") or "")
+        return self._mirrored_position_ref(position, candidates)
+
+    def _choose_and_commit_side_pair(self, ref: str) -> bool:
+        """Ask which part answers ``ref``, then write the row."""
+        context = self._side_pair_table_context()
+        source_candidates = context.get("source_candidates", [])
+        if not isinstance(source_candidates, list):
+            source_candidates = []
+        by_ref = {
+            str(candidate.get("ref") or ""): candidate
+            for candidate in source_candidates
+            if isinstance(candidate, dict)
+        }
+        subject = by_ref.get(ref) or {
+            "ref": ref,
+            "mesh_id": self._side_pair_ref_part_id(ref),
+            "position": self._side_pair_ref_position(ref),
+        }
+        candidates = [
+            candidate
+            for candidate in source_candidates
+            if isinstance(candidate, dict)
+            and str(candidate.get("ref") or "")
+            and str(candidate.get("ref")) != ref
+        ]
+        if not candidates:
+            self._show_error("Equivalent Parts", "No other part is available to pair with.")
             return False
-        updated = self._side_pair_editable_pair(pair)
-        updated[field] = ref
-        self._clear_side_pair_pick_target()
-        return self._commit_side_pair(updated, old_pair=pair, action="Updated")
+        value_by_label, _label_by_value = self._side_pair_source_option_maps(candidates)
+        existing = self._side_pair_partner_ref(ref)
+        partner = self._choose_counterpart_modal(
+            title="Equivalent Parts",
+            subject_heading="Part",
+            subject_text=self._side_pair_label_for(ref, context),
+            choice_heading="Equivalent To",
+            value_by_label=value_by_label,
+            suggested=self._suggest_side_pair_counterpart(subject, candidates),
+            initial=existing,
+            subject_value=ref,
+            empty_choice_message="Select the part on the other side.",
+            self_choice_message="Equivalent parts need two different entries.",
+        )
+        if not partner:
+            self.status_var.set("Equivalent part picker cancelled")
+            return False
+        kind = self._default_side_pair_kind(
+            str(subject.get("mesh_id") or self._side_pair_ref_part_id(ref)),
+            str(by_ref.get(partner, {}).get("mesh_id") or self._side_pair_ref_part_id(partner)),
+        )
+        return self._commit_side_pair(
+            {"left": ref, "right": partner, "kind": kind.lower()},
+            action="Updated" if existing else "Added",
+        )
 
     def _side_pair_current_pairs(self) -> list[dict[str, object]]:
         return core.normalized_side_pairs(self.conversion.get("sidePairs"))
-
-    def _side_pair_drafts(self) -> list[dict[str, object]]:
-        drafts = getattr(self, "side_pair_draft_rows", None)
-        if not isinstance(drafts, list):
-            drafts = []
-            self.side_pair_draft_rows = drafts
-        return drafts
-
-    def _next_side_pair_draft_id(self) -> str:
-        seq = int(getattr(self, "side_pair_draft_seq", 0)) + 1
-        self.side_pair_draft_seq = seq
-        return f"draft_{seq}"
-
-    def _upsert_side_pair_draft(
-        self,
-        pair: dict[str, object],
-        old_pair: dict[str, object] | None = None,
-    ) -> str:
-        draft_id = str(
-            pair.get("_draft")
-            or (old_pair.get("_draft") if isinstance(old_pair, dict) else "")
-            or self._next_side_pair_draft_id()
-        )
-        draft = {
-            "left": str(pair.get("left") or ""),
-            "right": str(pair.get("right") or ""),
-            "kind": str(pair.get("kind") or "part").lower(),
-            "_draft": draft_id,
-        }
-        drafts = self._side_pair_drafts()
-        for index, existing in enumerate(drafts):
-            if isinstance(existing, dict) and existing.get("_draft") == draft_id:
-                drafts[index] = draft
-                break
-        else:
-            drafts.append(draft)
-        return draft_id
-
-    def _remove_side_pair_draft(self, draft_id: str) -> None:
-        self.side_pair_draft_rows = [
-            draft
-            for draft in self._side_pair_drafts()
-            if not isinstance(draft, dict) or str(draft.get("_draft") or "") != draft_id
-        ]
 
     def _select_side_pair_row(self, left: str, right: str) -> None:
         key = self._side_pair_pair_key(left, right)
@@ -524,55 +620,29 @@ class SlotsWorkflowMixin:
                 self.slot_tree.see(row_iid)
                 return
 
-    def _select_side_pair_draft_row(self, draft_id: str) -> None:
-        rows_by_iid = getattr(self, "side_pair_rows_by_iid", {})
-        if not isinstance(rows_by_iid, dict):
-            return
-        for row_iid, row in rows_by_iid.items():
-            if isinstance(row, dict) and str(row.get("_draft") or "") == draft_id:
-                self.slot_tree.selection_set([row_iid])
-                self.slot_tree.focus(row_iid)
-                self.slot_tree.see(row_iid)
-                return
-
     def _commit_side_pair(
         self,
         pair: dict[str, object],
         *,
-        old_pair: dict[str, object] | None = None,
         action: str = "Updated",
     ) -> bool:
+        """Write one finished pair.
+
+        No old-row bookkeeping: ``set_side_pair`` drops every row either side
+        already sits on, so re-pairing a part replaces its row rather than
+        leaving the part on two.
+        """
         if self.context is None:
             self._show_error("No source", "Open a vehicle zip first.")
             return False
         left = str(pair.get("left") or "")
         right = str(pair.get("right") or "")
-        draft_id = str(pair.get("_draft") or (old_pair.get("_draft") if isinstance(old_pair, dict) else "") or "")
         if not left or not right:
-            if draft_id:
-                draft_id = self._upsert_side_pair_draft(pair, old_pair)
-                self._refresh_slots()
-                self._select_side_pair_draft_row(draft_id)
-                self.status_var.set("Fill both part columns to save the equivalent parts row")
-                return True
             self._show_error("Equivalent Parts", "Choose both parts.")
             return False
         if left == right:
             self._show_error("Equivalent Parts", "Equivalent parts need two different entries.")
             return False
-        if old_pair is not None:
-            old_draft = str(old_pair.get("_draft") or "")
-            if old_draft:
-                self._remove_side_pair_draft(old_draft)
-            else:
-                old_left = str(old_pair.get("left") or "")
-                old_right = str(old_pair.get("right") or "")
-                self.conversion["sidePairs"] = [
-                    existing
-                    for existing in self._side_pair_current_pairs()
-                    if self._side_pair_pair_key(existing.get("left"), existing.get("right"))
-                    != self._side_pair_pair_key(old_left, old_right)
-                ]
         core.set_side_pair(
             self.conversion,
             left,
@@ -589,29 +659,6 @@ class SlotsWorkflowMixin:
         )
         return True
 
-    def _side_pair_editable_pair(self, pair: dict[str, object]) -> dict[str, object]:
-        out = {
-            "left": str(pair.get("left") or ""),
-            "right": str(pair.get("right") or ""),
-            "kind": str(pair.get("kind") or "part").lower(),
-        }
-        if pair.get("_draft"):
-            out["_draft"] = str(pair.get("_draft") or "")
-        return out
-
-    def _add_default_side_pair(self) -> None:
-        if self.context is None:
-            self._show_error("No source", "Open a vehicle zip first.")
-            return
-        draft_id = self._upsert_side_pair_draft({
-            "left": "",
-            "right": "",
-            "kind": "seat",
-        })
-        self._refresh_slots()
-        self._select_side_pair_draft_row(draft_id)
-        self.status_var.set("Added blank equivalent parts row")
-
     def _remove_selected_side_pair(self) -> None:
         self._clear_side_pair_pick_target()
         selection = self.slot_tree.selection()
@@ -626,20 +673,6 @@ class SlotsWorkflowMixin:
         right = str(pair.get("right") or "")
         old_children = list(self.slot_tree.get_children())
         old_index = old_children.index(iid) if iid in old_children else 0
-        draft_id = str(pair.get("_draft") or "")
-        if draft_id:
-            self._remove_side_pair_draft(draft_id)
-            self._refresh_slots()
-            next_children = list(self.slot_tree.get_children())
-            if next_children:
-                next_iid = next_children[min(old_index, len(next_children) - 1)]
-                self.slot_tree.selection_set([next_iid])
-                self.slot_tree.focus(next_iid)
-                self.slot_tree.see(next_iid)
-            else:
-                self.slot_tree.selection_set([])
-            self.status_var.set("Removed blank equivalent parts row")
-            return
         self.conversion["sidePairs"] = [
             existing
             for existing in self._side_pair_current_pairs()
@@ -662,27 +695,6 @@ class SlotsWorkflowMixin:
             f"Removed equivalent parts: {self._side_pair_label_for(left, context)} <-> "
             f"{self._side_pair_label_for(right, context)}"
         )
-
-    def _edit_side_pair_cell(self, item: str, column: str) -> None:
-        rows_by_iid = getattr(self, "side_pair_rows_by_iid", {})
-        pair = rows_by_iid.get(item) if isinstance(rows_by_iid, dict) else None
-        name = self._tree_column_name(self.slot_tree, column)
-        if not isinstance(pair, dict) or name is None:
-            return
-        self.slot_tree.focus(item)
-        self.slot_tree.selection_set([item])
-        if name == "kind":
-            current = self._side_pair_kind_label(pair.get("kind"))
-
-            def commit(value: str) -> None:
-                updated = self._side_pair_editable_pair(pair)
-                updated["kind"] = self._side_pair_kind_value(value)
-                self._commit_side_pair(updated, old_pair=pair, action="Updated")
-
-            self._edit_tree_combo(self.slot_tree, item, column, SIDE_PAIR_KIND_OPTIONS, current, commit)
-            return
-        if name in {"left", "right"}:
-            self._start_side_pair_part_pick(item, name)
 
     def _focus_side_pair_table_shortcut(self, event: tk.Event) -> str | None:
         focus = self.focus_get()
@@ -734,9 +746,10 @@ class SlotsWorkflowMixin:
             return []
         label_universe = self._side_pair_mesh_candidates()
         candidates: list[dict[str, object]] = []
-        for row_id in self.current_part_ids:
-            if not self.part_tree.exists(row_id):
-                continue
+        # 2026-09-07: every row the table holds, not just the ones its filter is
+        # showing. The Equivalent Parts modal offers this list, and the filter
+        # typed to find the first part would otherwise hide its counterpart.
+        for row_id in getattr(self, "part_instance_rows", {}):
             mesh_id = self._part_row_mesh_id(row_id)
             if mesh_id not in self.context.objects:
                 continue

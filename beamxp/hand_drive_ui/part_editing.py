@@ -1073,8 +1073,9 @@ class PartEditingMixin:
         self.part_tree.focus_set()
         if not object_id:
             if isinstance(getattr(self, "side_pair_pick_target", None), dict):
+                # Clicking nothing is how a pick is called off. No table rebuild
+                # to do since 2026-09-07: the pick no longer holds a row open.
                 self._clear_side_pair_pick_target()
-                self._refresh_slots()
                 self.status_var.set("Equivalent part picker cancelled")
                 return
             self._clear_all_selection()  # empty click -> deselect everything

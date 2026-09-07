@@ -165,6 +165,103 @@ class WindowingMixin:
     def _show_error(self, title: str, message: str, *, parent: tk.Widget | None = None) -> None:
         messagebox.showerror(title, message, parent=parent or self)
 
+    def _choose_counterpart_modal(
+        self,
+        *,
+        title: str,
+        subject_heading: str,
+        subject_text: str,
+        choice_heading: str,
+        value_by_label: dict[str, str],
+        suggested: str = "",
+        initial: str = "",
+        subject_value: str = "",
+        empty_choice_message: str,
+        self_choice_message: str,
+    ) -> str | None:
+        """Name the thing on screen, offer the one that answers it, suggest one.
+
+        2026-09-07: extracted from the Swap Mesh source picker so Equivalent
+        Parts asks its question the same way. Both are "this one; which one
+        goes with it?", so they are one modal with two sets of words rather
+        than two dialogs the user has to learn separately.
+
+        Returns the chosen value, or None if the user cancelled.
+        """
+        label_by_value = {value: label for label, value in value_by_label.items()}
+
+        modal = tk.Toplevel(self)
+        modal.title(title)
+        modal.transient(self)
+        modal.resizable(False, False)
+        modal.columnconfigure(1, weight=1)
+
+        ttk.Label(modal, text=subject_heading).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        ttk.Label(modal, text=subject_text).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(0, 10),
+            pady=(10, 4),
+        )
+        ttk.Label(modal, text=choice_heading).grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        choice_var = tk.StringVar()
+        combo = ttk.Combobox(
+            modal,
+            textvariable=choice_var,
+            values=list(value_by_label),
+            state="readonly",
+            width=52,
+            height=min(max(len(value_by_label), 1), 16),
+        )
+        combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=4)
+
+        suggestion_text = (
+            f"Suggested: {label_by_value[suggested]}"
+            if suggested and suggested in label_by_value
+            else "Suggested: no obvious pair found"
+        )
+        ttk.Label(modal, text=suggestion_text).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=10,
+            pady=(0, 8),
+        )
+
+        if initial and initial in label_by_value:
+            choice_var.set(label_by_value[initial])
+        elif suggested and suggested in label_by_value:
+            choice_var.set(label_by_value[suggested])
+
+        result: dict[str, str | None] = {"value": None}
+
+        def commit() -> None:
+            selected = value_by_label.get(choice_var.get())
+            if not selected:
+                self._show_error(title, empty_choice_message, parent=modal)
+                return
+            if subject_value and selected == subject_value:
+                self._show_error(title, self_choice_message, parent=modal)
+                return
+            result["value"] = selected
+            modal.destroy()
+
+        buttons = ttk.Frame(modal)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="Cancel", command=modal.destroy).pack(side="right")
+        ttk.Button(buttons, text="Apply", command=commit).pack(side="right", padx=(0, 6))
+
+        modal.protocol("WM_DELETE_WINDOW", modal.destroy)
+        modal.bind("<Escape>", lambda _event: modal.destroy())
+        modal.bind("<Return>", lambda _event: commit())
+        self._place_modal_on_app_monitor(modal)
+        combo.focus_set()
+        modal.grab_set()
+        self.wait_window(modal)
+        return result["value"]
+
     def _ask_open_filename(self, **options) -> str:
         return filedialog.askopenfilename(parent=self, **options)
 

@@ -124,79 +124,18 @@ class RecommendationsUIMixin:
             self._part_option_label(candidate, label_universe): candidate
             for candidate in candidates
         }
-        label_by_value = {value: label for label, value in value_by_label.items()}
-
-        modal = tk.Toplevel(self)
-        modal.title("Swap Mesh")
-        modal.transient(self)
-        modal.resizable(False, False)
-        modal.columnconfigure(1, weight=1)
-
-        ttk.Label(modal, text="Mesh").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
-        ttk.Label(modal, text=self._part_option_label(object_id, label_universe)).grid(
-            row=0,
-            column=1,
-            sticky="w",
-            padx=(0, 10),
-            pady=(10, 4),
+        return self._choose_counterpart_modal(
+            title="Swap Mesh",
+            subject_heading="Mesh",
+            subject_text=self._part_option_label(object_id, label_universe),
+            choice_heading="Mirror From",
+            value_by_label=value_by_label,
+            suggested=suggested or "",
+            initial=existing,
+            subject_value=object_id,
+            empty_choice_message="Select a source mesh to mirror from.",
+            self_choice_message="A mesh cannot swap from itself.",
         )
-        ttk.Label(modal, text="Mirror From").grid(row=1, column=0, sticky="w", padx=10, pady=4)
-        source_var = tk.StringVar()
-        combo = ttk.Combobox(
-            modal,
-            textvariable=source_var,
-            values=list(value_by_label),
-            state="readonly",
-            width=52,
-            height=min(max(len(value_by_label), 1), 16),
-        )
-        combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=4)
-
-        suggestion_text = (
-            f"Suggested: {self._part_option_label(suggested, label_universe)}"
-            if suggested
-            else "Suggested: no obvious pair found"
-        )
-        ttk.Label(modal, text=suggestion_text).grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            padx=10,
-            pady=(0, 8),
-        )
-
-        if existing and existing in label_by_value:
-            source_var.set(label_by_value[existing])
-        elif suggested and suggested in label_by_value:
-            source_var.set(label_by_value[suggested])
-
-        result: dict[str, str | None] = {"source": None}
-
-        def commit() -> None:
-            selected = value_by_label.get(source_var.get())
-            if not selected:
-                self._show_error("Swap Mesh", "Select a source mesh to mirror from.", parent=modal)
-                return
-            if selected == object_id:
-                self._show_error("Swap Mesh", "A mesh cannot swap from itself.", parent=modal)
-                return
-            result["source"] = selected
-            modal.destroy()
-
-        buttons = ttk.Frame(modal)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="Cancel", command=modal.destroy).pack(side="right")
-        ttk.Button(buttons, text="Apply", command=commit).pack(side="right", padx=(0, 6))
-
-        modal.protocol("WM_DELETE_WINDOW", modal.destroy)
-        modal.bind("<Escape>", lambda _event: modal.destroy())
-        modal.bind("<Return>", lambda _event: commit())
-        self._place_modal_on_app_monitor(modal)
-        combo.focus_set()
-        modal.grab_set()
-        self.wait_window(modal)
-        return result["source"]
 
     def _open_recommendations_modal(self) -> None:
         if self.context is None:

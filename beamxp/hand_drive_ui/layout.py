@@ -306,7 +306,7 @@ class LayoutMixin:
         self.new_side_pair_button = ttk.Button(
             header,
             text="New",
-            command=self._add_default_side_pair,
+            command=self._start_new_side_pair,
             state="disabled",
         )
         self.new_side_pair_button.grid(row=0, column=2, sticky="e")
