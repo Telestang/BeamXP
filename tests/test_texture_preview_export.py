@@ -3552,7 +3552,127 @@ class SplitTextureManifestTests(unittest.TestCase):
 
 
 class SharedLayerRegionTests(unittest.TestCase):
-    """One material/part must use one accepted region set across its maps."""
+    """2026-09-06: Share eligible evidence while keeping colour detections local."""
+
+    def test_colour_corrects_itself_without_donating_to_companions(self) -> None:
+        dash = part("dashboard")
+        source_member = "vehicles/car/source.png"
+        target_member = "vehicles/car/ao.png"
+        relief_member = "vehicles/car/relief.png"
+        own_region = (1, 1, 3, 2)
+        relief_region = (1, 7, 3, 2)
+        mirror = np.zeros((16, 16), dtype=bool)
+        mirror[:, :8] = True
+        masks = rhd.DomainMasks(
+            mirror=mirror,
+            rigid=np.zeros_like(mirror),
+            conflict_coverage=0.0,
+            mirrored_triangles=1,
+            rigid_triangles=0,
+            parts_analysed=1,
+        )
+        config = replace(
+            rhd.DEFAULT_RHD_CONFIG,
+            detect_on_normal_map=False,
+            enable_repeat_filter=False,
+            enable_skewed_region_filter=False,
+            write_debug_overlays=False,
+            region_boundary_blend_px=0.0,
+        )
+
+        def binding(member, stage_key):
+            return rhd.MaterialTextureLayerBinding(
+                dae_material="interior",
+                material_key="interior",
+                materials_member="vehicles/car/main.materials.json",
+                texture_reference=f"/{member}",
+                texture_member=member,
+                stage_key=stage_key,
+                kind=rhd.MATERIAL_TEXTURE_STAGE_KINDS[stage_key],
+            )
+
+        for stage_key in (
+            "baseColorMap", "colorMap", "diffuseMap", "normalMap",
+            "clearCoatBottomNormalMap", "opacityMap", "emissiveMap", "overlayMap",
+        ):
+            with self.subTest(stage_key=stage_key), tempfile.TemporaryDirectory() as temporary:
+                workspace = Path(temporary)
+                source = workspace / "input.png"
+                pixels = np.zeros((16, 16, 4), dtype=np.uint8)
+                pixels[:, :, 3] = 255
+                pixels[1:3, 1:4, :3] = np.array([20, 90, 180])[:, None]
+                Image.fromarray(pixels).save(source)
+                bindings = {
+                    source_member: binding(source_member, stage_key),
+                    target_member: binding(target_member, "ambientOcclusionMap"),
+                }
+                ledger = rhd.SharedLayerRegionLedger()
+                ledger.record(relief_member, (16, 16), [relief_region], [None])
+
+                def build(
+                    member, *, detect_only=False, detect=True,
+                    workspace=workspace, ledger=ledger,
+                ):
+                    return rhd.build_rhd_texture(
+                        SimpleNamespace(materials=[]), SimpleNamespace(), member,
+                        workspace, config=config, part_scope=[dash],
+                        material_scope=("interior",), masks=masks,
+                        shared_layer_regions=ledger, detect_only=detect_only,
+                        detect=detect, log=lambda *_a: None,
+                    )
+
+                with (
+                    patch.object(
+                        rhd, "scoped_parts_using_material",
+                        side_effect=lambda _archive, _loaded, member, *_a, bindings=bindings, **_kw: [
+                            (dash, bindings[member])
+                        ],
+                    ),
+                    patch.object(
+                        rhd, "material_symbols_for_binding",
+                        return_value=("interior-material",),
+                    ),
+                    patch.object(rhd, "extract_archive_member", return_value=source),
+                    patch.object(
+                        rhd, "detect_layer_regions_with_glyph_lab",
+                        side_effect=lambda *_a, **_kw: rhd.RegionDetection(
+                            source="own", detected=1,
+                            regions=[own_region], rotations=[None],
+                        ),
+                    ),
+                    patch.object(
+                        rhd, "detect_flip_regions_by_uv_island",
+                        side_effect=lambda *_a, **_kw: rhd.RegionDetection(
+                            source="opacity", detected=1,
+                            regions=[own_region], rotations=[None],
+                        ),
+                    ),
+                    patch.object(
+                        rhd, "plan_island_flips",
+                        side_effect=lambda *_a, **_kw: ([], np.zeros_like(mirror)),
+                    ),
+                ):
+                    self.assertIsNone(build(source_member, detect_only=True))
+                    own = build(source_member)
+                    companion = build(target_member, detect=False)
+
+                self.assertEqual(set(own.in_place_flips), {own_region, relief_region})
+                self.assertEqual(own.report["shared_layer_region_sources"], [relief_member])
+                if stage_key in ("baseColorMap", "colorMap", "diffuseMap"):
+                    self.assertNotIn(source_member, ledger.layers)
+                    self.assertEqual(companion.in_place_flips, [relief_region])
+                    self.assertEqual(
+                        companion.report["shared_layer_region_sources"], [relief_member]
+                    )
+                    with Image.open(own.png_path) as corrected:
+                        np.testing.assert_array_equal(
+                            np.asarray(corrected)[1:3, 1:4], pixels[1:3, 1:4][:, ::-1]
+                        )
+                else:
+                    self.assertEqual(
+                        set(companion.in_place_flips), {own_region, relief_region}
+                    )
+                    self.assertIn(source_member, companion.report["shared_layer_region_sources"])
 
     def test_task_groups_do_not_cross_a_material_or_part_boundary(self) -> None:
         dash = part("dashboard")

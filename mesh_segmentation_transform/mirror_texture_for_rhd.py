@@ -29,6 +29,8 @@ turned over on that axis, or whether its glyphs have to be done individually.
 Off-axis cases are resolved to the nearer axis and not otherwise corrected.
 
 Base colour, emissive, opacity, overlay and normal maps are detector sources.
+2026-09-06: Colour detections correct only their own physical layer; the other
+detector sources still share accepted regions across the material's maps.
 Material-response maps are correction-only: they receive the accepted plan but
 never donate regions. Repeated references to one physical file are still
 processed once.
@@ -641,8 +643,8 @@ class RhdTextureResult:
 # surface, so they are registered to nothing in particular and flipping a
 # region of one would corrupt every other place it lands.  Cubemaps and
 # "@"-prefixed runtime aliases never name an archive member at all.
-# 2026-09-02: Every member here is corrected when a sibling's accepted plan
-# reaches it. Only ``DETECTION_SOURCE_STAGE_KEYS`` below may donate regions.
+# 2026-09-06: Every member here can receive a sibling's accepted regions.
+# ``DETECTION_SOURCE_STAGE_KEYS`` may detect; colour keeps its detections local.
 NORMAL_MAP_STAGE_KEYS = ("normalMap", "clearCoatBottomNormalMap")
 COLOUR_MAP_STAGE_KEYS = ("baseColorMap", "colorMap", "diffuseMap")
 SCALAR_MAP_STAGE_KEYS = (
@@ -747,7 +749,7 @@ class MaterialTextureLayerBinding:
 
 
 def stage_keys_allow_detection(stage_keys: Iterable[str]) -> bool:
-    """Whether any material slot sharing this file may donate regions."""
+    """2026-09-06: Whether any material slot sharing this file may detect regions."""
     return any(stage_key in DETECTION_SOURCE_STAGE_KEYS for stage_key in stage_keys)
 
 
@@ -5984,6 +5986,9 @@ class SharedLayerRegionLedger:
     the union, so a mark visible only as normal relief or faint gloss is still
     turned over in all maps that composite it.
 
+    2026-09-06: Colour detections stay local and are never recorded here by the
+    exporter. Colour layers still receive evidence from the other sources.
+
     A ledger belongs to exactly one correction-task group.  That scope is what
     prevents a shared atlas used by another material or another mesh from
     donating unrelated marks.  Pixel boxes are scaled through normalised atlas
@@ -7762,6 +7767,8 @@ def build_rhd_texture(
     ``shared_layer_regions`` is scoped by the caller to one material on one
     part/UV layout. A detect-only visit records source-layer evidence; a
     correction-only layer records none and reuses its siblings' accepted plan.
+    2026-09-06: Colour layers retain their own detections without donating them;
+    they still receive other source layers' shared evidence.
     """
     started = time.perf_counter()
     phase_timings: list[dict[str, object]] = []
@@ -8772,18 +8779,21 @@ def build_rhd_texture(
     shared_layer_sources: tuple[str, ...] = ()
     shared_layer_regions_added = 0
     if shared_layer_regions is not None:
-        if authoritative_shared_evidence is not None:
-            shared_layer_regions.record_evidence(
-                texture_member, authoritative_shared_evidence
-            )
-        else:
-            shared_layer_regions.record(
-                texture_member,
-                (width, height),
-                mirrored_regions,
-                mirrored_rotations,
-                mirrored_masks,
-            )
+        # 2026-09-06: Printed colour glyphs must not move companion relief or
+        # baked lighting. Keep their detections for this layer's own plan only.
+        if layer_kind != "colour":
+            if authoritative_shared_evidence is not None:
+                shared_layer_regions.record_evidence(
+                    texture_member, authoritative_shared_evidence
+                )
+            else:
+                shared_layer_regions.record(
+                    texture_member,
+                    (width, height),
+                    mirrored_regions,
+                    mirrored_rotations,
+                    mirrored_masks,
+                )
         if detect_only:
             emit_progress(
                 progress,
