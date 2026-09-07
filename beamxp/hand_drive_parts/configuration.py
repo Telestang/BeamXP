@@ -74,7 +74,47 @@ from beamxp.core.models import (
     VariantInfo,
     VehicleContext,
 )
+from beamxp.core.portable_paths import (
+    map_paths as map_asset_paths,
+    portable_path as portable_asset_path,
+    resolved_path as resolved_asset_path,
+    shareable_path,
+)
 from beamxp.plates import generator as plate_generator
+
+
+# The conversion.json layout this build writes. Absent means 1: every mesh and
+# every trim spelt out in full, with the plate designs embedded. 2 records only
+# what differs from the defaults and keeps the plate designs in plates.json
+# beside it. A format-1 file still loads -- the merge below rebuilds the
+# defaults either way, so a sparse file and a dense one describe the same
+# conversion, and format 1 is simply the dense spelling of it.
+CONVERSION_FORMAT = 2
+
+# The keys a saved mesh setting may carry. Anything else in a save -- an old
+# build's "textureFlip", say -- is dropped on load and never written back.
+PART_SETTING_KEYS = (
+    "mode",
+    "mirrorSource",
+    "translateOffset",
+    "steeringRef",
+    "includeChildren",
+    PART_TEXTURE_CORRECTION_KEY,
+    "viewerVisible",
+    "viewerSolo",
+)
+
+# Same for a trim. "plate" is listed because a format-1 save carries the
+# design inline; format 2 writes it to plates.json instead, and the loader
+# takes whichever is there.
+VARIANT_SETTING_KEYS = (
+    "selected",
+    "build",
+    "sourceHandOverride",
+    "plate",
+    "frontPlate",
+    "rearPlate",
+)
 
 
 def default_part_setting(object_id: str, obj: object | None = None) -> dict[str, object]:
@@ -452,13 +492,7 @@ def texture_quality_setting(conversion: dict[str, object]) -> str:
 def base_conversion_config(context: VehicleContext) -> dict[str, object]:
     return {
         "toolVersion": TOOL_VERSION,
-        "source": {
-            "fileName": context.source_zip.name,
-            "sourcePath": str(context.source_zip),
-            "vehicleId": context.vehicle_id,
-            "daeFiles": context.dae_paths,
-            "configs": sorted(context.variants),
-        },
+        "source": source_summary(context),
         "variants": default_variant_settings(context),
         "parts": default_part_settings(context),
         "slotPairs": [],
@@ -482,14 +516,187 @@ def conversion_path(context: VehicleContext) -> Path:
     return context.project_dir / "conversion.json"
 
 
+def plates_path(context: VehicleContext) -> Path:
+    """Where a project's licence-plate designs live, from format 2 on.
+
+    Separate from conversion.json for two reasons. A design references fonts
+    and artwork by absolute path, which is machine-specific and carries the
+    user's name in it, so keeping it out is what lets the conversion travel.
+    And a design is the part most likely to disagree between builds -- new
+    fields, new plate formats -- so a conversion that no longer understands a
+    design can still be read.
+    """
+    return context.project_dir / "plates.json"
+
+
+def source_summary(context: VehicleContext) -> dict[str, object]:
+    """What a conversion records about the vehicle it was authored against.
+
+    The zip's own name and the vehicle id, and nothing else. This used to
+    carry the absolute path to the zip -- which named the user's home
+    directory, and was read by nothing -- along with copies of the vehicle's
+    DAE and trim lists, which describe the vehicle rather than the conversion
+    and are equally unread. All three shipped inside every built mod.
+    """
+    return {
+        "fileName": context.source_zip.name,
+        "vehicleId": context.vehicle_id,
+    }
+
+
+def plate_document(conversion: dict[str, object]) -> dict[str, object]:
+    """The plate designs from an in-memory conversion, ready to write.
+
+    A binding that matches the default is left out: the loader rebuilds it,
+    and writing forty identical blocks was most of what made a saved trim
+    list long.
+    """
+    default_general = plate_generator.normalized_plate_binding(None)
+    default_variant = plate_generator.normalized_plate_binding(None, variant=True)
+
+    document: dict[str, object] = {"configFormat": CONVERSION_FORMAT}
+    general = plate_generator.normalized_plate_binding(conversion.get("plate"))
+    if general != default_general:
+        document["plate"] = map_asset_paths(general, portable_asset_path)
+
+    variants: dict[str, object] = {}
+    saved_variants = conversion.get("variants", {})
+    if isinstance(saved_variants, dict):
+        for name, settings in sorted(saved_variants.items()):
+            if not isinstance(settings, dict):
+                continue
+            binding = plate_generator.normalized_plate_binding(
+                settings.get("plate"), variant=True
+            )
+            if binding != default_variant:
+                variants[name] = map_asset_paths(binding, portable_asset_path)
+    if variants:
+        document["variants"] = variants
+    return document
+
+
+def apply_plate_document(
+    conversion: dict[str, object],
+    document: dict[str, object],
+) -> dict[str, object]:
+    """Put a plates.json back onto an in-memory conversion.
+
+    The rest of the tool reads ``conversion["plate"]`` and each trim's
+    ``["plate"]``, so the split is a matter of what reaches the disk and
+    nothing else has to know about it.
+    """
+    expanded = map_asset_paths(document, resolved_asset_path)
+    conversion["plate"] = plate_generator.normalized_plate_binding(expanded.get("plate"))
+    saved = expanded.get("variants", {})
+    saved = saved if isinstance(saved, dict) else {}
+    variants = conversion.get("variants", {})
+    if isinstance(variants, dict):
+        for name, settings in variants.items():
+            if isinstance(settings, dict):
+                settings["plate"] = plate_generator.normalized_plate_binding(
+                    saved.get(name), variant=True
+                )
+    return conversion
+
+
+def sparse_part_settings(
+    context: VehicleContext,
+    conversion: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    """Only the meshes whose settings differ from the ones load rebuilds.
+
+    Skip is the default for every mesh, and on a real vehicle nine in ten of
+    them keep it, so spelling each one out made a saved project ten to twenty
+    times larger than the decisions in it. The baseline is the whole default
+    map rather than one mesh's defaults, because the steering reference's
+    default is worked out across the vehicle.
+    """
+    baseline = default_part_settings(context)
+    saved = conversion.get("parts", {})
+    if not isinstance(saved, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for object_id, settings in sorted(saved.items()):
+        if not isinstance(settings, dict):
+            continue
+        default = baseline.get(object_id)
+        if default is None:
+            continue  # a mesh this vehicle no longer indexes
+        changed = {
+            key: settings[key]
+            for key in PART_SETTING_KEYS
+            if key in settings and settings[key] != default.get(key)
+        }
+        if changed:
+            out[object_id] = changed
+    return out
+
+
+def sparse_variant_settings(
+    context: VehicleContext,
+    conversion: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    """Only the trims whose settings differ from the ones load rebuilds.
+
+    "plate" is never written here -- it goes to plates.json -- and "selected"
+    travels with "build" even when only one of them changed, because they are
+    two spellings of one answer and an older build reads the other one.
+    """
+    baseline = default_variant_settings(context)
+    saved = conversion.get("variants", {})
+    if not isinstance(saved, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for name, settings in sorted(saved.items()):
+        if not isinstance(settings, dict):
+            continue
+        default = baseline.get(name)
+        if default is None:
+            continue
+        changed = {
+            key: settings[key]
+            for key in VARIANT_SETTING_KEYS
+            if key != "plate" and key in settings and settings[key] != default.get(key)
+        }
+        if changed and ("build" in changed or "selected" in changed):
+            changed["build"] = variant_build_mode(settings)
+            changed["selected"] = changed["build"] != BUILD_OFF
+        if changed:
+            out[name] = changed
+    return out
+
+
 def load_or_create_conversion(context: VehicleContext) -> tuple[dict[str, object], bool]:
     path = conversion_path(context)
     if path.exists():
         data = read_json_file(path)
         source = data.get("source", {})
         if not isinstance(source, dict) or source.get("vehicleId") in {None, context.vehicle_id}:
-            return merge_with_current_inventory(context, data), True
+            merged = merge_with_current_inventory(context, data)
+            # plates.json is authoritative where it exists. Where it does not,
+            # the merge above has already taken the designs a format-1 save
+            # embedded, and the next save moves them out.
+            document = read_plate_document(context)
+            if document is not None:
+                apply_plate_document(merged, document)
+            return merged, True
     return base_conversion_config(context), False
+
+
+def read_plate_document(context: VehicleContext) -> dict[str, object] | None:
+    """The project's plates.json, or None when it has none or it is unusable.
+
+    Unreadable is treated the same as absent on purpose: a design that cannot
+    be parsed must not stop the conversion opening, which is the whole reason
+    the designs live in their own file.
+    """
+    path = plates_path(context)
+    if not path.exists():
+        return None
+    try:
+        return read_json_file(path)
+    except Exception:
+        return None
 
 
 def merge_with_current_inventory(context: VehicleContext, data: dict[str, object]) -> dict[str, object]:
@@ -499,18 +706,7 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
         for name, settings in old_variants.items():
             if name in merged["variants"] and isinstance(settings, dict):
                 merged["variants"][name].update(
-                    {
-                        key: settings[key]
-                        for key in (
-                            "selected",
-                            "build",
-                            "sourceHandOverride",
-                            "plate",
-                            "frontPlate",
-                            "rearPlate",
-                        )
-                        if key in settings
-                    }
+                    {key: settings[key] for key in VARIANT_SETTING_KEYS if key in settings}
                 )
                 if "build" in settings:
                     migrated_build = variant_build_mode(settings)
@@ -543,20 +739,7 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
         for object_id, settings in old_parts.items():
             if object_id in merged["parts"] and isinstance(settings, dict):
                 merged["parts"][object_id].update(
-                    {
-                        key: settings[key]
-                        for key in (
-                            "mode",
-                            "mirrorSource",
-                            "translateOffset",
-                            "steeringRef",
-                            "includeChildren",
-                            PART_TEXTURE_CORRECTION_KEY,
-                            "viewerVisible",
-                            "viewerSolo",
-                        )
-                        if key in settings
-                    }
+                    {key: settings[key] for key in PART_SETTING_KEYS if key in settings}
                 )
         # Old saves written before single-ref enforcement may carry several.
         keep_single_steering_ref(context, merged["parts"])
@@ -579,6 +762,12 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
                 if key in old_delta
             }
         )
+    # Derived from the parts, never read back from the file, and until now
+    # left holding whatever auto-detection had guessed before the save's own
+    # choice was overlaid. Nothing consumed the stale value -- every caller
+    # that needs the refs asks selected_steering_refs -- but a loaded
+    # conversion that disagrees with itself is a trap for the next reader.
+    merged["delta"]["steeringRefs"] = selected_steering_refs(merged)
     return merged
 
 
@@ -601,18 +790,7 @@ def import_matching_conversion(
         for name, settings in imported_variants.items():
             if name in out["variants"] and isinstance(settings, dict):
                 out["variants"][name].update(
-                    {
-                        key: settings[key]
-                        for key in (
-                            "selected",
-                            "build",
-                            "sourceHandOverride",
-                            "plate",
-                            "frontPlate",
-                            "rearPlate",
-                        )
-                        if key in settings
-                    }
+                    {key: settings[key] for key in VARIANT_SETTING_KEYS if key in settings}
                 )
                 if "build" in settings:
                     imported_build = variant_build_mode(settings)
@@ -643,20 +821,7 @@ def import_matching_conversion(
         for object_id, settings in imported_parts.items():
             if object_id in out["parts"] and isinstance(settings, dict):
                 out["parts"][object_id].update(
-                    {
-                        key: settings[key]
-                        for key in (
-                            "mode",
-                            "mirrorSource",
-                            "translateOffset",
-                            "steeringRef",
-                            "includeChildren",
-                            PART_TEXTURE_CORRECTION_KEY,
-                            "viewerVisible",
-                            "viewerSolo",
-                        )
-                        if key in settings
-                    }
+                    {key: settings[key] for key in PART_SETTING_KEYS if key in settings}
                 )
                 counts["partImported"] += 1
             else:
@@ -699,15 +864,23 @@ def save_conversion(context: VehicleContext, conversion: dict[str, object]) -> P
     delta = conversion.setdefault("delta", {})
     if isinstance(delta, dict):
         delta["steeringRefs"] = selected_steering_refs(conversion)
-    conversion["source"] = {
-        "fileName": context.source_zip.name,
-        "sourcePath": str(context.source_zip),
-        "vehicleId": context.vehicle_id,
-        "daeFiles": context.dae_paths,
-        "configs": sorted(context.variants),
+    conversion["source"] = source_summary(context)
+
+    document = json.dumps(plate_document(conversion), indent=2)
+    write_text_file(plates_path(context), document, encoding="utf-8")
+
+    # What reaches the disk: the decisions, not the defaults, and no plate
+    # designs. The in-memory conversion is left exactly as the caller has it.
+    saved = {
+        key: value
+        for key, value in conversion.items()
+        if key not in {"parts", "variants", "plate"}
     }
+    saved["configFormat"] = CONVERSION_FORMAT
+    saved["parts"] = sparse_part_settings(context, conversion)
+    saved["variants"] = sparse_variant_settings(context, conversion)
     path = conversion_path(context)
-    write_text_file(path, json.dumps(conversion, indent=2), encoding="utf-8")
+    write_text_file(path, json.dumps(saved, indent=2), encoding="utf-8")
     return path
 
 
@@ -783,4 +956,4 @@ def set_slot_pair(conversion: dict[str, object], slot_type: str, partner: str) -
     conversion["slotPairs"] = normalized_slot_pairs(pairs)
 
 
-__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'TRIGGER_OFFSET_MODES', 'trigger_position_key', 'trigger_offset_value', 'normalized_trigger_modes', 'trigger_mode_map', 'trigger_offset_map', 'set_trigger_mode', 'set_trigger_offset', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'BC7_QUALITY_TIERS', 'DEFAULT_BC7_QUALITY', 'TEXTURE_QUALITY_LABELS', 'normalized_texture_quality', 'texture_quality_setting', 'base_conversion_config', 'conversion_path', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']
+__all__ = ['normalized_slot_pairs', 'normalized_side_pairs', 'set_side_pair', 'clear_side_pairs', 'TRIGGER_MODES', 'TRIGGER_OFFSET_MODES', 'trigger_position_key', 'trigger_offset_value', 'normalized_trigger_modes', 'trigger_mode_map', 'trigger_offset_map', 'set_trigger_mode', 'set_trigger_offset', 'clear_trigger_mode', 'clear_trigger_modes', 'active_slot_pairs', 'slot_pair_partner', 'set_slot_pair', 'default_part_setting', 'default_part_settings', 'default_variant_settings', 'variant_build_mode', 'set_variant_build_mode', 'BC7_QUALITY_TIERS', 'DEFAULT_BC7_QUALITY', 'TEXTURE_QUALITY_LABELS', 'normalized_texture_quality', 'texture_quality_setting', 'base_conversion_config', 'conversion_path', 'plates_path', 'read_plate_document', 'plate_document', 'apply_plate_document', 'portable_asset_path', 'resolved_asset_path', 'shareable_path', 'source_summary', 'map_asset_paths', 'sparse_part_settings', 'sparse_variant_settings', 'CONVERSION_FORMAT', 'PART_SETTING_KEYS', 'VARIANT_SETTING_KEYS', 'load_or_create_conversion', 'merge_with_current_inventory', 'import_matching_conversion', 'save_conversion', 'load_app_settings', 'save_app_settings']

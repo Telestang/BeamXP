@@ -27,6 +27,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from beamxp import transform_helpers
+from beamxp.core.portable_paths import map_paths, portable_path, resolved_path
 from beamxp.core.sjson import encode_beamng_json
 
 PLATE_SIZE_EU = "EU"
@@ -345,7 +346,10 @@ def plate_set_records() -> list[dict[str, object]]:
         records.append({
             "id": set_id,
             "name": str(raw.get("name") or set_id),
-            "config": normalized_plate_config(raw.get("config")),
+            # A set saved by this build names its font as "{fonts}/..."; one
+            # saved by an older build names it in full, and passes through
+            # untouched because it matches no token.
+            "config": normalized_plate_config(map_paths(raw.get("config"), resolved_path)),
         })
     return records
 
@@ -377,7 +381,15 @@ def save_plate_set(record: dict[str, object]) -> dict[str, object]:
     folder = plate_sets_dir()
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{set_id}.json"
-    path.write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
+    # A plate set is the most shared thing this tool makes -- the library has
+    # an Export button that zips the lot -- so a font or a piece of artwork
+    # living in a BeamXP directory is written as a token rather than as a
+    # path through somebody's home directory. Artwork outside those folders
+    # keeps its path: there is nothing portable to write instead, and the
+    # editor has to reopen it.
+    written = dict(normalized)
+    written["config"] = map_paths(normalized["config"], portable_path)
+    path.write_text(json.dumps(written, indent=2, ensure_ascii=False), encoding="utf-8")
     return normalized
 
 

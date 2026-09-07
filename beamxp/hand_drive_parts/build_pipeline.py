@@ -5495,7 +5495,22 @@ def build_batch(
     delta = conversion.setdefault("delta", {})
     if isinstance(delta, dict):
         delta["steeringRefs"] = selected_steering_refs(conversion)
-    embedded = copy.deepcopy(conversion)
+    # The copy that ships. Everything a project file leaves out is left out
+    # here too -- the defaults, the plate designs, the absolute paths -- and
+    # then every remaining path is reduced, because this file goes inside the
+    # zip a user installs or uploads. Before 2026-09-07 it carried the source
+    # zip's full path, the plate artwork's, and several hundred more through
+    # the texture-correction report, all of them naming a home directory.
+    embedded = {
+        key: copy.deepcopy(value)
+        for key, value in conversion.items()
+        if key not in {"parts", "variants", "plate"}
+    }
+    embedded["configFormat"] = CONVERSION_FORMAT
+    embedded["source"] = source_summary(context)
+    embedded["parts"] = sparse_part_settings(context, conversion)
+    embedded["variants"] = sparse_variant_settings(context, conversion)
+    embedded["plates"] = plate_document(conversion)
     embedded["builtAt"] = datetime.now(UTC).isoformat(timespec="seconds")
     embedded["build"] = {
         "generatedConfigs": generated_configs,
@@ -5516,6 +5531,10 @@ def build_batch(
         "cameraNodeMirrorCount": len(node_mirror_map),
         "plates": plate_summary,
     }
+    embedded = map_asset_paths(
+        embedded,
+        lambda value: shareable_path(value, context.project_dir),
+    )
     write_text_file(embedded_dir / "conversion.json", json.dumps(embedded, indent=2), encoding="utf-8")
 
     package_zip = None
