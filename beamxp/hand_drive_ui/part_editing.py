@@ -670,6 +670,13 @@ class PartEditingMixin:
         Falls back to the focused row so a keystroke still lands right after a
         click that moved the focus without settling a selection. Rows driven by
         a Replace Source parent are left out; they answer to that parent.
+
+        2026-09-07: that fallback stands down while the Triggers table holds
+        the selection. Tk keeps this table's focused row when its selection is
+        cleared, so a mesh clicked before the user moved to the Triggers table
+        was still focused there, and every trigger transform was applied to it
+        as well. An edit must never reach a table the user has stopped looking
+        at, however it came to keep a focus row.
         """
         if self.context is None or not hasattr(self, "part_tree"):
             return [], []
@@ -680,7 +687,8 @@ class PartEditingMixin:
             and self._part_row_mesh_id(row_id) in self.context.objects
             and not self._part_child_override(row_id)
         ]
-        if not target_rows:
+        trigger_tree = getattr(self, "trigger_tree", None)
+        if not target_rows and not (trigger_tree is not None and trigger_tree.selection()):
             item = self.part_tree.focus()
             if (
                 item

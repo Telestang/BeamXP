@@ -34,10 +34,17 @@ class FakeTree:
     Selecting and deleting a selected row both fire <<TreeviewSelect>>, and
     both are QUEUED -- verified against a live ttk.Treeview, where a bound
     handler runs only after selection_set has returned.
+
+    The focus row is modelled because it is *not* part of the selection:
+    against a live ttk.Treeview, ``selection_set([])`` leaves the focused item
+    exactly where it was, only ``focus("")`` or deleting that row clears it.
+    Both transform tables fall back to the focused row when nothing is
+    selected, so a focus left standing is a live target. 2026-09-07.
     """
 
     def __init__(self, on_select=None) -> None:
         self._selection: list[str] = []
+        self._focus = ""
         self._rows: list[str] = []
         self.on_select = on_select
         self.pending = 0
@@ -49,6 +56,14 @@ class FakeTree:
         self._selection = list(items)
         self._queue()
 
+    def focus(self, item: str | None = None) -> str:
+        if item is not None:
+            self._focus = item
+        return self._focus
+
+    def see(self, _item: str) -> None:
+        pass
+
     def get_children(self, item: str = "") -> list[str]:
         return list(self._rows)
 
@@ -58,6 +73,8 @@ class FakeTree:
     def delete(self, item: str) -> None:
         if item in self._rows:
             self._rows.remove(item)
+        if item == self._focus:
+            self._focus = ""  # as tk does when the focused row goes
         if item in self._selection:
             self._selection.remove(item)
             self._queue()
@@ -205,6 +222,66 @@ class RebuildDoesNotStealTests(unittest.TestCase):
         self.assertEqual(self.app.part_tree.selection(), [MESH])
 
 
+class FocusGoesWithTheSelectionTests(unittest.TestCase):
+    """A table that cedes the selection keeps no live target.
+
+    The bug: Tk keeps a Treeview's focused row when its selection is cleared,
+    and ``_selected_part_mode_targets`` falls back to the focused row when
+    nothing is selected. So clicking a mesh and then clicking a trigger box
+    left that mesh focused and targetable, and the transform set on the box
+    was written to the mesh as well.
+    """
+
+    def setUp(self) -> None:
+        self.app = Harness()
+        self.app.trigger_tree.insert("", "end", iid=BOX)
+        self.app.part_tree.insert("", "end", iid=MESH)
+
+    def test_claiming_for_triggers_clears_the_parts_focus(self) -> None:
+        self.app.part_tree.selection_set([MESH])
+        self.app.part_tree.focus(MESH)
+        self.app._selection_accumulating = False
+        self.app._claim_selection("triggers", BOX)
+        self.app.drain()
+        self.assertEqual(self.app.part_tree.focus(), "")
+
+    def test_claiming_for_parts_clears_the_trigger_focus(self) -> None:
+        self.app.trigger_tree.selection_set([BOX])
+        self.app.trigger_tree.focus(BOX)
+        self.app._selection_accumulating = False
+        self.app._claim_selection("parts", MESH)
+        self.app.drain()
+        self.assertEqual(self.app.trigger_tree.focus(), "")
+
+    def test_a_focus_with_no_selection_left_is_still_cleared(self) -> None:
+        # The second trigger click of a run: the parts selection went with the
+        # first one, so the "did it have a selection" guard no longer holds --
+        # but the focus row from the original mesh click is still there.
+        self.app.part_tree.focus(MESH)
+        self.app._selection_accumulating = False
+        self.app._claim_selection("triggers", BOX)
+        self.assertEqual(self.app.part_tree.focus(), "")
+
+    def test_a_gathering_click_leaves_the_other_focus_alone(self) -> None:
+        # Ctrl and Shift mean "add to what I have", so the other table keeps
+        # both its rows and its focus.
+        self.app.part_tree.selection_set([MESH])
+        self.app.part_tree.focus(MESH)
+        self.app._selection_accumulating = True
+        self.app._claim_selection("triggers", BOX)
+        self.app.drain()
+        self.assertEqual(self.app.part_tree.focus(), MESH)
+
+    def test_editing_inside_this_tables_own_selection_leaves_the_other_alone(self) -> None:
+        self.app.part_tree.selection_set([MESH])
+        self.app.part_tree.focus(MESH)
+        self.app.trigger_tree.selection_set([BOX])
+        self.app._selection_accumulating = False
+        self.app._claim_selection("triggers", BOX)
+        self.app.drain()
+        self.assertEqual(self.app.part_tree.focus(), MESH)
+
+
 class ClearAllTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = Harness()
@@ -217,6 +294,17 @@ class ClearAllTests(unittest.TestCase):
         self.assertEqual(self.app.part_tree.selection(), [])
         self.assertEqual(self.app.trigger_tree.selection(), [])
         self.assertGreater(self.app.detail_refreshes, 0)
+
+    def test_it_clears_the_focus_rows_too(self) -> None:
+        # Nothing selected has to mean nothing targeted: an empty click in the
+        # preview says deselect everything, and a focus row left behind is
+        # still a target for the next transform.
+        self.app.part_tree.focus(MESH)
+        self.app.trigger_tree.focus(BOX)
+        self.app._clear_all_selection()
+        self.app.drain()
+        self.assertEqual(self.app.part_tree.focus(), "")
+        self.assertEqual(self.app.trigger_tree.focus(), "")
 
 
 class SceneHighlightTests(unittest.TestCase):

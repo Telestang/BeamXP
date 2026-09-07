@@ -348,6 +348,12 @@ class TriggersWorkflowMixin:
         edit of that selection, not a new one, so it leaves the other table
         alone. That is what lets Move X be typed into one row of a gathered
         set without dropping the rest of it.
+
+        2026-09-07: the ceding table's *focus* row goes with its selection. Tk
+        keeps a Treeview's focused item when the selection is cleared, and both
+        tables fall back to that item when nothing is selected -- so the mesh
+        row clicked just before the user moved to the Triggers table stayed a
+        live target, and the next trigger transform landed on it too.
         """
         if getattr(self, "_selection_accumulating", False):
             return
@@ -355,8 +361,11 @@ class TriggersWorkflowMixin:
         if own is not None and item and own.exists(item) and item in own.selection():
             return
         other = getattr(self, "trigger_tree" if owner == "parts" else "part_tree", None)
-        if other is not None and other.selection():
+        if other is None:
+            return
+        if other.selection():
             other.selection_set([])
+        other.focus("")
 
     def _clear_all_selection(self) -> None:
         """Nothing selected in either table -- an empty click in the preview.
@@ -364,10 +373,15 @@ class TriggersWorkflowMixin:
         No re-entrancy guard needed: neither table's <<TreeviewSelect>> handler
         changes a selection any more, so clearing one cannot come back here.
         """
-        if hasattr(self, "part_tree") and self.part_tree.selection():
-            self.part_tree.selection_set([])
-        if hasattr(self, "trigger_tree") and self.trigger_tree.selection():
-            self.trigger_tree.selection_set([])
+        for name in ("part_tree", "trigger_tree"):
+            tree = getattr(self, name, None)
+            if tree is None:
+                continue
+            if tree.selection():
+                tree.selection_set([])
+            # Nothing selected has to mean nothing targeted, so the focus row
+            # goes too -- the transform fallbacks read it. 2026-09-07.
+            tree.focus("")
         self._refresh_trigger_highlight()
         self._update_detail()
 
@@ -642,10 +656,24 @@ class TriggersWorkflowMixin:
             self.trigger_tree.see(row_id)
 
     def _selected_trigger_row(self) -> dict[str, object] | None:
+        """The one box Reset acts on: selected, else focused.
+
+        The focus fallback stands down while the parts table holds the
+        selection, for the reason ``_selected_part_mode_targets`` gives: Tk
+        keeps this table's focused row after it has ceded the selection, and a
+        button must not act on a row the user has stopped looking at.
+        2026-09-07.
+        """
         if not hasattr(self, "trigger_tree"):
             return None
         selection = self.trigger_tree.selection()
-        item = str(selection[0]) if selection else str(self.trigger_tree.focus() or "")
+        if selection:
+            item = str(selection[0])
+        else:
+            part_tree = getattr(self, "part_tree", None)
+            if part_tree is not None and part_tree.selection():
+                return None
+            item = str(self.trigger_tree.focus() or "")
         return getattr(self, "trigger_rows_by_iid", {}).get(item)
 
     def _reset_selected_trigger(self) -> None:

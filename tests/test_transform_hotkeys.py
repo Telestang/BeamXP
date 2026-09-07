@@ -6,6 +6,13 @@ takes Skip, Move or Mirror. One key press must reach exactly one table: the
 trigger table keeps a focused row after the parts table has taken the
 selection off it, so reading the focus instead of the selection would let a
 long-dead trigger row swallow keys meant for a mesh.
+
+The parts table had the same hole in the other direction, and it shipped:
+``_selected_part_mode_targets`` falls back to the focused row, and nothing
+cleared that row when the Triggers table claimed the selection, so a transform
+set on a trigger box was written to the last-clicked mesh as well.
+``StaleFocusTests`` runs the real method rather than the stub the harness
+above uses, because the stub is exactly where the bug hid. 2026-09-07.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from __future__ import annotations
 import unittest
 
 from beamxp import hand_drive_core as core
+from beamxp.hand_drive_ui.part_editing import PartEditingMixin
 from beamxp.hand_drive_ui.shared import (
     MODE_CYCLE_VALUES,
     MODE_HOTKEYS,
@@ -643,6 +651,147 @@ class SelectionAccumulationTests(unittest.TestCase):
         self.app._note_selection_modifier(self._Event("not a bitmask"))
         self.app._claim_selection("triggers")
         self.assertEqual(self.app.part_tree.selection(), [])
+
+
+class _FakeContext:
+    def __init__(self, meshes) -> None:
+        self.objects = {mesh: object() for mesh in meshes}
+
+
+class RealTargetsHarness(TriggersWorkflowMixin, PartEditingMixin):
+    """The coordinator over the REAL ``_selected_part_mode_targets``.
+
+    Only the parts table's row bookkeeping and the refreshes are stubbed, so
+    the focus fallback that decides which meshes an edit reaches is the
+    shipping one.
+    """
+
+    def __init__(self, meshes) -> None:
+        self.part_tree = FakeTree()
+        self.trigger_tree = FakeTree()
+        self.part_tree.rows.extend(meshes)
+        self.context = _FakeContext(meshes)
+        self.conversion: dict[str, object] = {}
+        self.status_var = _FakeVar()
+        self.trigger_rows_by_iid: dict[str, dict] = {}
+        self.part_row_mesh_ids = {mesh: mesh for mesh in meshes}
+        self.part_child_overrides: dict[str, dict] = {}
+        self.part_modes: dict[str, str] = {}
+        self.part_settings: dict[str, dict] = {}
+
+    def _part_row_mesh_id(self, row_id) -> str:
+        text = str(row_id)
+        return self.part_row_mesh_ids.get(text, text.split("@@", 1)[0])
+
+    def _part_child_override(self, row_id):
+        return self.part_child_overrides.get(str(row_id))
+
+    def _apply_part_modes(self, targets, mode) -> None:
+        for object_id in targets:
+            self.part_modes[object_id] = mode
+            self.part_settings.setdefault(object_id, {})["mode"] = mode
+
+    def _get_part_setting(self, object_id, key, default=None):
+        return self.part_settings.get(object_id, {}).get(key, default)
+
+    def _part_settings(self, object_id) -> dict:
+        return self.part_settings.setdefault(object_id, {})
+
+    def _refresh_parts(self) -> None:
+        pass
+
+    def _refresh_triggers(self) -> None:
+        pass
+
+    def _refresh_delta_label(self) -> None:
+        pass
+
+    def _update_detail(self) -> None:
+        pass
+
+    def _show_error(self, _title, _message) -> None:
+        raise AssertionError("no error expected")
+
+    def add_trigger(self, row_id: str, trigger_id: str, at) -> dict:
+        row = {"id": row_id, "trigger": trigger_id, "at": at, "label": trigger_id, "mode": None}
+        self.trigger_rows_by_iid[row_id] = row
+        self.trigger_tree.rows.append(row_id)
+        return row
+
+
+class StaleFocusTests(unittest.TestCase):
+    """A trigger edit must not carry the last-clicked mesh with it.
+
+    Reported as "changing a trigger's transform changes a mesh's transform to
+    the same thing". Clicking a mesh row leaves it both selected and focused;
+    clicking a trigger box clears the parts *selection* but not its focus, and
+    the focus fallback then handed that mesh back as a target.
+    """
+
+    def setUp(self) -> None:
+        self.app = RealTargetsHarness(["dash"])
+        self.row = self.app.add_trigger(ROW_ID, "hood_int", AT)
+
+    def click_mesh_then_trigger(self) -> None:
+        """The two clicks, as tk delivers them."""
+        self.app.part_tree.selection_set(["dash"])
+        self.app.part_tree.focus("dash")
+        self.app._selection_accumulating = False
+        self.app._claim_selection("triggers", ROW_ID)
+        self.app.trigger_tree.selection_set([ROW_ID])
+        self.app.trigger_tree.focus(ROW_ID)
+
+    def test_a_trigger_mode_does_not_reach_the_last_clicked_mesh(self) -> None:
+        self.click_mesh_then_trigger()
+        self.app._apply_mode_to_selection(core.MODE_MIRROR)
+        self.assertEqual(
+            core.trigger_mode_map(self.app.conversion), {("hood_int", AT): core.MODE_MIRROR}
+        )
+        self.assertEqual(self.app.part_modes, {})
+        self.assertNotIn("mesh(es)", self.app.status_var.get())
+
+    def test_a_trigger_move_x_does_not_reach_it_either(self) -> None:
+        self.click_mesh_then_trigger()
+        self.app._apply_mode_to_selection(core.MODE_TRANSLATE)
+        self.row["mode"] = core.MODE_TRANSLATE
+        self.app.part_settings.setdefault("dash", {})["mode"] = core.MODE_TRANSLATE
+        self.app._apply_offset_to_selection("-0.42")
+        self.assertEqual(core.trigger_offset_map(self.app.conversion), {("hood_int", AT): -0.42})
+        self.assertIsNone(self.app.part_settings["dash"].get("translateOffset"))
+
+    def test_the_fallback_still_works_when_the_parts_table_is_the_live_one(self) -> None:
+        # The fallback is there so a keystroke lands right after a click that
+        # moved the focus without settling a selection. With no trigger row
+        # selected it must still do that.
+        self.app.part_tree.focus("dash")
+        self.assertEqual(self.app._selected_part_mode_targets()[0], ["dash"])
+        self.app._apply_mode_to_selection(core.MODE_MIRROR)
+        self.assertEqual(self.app.part_modes, {"dash": core.MODE_MIRROR})
+
+    def test_gathered_rows_in_both_tables_still_take_one_edit(self) -> None:
+        # The point of the multi-table selection: a Ctrl-click keeps both, and
+        # the guard must not shrink it back to one table.
+        self.app.part_tree.selection_set(["dash"])
+        self.app.part_tree.focus("dash")
+        self.app._selection_accumulating = True
+        self.app._claim_selection("triggers", ROW_ID)
+        self.app.trigger_tree.selection_set([ROW_ID])
+        self.app._apply_mode_to_selection(core.MODE_TRANSLATE)
+        self.assertEqual(self.app.part_modes, {"dash": core.MODE_TRANSLATE})
+        self.assertEqual(
+            core.trigger_mode_map(self.app.conversion), {("hood_int", AT): core.MODE_TRANSLATE}
+        )
+
+    def test_reset_trigger_stands_down_while_the_parts_table_holds_rows(self) -> None:
+        # The Reset button reads the same kind of fallback. A mesh selected and
+        # a trigger row merely focused means the user is working on meshes.
+        core.set_trigger_mode(self.app.conversion, "hood_int", AT, core.MODE_MIRROR)
+        self.app.trigger_tree.focus(ROW_ID)
+        self.app.part_tree.selection_set(["dash"])
+        self.app._reset_selected_trigger()
+        self.assertEqual(
+            core.trigger_mode_map(self.app.conversion), {("hood_int", AT): core.MODE_MIRROR}
+        )
 
 
 if __name__ == "__main__":
