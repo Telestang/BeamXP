@@ -4,21 +4,30 @@ import multiprocessing
 
 from beamxp.hand_drive_ui.app import HandDriveToolApp, main, parse_args, validate_source
 from beamxp.hand_drive_ui.recommendation_common import (
-    HANDED_PATTERNS,
-    MIRROR_PATTERNS,
+    CABIN_NAME_PATTERNS,
+    CENTRE_FUNCS,
+    DRIVER_BAND,
+    DRIVER_FUNCS,
+    DRIVER_NAME_PATTERNS,
+    INERT_NAME_PATTERNS,
     PAIR_MIN_OFFSET,
-    TRANSLATE_EXCLUDE_PATTERNS,
-    TRANSLATE_PATTERNS,
+    TEXTURE_GLYPH_PATTERNS,
     _is_door_card_mesh_id,
     _is_seat_mesh_id,
     _side_pair_kind_for_mesh,
+    assembly_func_role,
     mesh_center,
+    prop_func_role,
     recommendation_matches,
     recommendation_text,
+    slot_family,
+    slot_role,
 )
 from beamxp.hand_drive_ui.recommendation_engine import build_mode_recommendations
+from beamxp.hand_drive_ui.recommendation_evidence import vehicle_evidence
 from beamxp.hand_drive_ui.recommendation_pairing import (
     _name_pair_candidate,
+    handed_mesh_ids,
     resolve_side_twin,
 )
 from beamxp.hand_drive_ui.shared import *

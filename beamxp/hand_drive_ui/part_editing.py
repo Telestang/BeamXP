@@ -550,19 +550,32 @@ class PartEditingMixin:
             f"{'included' if include_children else 'not included'}"
         )
 
-    def _set_single_steering_ref(self, object_id: str) -> None:
+    def _set_single_steering_ref_value(self, object_id: str, selected: bool = True) -> bool:
+        """Make this mesh the one steering reference, clearing any other.
+
+        Split out of the row toggle so a caller that knows what it wants --
+        Recommend Transforms -- can say so, rather than flipping whatever is
+        there. Returns what the mesh ended up set to.
+        """
         if self.context is None:
-            return
+            return False
         object_id = self._part_row_mesh_id(object_id)
         parts = self.conversion.setdefault("parts", {})
-        was_selected = bool(self._get_part_setting(object_id, "steeringRef", False))
         for part_id in list(parts):
             settings = parts.get(part_id)
             if isinstance(settings, dict):
                 settings["steeringRef"] = False
-        settings = self._part_settings(object_id)
-        settings["steeringRef"] = not was_selected
+        self._part_settings(object_id)["steeringRef"] = selected
         self._invalidate_variant_detection()
+        return selected
+
+    def _set_single_steering_ref(self, object_id: str) -> None:
+        if self.context is None:
+            return
+        object_id = self._part_row_mesh_id(object_id)
+        was_selected = bool(self._get_part_setting(object_id, "steeringRef", False))
+        self._set_single_steering_ref_value(object_id, not was_selected)
+        settings = self._part_settings(object_id)
         self._refresh_variants()
         self._schedule_variant_detection()
         self._refresh_parts()

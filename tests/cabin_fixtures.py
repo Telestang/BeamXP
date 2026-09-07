@@ -2,7 +2,12 @@
 
 `make_context` builds a context from point clouds -- what the geometry
 helpers in `spatial_analysis.py` consume. `mesh_context` builds one from
-mesh centres alone, which is all the name-and-placement recommender reads.
+mesh centres alone.
+
+Both take a `parts` map, because the recommender reads the jbeam the engine
+reads: a part's slotType says what its meshes are for, and a props row's
+`func` says which electrics channel drives one. `cabin_parts()` below is the
+ordinary fit-out those readings expect to find.
 """
 
 from __future__ import annotations
@@ -71,6 +76,58 @@ def base_cabin() -> dict[str, np.ndarray]:
     }
 
 
+def part_body(
+    slot_type: str,
+    flexbodies: tuple[str, ...] = (),
+    props: tuple[tuple[str, str], ...] = (),
+    mirrors: tuple[str, ...] = (),
+) -> str:
+    """One jbeam part body, as the recommender's evidence scan reads them."""
+    lines = [f'"slotType": "{slot_type}",']
+    if flexbodies:
+        lines.append('"flexbodies": [')
+        lines.append('    ["mesh", "[group]:"],')
+        lines.extend(f'    ["{mesh}", ["g"]],' for mesh in flexbodies)
+        lines.append("],")
+    if props:
+        lines.append('"props": [')
+        lines.append('    ["func", "mesh", "idRef:", "idX:", "idY:"],')
+        lines.extend(
+            f'    ["{func}", "{mesh}", "a", "b", "c"],' for func, mesh in props
+        )
+        lines.append("],")
+    if mirrors:
+        lines.append('"mirrors": [')
+        lines.append('    ["mesh", "idRef:", "idX:", "idY:"],')
+        lines.extend(f'    ["{mesh}", "a", "b", "c"],' for mesh in mirrors)
+        lines.append("],")
+    return "{" + chr(10).join(lines) + "}"
+
+
+def cabin_parts() -> dict[str, str]:
+    """The fit-out `named_cabin` describes, spelt as BeamNG would spell it."""
+    return {
+        "veh_dash": part_body(
+            "veh_dash",
+            flexbodies=("veh_dash", "veh_floor", "veh_headliner"),
+        ),
+        "veh_windshield": part_body("veh_windshield", flexbodies=("veh_windscreen",)),
+        "veh_doorpanel_FL": part_body("veh_doorpanel_FL", flexbodies=("veh_doorpanel_FL",)),
+        "veh_doorpanel_FR": part_body("veh_doorpanel_FR", flexbodies=("veh_doorpanel_FR",)),
+        "veh_door_FL": part_body("veh_door_FL", flexbodies=("veh_door_FL",)),
+        "veh_door_FR": part_body("veh_door_FR", flexbodies=("veh_door_FR",)),
+        "veh_seat_FL": part_body("veh_seat_FL", flexbodies=("veh_seat_FL",)),
+        "veh_seat_FR": part_body("veh_seat_FR", flexbodies=("veh_seat_FR",)),
+        "veh_mirror_L": part_body(
+            "veh_mirror_L", flexbodies=("veh_mirror_L",), mirrors=("veh_mirror_L",)
+        ),
+        "veh_mirror_R": part_body(
+            "veh_mirror_R", flexbodies=("veh_mirror_R",), mirrors=("veh_mirror_R",)
+        ),
+        "veh_steer": part_body("veh_steer", props=(("steering", "veh_steer"),)),
+    }
+
+
 def make_context(
     meshes: dict[str, np.ndarray],
     *,
@@ -78,6 +135,7 @@ def make_context(
     trims: dict[str, list[str]] | None = None,
     materials: dict[str, tuple[str, ...]] | None = None,
     material_flags: dict[str, dict[str, bool]] | None = None,
+    parts: dict[str, str] | None = None,
 ) -> core.VehicleContext:
     objects = {}
     preview = {}
@@ -126,6 +184,10 @@ def make_context(
     context.mesh_roles_cache.update(roles_cache)
     context.resolved_positions_cache.update(resolved_cache)
     context._material_flags = dict(material_flags or {})
+    context.part_body_index = {
+        part_id: (body, "vehicles/veh/veh.jbeam")
+        for part_id, body in (parts or {}).items()
+    }
     return context
 
 

@@ -18,7 +18,9 @@ from beamxp.core.geometry import (
     base_rotation_global_matrix3,
     mirrored_base_rotation_global,
 )
-from beamxp.hand_drive_ui import recommendation_common
+from beamxp.hand_drive_ui.recommendation_evidence import vehicle_evidence
+from beamxp.hand_drive_ui.recommendation_pairing import handed_mesh_ids
+from tests import cabin_fixtures
 
 
 def mirror_part(side: str, pos: tuple[float, float, float], rot: tuple[float, float, float]) -> str:
@@ -91,32 +93,66 @@ SOURCES = {
 
 
 class MirrorSignalRecommendationTests(unittest.TestCase):
-    def test_both_spellings_of_a_signal_lens_join_the_mirror_family(self) -> None:
-        # sunburst2/scintilla/etkc/sbr write "mirrorsignal"; vivace/roamer/
-        # sv1ev3 write "mirror_signal". Only the second used to be recognised,
-        # so on the first group the casing swapped and the lens did not.
-        for name in (
-            "sunburst2_mirrorsignal_l",
-            "sbr_mirrorsignalglass_l",
-            "vivace_mirror_signal_l",
-            "roamer_mirror_signalglass_l_facelift",
-            "scintilla_mirrorsignal_r",
-        ):
-            self.assertTrue(
-                recommendation_common.recommendation_matches(
-                    name, recommendation_common.HANDED_PATTERNS
-                ),
-                name,
-            )
+    """Which lenses swap with the casing they are mounted on.
+
+    2026-09-07: this used to be a name table, and the spelling was the whole
+    problem -- sunburst2/scintilla/etkc/sbr write "mirrorsignal" while
+    vivace/roamer/sv1ev3 write "mirror_signal", and only the second was
+    recognised, so on the first group the casing swapped and the lens did
+    not. The family now comes from the slot the part fills, which the engine
+    selects it by, so every spelling in the list below is covered by not
+    reading any of them.
+    """
+
+    SPELLINGS: ClassVar[tuple[str, ...]] = (
+        "veh_mirrorsignal_L",
+        "veh_mirrorsignalglass_L",
+        "veh_mirror_signal_L",
+        "veh_mirror_signalglass_L_facelift",
+        "veh_mirror_signal_glass_L",
+    )
+
+    def _handed(self, parts: dict[str, str], centers: dict[str, tuple]) -> frozenset[str]:
+        context = cabin_fixtures.mesh_context(centers, parts=parts)
+        evidence = vehicle_evidence(context, ())
+        return handed_mesh_ids(context, evidence, set(centers))
+
+    def test_every_spelling_of_a_signal_lens_joins_its_casing(self) -> None:
+        centers = {"veh_mirror_L": (0.90, -0.42, 1.00), "veh_mirror_R": (-0.90, -0.42, 1.00)}
+        parts = {
+            "veh_mirror_L": cabin_fixtures.part_body(
+                "veh_mirror_L",
+                flexbodies=("veh_mirror_L", *self.SPELLINGS),
+                mirrors=("veh_mirror_L",),
+            ),
+        }
+        for spelling in self.SPELLINGS:
+            centers[spelling] = (0.98, -0.40, 0.99)
+        handed = self._handed(parts, centers)
+        for spelling in self.SPELLINGS:
+            self.assertIn(spelling, handed, spelling)
 
     def test_a_fender_repeater_is_not_a_wing_mirror(self) -> None:
-        for name in ("etk800_fendersignal_l", "etk800_taillight_l"):
-            self.assertFalse(
-                recommendation_common.recommendation_matches(
-                    name, recommendation_common.HANDED_PATTERNS
-                ),
-                name,
-            )
+        centers = {
+            "veh_mirror_L": (0.90, -0.42, 1.00),
+            "veh_fendersignal_L": (0.85, -1.20, 0.80),
+            "veh_taillight_L": (0.60, 2.00, 0.80),
+        }
+        parts = {
+            "veh_mirror_L": cabin_fixtures.part_body(
+                "veh_mirror_L", flexbodies=("veh_mirror_L",), mirrors=("veh_mirror_L",)
+            ),
+            "veh_fender_L": cabin_fixtures.part_body(
+                "veh_fender_L", flexbodies=("veh_fendersignal_L",)
+            ),
+            "veh_taillight_L": cabin_fixtures.part_body(
+                "veh_taillight_L", flexbodies=("veh_taillight_L",)
+            ),
+        }
+        handed = self._handed(parts, centers)
+        self.assertIn("veh_mirror_L", handed)
+        for name in ("veh_fendersignal_L", "veh_taillight_L"):
+            self.assertNotIn(name, handed, name)
 
 
 class MirrorPlaneSourceTests(unittest.TestCase):

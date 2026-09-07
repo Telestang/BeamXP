@@ -3,6 +3,18 @@ from __future__ import annotations
 from .recommendation_engine import build_mode_recommendations
 from .shared import *
 
+# What each recommendation row is proposing to change. Kept out of the
+# Transform column because "Mirror" reads the same whether it is a mesh mode
+# or the trigger box sitting on that mesh.
+RECOMMENDATION_KIND_LABELS = {
+    "pair": "Swap Mesh",
+    "equivalent": "Equivalent Parts",
+    "single": "Mesh transform",
+    "texture": "Texture Fix",
+    "steering": "Steering ref",
+    "trigger": "Trigger box",
+}
+
 
 class RecommendationsUIMixin:
     """The recommendation review/apply workflow."""
@@ -242,26 +254,33 @@ class RecommendationsUIMixin:
         frame.grid(row=2, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        columns = ("apply", "mode", "part", "source", "equivalent", "current", "reason")
+        columns = (
+            "apply", "kind", "mode", "part", "source", "equivalent",
+            "offset", "current", "reason",
+        )
         tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
         self.recommendation_tree = tree
         headings = {
             "apply": "Selected",
+            "kind": "Setting",
             "mode": "Transform",
             "part": "Mesh",
             "source": "Swap Source",
             "equivalent": "Equivalent Parts",
+            "offset": "Move X",
             "current": "Current",
             "reason": "Reason",
         }
         widths = {
             "apply": 54,
-            "mode": 132,
-            "part": 290,
-            "source": 250,
+            "kind": 96,
+            "mode": 122,
+            "part": 260,
+            "source": 210,
             "equivalent": 110,
-            "current": 190,
-            "reason": 220,
+            "offset": 68,
+            "current": 170,
+            "reason": 250,
         }
         for column in columns:
             tree.heading(
@@ -274,7 +293,7 @@ class RecommendationsUIMixin:
                 width=widths[column],
                 minwidth=50,
                 stretch=column in {"part", "reason"},
-                anchor="center" if column in {"apply", "equivalent"} else "w",
+                anchor="center" if column in {"apply", "equivalent", "offset"} else "w",
             )
         self._register_tree_headings(tree, headings)
         yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
@@ -304,9 +323,17 @@ class RecommendationsUIMixin:
         modal.bind("<Escape>", lambda _event: closed())
         self._place_modal_on_app_monitor(modal)
 
+        # Both are read on the UI thread while the worker runs read-only over
+        # them: the trims decide which parts the evidence scan covers, and the
+        # box scan is the Triggers tab's own cache, already warm.
+        config_names = tuple(self._selected_variant_names())
+        try:
+            boxes = [dict(box) for box in self._trigger_boxes()]
+        except Exception:
+            boxes = []
         worker = threading.Thread(
             target=self._recommendations_worker,
-            args=(seq, self.context, object_ids),
+            args=(seq, self.context, object_ids, config_names, boxes),
             daemon=True,
         )
         worker.start()
@@ -318,9 +345,13 @@ class RecommendationsUIMixin:
         seq: int,
         context: core.VehicleContext,
         object_ids: list[str],
+        config_names: tuple[str, ...] = (),
+        trigger_boxes: list[dict[str, object]] | None = None,
     ) -> None:
         try:
-            recommendations = build_mode_recommendations(context, object_ids)
+            recommendations = build_mode_recommendations(
+                context, object_ids, config_names, trigger_boxes
+            )
             self.worker_queue.put(("recommendations_success", (seq, context, recommendations)))
         except Exception as exc:
             self.worker_queue.put(("recommendations_error", (seq, exc)))
@@ -347,18 +378,31 @@ class RecommendationsUIMixin:
             self.recommendation_rows[row_id] = recommendation
             object_id = recommendation["object_id"]
             source_id = recommendation.get("source_id", "")
+            kind = str(recommendation.get("kind") or "single")
             current = self._recommendation_current_label(recommendation)
+            offset = recommendation.get("offset")
+            # A row the evidence could only half answer is offered rather than
+            # applied: Select All still takes it, but Apply Selected on a fresh
+            # modal does not.
+            selected = "N" if recommendation.get("confidence") == "low" else "Y"
+            label = (
+                str(object_id)
+                if kind == "trigger"
+                else self._part_option_label(object_id, label_universe)
+            )
             tree.insert(
                 "",
                 "end",
                 iid=row_id,
                 tags=self._row_tags(index),
                 values=(
-                    "Y",
+                    selected,
+                    RECOMMENDATION_KIND_LABELS.get(kind, "Transform"),
                     mode_label(recommendation["mode"]),
-                    self._part_option_label(object_id, label_universe),
+                    label,
                     self._part_option_label(source_id, label_universe) if source_id else "",
                     "Y" if recommendation.get("equivalent") else "N",
+                    "" if offset is None else f"{float(offset):+.3f}",
                     current,
                     recommendation.get("reason", ""),
                 ),
@@ -380,10 +424,23 @@ class RecommendationsUIMixin:
             self.recommendation_status_var.set("Recommendation scan failed.")
         self._show_error("Recommendations failed", str(exc))
 
-    def _recommendation_current_label(self, recommendation: dict[str, str]) -> str:
-        object_id = recommendation["object_id"]
+    def _recommendation_current_label(self, recommendation: dict[str, object]) -> str:
+        """What this setting is on now, so a row that changes nothing shows it."""
+        object_id = str(recommendation["object_id"])
+        kind = str(recommendation.get("kind") or "single")
+        if kind == "trigger":
+            key = recommendation.get("trigger_key")
+            chosen = core.trigger_mode_map(self.conversion)
+            current = chosen.get(tuple(key)) if isinstance(key, (tuple, list)) else None
+            return mode_label(current) if current else "(prediction)"
+        if kind == "texture":
+            on = bool(self._get_part_setting(object_id, core.PART_TEXTURE_CORRECTION_KEY, False))
+            return "On" if on else "Off"
+        if kind == "steering":
+            on = bool(self._get_part_setting(object_id, "steeringRef", False))
+            return "Set" if on else "Not set"
         mode = str(self._get_part_setting(object_id, "mode", core.MODE_SKIP))
-        source_id = recommendation.get("source_id", "")
+        source_id = str(recommendation.get("source_id") or "")
         if not source_id:
             return mode_label(mode)
         source_mode = str(self._get_part_setting(source_id, "mode", core.MODE_SKIP))
@@ -425,10 +482,34 @@ class RecommendationsUIMixin:
 
         applied = 0
         equivalences = 0
+        textures = 0
+        triggers = 0
+        steering = 0
         for recommendation in selected_rows:
             mode = recommendation["mode"]
             object_id = recommendation["object_id"]
             source_id = recommendation.get("source_id", "")
+            kind = str(recommendation.get("kind") or "single")
+
+            if kind == "trigger":
+                key = recommendation.get("trigger_key")
+                if isinstance(key, (tuple, list)) and len(key) == 2:
+                    core.set_trigger_mode(self.conversion, str(key[0]), key[1], mode)
+                    triggers += 1
+                continue
+            if kind == "texture":
+                # Only ever proposed for a reflecting mode, but the mesh may
+                # have been left on Skip because its own row was cleared, and
+                # the parts table refuses Texture Fix there for good reason.
+                if self._texture_correction_editable(object_id):
+                    self._part_settings(object_id)[core.PART_TEXTURE_CORRECTION_KEY] = True
+                    textures += 1
+                continue
+            if kind == "steering":
+                self._set_single_steering_ref_value(object_id)
+                steering += 1
+                continue
+
             if recommendation.get("equivalent") and source_id:
                 core.set_side_pair(
                     self.conversion,
@@ -446,10 +527,19 @@ class RecommendationsUIMixin:
                 # pair a previous pass left on the two meshes.
                 self._apply_single_part_mode(object_id, mode)
                 applied += 1
+            offset = recommendation.get("offset")
+            if mode == core.MODE_TRANSLATE and offset is not None:
+                self._part_settings(object_id)["translateOffset"] = float(offset)
 
+        # Texture Fix rows are ordered after the transforms that earn them, so
+        # a mesh set to Mirror in this same pass is already editable by the
+        # time its row is reached.
+        self._invalidate_trigger_cache()
         self._refresh_parts()
         self._refresh_slots()
+        self._refresh_triggers()
         self._refresh_delta_label()
+        self._refresh_variants()
         self._update_detail()
         if self.recommendation_modal is not None and self.recommendation_modal.winfo_exists():
             self.recommendation_modal.destroy()
@@ -459,10 +549,19 @@ class RecommendationsUIMixin:
             self._tree_heading_text.pop(self.recommendation_tree, None)
         self.recommendation_tree = None
         self.recommendation_rows = {}
-        summary = f"Applied {len(selected_rows)} recommendation(s) to {applied} part setting(s)"
+        parts_summary = [f"{applied} part setting(s)"]
         if equivalences:
-            summary = f"{summary} and {equivalences} equivalent parts row(s)"
-        self.status_var.set(summary)
+            parts_summary.append(f"{equivalences} equivalent parts row(s)")
+        if textures:
+            parts_summary.append(f"{textures} texture fix(es)")
+        if triggers:
+            parts_summary.append(f"{triggers} trigger box(es)")
+        if steering:
+            parts_summary.append("the steering reference")
+        self.status_var.set(
+            f"Applied {len(selected_rows)} recommendation(s) to "
+            + ", ".join(parts_summary)
+        )
 
     def _apply_single_part_mode(self, object_id: str, mode: str) -> None:
         settings = self._part_settings(object_id)
