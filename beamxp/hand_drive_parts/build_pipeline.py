@@ -4803,6 +4803,7 @@ def integrate_texture_correction_artifacts(
     glow_switch_forks: list[SwitchBaseFork] = []
     corrected_piece_materials: dict[str, set[str]] = {}
     generated_mesh_sources: dict[str, str] = {}
+    material_sources: dict[str, str] = {}
     hands = sorted(set(target_hands))
     texture_correction_targets = texture_correction_targets or {}
     structural_sources = structural_sources or {}
@@ -4831,6 +4832,9 @@ def integrate_texture_correction_artifacts(
         glow_switch_forks.extend(alias_to_material.switch_forks)
         if alias_to_material:
             glow_material_alias_sets.append(dict(alias_to_material))
+            for aliases in (alias_to_material.shared, *alias_to_material.by_part.values()):
+                for alias, material in aliases.items():
+                    material_sources.setdefault(material.lower(), _normalise_material_alias(alias))
         detail = json.loads(report_path.read_text(encoding="utf-8"))
         for dae_export in detail.get("dae_exports", []):
             if not isinstance(dae_export, dict):
@@ -5002,6 +5006,7 @@ def integrate_texture_correction_artifacts(
         "jbeamPatch": jbeam_patch,
         "groupedMeshes": sorted(grouped_meshes),
         "renamedMeshes": dict(row_renames),
+        "materialSources": material_sources,
         "rigidOnlyMaterials": sorted(glow_rigid_only_aliases),
         # Before that subtraction: a page on a piece nothing reflected is
         # already the right way round however the material was corrected
@@ -5018,6 +5023,151 @@ def integrate_texture_correction_artifacts(
             for fork in glow_switch_forks
         ],
     }
+
+
+def deduplicate_generated_flexbodies(
+    context: VehicleContext,
+    output_vehicle_dir: Path,
+    object_modes: dict[str, str],
+    target_hands: Iterable[str],
+    material_sources: dict[str, str],
+) -> list[dict[str, object]]:
+    """2026-09-08: isolate overlapping authored faces within one fitted part."""
+    from beamxp.core.collada_overlap import (
+        duplicate_uv_keys, filter_duplicate_faces, mesh_faces,
+    )
+
+    sources = {
+        generated_mesh_name(mesh, hand): mesh
+        for mesh, mode in object_modes.items() if mode == MODE_MIRROR and mesh in context.objects
+        for hand in target_hands
+    }
+    if not sources:
+        return []
+    trees = {}
+    nodes = {}
+    for path in sorted(output_vehicle_dir.glob("*")):
+        if path.suffix.lower() != ".dae":
+            continue
+        tree = ET.parse(path)
+        trees[path] = tree
+        for node in tree.getroot().findall(".//c:node", NS):
+            if node.get("name") in sources:
+                nodes[node.get("name")] = (path, node)
+    source_trees = {}
+    source_faces = {}
+
+    def authored_faces(mesh):
+        if mesh not in source_faces:
+            obj = context.objects[sources[mesh]]
+            key = (obj.dae_source_zip or context.source_zip, obj.dae_path)
+            if key not in source_trees:
+                source_trees[key] = parse_dae(*key).getroot()
+            root = source_trees[key]
+            node = find_dae_node(root, obj.id)
+            source_faces[mesh] = mesh_faces(root, node) if node is not None else []
+        return source_faces[mesh]
+
+    patches = []
+    changed_trees = set()
+    for path in sorted(output_vehicle_dir.rglob("*.jbeam")):
+        text = path.read_text(encoding="utf-8")
+        original_text = text
+        for part, (body, _filename) in build_part_body_index({str(path): text}).items():
+            document = parse_beamng_json(body, label=part)[part]
+            rows = document.get("flexbodies", [])
+            if not rows or not isinstance(rows[0], list):
+                continue
+            counts = {}
+            for row in rows[1:]:
+                if isinstance(row, list) and row:
+                    counts[row[0]] = counts.get(row[0], 0) + 1
+            state = {}
+            occupied = {}
+            renames = {}
+            for row in rows[1:]:
+                if isinstance(row, dict):
+                    state.update(row)
+                    continue
+                if not isinstance(row, list) or not row or row[0] not in nodes:
+                    continue
+                mesh = row[0]
+                if counts[mesh] != 1:
+                    continue
+                options = dict(state)
+                for index, value in enumerate(row[1:], 1):
+                    if isinstance(value, dict):
+                        options.update(value)
+                    elif index < len(rows[0]):
+                        options[rows[0][index]] = value
+                # 2026-09-08: meshs.lua/processFlexbodies creates each row and
+                # applies its groups/placement separately. Only rows with the
+                # same complete binding can share an authored surface.
+                binding = json.dumps(options, sort_keys=True)
+                seen = occupied.setdefault(binding, [])
+                faces = authored_faces(mesh)
+                duplicates = duplicate_uv_keys(faces, seen)
+                seen.extend(faces)
+                if not duplicates:
+                    continue
+                dae_path, node = nodes[mesh]
+                root = trees[dae_path].getroot()
+                library = root.find("c:library_geometries", NS)
+                geometries = {g.get("id"): g for g in library}
+                new_name = safe_id(f"{mesh}__unique_{part}")
+                new_node = copy.deepcopy(node)
+                new_node.set("id", new_name)
+                new_node.set("name", new_name)
+                copies = []
+                for index, instance in enumerate(new_node.findall("c:instance_geometry", NS)):
+                    source = geometries[instance.get("url", "").lstrip("#")]
+                    geometry = copy.deepcopy(source)
+                    ids = {
+                        element.get("id"): f"{new_name}_{index}_{number}"
+                        for number, element in enumerate(geometry.iter()) if element.get("id")
+                    }
+                    for element in geometry.iter():
+                        for key, value in list(element.attrib.items()):
+                            if key == "id" and value in ids:
+                                element.set(key, ids[value])
+                            elif value.startswith("#") and value[1:] in ids:
+                                element.set(key, "#" + ids[value[1:]])
+                    library.append(geometry)
+                    copies.append(geometry)
+                    instance.set("url", f"#{geometry.get('id')}")
+                    instance.set("name", new_name)
+                removed = filter_duplicate_faces(root, new_node, duplicates, material_sources)
+                if not removed:
+                    for geometry in copies:
+                        library.remove(geometry)
+                    continue
+                if removed == len(mesh_faces(root, node)):
+                    # 2026-09-08: a wholly redundant row requires removal;
+                    # preserve it here instead of emitting an empty mesh.
+                    for geometry in copies:
+                        library.remove(geometry)
+                    continue
+                # 2026-09-08: zero-count primitives need not reach the importer.
+                for geometry in copies:
+                    mesh_element = geometry.find("c:mesh", NS)
+                    for primitive in list(mesh_element):
+                        if primitive.tag == _collada_q("triangles") and primitive.get("count") == "0":
+                            mesh_element.remove(primitive)
+                root.find("c:library_visual_scenes/c:visual_scene", NS).append(new_node)
+                renames[mesh] = new_name
+                changed_trees.add(dae_path)
+                patches.append({"part": part, "mesh": mesh, "replacement": new_name, "removedFaces": removed})
+            if renames:
+                changed = _replace_all_jbeam_array_regions(
+                    body, "flexbodies",
+                    lambda array, names=renames: _rename_texture_correction_flexbody_array(array, names),
+                )
+                text = text.replace(body, changed, 1)
+        if text != original_text:
+            path.write_text(text, encoding="utf-8")
+    for path in changed_trees:
+        write_xml_tree(trees[path], path)
+    return patches
 
 
 def build_batch(
@@ -5448,6 +5598,10 @@ def build_batch(
             ),
         )
     texture_correction_report["runtimeScreens"] = runtime_screen_patch
+    texture_correction_report["duplicateSurfaces"] = deduplicate_generated_flexbodies(
+        context, output_vehicle_dir, object_modes, set(generated_variant_targets.values()),
+        texture_correction_report.get("integration", {}).get("materialSources", {}),
+    )
     emit_stage(
         7,
         "write_original_configs",
