@@ -70,7 +70,7 @@ def unpack_and_convert(archive_path: Path, output_directory: Path) -> tuple[int,
             png_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 write_texture_png(data, png_path)
-            except (OSError, UnidentifiedImageError) as error:
+            except (OSError, UnidentifiedImageError, NotImplementedError) as error:
                 failures.append(f"{info.filename}: {error}")
             else:
                 converted += 1
