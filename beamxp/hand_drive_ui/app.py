@@ -137,6 +137,7 @@ class HandDriveToolApp(
         )
         self.blender_var = tk.StringVar(value=str(self.settings.get("blenderExecutable") or ""))
         self.texture_quality_var = tk.StringVar(value="")
+        self.rear_window_sticker_var = tk.BooleanVar(value=False)
         self.texture_quality_to_tier: dict[str, str] = {}
         self.preview_output_var = tk.StringVar(value="")
         self.derived_output_var = tk.StringVar(value="")

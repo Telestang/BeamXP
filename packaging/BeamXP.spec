@@ -15,6 +15,7 @@ a = Analysis(
         # Composited onto generated config previews; xp_sticker_path() looks
         # for it in sys._MEIPASS in frozen builds.
         (str(ROOT / "assets" / "xp_sticker.png"), "assets"),
+        (str(ROOT / "assets" / "beamxp_imported_by_sticker.png"), "assets"),
     ],
     hiddenimports=[
         # Texture Fix is reached through a function-level import wrapped in a

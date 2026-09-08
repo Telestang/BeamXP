@@ -5644,6 +5644,17 @@ def build_batch(
     except plate_generator.PlateError as exc:
         raise RuntimeError(str(exc)) from exc
     emit_stage(7, "apply_plates", "Licence plate settings applied", current=2, total=2)
+    from beamxp.rear_window_sticker import apply_to_build as apply_stickers
+
+    sticker_summary = apply_stickers(context, conversion, output_vehicle_dir, output_plans)
+    if sticker_summary["enabled"]:
+        emit_stage(7, "rear_window_sticker",
+                   f"Rear-window stickers: {len(sticker_summary['placed'])} placed, "
+                   f"{len(sticker_summary['skipped'])} skipped")
+        for item in sticker_summary["skipped"]:
+            if progress is not None:
+                progress(f"Sticker skipped for {item['config']}: {item['reason']}")
+        generated_daes.extend(sorted(output_vehicle_dir.glob("beamxp_*_imported_by_*.dae")))
     embedded_dir = output_root / "handedness_conversion"
     embedded_dir.mkdir(parents=True, exist_ok=True)
     delta = conversion.setdefault("delta", {})
@@ -5684,6 +5695,7 @@ def build_batch(
         "bakedSharedMeshCount": len(baked_shared_specs),
         "cameraNodeMirrorCount": len(node_mirror_map),
         "plates": plate_summary,
+        "rearWindowSticker": sticker_summary,
     }
     embedded = map_asset_paths(
         embedded,

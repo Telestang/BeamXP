@@ -814,6 +814,34 @@ BeamXP remains a conversion tool rather than a complete vehicle re-authoring sys
 
 ---
 
+## Rear-window sticker (experimental)
+
+Enable **Rear-window BeamXP sticker (experimental)** in the build controls to add the
+imported-by artwork to converted exports. The setting is saved per project; it is off
+by default and does not apply to Plates Only outputs. Headless conversions can set
+`"rearWindowSticker": true`.
+
+The sticker is 24 cm wide, at least 3 cm inside the bottom-right edge as viewed from
+behind the vehicle. Its angle follows the nearby lower glass edge, its mesh follows
+the glass surface, and it uses the same node groups. It retains the supporting glass
+triangles so the two surfaces deform together; a padded opacity texture defines the
+sticker's outline. The material uses an opaque alpha cutout to keep the glass and
+heater lines from compositing over the artwork.
+It is attached to a cloned glass part, labelled **(BeamXP sticker)** in the parts selector,
+and hides when that pane's damage group fires. Stock glass textures are unchanged.
+
+Automatic placement currently requires a recognisable rear-glass part, transparent
+material evidence, and an authored-in-place pane with enough clear surface. Small,
+ambiguous, transformed, or unsupported panes are skipped with a reason in the build
+log and embedded conversion report. Hierarchical `partsTree` configs are also skipped.
+The sticker appears in the exported vehicle; the app's pre-build preview does not show it.
+
+2026-09-08: Headless geometry builds verified placement on Ardente 230 DCT. Scintilla
+GT and GT Spider are skipped because their cabin rear panes are too small for this
+size and margin; the engine-cover glass is not used. In-game appearance and breakage
+still require visual verification. Material setup follows BeamNG's
+[v1.5 material documentation](https://documentation.beamng.com/modding/materials/materials_1.5/).
+
 ## Output
 
 Projects are stored under:

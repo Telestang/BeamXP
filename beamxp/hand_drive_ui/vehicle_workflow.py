@@ -267,6 +267,7 @@ class VehicleWorkflowMixin:
         self._sync_delta_to_ui()
         self._sync_plate_to_ui()
         self._sync_texture_quality_to_ui()
+        self.rear_window_sticker_var.set(self.conversion.get("rearWindowSticker") is True)
         self._replace_viewer()
         self._refresh_all(reset_view=True)
         if not self.variant_detection_complete:
@@ -410,6 +411,11 @@ class VehicleWorkflowMixin:
         self.status_var.set(
             f"Texture quality: {core.TEXTURE_QUALITY_LABELS[tier]}"
         )
+
+    def _rear_window_sticker_changed(self) -> None:
+        self.conversion["rearWindowSticker"] = self.rear_window_sticker_var.get()
+        self.status_var.set("Rear-window sticker enabled for converted exports" if self.rear_window_sticker_var.get()
+                            else "Rear-window sticker disabled")
 
     def _sync_plate_to_ui(self) -> None:
         self.conversion["plate"] = plate_generator.normalized_plate_binding(self.conversion.get("plate"))

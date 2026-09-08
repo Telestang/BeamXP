@@ -657,6 +657,12 @@ class LayoutMixin:
         )
         self._refresh_texture_quality_choices()
 
+        ttk.Checkbutton(
+            controls, text="Rear-window BeamXP sticker (experimental)",
+            variable=self.rear_window_sticker_var,
+            command=self._rear_window_sticker_changed,
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         buttons = ttk.Frame(parent)
         buttons.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         buttons.columnconfigure((0, 1), weight=1)

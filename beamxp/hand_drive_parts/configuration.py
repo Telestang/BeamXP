@@ -500,6 +500,7 @@ def base_conversion_config(context: VehicleContext) -> dict[str, object]:
         "triggers": [],
         "plate": plate_generator.default_plate_binding(),
         "textureQuality": DEFAULT_BC7_QUALITY,
+        "rearWindowSticker": False,
         "delta": {
             "manual": False,
             "magnitude": None,
@@ -752,6 +753,7 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
     merged["triggers"] = normalized_trigger_modes(data.get("triggers"))
 
     merged["textureQuality"] = normalized_texture_quality(data.get("textureQuality"))
+    merged["rearWindowSticker"] = data.get("rearWindowSticker") is True
 
     old_delta = data.get("delta", {})
     if isinstance(old_delta, dict):
