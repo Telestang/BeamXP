@@ -5623,9 +5623,8 @@ def _gather_blocks(level: np.ndarray, indices: np.ndarray) -> np.ndarray:
     rows = (indices // blocks_wide) * 4
     columns = (indices % blocks_wide) * 4
     step = np.arange(4)
-    # Clamped rather than zero-filled: a level whose size is not a multiple of
-    # four has no texels past its edge, and repeating the last row is what the
-    # encoder sees when it is handed the partial surface itself.
+    # 2026-09-07: repeat edge texels just as write_dds pads a whole level;
+    # gathered and fully encoded blocks must receive identical 4x4 pixels.
     row_index = np.minimum(rows[:, None] + step, height - 1)
     column_index = np.minimum(columns[:, None] + step, width - 1)
     tiles = level[row_index[:, :, None], column_index[:, None, :]]
@@ -5782,8 +5781,18 @@ def write_dds(
 
     def encode(piece: np.ndarray) -> bytes:
         piece_height, piece_width = piece.shape[:2]
+        # 2026-09-07: ispc_texcomp only writes complete 4x4 blocks. Passing
+        # a partial surface leaves bytes unwritten (even a 4x2 mip varied
+        # between CPU-only runs). Pad the input, not the encoded byte stream.
+        pixels = piece[:, :, :channels]
+        if piece_height % 4 or piece_width % 4:
+            pixels = np.pad(
+                pixels, ((0, -piece_height % 4), (0, -piece_width % 4), (0, 0)),
+                mode="edge",
+            )
+            piece_height, piece_width = pixels.shape[:2]
         surface = ispc_texcomp.RGBASurface(
-            np.ascontiguousarray(piece[:, :, :channels]),
+            np.ascontiguousarray(pixels),
             piece_width,
             piece_height,
             piece_width * channels,

@@ -341,5 +341,40 @@ class DdsSurfaceLayoutTests(unittest.TestCase):
         self.assertIsNone(mt.dds_surface_layout(b"DDS " + bytes(200)))
 
 
+class PartialBlockEncodingTests(unittest.TestCase):
+    def test_real_encoder_receives_complete_edge_repeated_blocks_at_every_mip(self):
+        """2026-09-07: partial native surfaces returned unwritten bytes."""
+        import ispc_texcomp
+
+        settings = ispc_texcomp.BC7EncSettings.from_profile("basic")
+        for height, width in [(2, 4), (1, 1), (5, 9), (257, 5)]:
+            rgba = _image(height, width)
+            for codec in ("bc7", "bc7_srgb", "bc4", "bc5"):
+                with self.subTest(shape=(height, width), codec=codec), tempfile.TemporaryDirectory() as raw:
+                    path = Path(raw) / "out.dds"
+                    with patch.object(mt, "_dds_encode_workers", return_value=4):
+                        mt.write_dds(path, rgba, codec)
+                    written = path.read_bytes()
+                    layout = mt.dds_surface_layout(written)
+                    self.assertEqual((layout.height, layout.width), (height, width))
+                    channels = {"bc4": 1, "bc5": 2}.get(codec, 4)
+                    for level, (w, h, offset, length) in zip(mt.mip_chain(rgba), layout.levels):
+                        rows = np.minimum(np.arange((h + 3) // 4 * 4), h - 1)
+                        columns = np.minimum(np.arange((w + 3) // 4 * 4), w - 1)
+                        pixels = np.ascontiguousarray(level[rows[:, None], columns, :channels])
+                        surface = ispc_texcomp.RGBASurface(
+                            pixels, len(columns), len(rows), len(columns) * channels,
+                        )
+                        if codec == "bc4":
+                            expected = ispc_texcomp.compress_blocks_bc4(surface)
+                        elif codec == "bc5":
+                            expected = ispc_texcomp.compress_blocks_bc5(surface)
+                        else:
+                            expected = ispc_texcomp.compress_blocks_bc7(surface, settings)
+                        self.assertEqual(written[offset:offset + length], expected)
+                    mt.write_dds(path, rgba, codec)
+                    self.assertEqual(path.read_bytes(), written)
+
+
 if __name__ == "__main__":
     unittest.main()
