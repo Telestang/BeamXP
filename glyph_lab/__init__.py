@@ -10,8 +10,13 @@ so a conversion that regresses can be compared against what produced it.
 The order is the point of the rebuild: threshold, throw out texels that were
 never marks, and only then group what is left.  The first pipeline grouped
 first and argued afterwards, and a component welded together by noise cannot be
-taken apart by any later stage.  Detection runs per coalesced UV domain, in
-numpy and scipy only -- no cv2, no GPU.
+taken apart by any later stage. Detection runs per coalesced UV domain.
+2026-09-07: an optional ModernGL backend overlaps CPU domain work, computing
+integer masks and exact normal gradients. Normal decoding uses CPU lookup
+values; contrast, final normal scaling and region decisions retain NumPy/SciPy.
+BEAMXP_GLYPH_COMPUTE=cpu disables it; auto is the default and keeps small or
+unsupported workloads on CPU. 2026-09-08: BEAMXP_GLYPH_GPU_WORKERS selects one
+or two independent GPU workers per texture process; the default is two.
 
 Which way the imports run, and why it matters:
 

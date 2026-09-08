@@ -458,8 +458,8 @@ class RhdTextureConfig:
     # detected rectangles are mapped back into full-atlas coordinates before the
     # edit plan is applied.
     # Which detector finds the marks.  2026-09-02: "glyph_lab" is the rebuilt
-    # front end -- numpy/scipy only, per UV domain, thresholding before it
-    # groups rather than after -- and it brings each mark's own texels with it
+    # front end, per UV domain, thresholding before it groups rather than
+    # after -- and it brings each mark's own texels with it
     # so a flip writes the mark rather than its rectangle.  "legacy" is the
     # MSER/contrast/edge pipeline in ``annotate_texture_regions``, kept
     # reachable for one release so a conversion that regresses can be compared
@@ -10639,7 +10639,9 @@ def export_parts_preview(
     detection_session: ProductionDetectionSession[RegionDetection] = (
         ProductionDetectionSession()
     )
-    if (
+    # 2026-09-07: glyph_lab owns its integer-mask context; this warm-up is
+    # for the legacy floating-point shaders that detector actually consumes.
+    if config.detector != "glyph_lab" and (
         config.detect_on_normal_map
         or mser_config.box_source in {"contrast_gpu", "edge_gpu"}
         or relief_mser_config.box_source == "edge_gpu"
@@ -11459,7 +11461,9 @@ def build_all_rhd_textures(
     detection_session: ProductionDetectionSession[RegionDetection] = (
         ProductionDetectionSession()
     )
-    if (
+    # 2026-09-07: glyph_lab owns its integer-mask context; this warm-up is
+    # for the legacy floating-point shaders that detector actually consumes.
+    if config.detector != "glyph_lab" and (
         config.detect_on_normal_map
         or mser_config.box_source in {"contrast_gpu", "edge_gpu"}
         or any(

@@ -1,8 +1,8 @@
 """The local-contrast front end, producing regions that carry their texels.
 
-Deliberately numpy and scipy only.  cv2 is on its way out of this repo, and a
-new package is the wrong place to add call sites to it; a masked box filter is
-two ``uniform_filter`` passes and a divide, and labelling is one ``ndimage.label``.
+2026-09-07: floating-point decisions stay in NumPy/SciPy; optional integer GPU
+masks overlap CPU preparation and analysis. A masked box filter remains two
+``uniform_filter`` passes and a divide, and labelling is ``ndimage.label``.
 
 Detection runs per UV domain, not over the atlas, for the same reason the first
 pipeline does: the response is a pixel's distance from the mean of its
@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -34,6 +35,13 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from glyph_lab.corpus import CorpusTexture
+from glyph_lab.mask_compute import (
+    compute_backend,
+    pipeline_candidate,
+    prepared_items,
+    sparse_result,
+    submit_sparse_field,
+)
 from glyph_lab.material_transitions import (
     classify_material_transition_candidates,
     clear_of_material_transitions,
@@ -3249,6 +3257,43 @@ def group_outline(mask: np.ndarray, config: ContrastConfig) -> np.ndarray:
     return painted
 
 
+@dataclass(slots=True)
+class DomainThreshold:
+    """2026-09-07: unchanged CPU arithmetic, prepared ahead of region analysis."""
+
+    sample: np.ndarray
+    response: np.ndarray
+    level: float | np.ndarray
+    lit: np.ndarray
+    seconds: float
+    sparse_future: Future | None = None
+
+
+def prepare_domain_threshold(
+    colour: np.ndarray, domain: np.ndarray, contrast: ContrastConfig,
+) -> DomainThreshold:
+    started = time.perf_counter()
+    sample = sampling_mask(domain, contrast.boundary_skip_px)
+    response = contrast_response(colour, domain, contrast, sample)
+    # 2026-08-27: the same mask from here down, not `domain`.  The rim texels
+    # now carry a response of 0, and a floor or a percentile that averaged them
+    # in would read that as flat surface and drop its own bar -- letting noise
+    # through in a band around every island, which is the opposite of what
+    # taking the rim out was for.
+    if contrast.local_floor_multiple > 0:
+        level = np.maximum(
+            contrast.local_floor_multiple * local_response_floor(
+                response, sample, contrast.local_floor_px
+            ),
+            contrast.min_response,
+        )
+    else:
+        level = response_threshold(response, sample, contrast)
+
+    lit = (response >= level) & sample
+    return DomainThreshold(sample, response, level, lit, time.perf_counter() - started)
+
+
 def regions_in_domain(
     colour: np.ndarray,
     domain: np.ndarray,
@@ -3266,6 +3311,7 @@ def regions_in_domain(
     texture_name: str = "",
     normal_flat: np.ndarray | None = None,
     mesh_regions: np.ndarray | None = None,
+    prepared: DomainThreshold | None = None,
 ) -> tuple[list[Region], np.ndarray, np.ndarray]:
     """One domain, start to finish: the marks in it, their paths, their texels.
 
@@ -3342,24 +3388,9 @@ def regions_in_domain(
     if counts is None:
         counts = {}
     contrast = config.contrast
-    sample = sampling_mask(domain, contrast.boundary_skip_px)
-    response = contrast_response(colour, domain, contrast, sample)
-    # 2026-08-27: the same mask from here down, not `domain`.  The rim texels
-    # now carry a response of 0, and a floor or a percentile that averaged them
-    # in would read that as flat surface and drop its own bar -- letting noise
-    # through in a band around every island, which is the opposite of what
-    # taking the rim out was for.
-    if contrast.local_floor_multiple > 0:
-        level = np.maximum(
-            contrast.local_floor_multiple * local_response_floor(
-                response, sample, contrast.local_floor_px
-            ),
-            contrast.min_response,
-        )
-    else:
-        level = response_threshold(response, sample, contrast)
-
-    lit = (response >= level) & sample
+    prepared = prepared or prepare_domain_threshold(colour, domain, contrast)
+    sample, response, level, lit = prepared.sample, prepared.response, prepared.level, prepared.lit
+    reached = time.perf_counter() - prepared.seconds
     # An empty list, not nothing: it records that this stage has a region
     # count and that the count is zero, which is what the viewer needs to
     # say "no regions yet" rather than falling back on the final tally.
@@ -3386,9 +3417,12 @@ def regions_in_domain(
     # A marker, not a filter: `lit` goes on untouched.  What is recorded is the
     # blank ground the marks stand on, which is the one thing a mask of what
     # fired cannot show.
-    blank, field_sample = sparse_field_with_mesh_cuts(
-        lit, sample, mesh_regions,
-        contrast.sparse_kernel_px, contrast.max_sparse_texels,
+    blank, field_sample = sparse_result(
+        prepared.sparse_future,
+        lambda: sparse_field_with_mesh_cuts(
+            lit, sample, mesh_regions,
+            contrast.sparse_kernel_px, contrast.max_sparse_texels,
+        ),
     )
     sparse[:] = blank
     # The stage answers with the *inverse* of what it computes: the blank
@@ -3795,6 +3829,7 @@ def detect(
     normal_config: object | None = None,
     normal_flat: np.ndarray | None = None,
     domain_cache: object | None = None,
+    backend: str | None = None,
 ) -> Detection:
     """Detect over every UV domain of one texture.
 
@@ -3813,6 +3848,7 @@ def detect(
     are part of the harness result rather than incidental logging.
     """
     config = config or LabConfig()
+    backend = compute_backend(backend)
     stages: dict[str, np.ndarray] = {}
     stage_outlines: dict[str, np.ndarray] = {}
     counts: dict[str, int] = {}
@@ -3842,64 +3878,78 @@ def detect(
             slope_threshold=int(normal_config.slope_threshold),
             absence_kernel_px=int(normal_config.absence_kernel_px),
             max_slope_texels=int(normal_config.max_slope_texels),
+            backend=backend,
         )
     mesh_regions = mesh_region_labels(texture.domains, texture.seams)
-    for label, window in enumerate(texture.domain_windows(), start=1):
-        if window is None:
-            continue
-        x, y = int(window[1].start), int(window[0].start)
+    windows = [(label, window) for label, window in enumerate(texture.domain_windows(), start=1)
+               if window is not None]
+    parallel = stop != 1 and pipeline_candidate(windows, config.contrast.sparse_kernel_px, backend)
+
+    def prepare(item):
+        label, window = item
         domain = texture.domains[window] == label
-        captured: dict[str, np.ndarray] | None = {} if capture else None
-        drawn: dict[str, np.ndarray] | None = {} if capture else None
-        blank = np.zeros(domain.shape, dtype=bool)
-        cached = None
-        cache_key = None
-        # 2026-09-05: whole-atlas image keys miss every unchanged panel on a
-        # skin variant. The domain key below includes every input this visit
-        # can read, including the bounded repeat-filter context.
+        cached = cache_key = None
+        # 2026-09-07: cache hits bypass preparation; results still merge in
+        # domain order, including when the following domain finishes first.
         if domain_cache is not None and not capture and probe is None:
             cache_key = _domain_detection_cache_key(
                 texture.colour, domain, window, normal_flat, mesh_regions,
                 repeat_texture, config,
             )
             cached = domain_cache.get_glyph_domain(cache_key)
-        if cached is None:
-            found, outline, kept = regions_in_domain(
-                texture.colour[window], domain, label, (x, y), config, blank,
-                repeat_texture, captured, drawn, counts,
-                kept_regions=stage_regions if capture else None, timings=timings,
-                probe=probe, texture_name=texture.name,
-                normal_flat=(None if normal_flat is None else normal_flat[window]),
-                mesh_regions=mesh_regions[window],
+        threshold = None
+        if cached is None and parallel:
+            threshold = prepare_domain_threshold(texture.colour[window], domain, config.contrast)
+            threshold.sparse_future = submit_sparse_field(
+                threshold.lit, threshold.sample, mesh_regions[window],
+                config.contrast.sparse_kernel_px, config.contrast.max_sparse_texels, backend,
             )
-            final = DomainDetectionCacheEntry(
-                tuple(found), blank.copy(), outline.copy(), kept.copy(),
-            )
-            if cache_key is not None:
-                domain_cache.put_glyph_domain(cache_key, final)
-        else:
-            # A cache key deliberately excludes the layer-local label number.
-            # Region preserves that number for reports, so restore it here.
-            found = [
-                replace(region, domain=label, _cache={})
-                for region in cached.regions
-            ]
-            blank = cached.sparse
-            outline = cached.outline
-            kept = cached.kept
-        sparse[window] |= blank
-        for source, whole_atlas in ((captured, stages), (drawn, stage_outlines)):
-            if source is None:
-                continue
-            for name, mask in source.items():
-                whole = whole_atlas.get(name)
-                if whole is None:
-                    whole = np.zeros(texture.shape, dtype=bool)
-                    whole_atlas[name] = whole
-                whole[window] |= mask
-        regions.extend(found)
-        fired[window] |= kept
-        outlines[window] |= outline
+        return label, window, domain, cache_key, cached, threshold
+
+    with prepared_items(windows, prepare, parallel) as prepared:
+        for label, window, domain, cache_key, cached, threshold in prepared:
+            x, y = int(window[1].start), int(window[0].start)
+            captured: dict[str, np.ndarray] | None = {} if capture else None
+            drawn: dict[str, np.ndarray] | None = {} if capture else None
+            blank = np.zeros(domain.shape, dtype=bool)
+            if cached is None:
+                found, outline, kept = regions_in_domain(
+                    texture.colour[window], domain, label, (x, y), config, blank,
+                    repeat_texture, captured, drawn, counts,
+                    kept_regions=stage_regions if capture else None, timings=timings,
+                    probe=probe, texture_name=texture.name,
+                    normal_flat=(None if normal_flat is None else normal_flat[window]),
+                    mesh_regions=mesh_regions[window],
+                    prepared=threshold,
+                )
+                final = DomainDetectionCacheEntry(
+                    tuple(found), blank.copy(), outline.copy(), kept.copy(),
+                )
+                if cache_key is not None:
+                    domain_cache.put_glyph_domain(cache_key, final)
+            else:
+                # A cache key deliberately excludes the layer-local label number.
+                # Region preserves that number for reports, so restore it here.
+                found = [
+                    replace(region, domain=label, _cache={})
+                    for region in cached.regions
+                ]
+                blank = cached.sparse
+                outline = cached.outline
+                kept = cached.kept
+            sparse[window] |= blank
+            for source, whole_atlas in ((captured, stages), (drawn, stage_outlines)):
+                if source is None:
+                    continue
+                for name, mask in source.items():
+                    whole = whole_atlas.get(name)
+                    if whole is None:
+                        whole = np.zeros(texture.shape, dtype=bool)
+                        whole_atlas[name] = whole
+                    whole[window] |= mask
+            regions.extend(found)
+            fired[window] |= kept
+            outlines[window] |= outline
     return Detection(
         regions=regions, fired=fired, outlines=outlines, sparse=sparse,
         stages={name: np.packbits(mask) for name, mask in stages.items()},

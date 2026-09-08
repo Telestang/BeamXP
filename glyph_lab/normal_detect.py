@@ -25,6 +25,13 @@ from glyph_lab.detect import (
     sampling_mask,
     sparse_field,
 )
+from glyph_lab.mask_compute import (
+    compute_backend,
+    pipeline_candidate,
+    prepared_items,
+    sparse_result,
+    submit_sparse_field,
+)
 from glyph_lab.region_grouping import (
     GroupingConfig,
     group_regions_across_flat_ground,
@@ -558,9 +565,11 @@ def detect_normal(
     capture: bool = False,
     grouping: GroupingConfig | None = None,
     reference_colour: np.ndarray | None = None,
+    backend: str | None = None,
 ) -> Detection:
     """Paint holes left in a slope-free field over every UV domain."""
     config = config or NormalMapConfig()
+    backend = compute_backend(backend)
     grouping = grouping or GroupingConfig()
     colour_evidence = texture.colour if reference_colour is None else reference_colour
     mesh_regions = mesh_region_labels(texture.domains, texture.seams)
@@ -583,186 +592,198 @@ def detect_normal(
     if not 1 <= stop <= len(NORMAL_STAGES):
         stop = 0
 
-    for label, window in enumerate(texture.domain_windows(), start=1):
-        if window is None:
-            continue
-        x, y = int(window[1].start), int(window[0].start)
+    windows = [(label, window) for label, window in enumerate(texture.domain_windows(), start=1)
+               if window is not None]
+    parallel = pipeline_candidate(windows, config.absence_kernel_px, backend)
+
+    def prepare(item):
+        label, window = item
         domain = texture.domains[window] == label
         sample = sampling_mask(domain, config.boundary_skip_px)
         slopes = (texture.colour[window][:, :, 0] >= config.slope_threshold) & sample
-        slope_free = sparse_field(
-            slopes, sample, config.absence_kernel_px, config.max_slope_texels,
+        future = submit_sparse_field(
+            slopes, sample, None, config.absence_kernel_px, config.max_slope_texels, backend if parallel else "cpu",
         )
-        holes = regions_from_holes(slope_free, sample, label, (x, y))
-        outline, kept = paint_holes(holes, sample.shape, (x, y), config)  # type: ignore[arg-type]
-        stage_counts[NORMAL_ABSENT_SLOPES] += len(holes)
-        if capture:
-            stage_masks[NORMAL_ABSENT_SLOPES][window] |= kept
-            stage_outlines[NORMAL_ABSENT_SLOPES][window] |= outline
-        if stop == 1:
-            accepted = holes
-            accepted_outline, accepted_kept = outline, kept
-        else:
-            before_crowd = time.perf_counter()
-            hole_ids = mesh_region_ids(holes, mesh_regions[window], (x, y))
-            uncrowded = clear_of_normal_crowd(
-                holes, holes, config,
-                region_ids=hole_ids, company_ids=hole_ids,
+        return label, window, sample, slopes, future
+
+    with prepared_items(windows, prepare, parallel) as prepared:
+        for label, window, sample, slopes, future in prepared:
+            x, y = int(window[1].start), int(window[0].start)
+            slope_free, _sample = sparse_result(
+                future,
+                lambda slopes=slopes, sample=sample: (sparse_field(slopes, sample, config.absence_kernel_px,
+                                      config.max_slope_texels), sample),
             )
-            crowd_outline, crowd_kept = paint_holes(
-                uncrowded, sample.shape, (x, y), config,  # type: ignore[arg-type]
-            )
-            stage_times[NORMAL_CLEAR_OF_CROWD] += time.perf_counter() - before_crowd
-            stage_counts[NORMAL_CLEAR_OF_CROWD] += len(uncrowded)
+            holes = regions_from_holes(slope_free, sample, label, (x, y))
+            outline, kept = paint_holes(holes, sample.shape, (x, y), config)  # type: ignore[arg-type]
+            stage_counts[NORMAL_ABSENT_SLOPES] += len(holes)
             if capture:
-                stage_masks[NORMAL_CLEAR_OF_CROWD][window] |= crowd_kept
-                stage_outlines[NORMAL_CLEAR_OF_CROWD][window] |= crowd_outline
-            if stop == 2:
-                accepted = uncrowded
-                accepted_outline, accepted_kept = crowd_outline, crowd_kept
+                stage_masks[NORMAL_ABSENT_SLOPES][window] |= kept
+                stage_outlines[NORMAL_ABSENT_SLOPES][window] |= outline
+            if stop == 1:
+                accepted = holes
+                accepted_outline, accepted_kept = outline, kept
             else:
-                before_size = time.perf_counter()
-                sized = past_normal_size_floor(uncrowded, config)
-                size_outline, size_kept = paint_holes(
-                    sized, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                before_crowd = time.perf_counter()
+                hole_ids = mesh_region_ids(holes, mesh_regions[window], (x, y))
+                uncrowded = clear_of_normal_crowd(
+                    holes, holes, config,
+                    region_ids=hole_ids, company_ids=hole_ids,
                 )
-                stage_times[NORMAL_PAST_SIZE_FLOOR] += (
-                    time.perf_counter() - before_size
+                crowd_outline, crowd_kept = paint_holes(
+                    uncrowded, sample.shape, (x, y), config,  # type: ignore[arg-type]
                 )
-                stage_counts[NORMAL_PAST_SIZE_FLOOR] += len(sized)
+                stage_times[NORMAL_CLEAR_OF_CROWD] += time.perf_counter() - before_crowd
+                stage_counts[NORMAL_CLEAR_OF_CROWD] += len(uncrowded)
                 if capture:
-                    stage_masks[NORMAL_PAST_SIZE_FLOOR][window] |= size_kept
-                    stage_outlines[NORMAL_PAST_SIZE_FLOOR][window] |= size_outline
-                if stop == 3:
-                    accepted = sized
-                    accepted_outline, accepted_kept = size_outline, size_kept
+                    stage_masks[NORMAL_CLEAR_OF_CROWD][window] |= crowd_kept
+                    stage_outlines[NORMAL_CLEAR_OF_CROWD][window] |= crowd_outline
+                if stop == 2:
+                    accepted = uncrowded
+                    accepted_outline, accepted_kept = crowd_outline, crowd_kept
                 else:
-                    before_rim = time.perf_counter()
-                    rimmed = clear_of_normal_rim(sized, sample, (x, y), config)
-                    rim_outline, rim_kept = paint_holes(
-                        rimmed, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                    before_size = time.perf_counter()
+                    sized = past_normal_size_floor(uncrowded, config)
+                    size_outline, size_kept = paint_holes(
+                        sized, sample.shape, (x, y), config,  # type: ignore[arg-type]
                     )
-                    stage_times[NORMAL_CLEAR_OF_RIM] += (
-                        time.perf_counter() - before_rim
+                    stage_times[NORMAL_PAST_SIZE_FLOOR] += (
+                        time.perf_counter() - before_size
                     )
-                    stage_counts[NORMAL_CLEAR_OF_RIM] += len(rimmed)
+                    stage_counts[NORMAL_PAST_SIZE_FLOOR] += len(sized)
                     if capture:
-                        stage_masks[NORMAL_CLEAR_OF_RIM][window] |= rim_kept
-                        stage_outlines[NORMAL_CLEAR_OF_RIM][window] |= rim_outline
-                    if stop == 4:
-                        accepted = rimmed
-                        accepted_outline, accepted_kept = rim_outline, rim_kept
+                        stage_masks[NORMAL_PAST_SIZE_FLOOR][window] |= size_kept
+                        stage_outlines[NORMAL_PAST_SIZE_FLOOR][window] |= size_outline
+                    if stop == 3:
+                        accepted = sized
+                        accepted_outline, accepted_kept = size_outline, size_kept
                     else:
-                        before_frame = time.perf_counter()
-                        framed = clear_of_normal_frame(rimmed, config)
-                        frame_outline, frame_kept = paint_holes(
-                            framed, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                        before_rim = time.perf_counter()
+                        rimmed = clear_of_normal_rim(sized, sample, (x, y), config)
+                        rim_outline, rim_kept = paint_holes(
+                            rimmed, sample.shape, (x, y), config,  # type: ignore[arg-type]
                         )
-                        stage_times[NORMAL_CLEAR_OF_FRAME] += (
-                            time.perf_counter() - before_frame
+                        stage_times[NORMAL_CLEAR_OF_RIM] += (
+                            time.perf_counter() - before_rim
                         )
-                        stage_counts[NORMAL_CLEAR_OF_FRAME] += len(framed)
+                        stage_counts[NORMAL_CLEAR_OF_RIM] += len(rimmed)
                         if capture:
-                            stage_masks[NORMAL_CLEAR_OF_FRAME][window] |= frame_kept
-                            stage_outlines[NORMAL_CLEAR_OF_FRAME][window] |= frame_outline
-                        if stop == 5:
-                            accepted = framed
-                            accepted_outline, accepted_kept = frame_outline, frame_kept
+                            stage_masks[NORMAL_CLEAR_OF_RIM][window] |= rim_kept
+                            stage_outlines[NORMAL_CLEAR_OF_RIM][window] |= rim_outline
+                        if stop == 4:
+                            accepted = rimmed
+                            accepted_outline, accepted_kept = rim_outline, rim_kept
                         else:
-                            before_stripe = time.perf_counter()
-                            accepted = clear_of_normal_stripe(framed, config)
-                            accepted_outline, accepted_kept = paint_holes(
-                                accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                            before_frame = time.perf_counter()
+                            framed = clear_of_normal_frame(rimmed, config)
+                            frame_outline, frame_kept = paint_holes(
+                                framed, sample.shape, (x, y), config,  # type: ignore[arg-type]
                             )
-                            stage_times[NORMAL_CLEAR_OF_STRIPE] += (
-                                time.perf_counter() - before_stripe
+                            stage_times[NORMAL_CLEAR_OF_FRAME] += (
+                                time.perf_counter() - before_frame
                             )
-                            stage_counts[NORMAL_CLEAR_OF_STRIPE] += len(accepted)
+                            stage_counts[NORMAL_CLEAR_OF_FRAME] += len(framed)
                             if capture:
-                                stage_masks[NORMAL_CLEAR_OF_STRIPE][window] |= accepted_kept
-                                stage_outlines[NORMAL_CLEAR_OF_STRIPE][window] |= accepted_outline
-                            if stop != 6:
-                                before_group = time.perf_counter()
-                                accepted = group_regions_across_flat_ground(
-                                    accepted, colour_evidence[window], slope_free,
-                                    grouping, (x, y), mesh_regions[window],
-                                )
+                                stage_masks[NORMAL_CLEAR_OF_FRAME][window] |= frame_kept
+                                stage_outlines[NORMAL_CLEAR_OF_FRAME][window] |= frame_outline
+                            if stop == 5:
+                                accepted = framed
+                                accepted_outline, accepted_kept = frame_outline, frame_kept
+                            else:
+                                before_stripe = time.perf_counter()
+                                accepted = clear_of_normal_stripe(framed, config)
                                 accepted_outline, accepted_kept = paint_holes(
                                     accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
                                 )
-                                stage_times[NORMAL_GROUPED_FLAT_GROUND] += (
-                                    time.perf_counter() - before_group
+                                stage_times[NORMAL_CLEAR_OF_STRIPE] += (
+                                    time.perf_counter() - before_stripe
                                 )
-                                stage_counts[NORMAL_GROUPED_FLAT_GROUND] += len(accepted)
-                            if capture:
-                                stage_masks[NORMAL_GROUPED_FLAT_GROUND][window] |= accepted_kept
-                                stage_outlines[NORMAL_GROUPED_FLAT_GROUND][window] |= accepted_outline
-                            if stop not in (6, 7):
-                                before_panel = time.perf_counter()
-                                accepted = clear_of_normal_panel_face(accepted, config)
-                                accepted_outline, accepted_kept = paint_holes(
-                                    accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
-                                )
-                                stage_times[NORMAL_CLEAR_OF_PANEL] += (
-                                    time.perf_counter() - before_panel
-                                )
-                                stage_counts[NORMAL_CLEAR_OF_PANEL] += len(accepted)
+                                stage_counts[NORMAL_CLEAR_OF_STRIPE] += len(accepted)
                                 if capture:
-                                    stage_masks[NORMAL_CLEAR_OF_PANEL][window] |= accepted_kept
-                                    stage_outlines[NORMAL_CLEAR_OF_PANEL][window] |= accepted_outline
-                            if stop not in (6, 7, 8):
-                                before_hull = time.perf_counter()
-                                accepted = convex_region_hulls(accepted)
-                                accepted_outline, accepted_kept = paint_holes(
-                                    accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
-                                )
-                                stage_times[NORMAL_CONVEX_HULLED] += (
-                                    time.perf_counter() - before_hull
-                                )
-                                stage_counts[NORMAL_CONVEX_HULLED] += len(accepted)
+                                    stage_masks[NORMAL_CLEAR_OF_STRIPE][window] |= accepted_kept
+                                    stage_outlines[NORMAL_CLEAR_OF_STRIPE][window] |= accepted_outline
+                                if stop != 6:
+                                    before_group = time.perf_counter()
+                                    accepted = group_regions_across_flat_ground(
+                                        accepted, colour_evidence[window], slope_free,
+                                        grouping, (x, y), mesh_regions[window],
+                                    )
+                                    accepted_outline, accepted_kept = paint_holes(
+                                        accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                    )
+                                    stage_times[NORMAL_GROUPED_FLAT_GROUND] += (
+                                        time.perf_counter() - before_group
+                                    )
+                                    stage_counts[NORMAL_GROUPED_FLAT_GROUND] += len(accepted)
                                 if capture:
-                                    stage_masks[NORMAL_CONVEX_HULLED][window] |= accepted_kept
-                                    stage_outlines[NORMAL_CONVEX_HULLED][window] |= accepted_outline
-                            if stop not in (6, 7, 8, 9):
-                                before_rectangle = time.perf_counter()
-                                fitted = fit_region_rectangles(
-                                    accepted, config.rectangle_chain_tolerance_degrees,
-                                    config.rectangle_min_axis_lead_ratio,
-                                )
-                                accepted_outline, accepted_kept = paint_holes(
-                                    fitted, sample.shape, (x, y), config,  # type: ignore[arg-type]
-                                )
-                                stage_times[NORMAL_FITTED_RECTANGLE] += (
-                                    time.perf_counter() - before_rectangle
-                                )
-                                stage_counts[NORMAL_FITTED_RECTANGLE] += len(fitted)
-                                if capture:
-                                    stage_masks[NORMAL_FITTED_RECTANGLE][window] |= accepted_kept
-                                    stage_outlines[NORMAL_FITTED_RECTANGLE][window] |= accepted_outline
-                                # 2026-09-03: the fitted rectangle describes
-                                # a baseline for rotation, but must not replace
-                                # the convex region that correction flips. The
-                                # latter is passed through the exporter as a
-                                # mask, closed over its reflected partner.
-                            if stop not in (6, 7, 8, 9, 10):
-                                before_padding = time.perf_counter()
-                                accepted = pad_regions(
-                                    accepted, config.final_padding_px, sample, (x, y),
-                                )
-                                accepted_outline, accepted_kept = paint_holes(
-                                    accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
-                                )
-                                stage_times[NORMAL_PADDED] += (
-                                    time.perf_counter() - before_padding
-                                )
-                                stage_counts[NORMAL_PADDED] += len(accepted)
-                                if capture:
-                                    stage_masks[NORMAL_PADDED][window] |= accepted_kept
-                                    stage_outlines[NORMAL_PADDED][window] |= accepted_outline
-        sparse[window] |= slope_free
-        fired[window] |= accepted_kept
-        outlines[window] |= accepted_outline
-        regions.extend(accepted)
+                                    stage_masks[NORMAL_GROUPED_FLAT_GROUND][window] |= accepted_kept
+                                    stage_outlines[NORMAL_GROUPED_FLAT_GROUND][window] |= accepted_outline
+                                if stop not in (6, 7):
+                                    before_panel = time.perf_counter()
+                                    accepted = clear_of_normal_panel_face(accepted, config)
+                                    accepted_outline, accepted_kept = paint_holes(
+                                        accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                    )
+                                    stage_times[NORMAL_CLEAR_OF_PANEL] += (
+                                        time.perf_counter() - before_panel
+                                    )
+                                    stage_counts[NORMAL_CLEAR_OF_PANEL] += len(accepted)
+                                    if capture:
+                                        stage_masks[NORMAL_CLEAR_OF_PANEL][window] |= accepted_kept
+                                        stage_outlines[NORMAL_CLEAR_OF_PANEL][window] |= accepted_outline
+                                if stop not in (6, 7, 8):
+                                    before_hull = time.perf_counter()
+                                    accepted = convex_region_hulls(accepted)
+                                    accepted_outline, accepted_kept = paint_holes(
+                                        accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                    )
+                                    stage_times[NORMAL_CONVEX_HULLED] += (
+                                        time.perf_counter() - before_hull
+                                    )
+                                    stage_counts[NORMAL_CONVEX_HULLED] += len(accepted)
+                                    if capture:
+                                        stage_masks[NORMAL_CONVEX_HULLED][window] |= accepted_kept
+                                        stage_outlines[NORMAL_CONVEX_HULLED][window] |= accepted_outline
+                                if stop not in (6, 7, 8, 9):
+                                    before_rectangle = time.perf_counter()
+                                    fitted = fit_region_rectangles(
+                                        accepted, config.rectangle_chain_tolerance_degrees,
+                                        config.rectangle_min_axis_lead_ratio,
+                                    )
+                                    accepted_outline, accepted_kept = paint_holes(
+                                        fitted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                    )
+                                    stage_times[NORMAL_FITTED_RECTANGLE] += (
+                                        time.perf_counter() - before_rectangle
+                                    )
+                                    stage_counts[NORMAL_FITTED_RECTANGLE] += len(fitted)
+                                    if capture:
+                                        stage_masks[NORMAL_FITTED_RECTANGLE][window] |= accepted_kept
+                                        stage_outlines[NORMAL_FITTED_RECTANGLE][window] |= accepted_outline
+                                    # 2026-09-03: the fitted rectangle describes
+                                    # a baseline for rotation, but must not replace
+                                    # the convex region that correction flips. The
+                                    # latter is passed through the exporter as a
+                                    # mask, closed over its reflected partner.
+                                if stop not in (6, 7, 8, 9, 10):
+                                    before_padding = time.perf_counter()
+                                    accepted = pad_regions(
+                                        accepted, config.final_padding_px, sample, (x, y),
+                                    )
+                                    accepted_outline, accepted_kept = paint_holes(
+                                        accepted, sample.shape, (x, y), config,  # type: ignore[arg-type]
+                                    )
+                                    stage_times[NORMAL_PADDED] += (
+                                        time.perf_counter() - before_padding
+                                    )
+                                    stage_counts[NORMAL_PADDED] += len(accepted)
+                                    if capture:
+                                        stage_masks[NORMAL_PADDED][window] |= accepted_kept
+                                        stage_outlines[NORMAL_PADDED][window] |= accepted_outline
+            sparse[window] |= slope_free
+            fired[window] |= accepted_kept
+            outlines[window] |= accepted_outline
+            regions.extend(accepted)
 
     elapsed = time.perf_counter() - started
     stage_times[NORMAL_ABSENT_SLOPES] = max(

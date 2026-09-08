@@ -26,6 +26,9 @@ a = Analysis(
         "mesh_segmentation_transform.mirror_texture_for_rhd",
         "mesh_segmentation_transform.beamxp_transform_sym_mesh_POC",
         "ispc_texcomp",
+        # 2026-09-07: optional integer compute backend used by glyph_lab.
+        "glyph_lab.mask_compute",
+        "glyph_lab.normal_compute",
     ],
     hookspath=[],
     hooksconfig={},
