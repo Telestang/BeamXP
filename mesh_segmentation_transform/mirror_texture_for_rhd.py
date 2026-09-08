@@ -9921,7 +9921,7 @@ def write_blender_preview(
         # names whichever corrected file exists.  Blender prefers the PNG when
         # it is there; BeamNG is wired from outputMaps, which is DDS-first.
         corrected_path = result.png_path or result.dds_path
-        if not result.material_aliases or corrected_path is None:
+        if not result.material_aliases:
             continue
         # Several corrections of one texture reach here sharing a materials-JSON
         # key: the LC500's turn-signal and high-beam tell-tales are three DAE
@@ -9961,6 +9961,15 @@ def write_blender_preview(
                 stage_key = str(layer.get("stage_key") or "baseColorMap")
                 source_key = (materials_member, material_key)
                 source = source_by_key.get(source_key)
+                # 2026-09-08: licenseplatesSkins.lua/process skins the bound
+                # material by appending the skin slot/name. An unchanged skin
+                # still needs that definition when its base was corrected;
+                # Scintilla's race dashboard otherwise loses luxe/race skins.
+                if corrected_path is None and (
+                    source is None
+                    or not material_key.startswith(f"{dae_material}.skin")
+                ):
+                    continue
                 aliases = [dae_material, material_key]
                 if isinstance(source, dict) and not material_scope:
                     # Scoped to one DAE material, the sibling aliases sharing
@@ -9989,6 +9998,8 @@ def write_blender_preview(
                 assert isinstance(entry_switch_bases, list)
                 if dae_material in switch_bases and dae_material not in entry_switch_bases:
                     entry_switch_bases.append(dae_material)
+                if corrected_path is None:
+                    continue
                 path = (
                     result.report.get("outputs", {}).get("preview")
                     if isinstance(result.report.get("outputs"), dict)
@@ -10011,6 +10022,8 @@ def write_blender_preview(
             continue
 
         # Compatibility for callers/tests constructing pre-layer result data.
+        if corrected_path is None:
+            continue
         maps: dict[str, str] = {"baseColorMap": corrected_path.name}
         output_maps: list[dict[str, object]] = [
             {

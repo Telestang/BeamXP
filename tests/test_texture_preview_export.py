@@ -3425,6 +3425,58 @@ class SplitTextureManifestTests(unittest.TestCase):
         self.assertEqual(len(materials), 1)
         self.assertNotIn("partKeys", materials[0])
 
+    def test_unchanged_skins_follow_each_corrected_base(self) -> None:
+        from beamxp import hand_drive_core  # noqa: F401
+        from beamxp.hand_drive_parts import build_pipeline
+
+        results = []
+        for index, mesh in enumerate(("dashboard", "dashboard_race"), 1):
+            base = self._result(index, [mesh])
+            base.material_aliases = ("interior",)
+            base.report["material_scope"] = ["interior"]
+            layer = base.report["layer_bindings"][0]
+            layer.update(dae_material="interior", material_key="interior")
+            source = base.report["source_materials"][0]
+            source.update(key="interior", aliases=["interior"])
+            results.append(base)
+            for skin in ("luxe", "race"):
+                name = f"interior.skin_interior.{skin}"
+                unchanged = self._result(index, [mesh])
+                unchanged.png_path = unchanged.dds_path = None
+                unchanged.material_aliases = ("interior", name)
+                unchanged.report["material_scope"] = ["interior"]
+                unchanged.report["layer_bindings"][0].update(
+                    dae_material="interior", material_key=name,
+                )
+                unchanged.report["source_materials"][0].update(
+                    key=name, aliases=[name],
+                    material={"name": name, "mapTo": name, "Stages": [
+                        {"baseColorMap": f"/vehicles/car/{skin}.dds"},
+                    ]},
+                )
+                results.append(unchanged)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            rhd.write_blender_preview(output, results, log=lambda *_a: None)
+            manifest = json.loads((output / "rhd_materials.json").read_text())
+            self.assertEqual(len(manifest["materials"]), 6)
+            for entry in manifest["materials"]:
+                if ".skin_interior." in entry["aliases"][-1]:
+                    self.assertEqual(entry["maps"], {})
+                    self.assertEqual(entry["outputMaps"], [])
+            target = output / "vehicles/car"
+            target.mkdir(parents=True)
+            materials = build_pipeline._prepare_texture_correction_materials(output, target, output)
+            document = json.loads((target / "beamxp_texture_correction.materials.json").read_text())
+            for mesh in ("dashboard", "dashboard_race"):
+                base_name = materials.for_part(mesh)["interior"]
+                for skin in ("luxe", "race"):
+                    name = f"{base_name}.skin_interior.{skin}"
+                    self.assertEqual(document[name]["mapTo"], name)
+                    self.assertEqual(document[name]["Stages"][0]["baseColorMap"],
+                                     f"/vehicles/car/{skin}.dds")
+
     def test_a_single_colour_and_split_scalar_scope_reunite_in_one_material(self) -> None:
         colour = self._result(0, [])
         colour.report.update(
