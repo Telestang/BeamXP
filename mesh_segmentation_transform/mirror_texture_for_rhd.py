@@ -29,8 +29,8 @@ turned over on that axis, or whether its glyphs have to be done individually.
 Off-axis cases are resolved to the nearer axis and not otherwise corrected.
 
 Base colour, emissive, opacity, overlay and normal maps are detector sources.
-2026-09-06: Colour detections correct only their own physical layer; the other
-detector sources still share accepted regions across the material's maps.
+2026-09-09: Explicit per-source routes control which sibling maps receive accepted
+detections; every map retains its own local detections.
 Material-response maps are correction-only: they receive the accepted plan but
 never donate regions. Repeated references to one physical file are still
 processed once.
@@ -645,8 +645,8 @@ class RhdTextureResult:
 # surface, so they are registered to nothing in particular and flipping a
 # region of one would corrupt every other place it lands.  Cubemaps and
 # "@"-prefixed runtime aliases never name an archive member at all.
-# 2026-09-06: Every member here can receive a sibling's accepted regions.
-# ``DETECTION_SOURCE_STAGE_KEYS`` may detect; colour keeps its detections local.
+# 2026-09-08: Detection sources are selected by DETECTION_SOURCE_STAGE_KEYS;
+# sibling recipients are selected by DETECTION_CORRECTION_TARGETS below.
 NORMAL_MAP_STAGE_KEYS = ("normalMap", "clearCoatBottomNormalMap")
 COLOUR_MAP_STAGE_KEYS = ("baseColorMap", "colorMap", "diffuseMap")
 SCALAR_MAP_STAGE_KEYS = (
@@ -690,6 +690,92 @@ DETECTION_SOURCE_STAGE_KEYS = frozenset(
         "overlayMap",
     }.difference(TEMPORARILY_DISABLED_TEXTURE_STAGE_KEYS)
 )
+# 2026-09-08: EDIT HERE to route accepted detections between sibling maps.
+# Keys are detection-source material fields; values are recipient material fields.
+# Add/remove a target in a tuple to enable/disable that route. () (or a missing
+# source key) means no sharing. A map always retains its own local detections.
+# These routes do not enable detectors: DETECTION_SOURCE_STAGE_KEYS above does.
+# All routes stay within one material/part UV scope and retain mask/region checks.
+# Example: add "roughnessMap" to "baseColorMap" to correct roughness from colour.
+# common/racinginterior/skins.materials.json binds alcantar_m.data as metallicMap;
+# Lua ge/extensions/util/export.lua::_exportMaterial reads that material field.
+DETECTION_CORRECTION_TARGETS: dict[str, tuple[str, ...]] = {
+    "baseColorMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "roughnessMap", "metallicMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+    "colorMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "roughnessMap", "metallicMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+    "diffuseMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "roughnessMap", "metallicMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+    "normalMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "normalMap", "clearCoatBottomNormalMap", "roughnessMap",
+        "metallicMap", "ambientOcclusionMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+    "clearCoatBottomNormalMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "normalMap", "clearCoatBottomNormalMap", "roughnessMap",
+        "metallicMap", "ambientOcclusionMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+    "opacityMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "normalMap", "clearCoatBottomNormalMap", "roughnessMap",
+        "metallicMap", "ambientOcclusionMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+    "emissiveMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "normalMap", "clearCoatBottomNormalMap", "roughnessMap",
+        "metallicMap", "ambientOcclusionMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+    "overlayMap": (
+        "baseColorMap", "colorMap", "diffuseMap",
+        "normalMap", "clearCoatBottomNormalMap", "roughnessMap",
+        "metallicMap", "ambientOcclusionMap", "opacityMap",
+        "specularMap", "specularityMap", "clearCoatMap",
+        "clearCoatRoughnessMap", "reflectivityMap", "emissiveMap",
+        "colorPaletteMap", "overlayMap", "lightMap",
+    ),
+}
+
+
+def shared_layer_target_stage_keys(stage_keys: tuple[str, ...]) -> tuple[str, ...]:
+    """2026-09-08: Resolve sharing routes for a physical texture's bindings."""
+    # 2026-09-08: A physical map with colour and other bindings uses the colour
+    # detector, so secondary bindings must not bypass its sharing restrictions.
+    colour_keys = tuple(key for key in stage_keys if key in COLOUR_MAP_STAGE_KEYS)
+    return tuple(dict.fromkeys(
+        target
+        for source in (colour_keys or stage_keys)
+        for target in DETECTION_CORRECTION_TARGETS.get(source, ())
+    ))
+
+
 RASTER_TEXTURE_SUFFIXES = frozenset(
     {".dds", ".png", ".jpg", ".jpeg", ".bmp", ".tga"}
 )
@@ -5985,6 +6071,8 @@ class SharedLayerRegionEvidence:
     regions: tuple[tuple[int, int, int, int], ...]
     rotations: tuple[tuple[tuple[float, float], ...] | None, ...]
     masks: tuple[np.ndarray | None, ...] = ()
+    # 2026-09-08: None is unrestricted legacy evidence; () disables sharing.
+    target_stage_keys: tuple[str, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -5997,8 +6085,8 @@ class SharedLayerRegionLedger:
     the union, so a mark visible only as normal relief or faint gloss is still
     turned over in all maps that composite it.
 
-    2026-09-06: Colour detections stay local and are never recorded here by the
-    exporter. Colour layers still receive evidence from the other sources.
+    2026-09-09: DETECTION_CORRECTION_TARGETS controls sibling recipients per
+    source material field, independently of the local detections each map keeps.
 
     A ledger belongs to exactly one correction-task group.  That scope is what
     prevents a shared atlas used by another material or another mesh from
@@ -6040,6 +6128,8 @@ class SharedLayerRegionLedger:
         regions: list[tuple[int, int, int, int]],
         rotations: list[tuple[tuple[float, float], ...] | None],
         masks: list[np.ndarray | None] | None = None,
+        *,
+        stage_keys: tuple[str, ...] = (),
     ) -> tuple[
         list[tuple[int, int, int, int]],
         list[tuple[tuple[float, float], ...] | None],
@@ -6066,6 +6156,10 @@ class SharedLayerRegionLedger:
 
         for source_member, evidence in self.layers.items():
             if source_member == member_key or not evidence.regions:
+                continue
+            if evidence.target_stage_keys is not None and not set(stage_keys).intersection(
+                evidence.target_stage_keys
+            ):
                 continue
             donated = []
             for region, rotation, mask in zip(
@@ -7778,8 +7872,8 @@ def build_rhd_texture(
     ``shared_layer_regions`` is scoped by the caller to one material on one
     part/UV layout. A detect-only visit records source-layer evidence; a
     correction-only layer records none and reuses its siblings' accepted plan.
-    2026-09-06: Colour layers retain their own detections without donating them;
-    they still receive other source layers' shared evidence.
+    2026-09-08: DETECTION_CORRECTION_TARGETS controls donation routes; local
+    detections remain available to their own layer regardless of those routes.
     """
     started = time.perf_counter()
     phase_timings: list[dict[str, object]] = []
@@ -8790,21 +8884,16 @@ def build_rhd_texture(
     shared_layer_sources: tuple[str, ...] = ()
     shared_layer_regions_added = 0
     if shared_layer_regions is not None:
-        # 2026-09-06: Printed colour glyphs must not move companion relief or
-        # baked lighting. Keep their detections for this layer's own plan only.
-        if layer_kind != "colour":
-            if authoritative_shared_evidence is not None:
-                shared_layer_regions.record_evidence(
-                    texture_member, authoritative_shared_evidence
-                )
-            else:
-                shared_layer_regions.record(
-                    texture_member,
-                    (width, height),
-                    mirrored_regions,
-                    mirrored_rotations,
-                    mirrored_masks,
-                )
+        evidence = authoritative_shared_evidence
+        if evidence is None:
+            evidence = SharedLayerRegionEvidence(
+                (width, height), tuple(mirrored_regions),
+                tuple(mirrored_rotations), tuple(mirrored_masks),
+            )
+        evidence = replace(
+            evidence, target_stage_keys=shared_layer_target_stage_keys(layer_stage_keys)
+        )
+        shared_layer_regions.record_evidence(texture_member, evidence)
         if detect_only:
             emit_progress(
                 progress,
@@ -8828,6 +8917,7 @@ def build_rhd_texture(
             mirrored_regions,
             mirrored_rotations,
             mirrored_masks,
+            stage_keys=layer_stage_keys,
         )
         if shared_layer_sources:
             log(

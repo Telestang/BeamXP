@@ -3552,9 +3552,49 @@ class SplitTextureManifestTests(unittest.TestCase):
 
 
 class SharedLayerRegionTests(unittest.TestCase):
-    """2026-09-06: Share eligible evidence while keeping colour detections local."""
+    """2026-09-09: Verify configurable routes, including restricted colour sharing."""
 
-    def test_colour_corrects_itself_without_donating_to_companions(self) -> None:
+    def test_configurable_routes_can_redirect_or_disable_sharing(self) -> None:
+        region = (1, 1, 3, 2)
+        for source_stage in ("baseColorMap", "normalMap", "opacityMap"):
+            for targets in (("roughnessMap",), ()):
+                with self.subTest(source=source_stage, targets=targets), patch.dict(
+                    rhd.DETECTION_CORRECTION_TARGETS, {source_stage: targets}
+                ):
+                    ledger = rhd.SharedLayerRegionLedger()
+                    ledger.record_evidence(
+                        "source.png",
+                        rhd.SharedLayerRegionEvidence(
+                            (16, 16), (region,), (None,),
+                            target_stage_keys=rhd.shared_layer_target_stage_keys(
+                                (source_stage,)
+                            ),
+                        ),
+                    )
+                    for target_stage in ("roughnessMap", "metallicMap", "normalMap"):
+                        combined = ledger.combined(
+                            "target.png", (16, 16), [], [],
+                            stage_keys=(target_stage,),
+                        )
+                        self.assertEqual(
+                            combined[0], [region] if target_stage in targets else []
+                        )
+                    own = ledger.combined("source.png", (16, 16), [region], [None])
+                    self.assertEqual(own[0], [region])
+
+    @patch.dict(rhd.DETECTION_CORRECTION_TARGETS, {"baseColorMap": ("metallicMap",)})
+    def test_routes_use_colour_precedence_and_fail_closed_for_missing_sources(self) -> None:
+        self.assertEqual(
+            rhd.shared_layer_target_stage_keys(("baseColorMap", "opacityMap")),
+            ("metallicMap",),
+        )
+        with patch.dict(rhd.DETECTION_CORRECTION_TARGETS, {}, clear=True):
+            self.assertEqual(rhd.shared_layer_target_stage_keys(("normalMap",)), ())
+
+    @patch.dict(rhd.DETECTION_CORRECTION_TARGETS, {
+        key: ("metallicMap",) for key in ("baseColorMap", "colorMap", "diffuseMap")
+    })
+    def test_colour_corrects_itself_and_only_metallic_companions(self) -> None:
         dash = part("dashboard")
         source_member = "vehicles/car/source.png"
         target_member = "vehicles/car/ao.png"
@@ -3591,11 +3631,17 @@ class SharedLayerRegionTests(unittest.TestCase):
                 kind=rhd.MATERIAL_TEXTURE_STAGE_KINDS[stage_key],
             )
 
-        for stage_key in (
-            "baseColorMap", "colorMap", "diffuseMap", "normalMap",
-            "clearCoatBottomNormalMap", "opacityMap", "emissiveMap", "overlayMap",
+        for stage_key, target_stage in (
+            (source_stage, target_stage)
+            for source_stage in (
+                "baseColorMap", "colorMap", "diffuseMap", "normalMap",
+                "clearCoatBottomNormalMap", "opacityMap", "emissiveMap", "overlayMap",
+            )
+            for target_stage in (
+                "metallicMap", "ambientOcclusionMap", "roughnessMap", "normalMap",
+            )
         ):
-            with self.subTest(stage_key=stage_key), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(stage_key=stage_key, target_stage=target_stage), tempfile.TemporaryDirectory() as temporary:
                 workspace = Path(temporary)
                 source = workspace / "input.png"
                 pixels = np.zeros((16, 16, 4), dtype=np.uint8)
@@ -3604,7 +3650,7 @@ class SharedLayerRegionTests(unittest.TestCase):
                 Image.fromarray(pixels).save(source)
                 bindings = {
                     source_member: binding(source_member, stage_key),
-                    target_member: binding(target_member, "ambientOcclusionMap"),
+                    target_member: binding(target_member, target_stage),
                 }
                 ledger = rhd.SharedLayerRegionLedger()
                 ledger.record(relief_member, (16, 16), [relief_region], [None])
@@ -3658,21 +3704,30 @@ class SharedLayerRegionTests(unittest.TestCase):
 
                 self.assertEqual(set(own.in_place_flips), {own_region, relief_region})
                 self.assertEqual(own.report["shared_layer_region_sources"], [relief_member])
-                if stage_key in ("baseColorMap", "colorMap", "diffuseMap"):
-                    self.assertNotIn(source_member, ledger.layers)
-                    self.assertEqual(companion.in_place_flips, [relief_region])
+                is_colour = stage_key in ("baseColorMap", "colorMap", "diffuseMap")
+                if is_colour:
                     self.assertEqual(
-                        companion.report["shared_layer_region_sources"], [relief_member]
+                        ledger.layers[source_member].target_stage_keys, ("metallicMap",)
                     )
                     with Image.open(own.png_path) as corrected:
                         np.testing.assert_array_equal(
                             np.asarray(corrected)[1:3, 1:4], pixels[1:3, 1:4][:, ::-1]
                         )
+                if is_colour and target_stage != "metallicMap":
+                    self.assertEqual(companion.in_place_flips, [relief_region])
+                    self.assertEqual(
+                        companion.report["shared_layer_region_sources"], [relief_member]
+                    )
                 else:
                     self.assertEqual(
                         set(companion.in_place_flips), {own_region, relief_region}
                     )
                     self.assertIn(source_member, companion.report["shared_layer_region_sources"])
+                    if target_stage == "metallicMap":
+                        with Image.open(companion.png_path) as corrected:
+                            np.testing.assert_array_equal(
+                                np.asarray(corrected)[1:3, 1:4], pixels[1:3, 1:4][:, ::-1]
+                            )
 
     def test_task_groups_do_not_cross_a_material_or_part_boundary(self) -> None:
         dash = part("dashboard")
