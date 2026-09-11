@@ -82,6 +82,7 @@ from .recommendation_common import (
 )
 from .recommendation_controls import (
     driver_footrest,
+    pedal_assembly_mesh,
     pedal_offsets,
     steering_mount_meshes,
     trigger_hosts,
@@ -523,6 +524,10 @@ def build_mode_recommendations(
         inert = recommendation_matches(text, INERT_NAME_PATTERNS)
         cabin = in_cabin(context, object_id, volume)
         footrest = cabin and driver_footrest(context, evidence, object_id, available, center_x, side)
+        pedal_assembly = cabin and pedal_assembly_mesh(
+            context,
+            object_id,
+        )
         # 2026-09-10: A frame declared by an instrument slot is the cluster's
         # surround; the generic chassis-frame exclusion is too broad there.
         instrument_frame = "frame" in text and any(
@@ -542,6 +547,8 @@ def build_mode_recommendations(
             mode, reason = core.MODE_TRANSLATE, "diagnostic indicator materials at the driver's station"
         elif footrest and not twinned:
             mode, reason = core.MODE_TRANSLATE, "driver footrest beside the pedals"
+        elif pedal_assembly and not twinned:
+            mode, reason = core.MODE_TRANSLATE, "race pedal assembly"
         elif evidence.funcs(object_id) & lone_stalks and cabin and not twinned:
             mode, reason = core.MODE_MIRROR, "column stalk with no opposite stalk modelled"
             marks = "stalk symbols would read backwards"
@@ -676,17 +683,54 @@ def _add_move_offsets(
         for item in recommendations
         if item.get("mode") == core.MODE_TRANSLATE
     }
-    pedals = pedal_offsets(context, evidence, moving, center_x, side, delta)
+
+    footrests = []
+
+    for item in recommendations:
+        if (
+            item.get("mode") == core.MODE_TRANSLATE
+            and item.get("pedal_companion")
+        ):
+            center = mesh_center(
+                context,
+                str(item["object_id"]),
+            )
+            if center is not None:
+                footrests.append(center)
+
+    pedals = pedal_offsets(
+        context,
+        evidence,
+        moving,
+        center_x,
+        side,
+        footrests,
+    )
+
     for item in recommendations:
         if item.get("mode") != core.MODE_TRANSLATE:
             continue
         if item.get("pedal_companion"):
-            # 2026-09-10: This fixed rest travels with the driver's station;
-            # reflecting its own outboard centre would overshoot the footwell.
             continue
-        if str(item["object_id"]) in pedals:
-            item["offset"] = pedals[str(item["object_id"])]
-            item["reason"] = f"{item['reason']}; twice the pedal assembly's mean lateral position"
+
+        object_id = str(item["object_id"])
+
+        if object_id in pedals:
+            pedal_offset = pedals[object_id]
+
+            if pedal_offset is None:
+                # The nearby transferred footrest defines this footwell. Leave Move X
+                # unset so the whole assembly uses the normal shared Auto displacement.
+                item["reason"] = (
+                    f"{item['reason']}; preserves pedal-to-footrest spacing"
+                )
+            else:
+                item["offset"] = pedal_offset
+                item["reason"] = (
+                    f"{item['reason']}; "
+                    "twice the pedal assembly's mean lateral position"
+                )
+
             continue
         offset = _move_offset(
             context, evidence, str(item["object_id"]), moving, center_x, side, delta

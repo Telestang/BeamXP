@@ -229,15 +229,6 @@ class ControlTests(unittest.TestCase):
             preview["center"] = tuple(-x if i == 0 else x for i, x in enumerate(preview["center"]))
         self.assertEqual(set(pedal_offsets(context, evidence, centers, 0, -1).values()), {.6})
         self.assertEqual(pedal_offsets(context, evidence, ["brake"], 0, -1), {})
-        with patch("beamxp.hand_drive_ui.recommendation_controls.APPLY_PEDAL_AVERAGE_TO_ALL", False):
-            self.assertEqual(pedal_offsets(context, evidence, centers, 0, -1, .65), {})
-        with patch("beamxp.hand_drive_ui.recommendation_controls.APPLY_PEDAL_AVERAGE_TO_ALL", True):
-            self.assertEqual(set(pedal_offsets(context, evidence, centers, 0, -1, .65).values()), {.6})
-        evidence.prop_funcs["shaft"] = frozenset({"clutch"})
-        with patch("beamxp.hand_drive_ui.recommendation_controls.APPLY_PEDAL_AVERAGE_TO_ALL", False):
-            self.assertEqual(pedal_offsets(context, evidence, centers, 0, -1, .8), {})
-        with patch("beamxp.hand_drive_ui.recommendation_controls.APPLY_PEDAL_AVERAGE_TO_ALL", True):
-            self.assertEqual(set(pedal_offsets(context, evidence, centers, 0, -1, .8).values()), {.667})
 
 
 if __name__ == "__main__":

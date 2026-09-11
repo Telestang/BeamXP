@@ -187,10 +187,12 @@ class VehicleWorkflowMixin:
                 config_names = tuple(conversion["variants"])
                 object_ids = self._resolve_part_ids_worker(context, config_names)
                 boxes = self._collect_trigger_boxes(context, config_names)
-                recommendations = [
-                    row for row in build_mode_recommendations(context, object_ids, config_names, boxes)
-                    if row.get("confidence") != "low"
-                ]
+                recommendations = build_mode_recommendations(
+                    context,
+                    object_ids,
+                    config_names,
+                    boxes,
+                )
             self.worker_queue.put(
                 ("vehicle_load_success", (seq, source_zip, vehicle_id, context, conversion, loaded, recommendations))
             )

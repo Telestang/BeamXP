@@ -13,9 +13,17 @@ from .shared import core
 
 PEDAL_FUNCS = frozenset({"brake", "clutch", "throttle"})
 
-# 2026-09-11: True applies twice the pedal-channel mean to every complete
-# assembly. Set False to restore the selective steering-distance checks.
-APPLY_PEDAL_AVERAGE_TO_ALL = True
+PEDAL_ASSEMBLY_PATTERNS = (
+    r"(?:^|_)(?:pedalbox|padalbox|pedals)(?:_|$)",
+)
+
+
+def pedal_assembly_mesh(context, mesh):
+    """Race-pedal assembly geometry which may not expose a pedal prop itself."""
+    return recommendation_matches(
+        recommendation_text(context, mesh),
+        PEDAL_ASSEMBLY_PATTERNS,
+    )
 
 
 def driver_footrest(context, evidence, mesh, available, center_x, side):
@@ -89,45 +97,114 @@ def steering_mount_meshes(context, evidence, reference):
     return frozenset(result)
 
 
-def pedal_offsets(context, evidence, moving, center_x, side, steering_delta=None):
-    """Average control centres equally within nearby stock/shared assemblies."""
+def pedal_offsets(context, evidence, moving, center_x, side, footrests=()):
+    """Average pedal centres unless a moved footrest defines the footwell."""
     pedals = {}
+    companions = {}
+
     for mesh in sorted(moving):
-        channels = evidence.funcs(mesh) & PEDAL_FUNCS
         center = mesh_center(context, mesh)
-        if channels and center is not None:
+        if center is None:
+            continue
+
+        channels = evidence.funcs(mesh) & PEDAL_FUNCS
+        if channels:
             pedals[mesh] = (channels, center)
+
+        if pedal_assembly_mesh(context, mesh):
+            companions[mesh] = center
+
     groups = []
+
     for mesh, (channels, center) in pedals.items():
         obj = context.objects[mesh]
-        # 2026-09-10: Source identity separates optional race pedalboxes from
-        # stock pedals; y/z locality separates assemblies sharing one DAE.
-        source = (str(obj.dae_source_zip or context.source_zip), obj.dae_path)
-        group = next((g for g in groups if g[0] == source and
-                      abs(g[1][1] - center[1]) < .15 and abs(g[1][2] - center[2]) < .15), None)
+
+        # Source identity separates optional race pedalboxes from stock pedals;
+        # y/z locality separates assemblies sharing one DAE.
+        source = (
+            str(obj.dae_source_zip or context.source_zip),
+            obj.dae_path,
+        )
+
+        group = next(
+            (
+                g for g in groups
+                if g[0] == source
+                and abs(g[1][1] - center[1]) < .15
+                and abs(g[1][2] - center[2]) < .15
+            ),
+            None,
+        )
+
         if group is None:
             group = [source, center, []]
             groups.append(group)
+
         group[2].append(mesh)
+
     result = {}
-    for _, _, meshes in groups:
+
+    for source, assembly_center, meshes in groups:
         by_channel = {}
+
         for mesh in meshes:
             for channel in pedals[mesh][0]:
-                by_channel.setdefault(channel, []).append(pedals[mesh][1][0])
+                by_channel.setdefault(channel, []).append(
+                    pedals[mesh][1][0]
+                )
+
+        # A complete pedal station needs at least brake and throttle.
         if not {"brake", "throttle"} <= by_channel.keys():
             continue
-        centers = [sum(values) / len(values) for values in by_channel.values()]
-        offset = round(2 * (sum(centers) / len(centers) - center_x) * side, 3)
-        # 2026-09-11: Selective mode keeps the earlier target-based filter:
-        # recenter narrower two-pedal stations or outboard assemblies, while
-        # other assemblies inherit the existing Move distance.
-        if not APPLY_PEDAL_AVERAGE_TO_ALL and steering_delta is not None:
-            narrower_pair = len(by_channel) == 2 and offset < steering_delta - .10
-            outboard = offset > steering_delta + .06
-            if not (narrower_pair or outboard):
+
+        centers = [
+            sum(values) / len(values)
+            for values in by_channel.values()
+        ]
+
+        offset = round(
+            2 * (sum(centers) / len(centers) - center_x) * side,
+            3,
+        )
+
+        # Start with the actual functional pedal meshes.
+        assembly_meshes = set(meshes)
+
+        # Add named pedalbox/pedals companion geometry belonging to the same
+        # local assembly.
+        for mesh, center in companions.items():
+            obj = context.objects.get(mesh)
+            if obj is None:
                 continue
-        result.update(dict.fromkeys(meshes, offset))
+
+            companion_source = (
+                str(obj.dae_source_zip or context.source_zip),
+                obj.dae_path,
+            )
+
+            if companion_source != source:
+                continue
+
+            if (
+                abs(center[1] - assembly_center[1]) <= .25
+                and abs(center[2] - assembly_center[2]) <= .25
+            ):
+                assembly_meshes.add(mesh)
+
+        # A transferred footrest defines the driver's usable footwell.
+        # Preserve its original relationship to the pedals by leaving the whole
+        # pedal assembly on the normal shared Move distance (Auto).
+        has_footrest = any(
+            abs(center[1] - assembly_center[1]) <= .25
+            and abs(center[2] - assembly_center[2]) <= .25
+            for center in footrests
+        )
+
+        if has_footrest:
+            result.update(dict.fromkeys(assembly_meshes, None))
+        else:
+            result.update(dict.fromkeys(assembly_meshes, offset))
+
     return result
 
 
