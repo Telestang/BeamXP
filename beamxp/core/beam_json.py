@@ -146,10 +146,18 @@ def parse_beamng_json(text: str, *, label: str) -> dict[str, object]:
 
 def load_pc(source_zip: Path, pc_path: str) -> dict[str, object]:
     with zipfile.ZipFile(source_zip) as zf:
-        return parse_beamng_json(
+        pc = parse_beamng_json(
             zf.read(pc_path).decode("utf-8", errors="replace"),
             label=pc_path,
         )
+    # 2026-09-09: lua/ge/extensions/core/vehicle/partmgmt.lua,
+    # buildConfigFromString(), wraps legacy file contents in `parts`. Midsize's
+    # DX/LX configs still use that layout. Normalize at the shared load boundary
+    # so selection and export use the same choices; format 2 makes the game read
+    # the exported wrapper correctly. Keep already structured inputs intact.
+    if pc.get("format") != 2 and "parts" not in pc and "partsTree" not in pc:
+        return {"format": 2, "parts": pc}
+    return pc
 
 
 def load_info(source_zip: Path, info_path: str) -> dict[str, object]:

@@ -131,6 +131,41 @@ class MalformedRowTests(unittest.TestCase):
         self.assertEqual(core.slot_demand_types(body), {"acme_trim_F"})
 
 
+class PartMeshNameTests(unittest.TestCase):
+    def test_only_mesh_cells_are_mesh_names(self) -> None:
+        body = '''"base": {
+            "flexbodies": [
+                ["mesh", "[group]:", "nonFlexMaterials"],
+                ["racingseat_base", ["seat_FR", "floor"], ["seat_material", "other_material"],
+                    {"extra": ["nested_option", "other_option"]}],
+                ["cushion" ["cushion_group", "floor"]],
+            ],
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:"],
+                ["rpm", "needle", "ref", "x", "y", {"extra": ["fake_func", "fake_mesh", "ref"]}],
+            ],
+        }'''
+        self.assertEqual(th.extract_part_mesh_names(body), {"racingseat_base", "cushion", "needle"})
+
+    def test_commented_meshes_and_option_arrays_are_ignored(self) -> None:
+        body = '''"part": {
+            "flexbodies": [
+                ["mesh", "[group]:"],
+                //["disabled", ["group", "floor"]],
+                /* ["also_disabled", ["group", "floor"]], */
+                {"options": ["option_name", "option_value"]},
+                ["active", ["group", "floor"]],
+            ],
+            "props": [
+                ["func", "mesh", "idRef:"],
+                // ["rpm", "disabled_prop", "ref"],
+                /* ["rpm", "also_disabled_prop", "ref"], */
+                ["rpm", "active_prop", "ref"],
+            ],
+        }'''
+        self.assertEqual(th.extract_part_mesh_names(body), {"active", "active_prop"})
+
+
 class MainPartResolutionTests(unittest.TestCase):
     # A mod whose root part is NOT named after the vehicle id, and whose .pc
     # omits mainPartName -- BeamNG finds the root by slotType "main", so we must

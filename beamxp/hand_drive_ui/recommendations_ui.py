@@ -419,11 +419,34 @@ class RecommendationsUIMixin:
             self._show_error("No recommendations selected", "Select at least one recommendation to apply.")
             return
 
+        summary = self._apply_recommendations(selected_rows)
+
+        self._invalidate_trigger_cache()
+        self._refresh_parts()
+        self._refresh_slots()
+        self._refresh_triggers()
+        self._refresh_delta_label()
+        self._refresh_variants()
+        self._update_detail()
+        if self.recommendation_modal is not None and self.recommendation_modal.winfo_exists():
+            self.recommendation_modal.destroy()
+        self.recommendation_modal = None
+        if self.recommendation_tree is not None:
+            self._tree_sort.pop(self.recommendation_tree, None)
+            self._tree_heading_text.pop(self.recommendation_tree, None)
+        self.recommendation_tree = None
+        self.recommendation_rows = {}
+        self.status_var.set(summary)
+
+    def _apply_recommendations(self, selected_rows: list[dict[str, object]]) -> str:
+        """2026-09-09: Apply the same settings for manual review and new vehicle loads."""
         applied = 0
         equivalences = 0
         textures = 0
         triggers = 0
         steering = 0
+        # 2026-09-09: Texture rows follow their transforms so a mesh changed
+        # to Mirror in this pass is editable when its texture row is reached.
         for recommendation in selected_rows:
             mode = recommendation["mode"]
             object_id = recommendation["object_id"]
@@ -433,7 +456,22 @@ class RecommendationsUIMixin:
             if kind == "trigger":
                 key = recommendation.get("trigger_key")
                 if isinstance(key, (tuple, list)) and len(key) == 2:
+                    offset = recommendation.get("offset")
+                    host = recommendation.get("host_id")
+                    if mode == core.MODE_TRANSLATE and offset is None and host:
+                        # 2026-09-10: Applying a mesh Move without an override
+                        # preserves its hand-authored distance. Its trigger
+                        # must inherit that retained value as well.
+                        offset = self._get_part_setting(str(host), "translateOffset", None)
+                    # 2026-09-10: Trigger offsets intentionally normalize zero
+                    # to absent. A stationary host therefore earns Skip.
+                    if mode == core.MODE_TRANSLATE and offset == 0:
+                        mode = core.MODE_SKIP
                     core.set_trigger_mode(self.conversion, str(key[0]), key[1], mode)
+                    # 2026-09-10: A surface-mounted trigger travels by its
+                    # host's override; None clears an earlier override.
+                    if mode == core.MODE_TRANSLATE:
+                        core.set_trigger_offset(self.conversion, str(key[0]), key[1], offset)
                     triggers += 1
                 continue
             if kind == "texture":
@@ -470,24 +508,6 @@ class RecommendationsUIMixin:
             if mode == core.MODE_TRANSLATE and offset is not None:
                 self._part_settings(object_id)["translateOffset"] = float(offset)
 
-        # Texture Fix rows are ordered after the transforms that earn them, so
-        # a mesh set to Mirror in this same pass is already editable by the
-        # time its row is reached.
-        self._invalidate_trigger_cache()
-        self._refresh_parts()
-        self._refresh_slots()
-        self._refresh_triggers()
-        self._refresh_delta_label()
-        self._refresh_variants()
-        self._update_detail()
-        if self.recommendation_modal is not None and self.recommendation_modal.winfo_exists():
-            self.recommendation_modal.destroy()
-        self.recommendation_modal = None
-        if self.recommendation_tree is not None:
-            self._tree_sort.pop(self.recommendation_tree, None)
-            self._tree_heading_text.pop(self.recommendation_tree, None)
-        self.recommendation_tree = None
-        self.recommendation_rows = {}
         parts_summary = [f"{applied} part setting(s)"]
         if equivalences:
             parts_summary.append(f"{equivalences} equivalent parts row(s)")
@@ -497,7 +517,7 @@ class RecommendationsUIMixin:
             parts_summary.append(f"{triggers} trigger box(es)")
         if steering:
             parts_summary.append("the steering reference")
-        self.status_var.set(
+        return (
             f"Applied {len(selected_rows)} recommendation(s) to "
             + ", ".join(parts_summary)
         )

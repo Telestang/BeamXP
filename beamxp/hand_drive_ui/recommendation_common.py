@@ -111,6 +111,9 @@ DRIVER_FUNCS = frozenset({
     "watertemp",
     "coolanttemp",
     "oilpressure",
+    # 2026-09-10: electrics.lua/updateGFX supplies the oil warning signal;
+    # Hopper animates its oil indicator with this channel directly.
+    "oil",
     "boost",
     "airspeed",
     "altitude",
@@ -456,6 +459,10 @@ TEXTURE_GLYPH_PATTERNS = (
     # it; "interior_mirror" is a reflector and carries nothing.
     r"interior$|interior_facelift",
     r"gauge|instrument|cluster",
+    # 2026-09-10: Authored targets mark these labelled cabin-control families.
+    # They have no prop channel distinguishing printed legends from plain trim.
+    r"interior_(?:accessories_police|police_radio)|police_console",
+    r"shifter_?base_a(?:_|$)|shifter_manual_[0-9]+spd(?:_|$)",
 )
 
 _SEAT_NAME_RE = re.compile(r"\b(seat|bucket|racingseat)\b")

@@ -7,6 +7,8 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
+from beamxp.core import sjson
+
 NS = {"c": "http://www.collada.org/2005/11/COLLADASchema"}
 
 PROP_FUNC_MESH_RE = re.compile(
@@ -964,16 +966,33 @@ def extract_named_array(text: str, key: str) -> str | None:
 
 def extract_part_mesh_names(part_body: str) -> set[str]:
     meshes: set[str] = set()
-    flexbodies = extract_named_array(part_body, "flexbodies")
-    if flexbodies:
-        for mesh in re.findall(r'\[\s*"((?:[^"\\]|\\.)*)"\s*(?=,|\[|\{)', flexbodies):
-            if mesh and mesh != "mesh":
+    # 2026-09-09: lua/common/jbeam/tableSchema.lua processJbeamTableRow maps
+    # header columns to cells; sections/meshs.lua processFlexbodies/processProps
+    # consume the `mesh` cell. Nested group/material/option arrays are not mesh
+    # declarations. SJSON also excludes comments and accepts omitted commas.
+    for section in ("flexbodies", "props"):
+        array = extract_named_array(part_body, section)
+        if not array:
+            continue
+        try:
+            rows = sjson.decode(array)
+        except sjson.SJSONError:
+            # 2026-09-09: Keep mesh discovery available for malformed numeric
+            # options that the exporter already repairs and records. The source
+            # text stays intact so its eventual repair still carries that note.
+            repaired, _notes = sjson.repair_invalid_numbers(array)
+            rows = sjson.decode(repaired)
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], list):
+            continue
+        if "mesh" not in rows[0]:
+            continue
+        mesh_column = rows[0].index("mesh")
+        for row in rows[1:]:
+            if not isinstance(row, list) or len(row) <= mesh_column:
+                continue
+            mesh = row[mesh_column]
+            if isinstance(mesh, str) and mesh and mesh != "mesh":
                 meshes.add(mesh)
-    props = extract_named_array(part_body, "props")
-    if props:
-        for _full, _func, prop_mesh in PROP_FUNC_MESH_RE.findall(props):
-            if prop_mesh and prop_mesh != "mesh":
-                meshes.add(prop_mesh)
     return meshes
 
 

@@ -769,6 +769,37 @@ class EquivalentPartPlanTests(unittest.TestCase):
         self.assertIsNone(plan)
         self.assertEqual(core.authored_group_meshes(context, plan), set())
 
+    def test_regular_seat_group_on_racing_base_does_not_activate_regular_seat_pair(self) -> None:
+        # 2026-09-09: Midsize Drag's right racing base uses the regular seat's
+        # node-group name. It does not render that seat's mesh or select its part.
+        parts = dict(EMPTY_OPPOSITE_PARTS)
+        for side in ("FL", "FR"):
+            parts[f"seat_{side}"] = (
+                part(f"seat_{side}", f"seat_{side}", "Regular Seat", extra=flexbodies(f"seat_{side}")),
+                "seats.jbeam",
+            )
+            group = "race_seat_FL" if side == "FL" else "seat_FR"
+            parts[f"race_base_{side}"] = (
+                part(
+                    f"race_base_{side}", f"seat_{side}", "Racing Base",
+                    ((f"race_seat_{side}", f"race_seat_{side}"),),
+                    extra=flexbodies("racingseat_base").replace('["body"]', f'["{group}", "floor"]'),
+                ),
+                "seats.jbeam",
+            )
+        context = context_with_parts(parts, {"trim": selection((
+            ("car", "main", "/"),
+            ("race_base_FL", "seat_FL", "/seat_FL/"),
+            ("race_base_FR", "seat_FR", "/seat_FR/"),
+            ("race_seat_FL", "race_seat_FL", "/seat_FL/race_seat_FL/"),
+            ("race_seat_FR", "race_seat_FR", "/seat_FR/race_seat_FR/"),
+        ))})
+        race_pair = dict(CHILD_ROW)
+        regular_pair = {"left": "seat_FL@@/seat_FL/", "right": "seat_FR@@/seat_FR/", "kind": "seat"}
+        for pairs in ([regular_pair, race_pair], [race_pair, regular_pair], [race_pair]):
+            with self.subTest(pairs=pairs):
+                self.assertIsNone(core.resolve_side_pair_plan(context, "trim", pairs))
+
     def test_a_door_card_row_never_reaches_the_door_that_carries_it(self) -> None:
         # The door declares the card's flexbody, so the card's row matches the
         # door as readily as the card -- and the door does not fit the opposite

@@ -700,6 +700,47 @@ def read_plate_document(context: VehicleContext) -> dict[str, object] | None:
         return None
 
 
+def _migrated_trigger_modes(context: VehicleContext, value: object) -> list[dict[str, object]]:
+    """2026-09-09: Carry obsolete archive-wide trigger keys to resolved trim keys."""
+    records = normalized_trigger_modes(value)
+    if not records:
+        return records
+    by_key = {trigger_position_key(row["id"], row["at"]): row for row in records}
+    valid_keys: set[tuple] = set()
+    replacements: dict[tuple, set[tuple]] = {}
+    for config_name in context.variants:
+        try:
+            selected = selected_parts_for_config(context, config_name)
+            nodes = selected_node_positions_for_config(context, config_name)
+        except Exception:
+            continue
+        for part_id in selected.get("parts", ()):
+            found = part_body_for_context(context, str(part_id))
+            if found is None:
+                continue
+            resolved = authored_trigger_positions(found[0], nodes)
+            if not resolved:
+                continue
+            legacy = authored_trigger_positions(found[0], context.node_positions)
+            for trigger_id, position in resolved.items():
+                key = trigger_position_key(trigger_id, position)
+                valid_keys.add(key)
+                old_key = trigger_position_key(trigger_id, legacy.get(trigger_id))
+                if old_key in by_key and old_key != key:
+                    replacements.setdefault(old_key, set()).add(key)
+    # 2026-09-09: A key still used by a real trim is already authoritative.
+    # Explicit choices at corrected positions win over migrated older choices;
+    # unknown records remain intact rather than guessing from trigger names.
+    migrated = dict(by_key)
+    for old_key, keys in replacements.items():
+        if old_key in valid_keys:
+            continue
+        record = migrated.pop(old_key)
+        for key in keys:
+            migrated.setdefault(key, {**record, "at": list(key[1])})
+    return normalized_trigger_modes(list(migrated.values()))
+
+
 def merge_with_current_inventory(context: VehicleContext, data: dict[str, object]) -> dict[str, object]:
     merged = base_conversion_config(context)
     old_variants = data.get("variants", {})
@@ -750,7 +791,7 @@ def merge_with_current_inventory(context: VehicleContext, data: dict[str, object
 
     merged["slotPairs"] = normalized_slot_pairs(data.get("slotPairs"))
     merged["sidePairs"] = normalized_side_pairs(data.get("sidePairs"))
-    merged["triggers"] = normalized_trigger_modes(data.get("triggers"))
+    merged["triggers"] = _migrated_trigger_modes(context, data.get("triggers"))
 
     merged["textureQuality"] = normalized_texture_quality(data.get("textureQuality"))
     merged["rearWindowSticker"] = data.get("rearWindowSticker") is True
@@ -838,7 +879,7 @@ def import_matching_conversion(
     if imported_side_pairs:
         out["sidePairs"] = imported_side_pairs
         counts["sidePairImported"] = len(imported_side_pairs)
-    imported_triggers = normalized_trigger_modes(imported.get("triggers"))
+    imported_triggers = _migrated_trigger_modes(context, imported.get("triggers"))
     if imported_triggers:
         out["triggers"] = imported_triggers
         counts["triggerModeImported"] = len(imported_triggers)

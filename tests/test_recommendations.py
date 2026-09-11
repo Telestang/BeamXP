@@ -3,9 +3,8 @@
 The recommender reads three things the engine reads -- a prop's ``func``, the
 ``mirrors`` section, and the slotType a part fills -- plus the mesh centres
 already cached for the preview. Names come last and only separate families
-inside one cabin slot. Fixtures are therefore part bodies plus positions, and
-`test_recommending_never_reads_geometry` guards that no spatial work creeps
-back in.
+inside one cabin slot. 2026-09-10: the additional geometry queries have their
+own tests; this suite still guards against rebuilding resolved placements.
 
 2026-09-07: rewritten with the recommender. The suite it replaces described
 the name/placement tables that used to decide everything, and those tables --
@@ -429,10 +428,9 @@ class OtherSettingTests(unittest.TestCase):
 
 
 class CostTests(unittest.TestCase):
-    def test_recommending_never_reads_geometry(self) -> None:
-        """Placement comes from the preview bounds already cached for the 3D
-        view. Rebuilding point clouds is what the retired spatial classifier
-        cost 35 s a vehicle doing."""
+    def test_recommending_does_not_rebuild_resolved_placements(self) -> None:
+        """2026-09-10: Geometry queries use the existing preview placement;
+        they must not rerun the jbeam resolver while scanning recommendations."""
         context = mesh_context(named_cabin(), parts=cabin_parts())
         guarded = (
             "selected_prop_mesh_positions",

@@ -18,6 +18,8 @@ above uses, because the stub is exactly where the bug hid. 2026-09-07.
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from beamxp import hand_drive_core as core
 from beamxp.hand_drive_ui.part_editing import PartEditingMixin
@@ -717,6 +719,118 @@ class RealTargetsHarness(TriggersWorkflowMixin, PartEditingMixin):
         self.trigger_rows_by_iid[row_id] = row
         self.trigger_tree.rows.append(row_id)
         return row
+
+
+class CellEditSelectionTests(unittest.TestCase):
+    """2026-09-09: Exercise cell clicks through the real selection and edit targets."""
+
+    def make_app(self):
+        app = RealTargetsHarness(["dash", "knob", "other"])
+        app.part_tree.selection_set(["dash", "knob"])
+        app.part_tree.focus("dash")
+        app._apply_part_modes(["dash", "knob", "other"], core.MODE_TRANSLATE)
+        app.add_trigger(ROW_ID, "hood_int", AT)["mode"] = core.MODE_TRANSLATE
+        app.add_trigger("other_box", "other_box", (0, 0, 0))["mode"] = core.MODE_TRANSLATE
+        core.set_trigger_mode(app.conversion, "hood_int", AT, core.MODE_TRANSLATE)
+        core.set_trigger_mode(app.conversion, "other_box", (0, 0, 0), core.MODE_TRANSLATE)
+        app.trigger_tree.selection_set([ROW_ID])
+        app.trigger_tree.focus(ROW_ID)
+        app._tree_body_click = lambda *_args: True
+        app._tree_column_name = lambda _tree, column: column
+        app._close_tree_combo_editor = lambda: None
+        app._replace_source_candidate_ids = lambda *_args: []
+        app._mode_values_for_part_row = lambda *_args: MODE_CYCLE_VALUES
+        return app
+
+    def test_move_x_changes_only_the_clicked_row_unless_already_selected(self):
+        for owner, double in (("parts", False), ("parts", True), ("triggers", False)):
+            for selected in (False, True):
+                for state in (0, CONTROL_MASK, SHIFT_MASK):
+                    with self.subTest(owner=owner, double=double, selected=selected, state=state):
+                        app = self.make_app()
+                        tree = app.part_tree if owner == "parts" else app.trigger_tree
+                        item = ("dash" if selected else "other") if owner == "parts" else (
+                            ROW_ID if selected else "other_box"
+                        )
+                        tree.click_row = item
+                        tree.click_column = "offset"
+                        editor = Mock()
+                        app._edit_tree_entry = editor
+                        event = SimpleNamespace(x=0, y=0, state=state)
+                        handler = app._part_double_click if double else (
+                            app._part_click if owner == "parts" else app._trigger_click
+                        )
+                        self.assertEqual(handler(event), None if double else "break")
+                        editor.assert_called_once()
+                        editor.call_args.args[4]("0.42")
+                        meshes = {mesh for mesh, settings in app.part_settings.items()
+                                  if settings.get("translateOffset") == 0.42}
+                        boxes = core.trigger_offset_map(app.conversion)
+                        self.assertEqual(meshes, {"dash", "knob"} if selected else (
+                            {"other"} if owner == "parts" else set()
+                        ))
+                        self.assertEqual(boxes, {("hood_int", AT): 0.42} if selected else (
+                            {("other_box", (0, 0, 0)): 0.42} if owner == "triggers" else {}
+                        ))
+                        self.assertEqual(tree.focus(), item)
+                        if not selected:
+                            other = app.trigger_tree if owner == "parts" else app.part_tree
+                            self.assertEqual(tree.selection(), [item])
+                            self.assertEqual(other.selection(), [])
+                            self.assertEqual(other.focus(), "")
+
+    def test_mesh_properties_settle_selection_before_the_action(self):
+        actions = {
+            "visible": "_toggle_part_bool", "solo": "_toggle_part_bool",
+            "mode": "_edit_tree_combo", "textureCorrection": "_toggle_texture_correction",
+            "source": "_choose_structural_source", "children": "_toggle_include_children",
+            "steering": "_set_single_steering_ref",
+        }
+        for column, action in actions.items():
+            for selected in (False, True):
+                for state in (0, CONTROL_MASK, SHIFT_MASK):
+                    with self.subTest(column=column, selected=selected, state=state):
+                        app = self.make_app()
+                        item = "dash" if selected else "other"
+                        app.part_tree.click_row = item
+                        app.part_tree.click_column = column
+                        if column == "source":
+                            app.part_settings[item]["mode"] = core.MODE_MIRROR_STRUCTURAL
+
+                        def check_selection(*_args, app=app, selected=selected, item=item, **_kwargs):
+                            self.assertEqual(app.part_tree.selection(), ["dash", "knob"] if selected else [item])
+                            self.assertEqual(app.trigger_tree.selection(), [ROW_ID] if selected else [])
+                            self.assertEqual(app.part_tree.focus(), item)
+
+                        callback = Mock(side_effect=check_selection)
+                        setattr(app, action, callback)
+                        self.assertEqual(app._part_click(SimpleNamespace(x=0, y=0, state=state)), "break")
+                        callback.assert_called_once()
+
+    def test_unselected_trigger_mode_replaces_the_group_before_commit(self):
+        for state in (0, CONTROL_MASK, SHIFT_MASK):
+            with self.subTest(state=state):
+                app = self.make_app()
+                app.trigger_tree.click_row = "other_box"
+                app.trigger_tree.click_column = "mode"
+                app._edit_tree_combo = Mock()
+                app._trigger_click(SimpleNamespace(x=0, y=0, state=state))
+                app._edit_tree_combo.call_args.args[5]("Mirror")
+                self.assertEqual(core.trigger_mode_map(app.conversion), {
+                    ("hood_int", AT): core.MODE_TRANSLATE,
+                    ("other_box", (0, 0, 0)): core.MODE_MIRROR,
+                })
+                self.assertEqual(set(app.part_modes.values()), {core.MODE_TRANSLATE})
+                self.assertEqual(app.part_tree.selection(), [])
+                self.assertEqual(app.part_tree.focus(), "")
+
+    def test_mesh_name_click_leaves_extended_selection_to_tk(self):
+        app = self.make_app()
+        app.part_tree.click_row = "other"
+        app.part_tree.click_column = "#0"
+        self.assertIsNone(app._part_click(SimpleNamespace(x=0, y=0, state=CONTROL_MASK)))
+        self.assertEqual(app.part_tree.selection(), ["dash", "knob"])
+        self.assertEqual(app.trigger_tree.selection(), [ROW_ID])
 
 
 class StaleFocusTests(unittest.TestCase):

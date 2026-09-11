@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .recommendation_engine import build_mode_recommendations
 from .shared import *
 
 
@@ -177,8 +178,21 @@ class VehicleWorkflowMixin:
                 core.clear_variant_hands_cache(context)
                 core.clear_part_table_caches(context)
             conversion, loaded = core.load_or_create_conversion(context)
+            recommendations = []
+            if not loaded:
+                # 2026-09-09: Prepare fresh projects across every trim; saved
+                # projects retain their build choices and edited transforms.
+                for settings in conversion["variants"].values():
+                    core.set_variant_build_mode(settings, core.BUILD_CONVERTED)
+                config_names = tuple(conversion["variants"])
+                object_ids = self._resolve_part_ids_worker(context, config_names)
+                boxes = self._collect_trigger_boxes(context, config_names)
+                recommendations = [
+                    row for row in build_mode_recommendations(context, object_ids, config_names, boxes)
+                    if row.get("confidence") != "low"
+                ]
             self.worker_queue.put(
-                ("vehicle_load_success", (seq, source_zip, vehicle_id, context, conversion, loaded))
+                ("vehicle_load_success", (seq, source_zip, vehicle_id, context, conversion, loaded, recommendations))
             )
         except Exception as exc:
             self.worker_queue.put(("vehicle_load_error", (seq, exc)))
@@ -244,12 +258,14 @@ class VehicleWorkflowMixin:
         self._set_busy(busy)
 
     def _handle_vehicle_load_success(self, payload: object) -> None:
-        seq, source_zip, vehicle_id, context, conversion, loaded = payload
+        seq, source_zip, vehicle_id, context, conversion, loaded, recommendations = payload
         if seq != self.vehicle_load_seq:
             return
         self._reset_vehicle_ui_state()
         self.context = context
         self.conversion = conversion
+        if recommendations:
+            self._apply_recommendations(recommendations)
         self.preview_output_var.set("")
         cached_hands = core.load_cached_variant_hands(context, conversion) or {}
         self.variant_detected_hands = cached_hands
@@ -279,6 +295,7 @@ class VehicleWorkflowMixin:
         self.status_var.set(
             f"Loaded {context.vehicle_id}{from_cache}: {len(context.variants)} variant(s), "
             f"{len(context.objects)} DAE object(s)"
+            + (f"; applied {len(recommendations)} recommendation(s)" if not loaded else "")
         )
 
     def _reset_vehicle_ui_state(self) -> None:

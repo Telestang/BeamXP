@@ -3057,7 +3057,8 @@ def full_vehicle_preview_payload(
         "skipped_meshes": skipped,
         "rotation_calibration": rotation_counts,
         "trigger_boxes": preview_trigger_boxes(
-            context, conversion, selected, target_hand or HAND_RHD, trigger_actions
+            context, conversion, selected, target_hand or HAND_RHD, trigger_actions,
+            node_positions=selected_nodes,
         ),
     }
 
@@ -3091,6 +3092,8 @@ def preview_trigger_boxes(
     selected: dict[str, object],
     target_hand: str = HAND_RHD,
     trigger_actions: dict[tuple, str] | None = None,
+    *,
+    node_positions: dict[str, tuple[float, float, float]] | None = None,
 ) -> list[dict[str, object]]:
     """The trigger boxes this config fits, as drawable corner sets.
 
@@ -3103,7 +3106,13 @@ def preview_trigger_boxes(
     receive. The caller supplies it because working it out means running the
     attribution ladder, which the UI has already done and cached.
     """
-    node_positions = context.node_positions
+    # 2026-09-09: events.lua/processTriggers binds refs to the assembled vehicle
+    # via links.lua/resolveLinks. The archive-wide map can hold another model's
+    # same-named nodes (Vivace/Ardente) or nodes absent from this trim.
+    if node_positions is None:
+        node_positions = selected_node_positions_for_parts(
+            selected, context.jbeam_texts, context.part_body_index
+        )
     chosen = trigger_mode_map(conversion)
     actions = trigger_actions or {}
     offsets = trigger_offset_map(conversion)

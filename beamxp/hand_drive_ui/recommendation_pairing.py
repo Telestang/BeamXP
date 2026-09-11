@@ -229,3 +229,23 @@ def handed_pair_family(
     if any(_slot_is_front_door(family) for family in families):
         return "door", "front door slot; no separate card"
     return "part", "handed cabin part with an opposite-side twin"
+
+
+def primary_card_surface(context, evidence, object_id, handed):
+    """2026-09-10: Small attachments do not inherit a door card's lettering."""
+    def area(mesh):
+        bounds = context.preview_by_id.get(mesh, {}).get("bounds")
+        if bounds is None:
+            return None
+        lengths = sorted(abs(float(b) - float(a)) for a, b in zip(*bounds))
+        return lengths[-1] * lengths[-2]
+
+    own = area(object_id)
+    if own is None:
+        return True
+    for part in evidence.part_ids.get(object_id, ()):
+        scores = [area(mesh) for mesh in evidence.meshes_by_part.get(part, ()) if mesh in handed]
+        largest = max((value for value in scores if value is not None), default=own)
+        if own < largest * .5:
+            return False
+    return True

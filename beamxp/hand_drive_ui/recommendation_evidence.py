@@ -38,6 +38,7 @@ import re
 from dataclasses import dataclass, field
 
 from beamxp import transform_helpers
+from beamxp.core import sjson
 
 from .shared import core
 
@@ -47,7 +48,6 @@ from .shared import core
 _EVIDENCE_ATTR = "_recommendation_evidence"
 
 _SLOT_TYPE_RE = re.compile(r'"slotType"\s*:')
-_ROW_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,9 @@ class VehicleEvidence:
     part_ids: dict[str, frozenset[str]] = field(default_factory=dict)
     meshes_by_part: dict[str, frozenset[str]] = field(default_factory=dict)
     mirror_meshes: frozenset[str] = frozenset()
+    prop_frames: dict[str, frozenset[tuple[str, str, str]]] = field(default_factory=dict)
+    selected_part_ids: tuple[str, ...] = ()
+    material_funcs: dict[str, frozenset[str]] = field(default_factory=dict)
 
     def funcs(self, object_id: str) -> frozenset[str]:
         return self.prop_funcs.get(object_id, frozenset())
@@ -81,17 +84,10 @@ def _prop_funcs_for_part(context: core.VehicleContext, part_id: str) -> list[tup
     if not array_text:
         return []
     rows: list[tuple[str, str]] = []
-    for line in array_text.splitlines():
-        line = line.strip()
-        if not line.startswith("["):
-            continue
-        strings = _ROW_STRING_RE.findall(line)
-        if len(strings) < 2:
-            continue
-        func, mesh = strings[0], strings[1]
-        if func == "func" or mesh == "mesh" or not mesh:
-            continue
-        rows.append((func, mesh))
+    for row in core.iter_jbeam_table_rows(array_text):
+        func, mesh = row.get("func"), row.get("mesh")
+        if isinstance(func, str) and isinstance(mesh, str) and mesh:
+            rows.append((func, mesh))
     return rows
 
 
@@ -137,12 +133,34 @@ def vehicle_evidence(
     slot_types: dict[str, set[str]] = {}
     part_ids: dict[str, set[str]] = {}
     meshes_by_part: dict[str, frozenset[str]] = {}
+    prop_frames: dict[str, set[tuple[str, str, str]]] = {}
+    material_funcs: dict[str, set[str]] = {}
+    selected_part_ids = _relevant_part_ids(context, config_names)
 
-    for part_id in _relevant_part_ids(context, config_names):
+    for part_id in selected_part_ids:
         found = part_index.get(part_id)
         if found is None:
             continue
         body = found[0]
+        # 2026-09-10: materials.lua/process matches each glowMap base to its
+        # bound meshes, then evaluates simpleFunction/advancedFunction.triggers.
+        # These are actual indicator channels, independent of material spelling.
+        if '"glowMap"' in body:
+            glow = transform_helpers.extract_keyed_object(body, "glowMap")
+            try:
+                entries = sjson.decode(glow[glow.index("{"):]) if glow else {}
+            except (ValueError, TypeError):
+                entries = {}
+            if isinstance(entries, dict):
+                for material, entry in entries.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    simple = entry.get("simpleFunction")
+                    funcs = {simple} if isinstance(simple, str) else set(simple) if isinstance(simple, dict) else set()
+                    advanced = entry.get("advancedFunction")
+                    if isinstance(advanced, dict) and isinstance(advanced.get("triggers"), list):
+                        funcs.update(value for value in advanced["triggers"] if isinstance(value, str))
+                    material_funcs.setdefault(str(material).lower(), set()).update(funcs)
         meshes = core.part_mesh_names_for_context(context, part_id)
         if not meshes:
             continue
@@ -157,8 +175,17 @@ def vehicle_evidence(
             if declared:
                 slot_types.setdefault(mesh, set()).update(declared)
         if '"props"' in body:
-            for func, mesh in _prop_funcs_for_part(context, part_id):
+            # 2026-09-10: Table rows support compact/multiline arrays and
+            # modifier rows, matching tableSchema rather than line layout.
+            props = core.part_named_array_for_context(context, part_id, "props")
+            for row in core.iter_jbeam_table_rows(props or "[]"):
+                func, mesh = row.get("func"), row.get("mesh")
+                if not isinstance(func, str) or not isinstance(mesh, str) or not mesh:
+                    continue
                 prop_funcs.setdefault(mesh, set()).add(func)
+                frame = tuple(row.get(key) for key in ("idRef:", "idX:", "idY:"))
+                if all(isinstance(node, str) and node for node in frame):
+                    prop_frames.setdefault(mesh, set()).add(frame)
 
     evidence = VehicleEvidence(
         prop_funcs={mesh: frozenset(funcs) for mesh, funcs in prop_funcs.items()},
@@ -169,6 +196,9 @@ def vehicle_evidence(
         # authored in a part a narrow trim selection never reaches, and the
         # read is ~13 ms.
         mirror_meshes=frozenset(core.authored_mirror_rows(context)),
+        prop_frames={mesh: frozenset(frames) for mesh, frames in prop_frames.items()},
+        selected_part_ids=tuple(selected_part_ids),
+        material_funcs={material: frozenset(funcs) for material, funcs in material_funcs.items()},
     )
     setattr(context, _EVIDENCE_ATTR, (key, evidence))
     return evidence

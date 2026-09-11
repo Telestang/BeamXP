@@ -51,50 +51,59 @@ class TriggersWorkflowMixin:
         if isinstance(cached, tuple) and cached[0] == key:
             return cached[1]
 
-        part_ids: set[str] = set()
+        boxes = self._collect_trigger_boxes(self.context, configs)
+        self._trigger_box_cache = (key, boxes)
+        return boxes
+
+    @staticmethod
+    def _collect_trigger_boxes(
+        context: core.VehicleContext, configs: tuple[str, ...]
+    ) -> list[dict[str, object]]:
+        """2026-09-09: Collect the same authored boxes on the UI or load worker."""
+        # 2026-09-09: Resolve each trim before merging equal boxes. Shared part
+        # ids and node names can have different positions after slot transforms.
+        by_key: dict[tuple, dict[str, object]] = {}
         for config_name in configs:
             try:
-                selected = core.selected_parts_for_config(self.context, config_name)
+                selected = core.selected_parts_for_config(context, config_name)
+                positions = core.selected_node_positions_for_config(context, config_name)
             except Exception:
                 continue
-            part_ids.update(str(part_id) for part_id in selected.get("parts", ()))
 
-        positions = self.context.node_positions
-        by_key: dict[tuple, dict[str, object]] = {}
-        for part_id in sorted(part_ids):
-            found = core.part_body_for_context(self.context, part_id)
-            if found is None:
-                continue
-            part_body = found[0]
-            # One read of the part serves the rows, the twinned set and the
-            # authored positions.
-            rows = list(core.iter_trigger_rows(part_body))
-            if not rows:
-                continue
-            twinned = core.twinned_trigger_ids(entry[0] for entry in rows)
-            refs = {entry[0]: (entry[4][0] if entry[4] else "") for entry in rows}
-            for trigger_id, (anchor, centre) in core.authored_trigger_placements(
-                part_body, positions
-            ).items():
-                # Keyed on the anchor -- the raw authored value, so a saved
-                # answer survives corrections to how a shape is read -- but
-                # shown at the shape's middle, which is where it really is.
-                key_at = core.trigger_position_key(trigger_id, anchor)
-                if key_at is None:
+            for part_id in sorted(str(part) for part in selected.get("parts", ())):
+                found = core.part_body_for_context(context, part_id)
+                if found is None:
                     continue
-                entry = by_key.setdefault(key_at, {
-                    "trigger": trigger_id,
-                    "at": key_at[1],
-                    "centre": centre,
-                    "parts": set(),
-                    "twinned": False,
-                    "ref": "",
-                })
-                entry["parts"].add(part_id)
-                if trigger_id in twinned:
-                    entry["twinned"] = True
-                if not entry["ref"]:
-                    entry["ref"] = refs.get(trigger_id, "")
+                part_body = found[0]
+                # One read of the part serves the rows, the twinned set and the
+                # authored positions.
+                rows = list(core.iter_trigger_rows(part_body))
+                if not rows:
+                    continue
+                twinned = core.twinned_trigger_ids(entry[0] for entry in rows)
+                refs = {entry[0]: (entry[4][0] if entry[4] else "") for entry in rows}
+                for trigger_id, (anchor, centre) in core.authored_trigger_placements(
+                    part_body, positions
+                ).items():
+                    # Keyed on the anchor -- the raw authored value, so a saved
+                    # answer survives corrections to how a shape is read -- but
+                    # shown at the shape's middle, which is where it really is.
+                    key_at = core.trigger_position_key(trigger_id, anchor)
+                    if key_at is None:
+                        continue
+                    entry = by_key.setdefault(key_at, {
+                        "trigger": trigger_id,
+                        "at": key_at[1],
+                        "centre": centre,
+                        "parts": set(),
+                        "twinned": False,
+                        "ref": "",
+                    })
+                    entry["parts"].add(part_id)
+                    if trigger_id in twinned:
+                        entry["twinned"] = True
+                    if not entry["ref"]:
+                        entry["ref"] = refs.get(trigger_id, "")
 
         counts: dict[str, int] = {}
         for trigger_id, _at in by_key:
@@ -120,7 +129,6 @@ class TriggersWorkflowMixin:
                 "twinned": bool(entry["twinned"]),
                 "ref": str(entry["ref"]),
             })
-        self._trigger_box_cache = (key, boxes)
         return boxes
 
     def _auto_action(self, box: dict[str, object], node_transforms) -> str:
@@ -262,7 +270,7 @@ class TriggersWorkflowMixin:
                 modes,
                 {},
                 core.HAND_RHD,
-                self.context.node_positions,
+                core.selected_node_positions_for_config(self.context, configs[0]),
             )
         except Exception:
             owners = ([], {}, [])
@@ -367,6 +375,20 @@ class TriggersWorkflowMixin:
             other.selection_set([])
         other.focus("")
 
+    def _select_row_for_edit(self, owner: str, item: str) -> None:
+        """2026-09-09: An unselected cell starts a fresh edit in either table."""
+        tree = self.part_tree if owner == "parts" else self.trigger_tree
+        if item not in tree.selection():
+            # 2026-09-09: Cell handlers bypass Tk's row selection. Replace the
+            # whole group here, even with Ctrl/Shift held; those gather via names.
+            other = getattr(self, "trigger_tree" if owner == "parts" else "part_tree", None)
+            if other is not None:
+                if other.selection():
+                    other.selection_set([])
+                other.focus("")
+            tree.selection_set([item])
+        tree.focus(item)
+
     def _clear_all_selection(self) -> None:
         """Nothing selected in either table -- an empty click in the preview.
 
@@ -421,12 +443,7 @@ class TriggersWorkflowMixin:
             # swallowed it and left the table single-select whatever its
             # selectmode said.
             return None
-        self.trigger_tree.focus(item)
-        # An editor opening on a row that is already part of a gathered
-        # selection must not throw the rest of it away -- that edit is meant for
-        # all of them. Only a click on an unselected row starts fresh.
-        if item not in self.trigger_tree.selection():
-            self.trigger_tree.selection_set([item])
+        self._select_row_for_edit("triggers", item)
         if name == "mode":
             # Opens on what the cell shows, prediction included, so the list
             # starts from the transform in force rather than from blank.

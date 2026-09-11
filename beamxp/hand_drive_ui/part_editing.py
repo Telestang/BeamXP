@@ -24,6 +24,8 @@ class PartEditingMixin:
             return "break"
         object_id = self._part_row_mesh_id(item)
         name = self._tree_column_name(self.part_tree, column)
+        if name in {"visible", "solo", "mode", "textureCorrection", "source", "children", "offset", "steering"}:
+            self._select_row_for_edit("parts", item)
         child_override = self._part_child_override(item)
         if child_override and name in {"mode", "source", "children", "offset"}:
             self.status_var.set(self._part_override_status_label(child_override))
@@ -35,11 +37,6 @@ class PartEditingMixin:
             self._toggle_part_bool(object_id, "viewerSolo")
             return "break"
         if name == "mode":
-            self.part_tree.focus(item)
-            # Keep a gathered selection intact: the dropdown on one of its rows
-            # sets the mode for all of them. Only an unselected row starts fresh.
-            if item not in self.part_tree.selection():
-                self.part_tree.selection_set(item)
             current = mode_label(str(self._get_part_setting(object_id, "mode", core.MODE_SKIP)))
             replace_label = mode_label(core.MODE_REPLACE_SOURCE)
             disabled = set()
@@ -124,6 +121,8 @@ class PartEditingMixin:
             return
         object_id = self._part_row_mesh_id(item)
         name = self._tree_column_name(self.part_tree, column)
+        if name in {"mode", "offset"}:
+            self._select_row_for_edit("parts", item)
         child_override = self._part_child_override(item)
         if child_override and name in {"mode", "source", "children", "offset"}:
             self.status_var.set(self._part_override_status_label(child_override))

@@ -19,6 +19,13 @@ available at it, and a mesh leaves the ladder as soon as one claims it.
     at the driver's station it moves, anywhere else it reflects.
 6.  Everything else is left alone.
 
+2026-09-10: Reflections additionally pass projected-hull and small-component
+shape checks, or UV/material-matched triangle symmetry for larger panels.
+Pedal averages supply supported Move X overrides; nearby filled surfaces
+associate triggers with controls. Wheel-mount groups and glowMap channels
+identify additional driver controls. These CPU queries cache on the context;
+the timings below describe the initial ladder.
+
 Then four passes over what the ladder decided, answering the settings the
 modal used to leave to the parts table: a Move X for the rows whose own
 landing point is not the shared steering delta, Texture Fix on the reflecting
@@ -73,10 +80,23 @@ from .recommendation_common import (
     slot_family,
     slot_role,
 )
+from .recommendation_controls import (
+    driver_footrest,
+    pedal_offsets,
+    steering_mount_meshes,
+    trigger_hosts,
+)
 from .recommendation_evidence import vehicle_evidence
+from .recommendation_geometry import (
+    appearance_symmetric,
+    geometry_for_ids,
+    projected_symmetry,
+    small_component_symmetric,
+)
 from .recommendation_pairing import (
     handed_mesh_ids,
     handed_pair_family,
+    primary_card_surface,
     resolve_side_twin,
 )
 from .shared import core
@@ -257,6 +277,15 @@ def _at_driver_station(
     return (center[0] - center_x) * side >= DRIVER_BAND[0]
 
 
+def _warning_cluster(context, evidence, object_id, center_x, side):
+    """2026-09-10: Multiple diagnostic lamps identify a cluster's overlay mesh."""
+    signals = set()
+    for material in context.preview_by_id.get(object_id, {}).get("materials", ()):
+        signals.update(evidence.material_funcs.get(str(material).lower(), ()))
+    warnings = {"abs", "esc", "tcs", "checkengine", "lowfuel", "lowpressure", "oil", "battery"}
+    return len(signals & warnings) >= 2 and _at_driver_station(context, object_id, center_x, side)
+
+
 def _is_console_selector(
     context: core.VehicleContext,
     evidence,
@@ -381,6 +410,7 @@ def build_mode_recommendations(
     center_x = core.estimated_vehicle_center_x(context, scope, steering_ids)
     side = _driver_side(context, steering_ids, center_x)
     reference = _steering_reference(context, steering_ids)
+    wheel_mount = steering_mount_meshes(context, evidence, reference)
     delta = _delta_for_reference(context, reference, center_x)
     handed = handed_mesh_ids(context, evidence, scope)
     volume = cabin_volume(context, steering_ids)
@@ -442,7 +472,8 @@ def build_mode_recommendations(
             "confidence": "high",
             "equivalent": True,
             "pair_kind": family,
-            "marks": "door card lettering would read backwards" if family == "door" else "",
+            "marks": "door card lettering would read backwards"
+            if family == "door" and primary_card_surface(context, evidence, first, handed) else "",
         })
 
     # 2. Front seats: the opposite seat already fits the slot, so the swap is
@@ -491,13 +522,27 @@ def build_mode_recommendations(
         slot = slot_role(evidence.slots(object_id), context.vehicle_id)
         inert = recommendation_matches(text, INERT_NAME_PATTERNS)
         cabin = in_cabin(context, object_id, volume)
+        footrest = cabin and driver_footrest(context, evidence, object_id, available, center_x, side)
+        # 2026-09-10: A frame declared by an instrument slot is the cluster's
+        # surround; the generic chassis-frame exclusion is too broad there.
+        instrument_frame = "frame" in text and any(
+            any(token in slot_family(value, context.vehicle_id) for token in ("gauge", "instrument", "digidash"))
+            for value in evidence.slots(object_id))
+        if instrument_frame:
+            inert = False
         # A mesh with an opposite-side twin is half of a pair. Either the pair
         # is handed, in which case rung 1 has already swapped it, or it is a
         # true mirror pair -- a kick plate, a rear door card, a tie rod -- and
         # reflecting one half on its own only moves it onto its own twin.
         twinned = resolve_side_twin(context, object_id, available, center_x) is not None
         marks = ""
-        if evidence.funcs(object_id) & lone_stalks and cabin and not twinned:
+        if object_id in wheel_mount and cabin and not twinned:
+            mode, reason = core.MODE_TRANSLATE, "bound to the steering wheel's dedicated node mount"
+        elif cabin and not inert and not twinned and _warning_cluster(context, evidence, object_id, center_x, side):
+            mode, reason = core.MODE_TRANSLATE, "diagnostic indicator materials at the driver's station"
+        elif footrest and not twinned:
+            mode, reason = core.MODE_TRANSLATE, "driver footrest beside the pedals"
+        elif evidence.funcs(object_id) & lone_stalks and cabin and not twinned:
             mode, reason = core.MODE_MIRROR, "column stalk with no opposite stalk modelled"
             marks = "stalk symbols would read backwards"
         elif role == "driver" and cabin and not inert and not twinned:
@@ -537,8 +582,10 @@ def build_mode_recommendations(
             "equivalent": False,
             "pair_kind": "",
             "marks": marks,
+            "pedal_companion": footrest,
         })
 
+    _suppress_symmetric_reflections(context, recommendations, center_x, evidence)
     _add_move_offsets(context, evidence, recommendations, center_x, side, delta)
     _add_texture_rows(recommendations, text_by_id)
     _add_steering_row(reference, recommendations)
@@ -547,7 +594,7 @@ def build_mode_recommendations(
             (c[1] for c in (mesh_center(context, m) for m in steering_ids) if c is not None),
             default=None,
         )
-        _add_trigger_rows(recommendations, trigger_boxes, volume, wheel_y)
+        _add_trigger_rows(recommendations, trigger_boxes, volume, wheel_y, context, available)
 
     kind_order = {"pair": 0, "equivalent": 1, "single": 2, "texture": 3, "steering": 4, "trigger": 5}
     mode_order = {
@@ -567,6 +614,52 @@ def build_mode_recommendations(
     return recommendations
 
 
+def _suppress_symmetric_reflections(context, recommendations, center_x, evidence=None):
+    """2026-09-10: Check small component shape; require mapped symmetry for panels."""
+    candidates = [row for row in recommendations
+                  if row.get("kind") == "single" and row.get("mode") == core.MODE_MIRROR
+                  and str(row["object_id"]) not in context.variant_dependent_meshes]
+    geometry = geometry_for_ids(context, [str(row["object_id"]) for row in candidates])
+    symmetric = []
+    for row in candidates:
+        mesh = str(row["object_id"])
+        item = geometry.get(mesh)
+        if item is None:
+            continue
+        scores = item.setdefault("outline_scores", {})
+        if center_x not in scores:
+            scores[center_x] = projected_symmetry(item["points"], center_x)
+        score = scores[center_x]
+        row["outline_symmetry"] = score
+        if score is not None and score >= .98 and (evidence is None or mesh not in evidence.mirror_meshes):
+            small = item.setdefault("small_component_symmetry", {})
+            if center_x not in small:
+                small[center_x] = small_component_symmetric(item["points"], center_x)
+            if small[center_x]:
+                row["mode"] = core.MODE_SKIP
+                row["reason"] = "small symmetric component; keeps its existing texture"
+                row["shape_only_skip"] = True
+                continue
+        if score is None or score < .995:
+            continue
+        symmetric.append(row)
+    appearance = geometry_for_ids(context, [str(row["object_id"]) for row in symmetric], appearance=True)
+    for row in symmetric:
+        item = appearance.get(str(row["object_id"]), {})
+        verdicts = item.setdefault("appearance_symmetry", {})
+        if center_x not in verdicts:
+            verdicts[center_x] = appearance_symmetric(item.get("appearance"), center_x)
+        if verdicts[center_x]:
+            row["mode"] = core.MODE_SKIP
+            # 2026-09-10: Omitting an identical reflected mesh does not make
+            # a driver's clickable volume symmetric (e.g. a bonnet release).
+            row["trigger_mode"] = core.MODE_MIRROR
+            row["reason"] = "reflection preserves mesh surfaces, UV maps and materials"
+            row["confidence"] = "high"
+        else:
+            row["reason"] += "; symmetric outline, internal detail or texture mapping differs"
+
+
 def _add_move_offsets(
     context: core.VehicleContext,
     evidence,
@@ -583,13 +676,26 @@ def _add_move_offsets(
         for item in recommendations
         if item.get("mode") == core.MODE_TRANSLATE
     }
+    pedals = pedal_offsets(context, evidence, moving, center_x, side, delta)
     for item in recommendations:
         if item.get("mode") != core.MODE_TRANSLATE:
+            continue
+        if item.get("pedal_companion"):
+            # 2026-09-10: This fixed rest travels with the driver's station;
+            # reflecting its own outboard centre would overshoot the footwell.
+            continue
+        if str(item["object_id"]) in pedals:
+            item["offset"] = pedals[str(item["object_id"])]
+            item["reason"] = f"{item['reason']}; twice the pedal assembly's mean lateral position"
             continue
         offset = _move_offset(
             context, evidence, str(item["object_id"]), moving, center_x, side, delta
         )
         if offset is None:
+            continue
+        if offset == 0:
+            item["mode"] = core.MODE_SKIP
+            item["reason"] = f"{item['reason']}; already at its target position"
             continue
         item["offset"] = offset
         item["reason"] = f"{item['reason']}; lands at its mirrored position"
@@ -688,8 +794,10 @@ def _add_trigger_rows(
     trigger_boxes: list[dict[str, object]],
     volume: tuple[float, float] | None,
     wheel_y: float | None,
+    context=None,
+    available=(),
 ) -> None:
-    """A transform for each trigger box, from what it is attached to.
+    """2026-09-10: Follow a nearby mesh surface, retaining cabin fallbacks.
 
     A trigger is a clickable volume, so it ends up wherever the surface it
     sits on ends up. Four kinds, in order:
@@ -709,14 +817,21 @@ def _add_trigger_rows(
       into. Every one of them, including the release levers down by the sill
       at x=0.7 and the switches in the middle of the dash.
 
-    No box is recommended for Move. 2026-09-07: five of the 163 baseline boxes
-    are hand-set to Move -- two ESC buttons, two headlight switches and one
-    ignition -- and nothing separates them from the 56 hand-set to Mirror. A
-    lateral test was tried: the headlight switches sit at x=0.55 and 0.57, but
-    so do the bonnet and boot releases at x=0.65 to 0.75, which all reflect.
-    Reflecting everything scores 155/163; adding the test scored 142.
+    Filled triangles now identify separate switches where their fascia has
+    nearer vertices. The mesh recommendation supplies the mode and Move X;
+    omitting an identical reflected mesh still carries its clickable controls.
+    Without an identified transforming host, retain the cabin/panel rule.
+    Game placement: sections/events.lua, processTriggers, consumes the
+    reference triad, baseTranslation and translationOffset.
     """
-    for box in trigger_boxes:
+    hosts = trigger_hosts(context, available, trigger_boxes) if context is not None else {}
+    mesh_rows = {}
+    for row in recommendations:
+        if row.get("kind") in {"single", "pair"}:
+            mesh_rows[str(row["object_id"])] = row
+            if row.get("source_id"):
+                mesh_rows[str(row["source_id"])] = row
+    for index, box in enumerate(trigger_boxes):
         if box.get("twinned"):
             continue
         at = box.get("at") or box.get("centre")
@@ -725,6 +840,16 @@ def _add_trigger_rows(
         lowered = str(box.get("trigger") or "").lower()
         if recommendation_matches(lowered, _TRIGGER_FIXED_PATTERNS):
             continue
+        host = hosts.get(index)
+        owner = mesh_rows.get(host, {})
+        # 2026-09-10: No mesh row means unknown, not an affirmative Skip.
+        # A handed door-card control crosses sides with its swapped artwork;
+        # ordinary door handles were excluded by the fixed-trigger gate above.
+        mode = str(owner.get("trigger_mode", owner.get("mode", core.MODE_MIRROR)))
+        if mode == core.MODE_MIRROR_STRUCTURAL:
+            mode = core.MODE_MIRROR
+        if mode == core.MODE_TRANSLATE and owner.get("offset") == 0:
+            mode = core.MODE_SKIP
         inside = _trigger_in_cabin(at, volume, wheel_y)
         if recommendation_matches(lowered, _TRIGGER_PANEL_PATTERNS) and not inside:
             continue
@@ -732,12 +857,14 @@ def _add_trigger_rows(
             "kind": "trigger",
             "object_id": str(box.get("label") or box.get("trigger") or ""),
             "source_id": "",
-            "mode": core.MODE_MIRROR,
-            "reason": "cabin control; follows the fascia",
+            "mode": mode,
+            "reason": f"follows the surface of {host}" if host else "cabin control; follows the fascia",
             "confidence": "med",
             "equivalent": False,
             "pair_kind": "",
             "trigger_key": box.get("key"),
+            "host_id": host,
+            "offset": owner.get("offset") if mode == core.MODE_TRANSLATE else None,
         })
 
 

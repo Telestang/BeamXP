@@ -27,7 +27,11 @@ from beamxp.core.models import VehicleContext
 # 13: flexbodies whose node groups this trim leaves empty are excluded, so the
 #     used-part sets and preview scenes cached under 12 list meshes that never
 #     spawn (the BX race trims' door controls).
-CONTEXT_CACHE_VERSION = 13
+# 2026-09-09: 14 loads legacy flat PC choices instead of slot defaults; cached
+# PCs, selections and preview meshes from the old reader must be rebuilt.
+# 2026-09-09: 15 excludes node groups and commented rows from mesh ownership;
+# stale ownership could replace Midsize Drag's racing seats through side pairs.
+CONTEXT_CACHE_VERSION = 15
 HAND_DETECTION_CACHE_VERSION = 1
 # Bump when the mesh numbering or the flexbody/prop role split changes shape or
 # meaning, so an existing project stops reusing what the old rule produced.
